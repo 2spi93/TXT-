@@ -1,0 +1,205 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: txt-postgres
+    environment:
+      POSTGRES_DB: mission_control
+      POSTGRES_USER: txt
+      POSTGRES_PASSWORD: txt
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+
+  control-plane:
+    image: txt-python:3.11
+    build:
+      context: .
+      dockerfile: Dockerfile.txt-python
+    container_name: control-plane
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    environment:
+      SYSTEM_MODE: guarded_auto
+      RISK_GATEWAY_URL: http://risk-gateway:8001
+      EXECUTION_ROUTER_URL: http://execution-router:8002
+      MARKET_DATA_URL: http://market-data:8003
+      BROKER_ADAPTER_URL: http://broker-adapter:8004
+      AI_ORCHESTRATOR_URL: http://ai-orchestrator:8005
+      MT5_BRIDGE_URL: http://mt5-bridge:8006
+      EMBEDDINGS_SERVICE_URL: http://embeddings-service:8007
+      DATABASE_URL: postgresql://txt:txt@postgres:5432/mission_control
+      APPROVAL_HMAC_SECRET: mission-control-secret
+    env_file:
+      - ./.env
+    command: >
+      sh -c "uvicorn apps.control_plane.main:app --host 0.0.0.0 --port 8000"
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - risk-gateway
+      - execution-router
+      - market-data
+      - broker-adapter
+      - ai-orchestrator
+      - mt5-bridge
+      - embeddings-service
+
+  mt5-bridge:
+    image: txt-python:3.11
+    container_name: mt5-bridge
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    environment:
+      DATABASE_URL: postgresql://txt:txt@postgres:5432/mission_control
+      MT5_BRIDGE_MODE: paper
+    env_file:
+      - ./.env
+    command: >
+      sh -c "uvicorn apps.mt5_bridge.main:app --host 0.0.0.0 --port 8006"
+    ports:
+      - "8006:8006"
+    depends_on:
+      - postgres
+
+  embeddings-service:
+    image: txt-python:3.11
+    container_name: embeddings-service
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      DATABASE_URL: postgresql://txt:txt@postgres:5432/mission_control
+    env_file:
+      - ./.env
+    command: >
+      sh -c "uvicorn apps.embeddings_service.main:app --host 0.0.0.0 --port 8007"
+    ports:
+      - "8007:8007"
+    depends_on:
+      - postgres
+
+  risk-gateway:
+    image: txt-python:3.11
+    container_name: risk-gateway
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    environment:
+      RISK_POLICY_PATH: /workspace/config/risk_policy.json
+      DATABASE_URL: postgresql://txt:txt@postgres:5432/mission_control
+    command: >
+      sh -c "uvicorn apps.risk_gateway.main:app --host 0.0.0.0 --port 8001"
+    ports:
+      - "8001:8001"
+    depends_on:
+      - postgres
+
+  execution-router:
+    image: txt-python:3.11
+    container_name: execution-router
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    environment:
+      DATABASE_URL: postgresql://txt:txt@postgres:5432/mission_control
+      MARKET_DATA_URL: http://market-data:8003
+    command: >
+      sh -c "uvicorn apps.execution_router.main:app --host 0.0.0.0 --port 8002"
+    ports:
+      - "8002:8002"
+    depends_on:
+      - postgres
+
+  market-data:
+    image: txt-python:3.11
+    container_name: market-data
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    environment:
+      DATABASE_URL: postgresql://txt:txt@postgres:5432/mission_control
+    command: >
+      sh -c "uvicorn apps.market_data_plane.main:app --host 0.0.0.0 --port 8003"
+    ports:
+      - "8003:8003"
+    depends_on:
+      - postgres
+
+  broker-adapter:
+    image: txt-python:3.11
+    container_name: broker-adapter
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    environment:
+      DATABASE_URL: postgresql://txt:txt@postgres:5432/mission_control
+      MARKET_DATA_URL: http://market-data:8003
+    env_file:
+      - ./.env
+    command: >
+      sh -c "uvicorn apps.broker_adapter.main:app --host 0.0.0.0 --port 8004"
+    ports:
+      - "8004:8004"
+    depends_on:
+      - postgres
+      - market-data
+
+  ai-orchestrator:
+    image: txt-python:3.11
+    container_name: ai-orchestrator
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      DATABASE_URL: postgresql://txt:txt@postgres:5432/mission_control
+    env_file:
+      - ./.env
+    command: >
+      sh -c "uvicorn apps.ai_orchestrator.main:app --host 0.0.0.0 --port 8005"
+    ports:
+      - "8005:8005"
+    depends_on:
+      - postgres
+
+  mission-control-ui:
+    image: node:20-alpine
+    container_name: mission-control-ui
+    working_dir: /workspace/ui/mission-control
+    volumes:
+      - ./:/workspace
+    environment:
+      PORT: 3000
+      CONTROL_PLANE_URL: http://control-plane:8000
+      CONTROL_PLANE_TOKEN:
+      APPROVAL_HMAC_SECRET: mission-control-secret
+    env_file:
+      - ./.env
+    command: >
+      sh /workspace/scripts/run_mission_control_ui.sh
+    expose:
+      - "3000"
+    depends_on:
+      - control-plane
+
+  mission-control-gateway:
+    image: nginx:1.27-alpine
+    container_name: mission-control-gateway
+    volumes:
+      - ./docker/mission-control-gateway.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - mission-control-ui
+      - control-plane
+      - market-data
+
+volumes:
+  postgres_data:
