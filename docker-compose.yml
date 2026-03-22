@@ -8,8 +8,17 @@ services:
       POSTGRES_PASSWORD: txt
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
     ports:
       - "5433:5432"
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 20G
+        reservations:
+          memory: 16G
 
   control-plane:
     image: txt-python:3.11
@@ -34,7 +43,7 @@ services:
     env_file:
       - ./.env
     command: >
-      sh -c "uvicorn apps.control_plane.main:app --host 0.0.0.0 --port 8000"
+      sh -c "uvicorn apps.control_plane.main:app --host 0.0.0.0 --port 8000 --workers 4"
     ports:
       - "8000:8000"
     depends_on:
@@ -46,6 +55,11 @@ services:
       - ai-orchestrator
       - mt5-bridge
       - embeddings-service
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
 
   mt5-bridge:
     image: txt-python:3.11
@@ -59,11 +73,16 @@ services:
     env_file:
       - ./.env
     command: >
-      sh -c "uvicorn apps.mt5_bridge.main:app --host 0.0.0.0 --port 8006"
+      sh -c "uvicorn apps.mt5_bridge.main:app --host 0.0.0.0 --port 8006 --workers 2"
     ports:
       - "8006:8006"
     depends_on:
       - postgres
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
 
   embeddings-service:
     image: txt-python:3.11
@@ -78,11 +97,18 @@ services:
     env_file:
       - ./.env
     command: >
-      sh -c "uvicorn apps.embeddings_service.main:app --host 0.0.0.0 --port 8007"
+      sh -c "uvicorn apps.embeddings_service.main:app --host 0.0.0.0 --port 8007 --workers 2"
     ports:
       - "8007:8007"
     depends_on:
       - postgres
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4G
+        reservations:
+          memory: 2G
 
   risk-gateway:
     image: txt-python:3.11
@@ -94,11 +120,16 @@ services:
       RISK_POLICY_PATH: /workspace/config/risk_policy.json
       DATABASE_URL: postgresql://txt:txt@postgres:5432/mission_control
     command: >
-      sh -c "uvicorn apps.risk_gateway.main:app --host 0.0.0.0 --port 8001"
+      sh -c "uvicorn apps.risk_gateway.main:app --host 0.0.0.0 --port 8001 --workers 2"
     ports:
       - "8001:8001"
     depends_on:
       - postgres
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
 
   execution-router:
     image: txt-python:3.11
@@ -110,11 +141,16 @@ services:
       DATABASE_URL: postgresql://txt:txt@postgres:5432/mission_control
       MARKET_DATA_URL: http://market-data:8003
     command: >
-      sh -c "uvicorn apps.execution_router.main:app --host 0.0.0.0 --port 8002"
+      sh -c "uvicorn apps.execution_router.main:app --host 0.0.0.0 --port 8002 --workers 4"
     ports:
       - "8002:8002"
     depends_on:
       - postgres
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
 
   market-data:
     image: txt-python:3.11
@@ -125,11 +161,16 @@ services:
     environment:
       DATABASE_URL: postgresql://txt:txt@postgres:5432/mission_control
     command: >
-      sh -c "uvicorn apps.market_data_plane.main:app --host 0.0.0.0 --port 8003"
+      sh -c "uvicorn apps.market_data_plane.main:app --host 0.0.0.0 --port 8003 --workers 4"
     ports:
       - "8003:8003"
     depends_on:
       - postgres
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
 
   broker-adapter:
     image: txt-python:3.11
@@ -143,12 +184,17 @@ services:
     env_file:
       - ./.env
     command: >
-      sh -c "uvicorn apps.broker_adapter.main:app --host 0.0.0.0 --port 8004"
+      sh -c "uvicorn apps.broker_adapter.main:app --host 0.0.0.0 --port 8004 --workers 2"
     ports:
       - "8004:8004"
     depends_on:
       - postgres
       - market-data
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
 
   ai-orchestrator:
     image: txt-python:3.11
@@ -163,11 +209,18 @@ services:
     env_file:
       - ./.env
     command: >
-      sh -c "uvicorn apps.ai_orchestrator.main:app --host 0.0.0.0 --port 8005"
+      sh -c "uvicorn apps.ai_orchestrator.main:app --host 0.0.0.0 --port 8005 --workers 2"
     ports:
       - "8005:8005"
     depends_on:
       - postgres
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 8G
+        reservations:
+          memory: 4G
 
   mission-control-ui:
     image: node:20-alpine
@@ -188,6 +241,11 @@ services:
       - "3000"
     depends_on:
       - control-plane
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
 
   mission-control-gateway:
     image: nginx:1.27-alpine
@@ -200,6 +258,11 @@ services:
       - mission-control-ui
       - control-plane
       - market-data
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 256M
 
 volumes:
   postgres_data:

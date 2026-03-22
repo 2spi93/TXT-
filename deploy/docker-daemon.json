@@ -1,0 +1,16 @@
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m",
+    "max-file": "5"
+  },
+  "storage-driver": "overlay2",
+  "default-ulimits": {
+    "nofile": {
+      "Hard": 65536,
+      "Name": "nofile",
+      "Soft": 65536
+    }
+  },
+  "metrics-addr": "127.0.0.1:9323"
+}
