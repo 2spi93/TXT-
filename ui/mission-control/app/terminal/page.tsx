@@ -455,6 +455,32 @@ const DEFAULT_CONFLUENCE_WEIGHTS: MarketConfluenceWeights = {
 };
 const CHART_GROUPS: ChartGroupId[] = ["A"];
 const CHART_TIMEFRAMES: Array<"1m" | "5m" | "15m"> = ["1m", "5m", "15m"];
+const PRIMARY_CHART_GROUP: ChartGroupId = "A";
+const HUMAN_MODE_INDICATORS: ActiveIndicator[] = [
+  { id: "ema9", params: {} },
+  { id: "ema21", params: {} },
+  { id: "ema50", params: {} },
+  { id: "ema200", params: {} },
+  { id: "vwap", params: {} },
+  { id: "rsi", params: {} },
+  { id: "macd", params: {} },
+  { id: "atr", params: {} },
+  { id: "supertrend", params: {} },
+  { id: "market_structure", params: {} },
+];
+const HYBRID_MODE_INDICATORS: ActiveIndicator[] = [
+  { id: "ema21", params: {} },
+  { id: "vwap", params: {} },
+  { id: "rsi", params: {} },
+  { id: "supertrend", params: {} },
+];
+
+function cloneIndicatorPreset(preset: ActiveIndicator[]): ActiveIndicator[] {
+  return preset.map((indicator) => ({
+    id: indicator.id,
+    params: { ...(indicator.params || {}) },
+  }));
+}
 
 function riskAlertDefaultsForPreset(preset: LayoutPreset): { window: number; missThreshold: number; refreshSec: 5 | 15 | 30; hardAlertEnabled: boolean; hardAlertThresholdPct: number } {
   if (preset === "scalp") {
@@ -2309,6 +2335,38 @@ export default function TradingTerminalPage() {
   }, [signalDisplayMode]);
 
   useEffect(() => {
+    if (autoExecutionMode === "assisted") {
+      setSignalDisplayMode("classic");
+      setChartPerfMode("balanced");
+      setShowVwap(true);
+      setShowFvgOb(true);
+      setShowLiquidity(true);
+      setShowSessions(true);
+      setActiveIndicators(cloneIndicatorPreset(HUMAN_MODE_INDICATORS));
+      return;
+    }
+    if (autoExecutionMode === "semi-auto") {
+      setSignalDisplayMode("augmented");
+      setChartPerfMode("auto");
+      setShowVwap(true);
+      setShowFvgOb(true);
+      setShowLiquidity(true);
+      setShowSessions(false);
+      setActiveIndicators(cloneIndicatorPreset(HYBRID_MODE_INDICATORS));
+      return;
+    }
+    setSignalDisplayMode("ai-dominant");
+    setChartPerfMode("ultra");
+    setShowVwap(false);
+    setShowFvgOb(false);
+    setShowLiquidity(false);
+    setShowSessions(false);
+    setShowConfluenceTune(false);
+    setShowDecisionSecondary(false);
+    setActiveIndicators([]);
+  }, [autoExecutionMode]);
+
+  useEffect(() => {
     let cancelled = false;
     void fetchBackendUserUiPreferences().then((payload) => {
       if (cancelled) {
@@ -2917,20 +2975,18 @@ export default function TradingTerminalPage() {
     }
     try {
       const accountKey = accountId || "default";
-      for (const group of CHART_GROUPS) {
-        const key = `${TERMINAL_CHART_LINK_STORAGE_PREFIX}.${accountKey}.${group}`;
-        const raw = window.localStorage.getItem(key);
-        const previous = raw ? JSON.parse(raw) as Record<string, unknown> : {};
-        const panel = chartPanels[group];
-        const payload = {
-          ...previous,
-          updatedAt: new Date().toISOString(),
-          workspace: layoutWorkspaceName,
-          symbol: chartLinkSymbolEnabled ? panel.symbol : previous.symbol,
-          timeframe: chartLinkTimeframeEnabled ? panel.timeframe : previous.timeframe,
-        };
-        window.localStorage.setItem(key, JSON.stringify(payload));
-      }
+      const key = `${TERMINAL_CHART_LINK_STORAGE_PREFIX}.${accountKey}.${PRIMARY_CHART_GROUP}`;
+      const raw = window.localStorage.getItem(key);
+      const previous = raw ? JSON.parse(raw) as Record<string, unknown> : {};
+      const panel = chartPanels[PRIMARY_CHART_GROUP];
+      const payload = {
+        ...previous,
+        updatedAt: new Date().toISOString(),
+        workspace: layoutWorkspaceName,
+        symbol: chartLinkSymbolEnabled ? panel.symbol : previous.symbol,
+        timeframe: chartLinkTimeframeEnabled ? panel.timeframe : previous.timeframe,
+      };
+      window.localStorage.setItem(key, JSON.stringify(payload));
     } catch {
       // noop
     }
@@ -3660,9 +3716,7 @@ export default function TradingTerminalPage() {
       }
     };
 
-    for (const group of CHART_GROUPS) {
-      void fetchGroup(group);
-    }
+    void fetchGroup(PRIMARY_CHART_GROUP);
 
     return () => {
       closed = true;
@@ -4401,8 +4455,7 @@ export default function TradingTerminalPage() {
     const reference = Math.max(0.0000001, chartLastValue || sample[sample.length - 1].close || 1);
     return atr / reference;
   }, [chartCandles, chartLastValue]);
-  const activeChartPanel = chartPanels.A;
-  const visibleChartGroups = CHART_GROUPS;
+  const activeChartPanel = chartPanels[PRIMARY_CHART_GROUP];
   const chartSyncModeLabel = chartSyncPriorityMode === "leader" ? `leader ${chartSyncLeaderGroup}` : "last-edited";
   const chartSyncSourceLabel = (panel: ChartPanelState): string => {
     if (panel.source === "leader") {
@@ -4419,6 +4472,23 @@ export default function TradingTerminalPage() {
     }
     return "manual";
   };
+  const modeUxProfile = autoExecutionMode === "assisted"
+    ? {
+        label: "Human",
+        shortLabel: "MODE HUMAN",
+        summary: "chart classique · full indicators · full overlays",
+      }
+    : autoExecutionMode === "semi-auto"
+      ? {
+          label: "Hybrid",
+          shortLabel: "MODE HYBRID",
+          summary: "mix intelligent · overlays visibles mais attenues",
+        }
+      : {
+          label: "AI",
+          shortLabel: "MODE AI",
+          summary: "perception layer dominant · bruit supprime · decision visible en 0.2s",
+        };
 
   const applyChartOrderPreset = (preset: ChartOrderPreset, nextSide?: "buy" | "sell") => {
     const config = preset === "custom" ? null : CHART_ORDER_PRESETS[preset];
@@ -9655,19 +9725,17 @@ export default function TradingTerminalPage() {
                   return <option key={`sel-${symbolValue}`} value={symbolValue}>{symbolValue}</option>;
                 })}
               </select>
-              <span className="chart-chip active">Unified Chart</span>
-              <button type="button" className={`chart-chip ${chartLinkSymbolEnabled ? "active" : ""}`} onClick={() => setChartLinkSymbolEnabled((v) => !v)}>
-                Link Sym
-              </button>
-              <button type="button" className={`chart-chip ${chartLinkTimeframeEnabled ? "active" : ""}`} onClick={() => setChartLinkTimeframeEnabled((v) => !v)}>
-                Link TF
-              </button>
-              <button type="button" className={`chart-chip ${chartSyncPriorityMode === "last-edited" ? "active" : ""}`} onClick={() => setChartSyncPriorityMode("last-edited")}>
-                Last
-              </button>
-              <button type="button" className={`chart-chip ${chartSyncPriorityMode === "leader" ? "active" : ""}`} onClick={() => setChartSyncPriorityMode("leader")}>
-                Leader
-              </button>
+              <span className="chart-chip active">1 Chart</span>
+              {(["assisted", "semi-auto", "full-auto"] as const).map((mode) => (
+                <button
+                  key={`top-mode-${mode}`}
+                  type="button"
+                  className={`chart-chip ${autoExecutionMode === mode ? "active" : ""}`}
+                  onClick={() => setAutoExecutionMode(mode)}
+                >
+                  {mode === "assisted" ? "Human" : mode === "semi-auto" ? "Hybrid" : "AI"}
+                </button>
+              ))}
               {(["auto", "balanced", "ultra"] as const).map((mode) => (
                 <button
                   key={mode}
@@ -9769,11 +9837,10 @@ export default function TradingTerminalPage() {
                 {signal.label}
               </span>
             ))}
-            <span className="chart-overlay-chip">Unified chart · {chartLinkSymbolEnabled ? "Sym On" : "Sym Off"} · {chartLinkTimeframeEnabled ? "TF On" : "TF Off"}</span>
-            <span className="chart-overlay-chip">Sync {chartSyncModeLabel}</span>
+            <span className="chart-overlay-chip">1 Chart · 3 Modes</span>
+            <span className="chart-overlay-chip">{modeUxProfile.shortLabel}</span>
+            <span className="chart-overlay-chip">{modeUxProfile.summary}</span>
             <span className="chart-overlay-chip">Source {chartSyncSourceLabel(activeChartPanel)}</span>
-            <span className="chart-overlay-chip">Modules Human / Hybrid / AI</span>
-            <span className="chart-overlay-chip">Prop {chartPropagationByGroup.A}</span>
             <span className={`chart-overlay-chip ${replayState.enabled ? "chart-overlay-chip-warn" : "chart-overlay-chip-good"}`}>{replayState.enabled ? "REPLAY MODE" : "LIVE MODE"}</span>
             <span className="chart-overlay-chip chart-overlay-chip-good">VWAP D/W/M {dayVwap > 0 ? dayVwap.toFixed(2) : "–"} / {weekVwap > 0 ? weekVwap.toFixed(2) : "–"} / {monthVwap > 0 ? monthVwap.toFixed(2) : "–"}</span>
             {uiMode === "expert" ? <span className="chart-overlay-chip">Sessions Asia / London / New York</span> : null}
@@ -9783,75 +9850,6 @@ export default function TradingTerminalPage() {
             <span className={`chart-overlay-chip ${chartChange >= 0 ? "chart-overlay-chip-good" : "chart-overlay-chip-warn"}`}>Δ {chartChange >= 0 ? "+" : ""}{chartChangePct.toFixed(2)}%</span>
             <span className="chart-overlay-chip">Spread {chartHeaderSpread > 0 ? chartHeaderSpread.toFixed(2) : "–"}</span>
             {uiMode === "expert" ? <span className="chart-overlay-chip">active tKey {activeTimeKey || "–"}</span> : null}
-          </div>
-
-          <div className={`chart-link-grid chart-link-grid-${chartViewDensity}`} aria-label="Unified chart workspace">
-            {visibleChartGroups.map((group) => {
-              const panel = chartPanels[group];
-              const panelData = chartPanelData[group];
-              const panelChange = panelData.points.length > 1
-                ? ((panelData.points[panelData.points.length - 1].value - panelData.points[0].value) / Math.max(0.0000001, panelData.points[0].value)) * 100
-                : 0;
-              return (
-                <section key={`link-grid-${group}`} className={`chart-link-card ${chartLinkGroup === group ? "active" : ""}`}>
-                  <div className="chart-link-head">
-                    <span className="chart-chip active">MAIN</span>
-                    <select
-                      value={panel.symbol}
-                      onChange={(event) => {
-                        setChartLinkGroup(group);
-                        applyChartPanelUpdate(group, { symbol: event.target.value }, "manual");
-                      }}
-                      className="chart-link-select"
-                      aria-label="Main chart symbol"
-                    >
-                      {filteredQuotes.slice(0, 18).map((quote) => {
-                        const symbolValue = instrumentLabel(quote);
-                        return <option key={`group-${group}-sym-${symbolValue}`} value={symbolValue}>{symbolValue}</option>;
-                      })}
-                    </select>
-                    <span className={`chart-link-source source-${panel.source}`}>{chartSyncSourceLabel(panel)}</span>
-                  </div>
-                  <div className="chart-link-timeframe-row">
-                    {CHART_TIMEFRAMES.map((tf) => (
-                      <button
-                        key={`group-${group}-tf-${tf}`}
-                        type="button"
-                        className={`chart-chip ${panel.timeframe === tf ? "active" : ""}`}
-                        onClick={() => {
-                          setChartLinkGroup(group);
-                          applyChartPanelUpdate(group, { timeframe: tf }, "manual");
-                        }}
-                      >
-                        {tf}
-                      </button>
-                    ))}
-                    <span className={`chart-link-change ${panelChange >= 0 ? "up" : "down"}`}>{panelChange >= 0 ? "+" : ""}{panelChange.toFixed(2)}%</span>
-                  </div>
-                  <div className="chart-link-stage">
-                    {panelData.loading ? <div className="chart-link-loading">loading…</div> : null}
-                    <InstitutionalChart
-                      symbol={panel.symbol}
-                      timeframe={panel.timeframe}
-                      mode={chartMode === "footprint" ? "candles" : chartMode}
-                      interactionMode={chartPerfMode === "balanced" ? "full" : "lite"}
-                      frozen={false}
-                      chartMotionPreset={chartMotionPreset}
-                      points={panelData.points}
-                      candles={panelData.candles}
-                      overlayZones={buildOverlayZones(panelData.points)}
-                      liquidityZones={buildLiquidityZones(panelData.points)}
-                      dayVwap={showVwap ? weightedVwap(panelData.points.slice(-12)) : 0}
-                      weekVwap={showVwap ? weightedVwap(panelData.points.slice(-24)) : 0}
-                      monthVwap={showVwap ? weightedVwap(panelData.points) : 0}
-                      showSessions={false}
-                      indicatorSeries={[]}
-                      candleTransform="none"
-                    />
-                  </div>
-                </section>
-              );
-            })}
           </div>
 
           <div className={`replay-control-strip ${replayState.enabled ? "active" : ""}`}>
@@ -9953,15 +9951,18 @@ export default function TradingTerminalPage() {
           />
           <div className={`chart-shell chart-shell-premium chart-shell-${chartMotionClass} chart-shell-signal-mode-${signalDisplayMode}`}>
             <aside className="chart-tools-panel" aria-label="Chart tools">
+              <div className="chart-signal-kicker">1 CHART - 3 MODES</div>
+              <div className="chart-mode-switch" role="group" aria-label="Execution mode">
+                <button type="button" className={`chart-tool-btn chart-mode-btn ${autoExecutionMode === "assisted" ? "active" : ""}`} onClick={() => setAutoExecutionMode("assisted")}>HUMAN</button>
+                <button type="button" className={`chart-tool-btn chart-mode-btn ${autoExecutionMode === "semi-auto" ? "active" : ""}`} onClick={() => setAutoExecutionMode("semi-auto")}>HYBRID</button>
+                <button type="button" className={`chart-tool-btn chart-mode-btn ${autoExecutionMode === "full-auto" ? "active" : ""}`} onClick={() => setAutoExecutionMode("full-auto")}>AI</button>
+              </div>
+              <div className="chart-mode-label">{modeUxProfile.shortLabel}</div>
+              <div className="chart-action-pill">{modeUxProfile.summary}</div>
               <button type="button" className={`chart-tool-btn ${showVwap ? "active" : ""}`} onClick={() => setShowVwap((v) => !v)}>VWAP</button>
               <button type="button" className={`chart-tool-btn ${showFvgOb ? "active" : ""}`} onClick={() => setShowFvgOb((v) => !v)}>FVG/OB</button>
               <button type="button" className={`chart-tool-btn ${showLiquidity ? "active" : ""}`} onClick={() => setShowLiquidity((v) => !v)}>LIQ</button>
               <button type="button" className={`chart-tool-btn ${showSessions ? "active" : ""}`} onClick={() => setShowSessions((v) => !v)}>SESS</button>
-              <div className="chart-mode-switch" role="group" aria-label="Signal mode">
-                <button type="button" className={`chart-tool-btn chart-mode-btn ${signalDisplayMode === "classic" ? "active" : ""}`} onClick={() => setSignalDisplayMode("classic")}>CL</button>
-                <button type="button" className={`chart-tool-btn chart-mode-btn ${signalDisplayMode === "augmented" ? "active" : ""}`} onClick={() => setSignalDisplayMode("augmented")}>AUG</button>
-                <button type="button" className={`chart-tool-btn chart-mode-btn ${signalDisplayMode === "ai-dominant" ? "active" : ""}`} onClick={() => setSignalDisplayMode("ai-dominant")}>AI</button>
-              </div>
               <Link
                 href={`/settings?chartPreset=${nextChartMotionPreset(chartMotionPreset)}#chart-motion-preset`}
                 className={`chart-preset-reminder chart-preset-reminder-link chart-preset-reminder-${chartMotionClass}`}
@@ -10027,7 +10028,7 @@ export default function TradingTerminalPage() {
                       <strong>Chart Trading</strong>
                       <span className={`chart-order-hud-mode chart-order-hud-mode-${chartMotionClass}`}>{chartMotionPreset}</span>
                     </div>
-                    <div className="chart-mode-label">Mode {signalDisplayMode === "classic" ? "Classic" : signalDisplayMode === "augmented" ? "Augmented" : "AI Dominant"}</div>
+                    <div className="chart-mode-label">{modeUxProfile.shortLabel}</div>
                     {signalDisplayMode !== "classic" ? (
                     <div className={`chart-signal-card chart-signal-card-${marketSignalV1.dominantDirection}`}>
                       <div className={`chart-perception-layer direction-${marketSignalV1.dominantDirection} motion-${perceptionMotionClass} ${perceptionSetupReady ? "setup-ready" : ""}`}>
