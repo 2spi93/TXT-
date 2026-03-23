@@ -247,22 +247,6 @@ type ChartOrderTicket = {
   oco: boolean;
   active: boolean;
 };
-type ChartGroupId = "A" | "B" | "C";
-type ChartSyncPriorityMode = "leader" | "last-edited";
-type ChartPropagationMode = "both" | "symbol-only" | "timeframe-only";
-type ChartSyncSourceLabel = "manual" | "leader" | "last-edited" | "storage" | "workspace";
-type ChartPanelState = {
-  symbol: string;
-  timeframe: "1m" | "5m" | "15m";
-  source: ChartSyncSourceLabel;
-  sourceFrom: ChartGroupId | null;
-  updatedAt: string;
-};
-type ChartPanelData = {
-  points: QuotePoint[];
-  candles: Array<{ label: string; open: number; high: number; low: number; close: number; volume: number }>;
-  loading: boolean;
-};
 type ChartSendHistoryEntry = {
   atIso: string;
   symbol: string;
@@ -389,14 +373,8 @@ type TerminalLayoutConfig = {
   monitoringOrder: DockPanelId[];
   floatingPanels: FloatingPanelState[];
   chartLink: {
-    group: "A" | "B" | "C";
     symbol: boolean;
     timeframe: boolean;
-    sync: "light";
-    priority: ChartSyncPriorityMode;
-    leader: ChartGroupId;
-    density: 2 | 3;
-    propagationByGroup: Record<ChartGroupId, ChartPropagationMode>;
   };
   riskAlert: {
     window: number;
@@ -428,19 +406,10 @@ const DEFAULT_HARD_ALERT_RATIO_PCT = 60;
 const FLOATING_GRID_SIZE = 16;
 const FLOATING_MIN_W = 260;
 const FLOATING_MIN_H = 180;
+const LEGACY_PRIMARY_CHART_LINK_SCOPE = "A";
 const DEFAULT_CHART_LINK = {
-  group: "A" as const,
   symbol: true,
   timeframe: true,
-  sync: "light" as const,
-  priority: "last-edited" as const,
-  leader: "A" as const,
-  density: 3 as const,
-  propagationByGroup: {
-    A: "both" as const,
-    B: "both" as const,
-    C: "both" as const,
-  },
 };
 const CHART_ORDER_PRESETS: Record<Exclude<ChartOrderPreset, "custom">, { slPct: number; tpPct: number; notional: number; maxSpread: number }> = {
   scalp: { slPct: 0.003, tpPct: 0.006, notional: 10000, maxSpread: 10 },
@@ -453,9 +422,7 @@ const DEFAULT_CONFLUENCE_WEIGHTS: MarketConfluenceWeights = {
   liquidity: 1.1,
   "price-action": 0.95,
 };
-const CHART_GROUPS: ChartGroupId[] = ["A"];
 const CHART_TIMEFRAMES: Array<"1m" | "5m" | "15m"> = ["1m", "5m", "15m"];
-const PRIMARY_CHART_GROUP: ChartGroupId = "A";
 const HUMAN_MODE_INDICATORS: ActiveIndicator[] = [
   { id: "ema9", params: {} },
   { id: "ema21", params: {} },
@@ -604,37 +571,9 @@ function normalizeChartLinkConfig(raw: unknown, fallback: TerminalLayoutConfig["
     return fallback;
   }
   const entry = raw as Partial<TerminalLayoutConfig["chartLink"]>;
-  const group = "A" as const;
-  const priority = entry.priority === "leader" ? "leader" : "last-edited";
-  const leader = "A" as const;
-  const density = 2 as const;
-  const rawPropagation = entry.propagationByGroup;
-  const normalizePropagation = (groupId: ChartGroupId): ChartPropagationMode => {
-    if (!rawPropagation || typeof rawPropagation !== "object") {
-      return fallback.propagationByGroup[groupId];
-    }
-    const candidate = (rawPropagation as Record<string, unknown>)[groupId];
-    if (candidate === "symbol-only" || candidate === "timeframe-only") {
-      return candidate;
-    }
-    if (candidate === "both") {
-      return "both";
-    }
-    return fallback.propagationByGroup[groupId];
-  };
   return {
-    group,
     symbol: typeof entry.symbol === "boolean" ? entry.symbol : fallback.symbol,
     timeframe: typeof entry.timeframe === "boolean" ? entry.timeframe : fallback.timeframe,
-    sync: "light",
-    priority,
-    leader,
-    density,
-    propagationByGroup: {
-      A: normalizePropagation("A"),
-      B: normalizePropagation("B"),
-      C: normalizePropagation("C"),
-    },
   };
 }
 
@@ -1813,10 +1752,8 @@ export default function TradingTerminalPage() {
   const [floatingPanels, setFloatingPanels] = useState<FloatingPanelState[]>([]);
   const [layoutDropPreview, setLayoutDropPreview] = useState<{ zone: DockZone; targetId?: DockPanelId; mode: "zone" | "panel" } | null>(null);
   const [selectedChartSymbol, setSelectedChartSymbol] = useState("BTCUSD");
-  const [chartLinkGroup, setChartLinkGroup] = useState<"A" | "B" | "C">("A");
   const [chartLinkSymbolEnabled, setChartLinkSymbolEnabled] = useState(true);
   const [chartLinkTimeframeEnabled, setChartLinkTimeframeEnabled] = useState(true);
-  const [chartViewDensity, setChartViewDensity] = useState<2 | 3>(2);
   const [chartPerfMode, setChartPerfMode] = useState<"auto" | "balanced" | "ultra">("auto");
   const [activeIndicators, setActiveIndicators] = useState<ActiveIndicator[]>([]);
   const [showIndicatorPanel, setShowIndicatorPanel] = useState(false);
@@ -1840,24 +1777,6 @@ export default function TradingTerminalPage() {
       return exists ? prev.filter((a) => a.id !== id) : [...prev, { id, params: {} }];
     });
   }
-  const [chartPropagationByGroup, setChartPropagationByGroup] = useState<Record<ChartGroupId, ChartPropagationMode>>({
-    A: "both",
-    B: "both",
-    C: "both",
-  });
-  const [chartSyncPriorityMode, setChartSyncPriorityMode] = useState<ChartSyncPriorityMode>("last-edited");
-  const [chartSyncLeaderGroup, setChartSyncLeaderGroup] = useState<ChartGroupId>("A");
-  const [chartPanels, setChartPanels] = useState<Record<ChartGroupId, ChartPanelState>>({
-    A: { symbol: "BTCUSD", timeframe: "1m", source: "workspace", sourceFrom: null, updatedAt: new Date().toISOString() },
-    B: { symbol: "BTCUSD", timeframe: "5m", source: "workspace", sourceFrom: null, updatedAt: new Date().toISOString() },
-    C: { symbol: "BTCUSD", timeframe: "15m", source: "workspace", sourceFrom: null, updatedAt: new Date().toISOString() },
-  });
-  const [chartPanelData, setChartPanelData] = useState<Record<ChartGroupId, ChartPanelData>>({
-    A: { points: [], candles: [], loading: false },
-    B: { points: [], candles: [], loading: false },
-    C: { points: [], candles: [], loading: false },
-  });
-
   const [accountId, setAccountId] = useState("mt5-demo-01");
   const [symbol, setSymbol] = useState("BTCUSD");
   const [side, setSide] = useState("buy");
@@ -2004,7 +1923,6 @@ export default function TradingTerminalPage() {
   const marketBurstLastKeyRef = useRef("");
   const marketBurstLastStartedAtRef = useRef(0);
   const routingScoreCacheRef = useRef<Map<string, { timestamp: number; promise: Promise<JsonMap | null> }>>(new Map());
-  const chartPanelsAbortRef = useRef<AbortController | null>(null);
   const marketMetricsAbortRef = useRef<AbortController | null>(null);
   const quotesRef = useRef<JsonMap[]>([]);
   const backendPrefsReadyRef = useRef(false);
@@ -2031,7 +1949,8 @@ export default function TradingTerminalPage() {
 
   const layoutStorageKey = `${TERMINAL_LAYOUT_STORAGE_PREFIX}.${accountId || "default"}`;
   const layoutWorkspaceStorageKey = `${TERMINAL_WORKSPACES_STORAGE_PREFIX}.${accountId || "default"}`;
-  const chartLinkStorageKey = `${TERMINAL_CHART_LINK_STORAGE_PREFIX}.${accountId || "default"}.${chartLinkGroup}`;
+  const chartLinkStorageKey = `${TERMINAL_CHART_LINK_STORAGE_PREFIX}.${accountId || "default"}`;
+  const legacyChartLinkStorageKey = `${TERMINAL_CHART_LINK_STORAGE_PREFIX}.${accountId || "default"}.${LEGACY_PRIMARY_CHART_LINK_SCOPE}`;
   const coreSplitByScreenStorageKey = `${layoutStorageKey}.core-split-by-screen.v1`;
   const signalEngineStorageKey = `${layoutStorageKey}.signal-engine.v1.${layoutWorkspaceName}`;
   const reasonLegendStorageKey = `${signalEngineStorageKey}.reason-codes-legend.v1`;
@@ -2478,7 +2397,7 @@ export default function TradingTerminalPage() {
       const fallbackLocalTs = readLocalUserUiPreferencesUpdatedAt() || clientUpdatedAt;
       setLocalUserUiPreferencesUpdatedAt(fallbackLocalTs);
     });
-  }, [accountId, chartHapticMode, chartLinkGroup, chartLinkSymbolEnabled, chartLinkTimeframeEnabled, chartMotionPreset, chartPropagationByGroup, chartReleaseSendMode, chartSnapEnabled, chartSnapPriority, chartSyncLeaderGroup, chartSyncPriorityMode, chartViewDensity, floatingPanels, layoutCoreSplit, layoutLowerOrder, layoutMicroOrder, layoutMonitoringOrder, layoutPreset, layoutWorkspaceName, riskAlertMissThreshold, riskAlertWindow, riskHardAlertEnabled, riskHardAlertThresholdPct, riskTimelineRefreshSec, uiMode]);
+  }, [accountId, chartHapticMode, chartLinkSymbolEnabled, chartLinkTimeframeEnabled, chartMotionPreset, chartReleaseSendMode, chartSnapEnabled, chartSnapPriority, floatingPanels, layoutCoreSplit, layoutLowerOrder, layoutMicroOrder, layoutMonitoringOrder, layoutPreset, layoutWorkspaceName, riskAlertMissThreshold, riskAlertWindow, riskHardAlertEnabled, riskHardAlertThresholdPct, riskTimelineRefreshSec, uiMode]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2565,14 +2484,8 @@ export default function TradingTerminalPage() {
     monitoringOrder: layoutMonitoringOrder,
     floatingPanels,
     chartLink: {
-      group: chartLinkGroup,
       symbol: chartLinkSymbolEnabled,
       timeframe: chartLinkTimeframeEnabled,
-      sync: "light",
-      priority: chartSyncPriorityMode,
-      leader: chartSyncLeaderGroup,
-      density: chartViewDensity,
-      propagationByGroup: chartPropagationByGroup,
     },
     riskAlert: {
       window: Math.max(3, Math.min(100, riskAlertWindow)),
@@ -2651,6 +2564,37 @@ export default function TradingTerminalPage() {
     }
   };
 
+  const applyNormalizedLayoutState = (normalized: TerminalLayoutConfig) => {
+    setLayoutPreset(normalized.preset);
+    setLayoutCoreSplit(normalized.coreSplit);
+    setLayoutMicroOrder(normalized.microOrder);
+    setLayoutLowerOrder(normalized.lowerOrder);
+    setLayoutMonitoringOrder(normalized.monitoringOrder);
+    setFloatingPanels(normalized.floatingPanels);
+    setChartLinkSymbolEnabled(normalized.chartLink.symbol);
+    setChartLinkTimeframeEnabled(normalized.chartLink.timeframe);
+    setRiskAlertWindow(normalized.riskAlert.window);
+    setRiskAlertMissThreshold(Math.min(normalized.riskAlert.window, normalized.riskAlert.missThreshold));
+    setRiskTimelineRefreshSec(normalized.riskAlert.refreshSec);
+    setRiskHardAlertEnabled(normalized.riskAlert.hardAlertEnabled);
+    setRiskHardAlertThresholdPct(normalized.riskAlert.hardAlertThresholdPct);
+    if (termCoreGroupRef.current) {
+      termCoreGroupRef.current.setLayout([normalized.coreSplit, 100 - normalized.coreSplit]);
+    }
+  };
+
+  const applyChartLinkPayload = (payload: { symbol?: string; timeframe?: string }) => {
+    if (chartLinkSymbolEnabled && typeof payload.symbol === "string") {
+      const nextSymbol = payload.symbol.trim();
+      if (nextSymbol) {
+        setSelectedChartSymbol(nextSymbol);
+      }
+    }
+    if (chartLinkTimeframeEnabled && (payload.timeframe === "1m" || payload.timeframe === "5m" || payload.timeframe === "15m")) {
+      setChartTimeframe(payload.timeframe);
+    }
+  };
+
   const applyLayoutPreset = (preset: LayoutPreset) => {
     const next = buildLayoutPreset(preset, uiMode === "novice");
     setLayoutPreset(next.preset);
@@ -2686,28 +2630,7 @@ export default function TradingTerminalPage() {
       const parsed = JSON.parse(raw) as Partial<TerminalLayoutConfig>;
       const baseline = buildLayoutPreset(parsed.preset === "scalp" || parsed.preset === "monitoring" ? parsed.preset : "swing", uiMode === "novice");
       const normalized = normalizeDockLayout(parsed, baseline);
-
-      setLayoutPreset(normalized.preset);
-      setLayoutCoreSplit(normalized.coreSplit);
-      setLayoutMicroOrder(normalized.microOrder);
-      setLayoutLowerOrder(normalized.lowerOrder);
-      setLayoutMonitoringOrder(normalized.monitoringOrder);
-      setFloatingPanels(normalized.floatingPanels);
-      setChartLinkGroup(normalized.chartLink.group);
-      setChartLinkSymbolEnabled(normalized.chartLink.symbol);
-      setChartLinkTimeframeEnabled(normalized.chartLink.timeframe);
-      setChartSyncPriorityMode(normalized.chartLink.priority);
-      setChartSyncLeaderGroup(normalized.chartLink.leader);
-      setChartViewDensity(normalized.chartLink.density);
-      setChartPropagationByGroup(normalized.chartLink.propagationByGroup);
-      setRiskAlertWindow(normalized.riskAlert.window);
-      setRiskAlertMissThreshold(Math.min(normalized.riskAlert.window, normalized.riskAlert.missThreshold));
-      setRiskTimelineRefreshSec(normalized.riskAlert.refreshSec);
-      setRiskHardAlertEnabled(normalized.riskAlert.hardAlertEnabled);
-      setRiskHardAlertThresholdPct(normalized.riskAlert.hardAlertThresholdPct);
-      if (termCoreGroupRef.current) {
-        termCoreGroupRef.current.setLayout([normalized.coreSplit, 100 - normalized.coreSplit]);
-      }
+      applyNormalizedLayoutState(normalized);
     } catch {
       applyLayoutPreset("swing");
     }
@@ -2735,28 +2658,14 @@ export default function TradingTerminalPage() {
       const noviceRiskDefaults = riskAlertDefaultsForPreset(layout.preset);
       nextLayout = {
         ...layout,
-        chartLink: {
-          ...layout.chartLink,
-          group: "A",
-          leader: "A",
-          density: 2,
-          propagationByGroup: {
-            ...layout.chartLink.propagationByGroup,
-            A: "symbol-only",
-          },
-        },
         riskAlert: noviceRiskDefaults,
       };
-      setChartLinkGroup("A");
-      setChartSyncLeaderGroup("A");
-      setChartViewDensity(2);
-      setChartPropagationByGroup((current) => ({ ...current, A: "symbol-only" }));
       setRiskAlertWindow(noviceRiskDefaults.window);
       setRiskAlertMissThreshold(noviceRiskDefaults.missThreshold);
       setRiskTimelineRefreshSec(noviceRiskDefaults.refreshSec);
       setRiskHardAlertEnabled(noviceRiskDefaults.hardAlertEnabled);
       setRiskHardAlertThresholdPct(noviceRiskDefaults.hardAlertThresholdPct);
-      setWorkspaceHintBadge("Novice preset applied: 2V + A sym-only");
+      setWorkspaceHintBadge("Novice preset applied");
     }
     bundle.active = activeName;
     bundle.workspaces = {
@@ -2801,97 +2710,12 @@ export default function TradingTerminalPage() {
       setLayoutWorkspaceName(active);
       const fallback = buildLayoutPreset("swing", uiMode === "novice");
       const normalized = normalizeDockLayout(parsed.workspaces[active], fallback);
-      setLayoutPreset(normalized.preset);
-      setLayoutCoreSplit(normalized.coreSplit);
-      setLayoutMicroOrder(normalized.microOrder);
-      setLayoutLowerOrder(normalized.lowerOrder);
-      setLayoutMonitoringOrder(normalized.monitoringOrder);
-      setFloatingPanels(normalized.floatingPanels);
-      setChartLinkGroup(normalized.chartLink.group);
-      setChartLinkSymbolEnabled(normalized.chartLink.symbol);
-      setChartLinkTimeframeEnabled(normalized.chartLink.timeframe);
-      setChartSyncPriorityMode(normalized.chartLink.priority);
-      setChartSyncLeaderGroup(normalized.chartLink.leader);
-      setChartViewDensity(normalized.chartLink.density);
-      setChartPropagationByGroup(normalized.chartLink.propagationByGroup);
-      setRiskAlertWindow(normalized.riskAlert.window);
-      setRiskAlertMissThreshold(Math.min(normalized.riskAlert.window, normalized.riskAlert.missThreshold));
-      setRiskTimelineRefreshSec(normalized.riskAlert.refreshSec);
-      setRiskHardAlertEnabled(normalized.riskAlert.hardAlertEnabled);
-      setRiskHardAlertThresholdPct(normalized.riskAlert.hardAlertThresholdPct);
-      if (termCoreGroupRef.current) {
-        termCoreGroupRef.current.setLayout([normalized.coreSplit, 100 - normalized.coreSplit]);
-      }
+      applyNormalizedLayoutState(normalized);
     } catch {
       setLayoutWorkspaceOptions(["Scalp-1", "Swing-NY", "Monitoring-Risk"]);
       setLayoutWorkspaceName("Swing-NY");
     }
   };
-
-  const applyChartPanelUpdate = (
-    originGroup: ChartGroupId,
-    update: Partial<Pick<ChartPanelState, "symbol" | "timeframe">>,
-    source: ChartSyncSourceLabel,
-  ) => {
-    const normalizedTimeframe = update.timeframe && CHART_TIMEFRAMES.includes(update.timeframe)
-      ? update.timeframe
-      : undefined;
-    const now = new Date().toISOString();
-    setChartPanels((current) => {
-      const originCurrent = current[originGroup];
-      const nextSymbol = (update.symbol || originCurrent.symbol || "BTCUSD").trim() || "BTCUSD";
-      const nextTimeframe = normalizedTimeframe || originCurrent.timeframe;
-      let changed = nextSymbol !== originCurrent.symbol || nextTimeframe !== originCurrent.timeframe || source !== originCurrent.source;
-      const next: Record<ChartGroupId, ChartPanelState> = {
-        ...current,
-        [originGroup]: {
-          ...originCurrent,
-          symbol: nextSymbol,
-          timeframe: nextTimeframe,
-          source,
-          sourceFrom: source === "leader" || source === "last-edited" ? originGroup : null,
-          updatedAt: now,
-        },
-      };
-
-      const canPropagate = chartSyncPriorityMode === "last-edited" || originGroup === chartSyncLeaderGroup;
-      const propagationMode = chartPropagationByGroup[originGroup] || "both";
-      const propagateSymbol = chartLinkSymbolEnabled && propagationMode !== "timeframe-only";
-      const propagateTimeframe = chartLinkTimeframeEnabled && propagationMode !== "symbol-only";
-      if (canPropagate) {
-        for (const group of CHART_GROUPS) {
-          if (group === originGroup) {
-            continue;
-          }
-          const target = current[group];
-          const propagatedSymbol = propagateSymbol ? nextSymbol : target.symbol;
-          const propagatedTimeframe = propagateTimeframe ? nextTimeframe : target.timeframe;
-          if (propagatedSymbol !== target.symbol || propagatedTimeframe !== target.timeframe) {
-            changed = true;
-            next[group] = {
-              ...target,
-              symbol: propagatedSymbol,
-              timeframe: propagatedTimeframe,
-              source: chartSyncPriorityMode === "leader" ? "leader" : "last-edited",
-              sourceFrom: originGroup,
-              updatedAt: now,
-            };
-          }
-        }
-      }
-
-      return changed ? next : current;
-    });
-  };
-
-  useEffect(() => {
-    if (chartLinkGroup !== "A") {
-      setChartLinkGroup("A");
-    }
-    if (chartSyncLeaderGroup !== "A") {
-      setChartSyncLeaderGroup("A");
-    }
-  }, [chartLinkGroup, chartSyncLeaderGroup]);
 
   useEffect(() => {
     if (!workspaceHintBadge) {
@@ -2903,33 +2727,19 @@ export default function TradingTerminalPage() {
     return () => window.clearTimeout(timer);
   }, [workspaceHintBadge]);
 
-  const setActiveChartSymbol = (symbolValue: string, source: ChartSyncSourceLabel = "manual") => {
-    applyChartPanelUpdate(chartLinkGroup, { symbol: symbolValue }, source);
+  const setActiveChartSymbol = (symbolValue: string) => {
+    const nextSymbol = symbolValue.trim();
+    if (!nextSymbol) {
+      return;
+    }
+    setSelectedChartSymbol(nextSymbol);
   };
 
-  const setActiveChartTimeframe = (timeframeValue: "1m" | "5m" | "15m", source: ChartSyncSourceLabel = "manual") => {
-    applyChartPanelUpdate(chartLinkGroup, { timeframe: timeframeValue }, source);
+  const setActiveChartTimeframe = (timeframeValue: "1m" | "5m" | "15m") => {
+    if (CHART_TIMEFRAMES.includes(timeframeValue)) {
+      setChartTimeframe(timeframeValue);
+    }
   };
-
-  useEffect(() => {
-    const activePanel = chartPanels[chartLinkGroup];
-    if (activePanel.symbol !== selectedChartSymbol) {
-      setSelectedChartSymbol(activePanel.symbol);
-    }
-    if (activePanel.timeframe !== chartTimeframe) {
-      setChartTimeframe(activePanel.timeframe);
-    }
-  }, [chartLinkGroup, chartPanels, chartTimeframe, selectedChartSymbol]);
-
-  useEffect(() => {
-    const activePanel = chartPanels[chartLinkGroup];
-    if (selectedChartSymbol && selectedChartSymbol !== activePanel.symbol) {
-      applyChartPanelUpdate(chartLinkGroup, { symbol: selectedChartSymbol }, "manual");
-    }
-    if ((chartTimeframe === "1m" || chartTimeframe === "5m" || chartTimeframe === "15m") && chartTimeframe !== activePanel.timeframe) {
-      applyChartPanelUpdate(chartLinkGroup, { timeframe: chartTimeframe }, "manual");
-    }
-  }, [chartLinkGroup, chartPanels, chartTimeframe, selectedChartSymbol]);
 
   useEffect(() => {
     restoreSavedLayout();
@@ -2948,7 +2758,23 @@ export default function TradingTerminalPage() {
     const payload = currentLayoutSnapshot();
     window.localStorage.setItem(layoutStorageKey, JSON.stringify(payload));
     saveWorkspaceBundle(layoutWorkspaceName, payload);
-  }, [chartLinkGroup, chartLinkSymbolEnabled, chartLinkTimeframeEnabled, chartPropagationByGroup, chartSyncLeaderGroup, chartSyncPriorityMode, chartViewDensity, floatingPanels, layoutCoreSplit, layoutLowerOrder, layoutMicroOrder, layoutMonitoringOrder, layoutPreset, layoutStorageKey, riskAlertMissThreshold, riskAlertWindow, riskHardAlertEnabled, riskHardAlertThresholdPct, riskTimelineRefreshSec]);
+  }, [chartLinkSymbolEnabled, chartLinkTimeframeEnabled, floatingPanels, layoutCoreSplit, layoutLowerOrder, layoutMicroOrder, layoutMonitoringOrder, layoutPreset, layoutStorageKey, riskAlertMissThreshold, riskAlertWindow, riskHardAlertEnabled, riskHardAlertThresholdPct, riskTimelineRefreshSec]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    try {
+      const raw = window.localStorage.getItem(chartLinkStorageKey) || window.localStorage.getItem(legacyChartLinkStorageKey);
+      if (!raw) {
+        return;
+      }
+      const payload = JSON.parse(raw) as { symbol?: string; timeframe?: string };
+      applyChartLinkPayload(payload);
+    } catch {
+      // noop
+    }
+  }, [chartLinkStorageKey, chartLinkSymbolEnabled, chartLinkTimeframeEnabled, legacyChartLinkStorageKey]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -2956,63 +2782,38 @@ export default function TradingTerminalPage() {
     }
     try {
       const raw = window.localStorage.getItem(chartLinkStorageKey);
-      if (!raw) {
-        return;
-      }
-      const payload = JSON.parse(raw) as { symbol?: string; timeframe?: string };
-      applyChartPanelUpdate(chartLinkGroup, {
-        symbol: chartLinkSymbolEnabled ? payload.symbol : undefined,
-        timeframe: chartLinkTimeframeEnabled && (payload.timeframe === "1m" || payload.timeframe === "5m" || payload.timeframe === "15m") ? payload.timeframe : undefined,
-      }, "storage");
-    } catch {
-      // noop
-    }
-  }, [chartLinkGroup, chartLinkStorageKey, chartLinkSymbolEnabled, chartLinkTimeframeEnabled]);
-
-  useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-    try {
-      const accountKey = accountId || "default";
-      const key = `${TERMINAL_CHART_LINK_STORAGE_PREFIX}.${accountKey}.${PRIMARY_CHART_GROUP}`;
-      const raw = window.localStorage.getItem(key);
       const previous = raw ? JSON.parse(raw) as Record<string, unknown> : {};
-      const panel = chartPanels[PRIMARY_CHART_GROUP];
       const payload = {
         ...previous,
         updatedAt: new Date().toISOString(),
         workspace: layoutWorkspaceName,
-        symbol: chartLinkSymbolEnabled ? panel.symbol : previous.symbol,
-        timeframe: chartLinkTimeframeEnabled ? panel.timeframe : previous.timeframe,
+        symbol: chartLinkSymbolEnabled ? selectedChartSymbol : previous.symbol,
+        timeframe: chartLinkTimeframeEnabled ? chartTimeframe : previous.timeframe,
       };
-      window.localStorage.setItem(key, JSON.stringify(payload));
+      window.localStorage.setItem(chartLinkStorageKey, JSON.stringify(payload));
     } catch {
       // noop
     }
-  }, [accountId, chartLinkGroup, chartLinkStorageKey, chartLinkSymbolEnabled, chartLinkTimeframeEnabled, chartPanels, layoutWorkspaceName]);
+  }, [chartLinkStorageKey, chartLinkSymbolEnabled, chartLinkTimeframeEnabled, chartTimeframe, layoutWorkspaceName, selectedChartSymbol]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
     const handleStorage = (event: StorageEvent) => {
-      if (event.key !== chartLinkStorageKey || !event.newValue) {
+      if ((event.key !== chartLinkStorageKey && event.key !== legacyChartLinkStorageKey) || !event.newValue) {
         return;
       }
       try {
         const payload = JSON.parse(event.newValue) as { symbol?: string; timeframe?: string };
-        applyChartPanelUpdate(chartLinkGroup, {
-          symbol: chartLinkSymbolEnabled ? payload.symbol : undefined,
-          timeframe: chartLinkTimeframeEnabled && (payload.timeframe === "1m" || payload.timeframe === "5m" || payload.timeframe === "15m") ? payload.timeframe : undefined,
-        }, "storage");
+        applyChartLinkPayload(payload);
       } catch {
         // noop
       }
     };
     window.addEventListener("storage", handleStorage);
     return () => window.removeEventListener("storage", handleStorage);
-  }, [chartLinkGroup, chartLinkStorageKey, chartLinkSymbolEnabled, chartLinkTimeframeEnabled]);
+  }, [chartLinkStorageKey, chartLinkSymbolEnabled, chartLinkTimeframeEnabled, legacyChartLinkStorageKey]);
 
   const saveCurrentLayout = () => {
     if (typeof window === "undefined") {
@@ -3057,27 +2858,7 @@ export default function TradingTerminalPage() {
       const fallback = buildLayoutPreset("swing", uiMode === "novice");
       const normalized = normalizeDockLayout(layout, fallback);
       setLayoutWorkspaceName(name);
-      setLayoutPreset(normalized.preset);
-      setLayoutCoreSplit(normalized.coreSplit);
-      setLayoutMicroOrder(normalized.microOrder);
-      setLayoutLowerOrder(normalized.lowerOrder);
-      setLayoutMonitoringOrder(normalized.monitoringOrder);
-      setFloatingPanels(normalized.floatingPanels);
-      setChartLinkGroup(normalized.chartLink.group);
-      setChartLinkSymbolEnabled(normalized.chartLink.symbol);
-      setChartLinkTimeframeEnabled(normalized.chartLink.timeframe);
-      setChartSyncPriorityMode(normalized.chartLink.priority);
-      setChartSyncLeaderGroup(normalized.chartLink.leader);
-      setChartViewDensity(normalized.chartLink.density);
-      setChartPropagationByGroup(normalized.chartLink.propagationByGroup);
-      setRiskAlertWindow(normalized.riskAlert.window);
-      setRiskAlertMissThreshold(Math.min(normalized.riskAlert.window, normalized.riskAlert.missThreshold));
-      setRiskTimelineRefreshSec(normalized.riskAlert.refreshSec);
-      setRiskHardAlertEnabled(normalized.riskAlert.hardAlertEnabled);
-      setRiskHardAlertThresholdPct(normalized.riskAlert.hardAlertThresholdPct);
-      if (termCoreGroupRef.current) {
-        termCoreGroupRef.current.setLayout([normalized.coreSplit, 100 - normalized.coreSplit]);
-      }
+      applyNormalizedLayoutState(normalized);
       saveWorkspaceBundle(name, normalized);
     } catch {
       // noop
@@ -3160,27 +2941,7 @@ export default function TradingTerminalPage() {
     }
     if (parsed.currentLayout) {
       const normalized = normalizeDockLayout(parsed.currentLayout, fallback);
-      setLayoutPreset(normalized.preset);
-      setLayoutCoreSplit(normalized.coreSplit);
-      setLayoutMicroOrder(normalized.microOrder);
-      setLayoutLowerOrder(normalized.lowerOrder);
-      setLayoutMonitoringOrder(normalized.monitoringOrder);
-      setFloatingPanels(normalized.floatingPanels);
-      setChartLinkGroup(normalized.chartLink.group);
-      setChartLinkSymbolEnabled(normalized.chartLink.symbol);
-      setChartLinkTimeframeEnabled(normalized.chartLink.timeframe);
-      setChartSyncPriorityMode(normalized.chartLink.priority);
-      setChartSyncLeaderGroup(normalized.chartLink.leader);
-      setChartViewDensity(normalized.chartLink.density);
-      setChartPropagationByGroup(normalized.chartLink.propagationByGroup);
-      setRiskAlertWindow(normalized.riskAlert.window);
-      setRiskAlertMissThreshold(Math.min(normalized.riskAlert.window, normalized.riskAlert.missThreshold));
-      setRiskTimelineRefreshSec(normalized.riskAlert.refreshSec);
-      setRiskHardAlertEnabled(normalized.riskAlert.hardAlertEnabled);
-      setRiskHardAlertThresholdPct(normalized.riskAlert.hardAlertThresholdPct);
-      if (termCoreGroupRef.current) {
-        termCoreGroupRef.current.setLayout([normalized.coreSplit, 100 - normalized.coreSplit]);
-      }
+      applyNormalizedLayoutState(normalized);
       saveWorkspaceBundle(layoutWorkspaceName || "Imported", normalized);
     }
   };
@@ -3271,90 +3032,34 @@ export default function TradingTerminalPage() {
 
   const dockPanel = (id: DockPanelId) => {
     const fp = floatingPanels.find((f) => f.id === id);
-    if (!fp) return;
+    if (!fp) {
+      return;
+    }
     setFloatingPanels((prev) => prev.filter((f) => f.id !== id));
     insertDockPanel(fp.fromZone, id);
   };
 
-  // floating drag — global mouse listeners
-  useEffect(() => {
-    const onMove = (e: MouseEvent) => {
-      const drag = floatingDragRef.current;
-      if (!drag) return;
-      setFloatingPanels((prev) =>
-        prev.map((fp) =>
-          fp.id === drag.id
-            ? clampFloatingPanel({ ...fp, x: drag.origX + e.clientX - drag.startX, y: drag.origY + e.clientY - drag.startY })
-            : fp,
-        ),
-      );
-    };
-    const onUp = () => { floatingDragRef.current = null; };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-    return () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-    };
-  }, []);
-
-  // ─── Hotkeys — Alt+1 Scalp  Alt+2 Swing  Alt+3 Monitoring  Alt+E Edit ──
-  useEffect(() => {
-    hotkeyActionsRef.current = {
-      applyLayoutPreset,
-      toggleEditMode: () => setLayoutEditMode((v) => !v),
-      saveLayout: saveCurrentLayout,
-      restoreLayout: restoreSavedLayout,
-      resetFloating: resetFloatingPanels,
-      cycleWorkspace,
-    };
-  });
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (!e.altKey || e.ctrlKey || e.metaKey) return;
-      const tag = (e.target as HTMLElement)?.tagName?.toLowerCase();
-      if (tag === "input" || tag === "textarea" || tag === "select") return;
-      if (e.key === "1") { e.preventDefault(); hotkeyActionsRef.current.applyLayoutPreset("scalp"); }
-      else if (e.key === "2") { e.preventDefault(); hotkeyActionsRef.current.applyLayoutPreset("swing"); }
-      else if (e.key === "3") { e.preventDefault(); hotkeyActionsRef.current.applyLayoutPreset("monitoring"); }
-      else if (e.key === "e" || e.key === "E") { e.preventDefault(); hotkeyActionsRef.current.toggleEditMode(); }
-      else if (e.key === "s" || e.key === "S") { e.preventDefault(); hotkeyActionsRef.current.saveLayout(); }
-      else if (e.key === "r" || e.key === "R") { e.preventDefault(); hotkeyActionsRef.current.restoreLayout(); }
-      else if (e.key === "0") { e.preventDefault(); hotkeyActionsRef.current.resetFloating(); }
-      else if (e.key === "ArrowLeft") { e.preventDefault(); hotkeyActionsRef.current.cycleWorkspace(-1); }
-      else if (e.key === "ArrowRight") { e.preventDefault(); hotkeyActionsRef.current.cycleWorkspace(1); }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, []);
-
-  const microOrderById = orderMap(layoutMicroOrder);
-  const lowerOrderById = orderMap(layoutLowerOrder);
-  const monitoringOrderById = orderMap(layoutMonitoringOrder);
-
-  async function loadAll(): Promise<void> {
+  const loadAll = async () => {
     if (Date.now() < authBackoffUntilRef.current) {
       return;
     }
+
     let sawUnauthorized = false;
-    const fetchMaybeUnauthorized = async (path: string): Promise<unknown | null> => {
-      try {
-        const payload = await fetchJson(path, { allowUnauthorized: true });
-        if (payload === null) {
-          sawUnauthorized = true;
-        }
-        return payload;
-      } catch {
+    const fetchMaybeUnauthorized = async (url: string): Promise<unknown> => {
+      const response = await fetch(url, { cache: "no-store" });
+      if (response.status === 401 || response.status === 403) {
+        sawUnauthorized = true;
         return null;
       }
+      if (!response.ok) {
+        throw new Error(`${url} -> ${response.status}`);
+      }
+      return response.json();
     };
-    const fetchArrayFallback = async (path: string): Promise<unknown[]> => {
+
+    const fetchArrayFallback = async (url: string): Promise<unknown[]> => {
       try {
-        const response = await fetch(path, { cache: "no-store" });
-        if (!response.ok) {
-          return [];
-        }
-        const payload = await response.json();
+        const payload = await fetchMaybeUnauthorized(url);
         return Array.isArray(payload) ? payload : [];
       } catch {
         return [];
@@ -3382,6 +3087,7 @@ export default function TradingTerminalPage() {
     }
 
     setAuthSessionRequired(false);
+    setError(null);
 
     const nextQuotes = Array.isArray(quotesPayload) ? (quotesPayload as JsonMap[]) : [];
 
@@ -3412,7 +3118,7 @@ export default function TradingTerminalPage() {
       }
       return updated;
     });
-  }
+  };
 
   useEffect(() => {
     loadAll().catch((err) => setError(err instanceof Error ? err.message : "Erreur inconnue"));
@@ -3542,7 +3248,7 @@ export default function TradingTerminalPage() {
   useEffect(() => {
     const hasSelected = quotes.some((quote) => instrumentLabel(quote) === selectedChartSymbol);
     if (!hasSelected && quotes.length > 0) {
-      setActiveChartSymbol(instrumentLabel(quotes[0]), "workspace");
+      setActiveChartSymbol(instrumentLabel(quotes[0]));
     }
   }, [quotes, selectedChartSymbol]);
 
@@ -3644,85 +3350,9 @@ export default function TradingTerminalPage() {
 
   useEffect(() => {
     if (authSessionRequired) {
-      setChartPanelData((current) => ({
-        A: { ...current.A, loading: false },
-        B: { ...current.B, loading: false },
-        C: { ...current.C, loading: false },
-      }));
       return;
     }
-    chartPanelsAbortRef.current?.abort();
-    const controller = new AbortController();
-    chartPanelsAbortRef.current = controller;
-    let closed = false;
-    const fetchGroup = async (group: ChartGroupId) => {
-      const panel = chartPanels[group];
-      setChartPanelData((current) => ({
-        ...current,
-        [group]: {
-          ...current[group],
-          loading: true,
-        },
-      }));
-
-      const selectedQuote = quotesRef.current.find((quote) => instrumentLabel(quote) === panel.symbol);
-      const venue = String(selectedQuote?.venue || "binance-public");
-      const instrument = normalizeInstrument(String(selectedQuote?.instrument || panel.symbol || "BTCUSD"));
-      try {
-        const response = await fetch(`/api/market/ohlcv?instrument=${encodeURIComponent(instrument)}&venue=${encodeURIComponent(venue)}&timeframe=${encodeURIComponent(panel.timeframe)}&limit=320`, {
-          cache: "no-store",
-          signal: controller.signal,
-          headers: buildRoutingRequestHeaders("ui", instrument),
-        });
-        const payload = response.ok ? await response.json() : [];
-        if (closed || controller.signal.aborted) {
-          return;
-        }
-        const bars = (payload as JsonMap[]) || [];
-        const points = bars
-          .map((bar) => ({ label: String(bar.bucket_start || "-"), value: toNumber(bar.close, 0) }))
-          .filter((point) => point.value > 0)
-          .slice(-280);
-        const candles = bars
-          .map((bar) => ({
-            label: String(bar.bucket_start || "-"),
-            open: toNumber(bar.open, 0),
-            high: toNumber(bar.high, 0),
-            low: toNumber(bar.low, 0),
-            close: toNumber(bar.close, 0),
-            volume: toNumber(bar.volume, 0),
-          }))
-          .slice(-280);
-        setChartPanelData((current) => ({
-          ...current,
-          [group]: {
-            points,
-            candles,
-            loading: false,
-          },
-        }));
-      } catch {
-        if (closed || controller.signal.aborted) {
-          return;
-        }
-        setChartPanelData((current) => ({
-          ...current,
-          [group]: {
-            points: current[group].points,
-            candles: current[group].candles,
-            loading: false,
-          },
-        }));
-      }
-    };
-
-    void fetchGroup(PRIMARY_CHART_GROUP);
-
-    return () => {
-      closed = true;
-      controller.abort();
-    };
-  }, [authSessionRequired, chartPanels]);
+  }, [authSessionRequired]);
 
   useEffect(() => {
     marketMetricsAbortRef.current?.abort();
@@ -4455,23 +4085,6 @@ export default function TradingTerminalPage() {
     const reference = Math.max(0.0000001, chartLastValue || sample[sample.length - 1].close || 1);
     return atr / reference;
   }, [chartCandles, chartLastValue]);
-  const activeChartPanel = chartPanels[PRIMARY_CHART_GROUP];
-  const chartSyncModeLabel = chartSyncPriorityMode === "leader" ? `leader ${chartSyncLeaderGroup}` : "last-edited";
-  const chartSyncSourceLabel = (panel: ChartPanelState): string => {
-    if (panel.source === "leader") {
-      return `leader:${panel.sourceFrom || chartSyncLeaderGroup}`;
-    }
-    if (panel.source === "last-edited") {
-      return `last:${panel.sourceFrom || "?"}`;
-    }
-    if (panel.source === "storage") {
-      return "storage";
-    }
-    if (panel.source === "workspace") {
-      return "workspace";
-    }
-    return "manual";
-  };
   const modeUxProfile = autoExecutionMode === "assisted"
     ? {
         label: "Human",
@@ -4489,6 +4102,9 @@ export default function TradingTerminalPage() {
           shortLabel: "MODE AI",
           summary: "perception layer dominant · bruit supprime · decision visible en 0.2s",
         };
+  const microOrderById = orderMap(layoutMicroOrder);
+  const lowerOrderById = orderMap(layoutLowerOrder);
+  const monitoringOrderById = orderMap(layoutMonitoringOrder);
 
   const applyChartOrderPreset = (preset: ChartOrderPreset, nextSide?: "buy" | "sell") => {
     const config = preset === "custom" ? null : CHART_ORDER_PRESETS[preset];
@@ -9607,20 +9223,7 @@ export default function TradingTerminalPage() {
                   if (preset) {
                     const fb = buildLayoutPreset("swing", uiMode === "novice");
                     const n = normalizeDockLayout(preset, fb);
-                    setLayoutPreset(n.preset);
-                    setLayoutCoreSplit(n.coreSplit);
-                    setLayoutMicroOrder(n.microOrder);
-                    setLayoutLowerOrder(n.lowerOrder);
-                    setLayoutMonitoringOrder(n.monitoringOrder);
-                    setFloatingPanels(n.floatingPanels);
-                    setChartLinkGroup(n.chartLink.group);
-                    setChartLinkSymbolEnabled(n.chartLink.symbol);
-                    setChartLinkTimeframeEnabled(n.chartLink.timeframe);
-                    setChartSyncPriorityMode(n.chartLink.priority);
-                    setChartSyncLeaderGroup(n.chartLink.leader);
-                    setChartViewDensity(n.chartLink.density);
-                    setChartPropagationByGroup(n.chartLink.propagationByGroup);
-                    if (termCoreGroupRef.current) termCoreGroupRef.current.setLayout([n.coreSplit, 100 - n.coreSplit]);
+                    applyNormalizedLayoutState(n);
                     const copyName = `Copy of ${presetName.replace("⬡ ", "")}`;
                     setLayoutWorkspaceName(copyName);
                     saveWorkspaceBundle(copyName, n);
@@ -9840,7 +9443,6 @@ export default function TradingTerminalPage() {
             <span className="chart-overlay-chip">1 Chart · 3 Modes</span>
             <span className="chart-overlay-chip">{modeUxProfile.shortLabel}</span>
             <span className="chart-overlay-chip">{modeUxProfile.summary}</span>
-            <span className="chart-overlay-chip">Source {chartSyncSourceLabel(activeChartPanel)}</span>
             <span className={`chart-overlay-chip ${replayState.enabled ? "chart-overlay-chip-warn" : "chart-overlay-chip-good"}`}>{replayState.enabled ? "REPLAY MODE" : "LIVE MODE"}</span>
             <span className="chart-overlay-chip chart-overlay-chip-good">VWAP D/W/M {dayVwap > 0 ? dayVwap.toFixed(2) : "–"} / {weekVwap > 0 ? weekVwap.toFixed(2) : "–"} / {monthVwap > 0 ? monthVwap.toFixed(2) : "–"}</span>
             {uiMode === "expert" ? <span className="chart-overlay-chip">Sessions Asia / London / New York</span> : null}
