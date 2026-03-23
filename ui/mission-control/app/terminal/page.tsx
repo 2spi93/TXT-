@@ -453,7 +453,7 @@ const DEFAULT_CONFLUENCE_WEIGHTS: MarketConfluenceWeights = {
   liquidity: 1.1,
   "price-action": 0.95,
 };
-const CHART_GROUPS: ChartGroupId[] = ["A", "B", "C"];
+const CHART_GROUPS: ChartGroupId[] = ["A"];
 const CHART_TIMEFRAMES: Array<"1m" | "5m" | "15m"> = ["1m", "5m", "15m"];
 
 function riskAlertDefaultsForPreset(preset: LayoutPreset): { window: number; missThreshold: number; refreshSec: 5 | 15 | 30; hardAlertEnabled: boolean; hardAlertThresholdPct: number } {
@@ -871,40 +871,101 @@ function downloadCsvFile(filename: string, rows: Array<Array<string | number>>):
   URL.revokeObjectURL(href);
 }
 
+const SELF_LEARNING_STATE_CACHE_TTL_MS = 6000;
+const SELF_LEARNING_SCOPES_CACHE_TTL_MS = 20000;
+
+const selfLearningStateCache = new Map<string, {
+  atMs: number;
+  value: {
+    state: SelfLearningV4PersistedState | null;
+    storage: SelfLearningV4Storage;
+    updatedAt: string | null;
+    unauthorized: boolean;
+  };
+}>();
+const selfLearningStateInflight = new Map<string, Promise<{
+  state: SelfLearningV4PersistedState | null;
+  storage: SelfLearningV4Storage;
+  updatedAt: string | null;
+  unauthorized: boolean;
+}>>();
+
+const selfLearningScopesCache = new Map<string, {
+  atMs: number;
+  value: {
+    items: SelfLearningV4ScopeSummary[];
+    storage: SelfLearningV4Storage;
+  };
+}>();
+const selfLearningScopesInflight = new Map<string, Promise<{
+  items: SelfLearningV4ScopeSummary[];
+  storage: SelfLearningV4Storage;
+}>>();
+
 async function fetchSelfLearningV4State(scope: { accountId: string; symbol: string; timeframe: string }): Promise<{
   state: SelfLearningV4PersistedState | null;
   storage: SelfLearningV4Storage;
   updatedAt: string | null;
   unauthorized: boolean;
 }> {
+  const cacheKey = `${scope.accountId}::${scope.symbol}::${scope.timeframe}`;
+  const nowMs = Date.now();
+  const cached = selfLearningStateCache.get(cacheKey);
+  if (cached && nowMs - cached.atMs <= SELF_LEARNING_STATE_CACHE_TTL_MS) {
+    return cached.value;
+  }
+  const inflight = selfLearningStateInflight.get(cacheKey);
+  if (inflight) {
+    return inflight;
+  }
+
   const params = new URLSearchParams({
     account_id: scope.accountId,
     symbol: scope.symbol,
     timeframe: scope.timeframe,
   });
-  const response = await fetch(`/api/strategies/self-learning-v4?${params.toString()}`, { cache: "no-store" });
-  if (response.status === 401) {
-    return {
-      state: null,
-      storage: "unknown",
-      updatedAt: null,
-      unauthorized: true,
+  const requestPromise = (async () => {
+    const response = await fetch(`/api/strategies/self-learning-v4?${params.toString()}`, { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`self_learning_v4_get_${response.status}`);
+    }
+    const payload = await response.json() as {
+      state?: SelfLearningV4PersistedState | null;
+      storage?: SelfLearningV4Storage;
+      updatedAt?: string | null;
+      detail?: string;
+      upstream_status?: number;
     };
+    const unauthorized = response.status === 401
+      || payload.detail === "self_learning_v4_anonymous_degraded"
+      || payload.upstream_status === 401
+      || payload.upstream_status === 403;
+    const value = {
+      state: payload.state || null,
+      storage: payload.storage || "unknown",
+      updatedAt: payload.updatedAt || payload.state?.updatedAt || null,
+      unauthorized,
+    };
+    selfLearningStateCache.set(cacheKey, { atMs: Date.now(), value });
+    if (selfLearningStateCache.size > 80) {
+      for (const [key, entry] of selfLearningStateCache.entries()) {
+        if (Date.now() - entry.atMs > SELF_LEARNING_STATE_CACHE_TTL_MS * 4) {
+          selfLearningStateCache.delete(key);
+        }
+        if (selfLearningStateCache.size <= 60) {
+          break;
+        }
+      }
+    }
+    return value;
+  })();
+
+  selfLearningStateInflight.set(cacheKey, requestPromise);
+  try {
+    return await requestPromise;
+  } finally {
+    selfLearningStateInflight.delete(cacheKey);
   }
-  if (!response.ok) {
-    throw new Error(`self_learning_v4_get_${response.status}`);
-  }
-  const payload = await response.json() as {
-    state?: SelfLearningV4PersistedState | null;
-    storage?: SelfLearningV4Storage;
-    updatedAt?: string | null;
-  };
-  return {
-    state: payload.state || null,
-    storage: payload.storage || "unknown",
-    updatedAt: payload.updatedAt || payload.state?.updatedAt || null,
-    unauthorized: false,
-  };
 }
 
 async function saveSelfLearningV4State(state: Omit<SelfLearningV4PersistedState, "version" | "updatedAt">): Promise<{
@@ -943,6 +1004,22 @@ async function fetchSelfLearningV4Scopes(params: {
   items: SelfLearningV4ScopeSummary[];
   storage: SelfLearningV4Storage;
 }> {
+  const cacheKey = JSON.stringify({
+    accountId: params.accountId || "",
+    symbol: params.symbol || "",
+    timeframe: params.timeframe || "",
+    limit: params.limit || 120,
+  });
+  const nowMs = Date.now();
+  const cached = selfLearningScopesCache.get(cacheKey);
+  if (cached && nowMs - cached.atMs <= SELF_LEARNING_SCOPES_CACHE_TTL_MS) {
+    return cached.value;
+  }
+  const inflight = selfLearningScopesInflight.get(cacheKey);
+  if (inflight) {
+    return inflight;
+  }
+
   const query = new URLSearchParams();
   if (params.accountId) {
     query.set("account_id", params.accountId);
@@ -954,18 +1031,39 @@ async function fetchSelfLearningV4Scopes(params: {
     query.set("timeframe", params.timeframe);
   }
   query.set("limit", String(params.limit || 120));
-  const response = await fetch(`/api/strategies/self-learning-v4/scopes?${query.toString()}`, { cache: "no-store" });
-  if (!response.ok) {
-    throw new Error(`self_learning_v4_scopes_${response.status}`);
+  const requestPromise = (async () => {
+    const response = await fetch(`/api/strategies/self-learning-v4/scopes?${query.toString()}`, { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`self_learning_v4_scopes_${response.status}`);
+    }
+    const payload = await response.json() as {
+      items?: SelfLearningV4ScopeSummary[];
+      storage?: SelfLearningV4Storage;
+    };
+    const value = {
+      items: Array.isArray(payload.items) ? payload.items : [],
+      storage: payload.storage || "unknown",
+    };
+    selfLearningScopesCache.set(cacheKey, { atMs: Date.now(), value });
+    if (selfLearningScopesCache.size > 80) {
+      for (const [key, entry] of selfLearningScopesCache.entries()) {
+        if (Date.now() - entry.atMs > SELF_LEARNING_SCOPES_CACHE_TTL_MS * 3) {
+          selfLearningScopesCache.delete(key);
+        }
+        if (selfLearningScopesCache.size <= 60) {
+          break;
+        }
+      }
+    }
+    return value;
+  })();
+
+  selfLearningScopesInflight.set(cacheKey, requestPromise);
+  try {
+    return await requestPromise;
+  } finally {
+    selfLearningScopesInflight.delete(cacheKey);
   }
-  const payload = await response.json() as {
-    items?: SelfLearningV4ScopeSummary[];
-    storage?: SelfLearningV4Storage;
-  };
-  return {
-    items: Array.isArray(payload.items) ? payload.items : [],
-    storage: payload.storage || "unknown",
-  };
 }
 
 function escapeHtml(value: string): string {
@@ -2729,14 +2827,14 @@ export default function TradingTerminalPage() {
   };
 
   useEffect(() => {
-    if (chartViewDensity === 3) {
-      return;
-    }
-    if (chartLinkGroup === "C") {
+    if (chartLinkGroup !== "A") {
       setChartLinkGroup("A");
     }
-    if (chartSyncLeaderGroup === "C") {
+    if (chartSyncLeaderGroup !== "A") {
       setChartSyncLeaderGroup("A");
+    }
+    if (chartViewDensity !== 2) {
+      setChartViewDensity(2);
     }
   }, [chartLinkGroup, chartSyncLeaderGroup, chartViewDensity]);
 
@@ -4137,7 +4235,7 @@ export default function TradingTerminalPage() {
   const nativeSeries = ohlcvBars.map((bar) => ({ label: String(bar.bucket_start || "-"), value: toNumber(bar.close, 0) })).filter((point) => point.value > 0);
   const chartSeriesRaw = nativeSeries.length > 0 ? nativeSeries : (quoteHistory[selectedChartSymbol] || []);
   const chartSeries = chartSeriesRaw.slice(-Math.max(20, Math.min(chartWindow, 500)));
-  const chartCandles = ohlcvBars.slice(-Math.max(20, Math.min(chartWindow, 500))).map((bar) => ({
+  const ohlcvCandles = ohlcvBars.slice(-Math.max(20, Math.min(chartWindow, 500))).map((bar) => ({
     label: String(bar.bucket_start || "-"),
     open: toNumber(bar.open, 0),
     high: toNumber(bar.high, 0),
@@ -4145,6 +4243,23 @@ export default function TradingTerminalPage() {
     close: toNumber(bar.close, 0),
     volume: toNumber(bar.volume, 0),
   }));
+  const chartCandles = ohlcvCandles.length > 0
+    ? ohlcvCandles
+    : chartSeries.map((point, index) => {
+      const previous = index > 0 ? chartSeries[index - 1].value : point.value;
+      const open = Number.isFinite(previous) && previous > 0 ? previous : point.value;
+      const close = point.value;
+      const high = Math.max(open, close);
+      const low = Math.min(open, close);
+      return {
+        label: point.label,
+        open,
+        high,
+        low,
+        close,
+        volume: 0,
+      };
+    });
 
   // ── Memoized indicator computation (PERF) ──────────────────────────────────
   // Hash-based memoization: only recompute if bars or active indicators actually change
@@ -9543,34 +9658,7 @@ export default function TradingTerminalPage() {
                   return <option key={`sel-${symbolValue}`} value={symbolValue}>{symbolValue}</option>;
                 })}
               </select>
-              {(["A", "B", "C"] as const).map((group) => (
-                <button key={group} type="button" className={`chart-chip ${chartLinkGroup === group ? "active" : ""}`} onClick={() => setChartLinkGroup(group)}>
-                  G{group}
-                </button>
-              ))}
-              <button type="button" className={`chart-chip ${chartLinkSymbolEnabled ? "active" : ""}`} onClick={() => setChartLinkSymbolEnabled((v) => !v)}>
-                Link Sym
-              </button>
-              <button type="button" className={`chart-chip ${chartLinkTimeframeEnabled ? "active" : ""}`} onClick={() => setChartLinkTimeframeEnabled((v) => !v)}>
-                Link TF
-              </button>
-              <button type="button" className={`chart-chip ${chartSyncPriorityMode === "last-edited" ? "active" : ""}`} onClick={() => setChartSyncPriorityMode("last-edited")}>
-                Last
-              </button>
-              <button type="button" className={`chart-chip ${chartSyncPriorityMode === "leader" ? "active" : ""}`} onClick={() => setChartSyncPriorityMode("leader")}>
-                Leader
-              </button>
-              {chartSyncPriorityMode === "leader" && CHART_GROUPS.map((group) => (
-                <button key={`lead-${group}`} type="button" className={`chart-chip ${chartSyncLeaderGroup === group ? "active" : ""}`} onClick={() => setChartSyncLeaderGroup(group)}>
-                  L{group}
-                </button>
-              ))}
-              <button type="button" className={`chart-chip ${chartViewDensity === 2 ? "active" : ""}`} onClick={() => setChartViewDensity(2)}>
-                2V
-              </button>
-              <button type="button" className={`chart-chip ${chartViewDensity === 3 ? "active" : ""}`} onClick={() => setChartViewDensity(3)}>
-                3V
-              </button>
+              <span className="chart-chip active" aria-label="Single chart mode">CH1</span>
               {(["auto", "balanced", "ultra"] as const).map((mode) => (
                 <button
                   key={mode}
@@ -9673,11 +9761,7 @@ export default function TradingTerminalPage() {
                 {signal.label}
               </span>
             ))}
-            <span className="chart-overlay-chip">Group {chartLinkGroup} · {chartLinkSymbolEnabled ? "Sym On" : "Sym Off"} · {chartLinkTimeframeEnabled ? "TF On" : "TF Off"}</span>
-            <span className="chart-overlay-chip">Sync {chartSyncModeLabel}</span>
-            <span className="chart-overlay-chip">Source {chartSyncSourceLabel(activeChartPanel)}</span>
-            <span className="chart-overlay-chip">Density {chartViewDensity} views</span>
-            <span className="chart-overlay-chip">Prop {chartPropagationByGroup[chartLinkGroup]}</span>
+            <span className="chart-overlay-chip">Single chart mode</span>
             <span className={`chart-overlay-chip ${replayState.enabled ? "chart-overlay-chip-warn" : "chart-overlay-chip-good"}`}>{replayState.enabled ? "REPLAY MODE" : "LIVE MODE"}</span>
             <span className="chart-overlay-chip chart-overlay-chip-good">VWAP D/W/M {dayVwap > 0 ? dayVwap.toFixed(2) : "–"} / {weekVwap > 0 ? weekVwap.toFixed(2) : "–"} / {monthVwap > 0 ? monthVwap.toFixed(2) : "–"}</span>
             {uiMode === "expert" ? <span className="chart-overlay-chip">Sessions Asia / London / New York</span> : null}
@@ -9689,7 +9773,7 @@ export default function TradingTerminalPage() {
             {uiMode === "expert" ? <span className="chart-overlay-chip">active tKey {activeTimeKey || "–"}</span> : null}
           </div>
 
-          <div className={`chart-link-grid chart-link-grid-${chartViewDensity}`} aria-label="Linked chart views A/B/C">
+          <div className={`chart-link-grid chart-link-grid-${chartViewDensity}`} aria-label="Single chart view">
             {visibleChartGroups.map((group) => {
               const panel = chartPanels[group];
               const panelData = chartPanelData[group];
