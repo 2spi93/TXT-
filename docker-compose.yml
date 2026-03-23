@@ -2,23 +2,21 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: txt-postgres
+    restart: unless-stopped
     environment:
       POSTGRES_DB: mission_control
       POSTGRES_USER: txt
       POSTGRES_PASSWORD: txt
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./docker/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
-    command: postgres -c config_file=/etc/postgresql/postgresql.conf
     ports:
       - "5433:5432"
-    deploy:
-      resources:
-        limits:
-          cpus: "4"
-          memory: 20G
-        reservations:
-          memory: 16G
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U txt -d mission_control"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
 
   control-plane:
     image: txt-python:3.11
@@ -26,6 +24,7 @@ services:
       context: .
       dockerfile: Dockerfile.txt-python
     container_name: control-plane
+    restart: unless-stopped
     working_dir: /workspace
     volumes:
       - ./:/workspace
@@ -43,27 +42,37 @@ services:
     env_file:
       - ./.env
     command: >
-      sh -c "uvicorn apps.control_plane.main:app --host 0.0.0.0 --port 8000 --workers 4"
+      sh -c "uvicorn apps.control_plane.main:app --host 0.0.0.0 --port 8000"
     ports:
       - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3); sys.exit(0)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
     depends_on:
-      - postgres
-      - risk-gateway
-      - execution-router
-      - market-data
-      - broker-adapter
-      - ai-orchestrator
-      - mt5-bridge
-      - embeddings-service
-    deploy:
-      resources:
-        limits:
-          cpus: "2"
-          memory: 2G
+      postgres:
+        condition: service_healthy
+      risk-gateway:
+        condition: service_healthy
+      execution-router:
+        condition: service_healthy
+      market-data:
+        condition: service_healthy
+      broker-adapter:
+        condition: service_healthy
+      ai-orchestrator:
+        condition: service_healthy
+      mt5-bridge:
+        condition: service_healthy
+      embeddings-service:
+        condition: service_healthy
 
   mt5-bridge:
     image: txt-python:3.11
     container_name: mt5-bridge
+    restart: unless-stopped
     working_dir: /workspace
     volumes:
       - ./:/workspace
@@ -73,20 +82,23 @@ services:
     env_file:
       - ./.env
     command: >
-      sh -c "uvicorn apps.mt5_bridge.main:app --host 0.0.0.0 --port 8006 --workers 2"
+      sh -c "uvicorn apps.mt5_bridge.main:app --host 0.0.0.0 --port 8006"
     ports:
       - "8006:8006"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8006/health', timeout=3); sys.exit(0)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
     depends_on:
-      - postgres
-    deploy:
-      resources:
-        limits:
-          cpus: "1"
-          memory: 1G
+      postgres:
+        condition: service_healthy
 
   embeddings-service:
     image: txt-python:3.11
     container_name: embeddings-service
+    restart: unless-stopped
     working_dir: /workspace
     volumes:
       - ./:/workspace
@@ -97,22 +109,23 @@ services:
     env_file:
       - ./.env
     command: >
-      sh -c "uvicorn apps.embeddings_service.main:app --host 0.0.0.0 --port 8007 --workers 2"
+      sh -c "uvicorn apps.embeddings_service.main:app --host 0.0.0.0 --port 8007"
     ports:
       - "8007:8007"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8007/health', timeout=3); sys.exit(0)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
     depends_on:
-      - postgres
-    deploy:
-      resources:
-        limits:
-          cpus: "2"
-          memory: 4G
-        reservations:
-          memory: 2G
+      postgres:
+        condition: service_healthy
 
   risk-gateway:
     image: txt-python:3.11
     container_name: risk-gateway
+    restart: unless-stopped
     working_dir: /workspace
     volumes:
       - ./:/workspace
@@ -120,20 +133,23 @@ services:
       RISK_POLICY_PATH: /workspace/config/risk_policy.json
       DATABASE_URL: postgresql://txt:txt@postgres:5432/mission_control
     command: >
-      sh -c "uvicorn apps.risk_gateway.main:app --host 0.0.0.0 --port 8001 --workers 2"
+      sh -c "uvicorn apps.risk_gateway.main:app --host 0.0.0.0 --port 8001"
     ports:
       - "8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3); sys.exit(0)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
     depends_on:
-      - postgres
-    deploy:
-      resources:
-        limits:
-          cpus: "1"
-          memory: 1G
+      postgres:
+        condition: service_healthy
 
   execution-router:
     image: txt-python:3.11
     container_name: execution-router
+    restart: unless-stopped
     working_dir: /workspace
     volumes:
       - ./:/workspace
@@ -141,40 +157,46 @@ services:
       DATABASE_URL: postgresql://txt:txt@postgres:5432/mission_control
       MARKET_DATA_URL: http://market-data:8003
     command: >
-      sh -c "uvicorn apps.execution_router.main:app --host 0.0.0.0 --port 8002 --workers 4"
+      sh -c "uvicorn apps.execution_router.main:app --host 0.0.0.0 --port 8002"
     ports:
       - "8002:8002"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=3); sys.exit(0)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
     depends_on:
-      - postgres
-    deploy:
-      resources:
-        limits:
-          cpus: "2"
-          memory: 2G
+      postgres:
+        condition: service_healthy
 
   market-data:
     image: txt-python:3.11
     container_name: market-data
+    restart: unless-stopped
     working_dir: /workspace
     volumes:
       - ./:/workspace
     environment:
       DATABASE_URL: postgresql://txt:txt@postgres:5432/mission_control
     command: >
-      sh -c "uvicorn apps.market_data_plane.main:app --host 0.0.0.0 --port 8003 --workers 4"
+      sh -c "uvicorn apps.market_data_plane.main:app --host 0.0.0.0 --port 8003"
     ports:
       - "8003:8003"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=3); sys.exit(0)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
     depends_on:
-      - postgres
-    deploy:
-      resources:
-        limits:
-          cpus: "2"
-          memory: 2G
+      postgres:
+        condition: service_healthy
 
   broker-adapter:
     image: txt-python:3.11
     container_name: broker-adapter
+    restart: unless-stopped
     working_dir: /workspace
     volumes:
       - ./:/workspace
@@ -184,21 +206,25 @@ services:
     env_file:
       - ./.env
     command: >
-      sh -c "uvicorn apps.broker_adapter.main:app --host 0.0.0.0 --port 8004 --workers 2"
+      sh -c "uvicorn apps.broker_adapter.main:app --host 0.0.0.0 --port 8004"
     ports:
       - "8004:8004"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8004/health', timeout=3); sys.exit(0)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
     depends_on:
-      - postgres
-      - market-data
-    deploy:
-      resources:
-        limits:
-          cpus: "1"
-          memory: 1G
+      postgres:
+        condition: service_healthy
+      market-data:
+        condition: service_healthy
 
   ai-orchestrator:
     image: txt-python:3.11
     container_name: ai-orchestrator
+    restart: unless-stopped
     working_dir: /workspace
     volumes:
       - ./:/workspace
@@ -209,22 +235,23 @@ services:
     env_file:
       - ./.env
     command: >
-      sh -c "uvicorn apps.ai_orchestrator.main:app --host 0.0.0.0 --port 8005 --workers 2"
+      sh -c "uvicorn apps.ai_orchestrator.main:app --host 0.0.0.0 --port 8005"
     ports:
       - "8005:8005"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8005/health', timeout=3); sys.exit(0)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
     depends_on:
-      - postgres
-    deploy:
-      resources:
-        limits:
-          cpus: "4"
-          memory: 8G
-        reservations:
-          memory: 4G
+      postgres:
+        condition: service_healthy
 
   mission-control-ui:
     image: node:20-alpine
     container_name: mission-control-ui
+    restart: unless-stopped
     working_dir: /workspace/ui/mission-control
     volumes:
       - ./:/workspace
@@ -239,30 +266,65 @@ services:
       sh /workspace/scripts/run_mission_control_ui.sh
     expose:
       - "3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/"]
+      interval: 20s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
     depends_on:
-      - control-plane
-    deploy:
-      resources:
-        limits:
-          cpus: "2"
-          memory: 2G
+      control-plane:
+        condition: service_healthy
 
   mission-control-gateway:
     image: nginx:1.27-alpine
     container_name: mission-control-gateway
+    restart: unless-stopped
     volumes:
       - ./docker/mission-control-gateway.conf:/etc/nginx/conf.d/default.conf:ro
     ports:
       - "3000:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/"]
+      interval: 20s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
     depends_on:
-      - mission-control-ui
-      - control-plane
-      - market-data
-    deploy:
-      resources:
-        limits:
-          cpus: "1"
-          memory: 256M
+      mission-control-ui:
+        condition: service_healthy
+      control-plane:
+        condition: service_healthy
+      market-data:
+        condition: service_healthy
+
+  mission-control-tls:
+    image: nginx:1.27-alpine
+    container_name: mission-control-tls
+    restart: unless-stopped
+    volumes:
+      - ./docker/mission-control-tls.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./data/certbot/www:/var/www/certbot
+      - ./secrets/tls:/etc/letsencrypt
+    command: >
+      sh -c "apk add --no-cache openssl >/dev/null &&
+      mkdir -p /etc/letsencrypt/live/app.txt.gtixt.com &&
+      if [ ! -s /etc/letsencrypt/live/app.txt.gtixt.com/fullchain.pem ] || [ ! -s /etc/letsencrypt/live/app.txt.gtixt.com/privkey.pem ]; then
+        openssl req -x509 -nodes -newkey rsa:2048 -days 7 -keyout /etc/letsencrypt/live/app.txt.gtixt.com/privkey.pem -out /etc/letsencrypt/live/app.txt.gtixt.com/fullchain.pem -subj '/CN=app.txt.gtixt.com' >/dev/null 2>&1;
+      fi &&
+      nginx -g 'daemon off;'"
+    ports:
+      - "80:80"
+      - "443:443"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      interval: 20s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    depends_on:
+      mission-control-gateway:
+        condition: service_healthy
 
 volumes:
   postgres_data:
