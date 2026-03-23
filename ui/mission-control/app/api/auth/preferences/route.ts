@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { cpFetch } from "../../../../lib/controlPlane";
+import { cpFetchJsonSafe } from "../../../../lib/controlPlane";
 import { executeWithShadowMode, shadowResponse } from "../../../../lib/shadowMode";
 
 const SHADOW_CONFIG_GET = {
@@ -91,6 +91,8 @@ function buildThrottledHeaders(kind: "cache-hit" | "burst"): HeadersInit {
 
 function generateFallback() {
   return {
+    user_id: null,
+    updated_at: null,
     preferences: {
       ui_mode: "novice",
       theme: "dark",
@@ -135,9 +137,9 @@ export async function GET(request: Request): Promise<Response> {
     { ...SHADOW_CONFIG_GET, userId },
     {
       fetchBackend: async () => {
-        const response = await cpFetch("/v1/auth/preferences");
+        const { response, payload } = await cpFetchJsonSafe("/v1/auth/preferences");
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return response.json();
+        return payload;
       },
       getFallback: generateFallback,
     }
@@ -163,13 +165,13 @@ export async function PUT(request: Request): Promise<Response> {
     { ...SHADOW_CONFIG_PUT, userId },
     {
       fetchBackend: async () => {
-        const response = await cpFetch("/v1/auth/preferences", {
+        const { response, payload } = await cpFetchJsonSafe("/v1/auth/preferences", {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body,
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return response.json();
+        return payload;
       },
       getFallback: () => ({
         status: "ok",
