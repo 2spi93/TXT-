@@ -88,6 +88,16 @@ type LearningRegimeV4 = "trend" | "chop" | "volatile";
 type SignalDisplayMode = "classic" | "augmented" | "ai-dominant";
 type ExecutionAdaptMode = "auto" | "confirm" | "manual";
 type AutoExecutionMode = "assisted" | "semi-auto" | "full-auto";
+
+function autoExecutionModeLabel(mode: AutoExecutionMode): "Human" | "Hybrid" | "AI" {
+  if (mode === "assisted") {
+    return "Human";
+  }
+  if (mode === "semi-auto") {
+    return "Hybrid";
+  }
+  return "AI";
+}
 type MarketSuggestedBracket = {
   side: "buy" | "sell";
   entry: number;
@@ -10182,7 +10192,7 @@ export default function TradingTerminalPage() {
                             </div>
                           </div>
                           <div className="chart-auto-exec-panel">
-                            <div className="chart-signal-kicker">Auto-Execution</div>
+                            <div className="chart-signal-kicker">Auto-Execution Modules</div>
                             <div className="chart-auto-exec-mode-row">
                               {(["assisted", "semi-auto", "full-auto"] as const).map((mode) => (
                                 <button
@@ -10191,7 +10201,7 @@ export default function TradingTerminalPage() {
                                   className={`chart-chip ${autoExecutionMode === mode ? "active" : ""}`}
                                   onClick={() => setAutoExecutionMode(mode)}
                                 >
-                                  {mode === "assisted" ? "Assisted" : mode === "semi-auto" ? "Semi Auto" : "Full Auto"}
+                                  {autoExecutionModeLabel(mode)}
                                 </button>
                               ))}
                               <button
@@ -10294,7 +10304,7 @@ export default function TradingTerminalPage() {
                                 <div key={event.id} className="chart-auto-exec-audit-row">
                                   <span>{formatClock(event.timestampIso)}</span>
                                   <span>{event.gateState}</span>
-                                  <span>{event.mode}</span>
+                                  <span>{autoExecutionModeLabel(event.mode)}</span>
                                   <span>{event.sizeUsd.toFixed(0)} USD</span>
                                   <span>{event.reasons.length > 0 ? event.reasons.join("+") : "ok"}</span>
                                 </div>
