@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { cpFetch, extractMcContextHeaders } from "../../../../../lib/controlPlane";
+import { cpFetchJsonSafe, extractMcContextHeaders } from "../../../../../lib/controlPlane";
 
 type JsonMap = Record<string, unknown>;
 
@@ -106,7 +106,7 @@ export async function POST(request: Request): Promise<NextResponse> {
     },
   };
 
-  const response = await cpFetch("/v1/mt5/orders/filter", {
+  const { response, payload } = await cpFetchJsonSafe("/v1/mt5/orders/filter", {
     method: "POST",
     headers: {
       ...Object.fromEntries(forwardedHeaders.entries()),
@@ -114,7 +114,6 @@ export async function POST(request: Request): Promise<NextResponse> {
     },
     body: JSON.stringify(body),
   });
-  const payload = await response.json();
   const augmented = asObject(payload);
   if (normalizedOrderIntent) {
     augmented.order_intent = augmented.order_intent || normalizedOrderIntent;

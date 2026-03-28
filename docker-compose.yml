@@ -42,7 +42,7 @@ services:
     env_file:
       - ./.env
     command: >
-      sh -c "uvicorn apps.control_plane.main:app --host 0.0.0.0 --port 8000"
+      sh -c "uvicorn apps.control_plane.main:app --host 0.0.0.0 --port 8000 --ws websockets"
     ports:
       - "8000:8000"
     healthcheck:
@@ -180,7 +180,7 @@ services:
     environment:
       DATABASE_URL: postgresql://txt:txt@postgres:5432/mission_control
     command: >
-      sh -c "uvicorn apps.market_data_plane.main:app --host 0.0.0.0 --port 8003"
+      sh -c "uvicorn apps.market_data_plane.main:app --host 0.0.0.0 --port 8003 --ws websockets"
     ports:
       - "8003:8003"
     healthcheck:
@@ -260,6 +260,7 @@ services:
       CONTROL_PLANE_URL: http://control-plane:8000
       CONTROL_PLANE_TOKEN:
       APPROVAL_HMAC_SECRET: mission-control-secret
+      FORCE_UI_REBUILD_ON_BOOT: 1
     env_file:
       - ./.env
     command: >
@@ -310,7 +311,8 @@ services:
       sh -c "apk add --no-cache openssl >/dev/null &&
       mkdir -p /etc/letsencrypt/live/app.txt.gtixt.com &&
       if [ ! -s /etc/letsencrypt/live/app.txt.gtixt.com/fullchain.pem ] || [ ! -s /etc/letsencrypt/live/app.txt.gtixt.com/privkey.pem ]; then
-        openssl req -x509 -nodes -newkey rsa:2048 -days 7 -keyout /etc/letsencrypt/live/app.txt.gtixt.com/privkey.pem -out /etc/letsencrypt/live/app.txt.gtixt.com/fullchain.pem -subj '/CN=app.txt.gtixt.com' >/dev/null 2>&1;
+        printf '%s\n' '[req]' 'distinguished_name = req_distinguished_name' 'x509_extensions = v3_req' 'prompt = no' '' '[req_distinguished_name]' 'CN = app.txt.gtixt.com' '' '[v3_req]' 'subjectAltName = @alt_names' '' '[alt_names]' 'DNS.1 = app.txt.gtixt.com' 'DNS.2 = txt.gtixt.com' 'DNS.3 = api.txt.gtixt.com' 'DNS.4 = staging.txt.gtixt.com' 'DNS.5 = api.staging.txt.gtixt.com' >/tmp/mc_tls_san.cnf &&
+        openssl req -x509 -nodes -newkey rsa:2048 -days 7 -keyout /etc/letsencrypt/live/app.txt.gtixt.com/privkey.pem -out /etc/letsencrypt/live/app.txt.gtixt.com/fullchain.pem -config /tmp/mc_tls_san.cnf -extensions v3_req >/dev/null 2>&1;
       fi &&
       nginx -g 'daemon off;'"
     ports:

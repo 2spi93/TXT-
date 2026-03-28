@@ -1,7 +1,7 @@
 import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 
-import { getControlPlaneUrl } from "../../../../lib/controlPlane";
+import { getControlPlaneUrl, readJsonFromResponseSafe } from "../../../../lib/controlPlane";
 import { buildAppUrl, isHttpsRequest } from "../../../../lib/redirect";
 
 export async function POST(request: Request): Promise<NextResponse> {
@@ -30,7 +30,13 @@ export async function POST(request: Request): Promise<NextResponse> {
     return NextResponse.redirect(buildAppUrl(request, "/login?error=1"));
   }
 
-  const payload = await response.json();
+  const payload = await readJsonFromResponseSafe(response) as {
+    access_token?: string;
+    password_must_change?: boolean;
+  };
+  if (!payload.access_token) {
+    return NextResponse.redirect(buildAppUrl(request, "/login?error=1"));
+  }
   const cookieStore = await cookies();
   const secureCookie = isHttpsRequest(request);
   cookieStore.set("mc_token", payload.access_token, {
@@ -39,6 +45,15 @@ export async function POST(request: Request): Promise<NextResponse> {
     secure: secureCookie,
     path: "/",
     maxAge: 12 * 3600,
+  });
+  // Chrome on some managed clients can reject secure cookies under proxied
+  // mixed scheme paths; keep a short-lived compatibility cookie to avoid lockout.
+  cookieStore.set("mc_token_compat", payload.access_token, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: false,
+    path: "/",
+    maxAge: 2 * 3600,
   });
 
   if (payload.password_must_change) {

@@ -1,17 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import { fallbackDepth, hasUsableObject } from "../../../../../lib/binanceMarketFallback";
-import { cpFetch, extractMcContextHeaders } from "../../../../../lib/controlPlane";
+import { cpFetchJsonSafe, extractMcContextHeaders } from "../../../../../lib/controlPlane";
 
 export async function GET(request: NextRequest): Promise<NextResponse> {
   const instrument = request.nextUrl.searchParams.get("instrument") || "BTCUSDT";
   const venue = request.nextUrl.searchParams.get("venue") || "binance-public";
 
   try {
-    const response = await cpFetch(`/v1/market/orderbook/depth?instrument=${encodeURIComponent(instrument)}&venue=${encodeURIComponent(venue)}`, {
+    const { response, payload } = await cpFetchJsonSafe(`/v1/market/orderbook/depth?instrument=${encodeURIComponent(instrument)}&venue=${encodeURIComponent(venue)}`, {
       headers: extractMcContextHeaders(request),
     });
-    const payload = await response.json();
     if (response.ok && hasUsableObject(payload)) {
       return NextResponse.json(payload, { status: response.status });
     }

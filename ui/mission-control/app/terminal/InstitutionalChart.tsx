@@ -1,6 +1,6 @@
 "use client";
 
-import { CSSProperties, PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
+import { CSSProperties, PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AreaSeriesPartialOptions,
   CandlestickSeriesPartialOptions,
@@ -24,7 +24,6 @@ import { getDensityLevel, getDensityConfig, type DensityLevel } from "../../lib/
 import type { IndicatorSeriesData } from "../../lib/indicators/engine";
 import { heikinAshi, volumeProfile } from "../../lib/indicators/transforms";
 
-type QuotePoint = { label: string; value: number };
 type CandlePoint = { label: string; open: number; high: number; low: number; close: number; volume: number };
 type OverlayZone = {
   kind: "fvg" | "ob";
@@ -37,6 +36,7 @@ type OverlayZone = {
 };
 type LiquidityZone = { level: number; label: string };
 type ChartMotionPreset = "stable" | "balanced" | "aggressive" | "scalping" | "swing" | "auto";
+type ChartVisualMode = "auto" | "clean" | "full";
 
 type Props = {
   className?: string;
@@ -46,7 +46,7 @@ type Props = {
   interactionMode?: "full" | "lite";
   frozen?: boolean;
   chartMotionPreset?: ChartMotionPreset;
-  points: QuotePoint[];
+  visualMode?: ChartVisualMode;
   candles: CandlePoint[];
   overlayZones: OverlayZone[];
   liquidityZones: LiquidityZone[];
@@ -147,6 +147,44 @@ type CandleRenderPoint = {
   close: number;
 };
 
+function isFiniteCandleRenderPoint(point: CandleRenderPoint | null | undefined): point is CandleRenderPoint {
+  return Boolean(
+    point
+    && Number.isFinite(point.time)
+    && Number.isFinite(point.open)
+    && Number.isFinite(point.high)
+    && Number.isFinite(point.low)
+    && Number.isFinite(point.close)
+  );
+}
+
+function normalizeRenderPoint(point: CandleRenderPoint): CandleRenderPoint {
+  const open = Number(point.open);
+  const close = Number(point.close);
+  const high = Math.max(Number(point.high), open, close);
+  const low = Math.min(Number(point.low), open, close);
+  return {
+    time: Number(point.time),
+    open,
+    high,
+    low,
+    close,
+  };
+}
+
+type ManagedPriceLineSpec = {
+  price: number;
+  color: string;
+  fadedColor: string;
+  title: string;
+  compactTitle: string;
+  lineStyle: number;
+  lineWidth: number;
+  priority: number;
+  preserveNearLastLabel?: boolean;
+  hideNearLastLabel?: boolean;
+};
+
 type ChartMotionTuning = {
   smoothingBase: number;
   smoothingDistanceScale: number;
@@ -169,6 +207,13 @@ type ChartMotionTuning = {
 
 const OVERLAY_OFFSET_STORAGE_PREFIX = "gtix.overlay.offsets.v1";
 const DOM_LOCK_STORAGE_PREFIX = "gtix.dom.locked-walls.v1";
+const USE_NATIVE_WHEEL_NAV = false;
+const OVERLAY_UPDATE_INTERVAL_MS = 120;
+const CANDLE_UPDATE_INTERVAL_MS = 16;
+const HEATMAP_UPDATE_INTERVAL_MS = 160;
+const DOM_UPDATE_INTERVAL_MS = 180;
+const FOOTPRINT_UPDATE_INTERVAL_MS = 220;
+const VOLUME_PROFILE_UPDATE_INTERVAL_MS = 260;
 
 const AREA_OPTIONS: AreaSeriesPartialOptions = {
   lineColor: "#7ed7ff",
@@ -180,14 +225,14 @@ const AREA_OPTIONS: AreaSeriesPartialOptions = {
 };
 
 const CANDLE_OPTIONS: CandlestickSeriesPartialOptions = {
-  upColor: "rgba(30, 198, 126, 1)",
-  downColor: "rgba(237, 74, 74, 1)",
-  wickUpColor: "rgba(208, 255, 234, 0.98)",
-  wickDownColor: "rgba(255, 226, 226, 0.98)",
+  upColor: "#00ffa3",
+  downColor: "#ff3b3b",
+  wickUpColor: "#00ffa3",
+  wickDownColor: "#ff3b3b",
   wickVisible: true,
   borderVisible: true,
-  borderUpColor: "rgba(240, 255, 249, 1)",
-  borderDownColor: "rgba(255, 238, 238, 1)",
+  borderUpColor: "#00ffa3",
+  borderDownColor: "#ff3b3b",
   priceLineVisible: false,
   lastValueVisible: false,
 };
@@ -222,52 +267,205 @@ function inferAssetContrastClass(symbol: string): AssetContrastClass {
   return "other";
 }
 
-function inferTimeframeContrastBand(timeframe: string): "fast" | "swing" {
-  return timeframe === "1m" || timeframe === "5m" ? "fast" : "swing";
+function inferTimeframeContrastBand(timeframe: string): "scalp" | "fast" | "swing" {
+  if (timeframe === "1m") {
+    return "scalp";
+  }
+  return timeframe === "5m" ? "fast" : "swing";
 }
 
 function resolveCandleContrastOptions(symbol: string, timeframe: string): Partial<CandlestickSeriesPartialOptions> {
   const assetClass = inferAssetContrastClass(symbol);
   const band = inferTimeframeContrastBand(timeframe);
   if (assetClass === "crypto") {
-    return band === "fast"
+    return band === "scalp"
       ? {
-        upColor: "rgba(22, 203, 130, 1)",
-        downColor: "rgba(240, 66, 66, 1)",
-        wickUpColor: "rgba(220, 255, 238, 1)",
-        wickDownColor: "rgba(255, 233, 233, 1)",
-        borderUpColor: "rgba(246, 255, 251, 1)",
-        borderDownColor: "rgba(255, 242, 242, 1)",
+        upColor: "#00ffa3",
+        downColor: "#ff2e2e",
+        wickUpColor: "#00ffa3",
+        wickDownColor: "#ff2e2e",
+        borderUpColor: "#00ffa3",
+        borderDownColor: "#ff2e2e",
+      }
+      : band === "fast"
+      ? {
+        upColor: "rgba(14, 224, 138, 1)",
+        downColor: "rgba(250, 74, 74, 1)",
+        wickUpColor: "rgba(14, 224, 138, 1)",
+        wickDownColor: "rgba(250, 74, 74, 1)",
+        borderUpColor: "rgba(252, 255, 253, 1)",
+        borderDownColor: "rgba(255, 246, 246, 1)",
       }
       : {
-        upColor: "rgba(28, 194, 128, 0.98)",
-        downColor: "rgba(233, 77, 77, 0.98)",
-        wickUpColor: "rgba(206, 249, 228, 0.98)",
-        wickDownColor: "rgba(255, 224, 224, 0.98)",
-        borderUpColor: "rgba(235, 252, 245, 0.98)",
-        borderDownColor: "rgba(255, 234, 234, 0.98)",
+        upColor: "rgba(22, 208, 134, 1)",
+        downColor: "rgba(240, 82, 82, 1)",
+        wickUpColor: "rgba(22, 208, 134, 1)",
+        wickDownColor: "rgba(240, 82, 82, 1)",
+        borderUpColor: "rgba(244, 255, 249, 1)",
+        borderDownColor: "rgba(255, 240, 240, 1)",
       };
   }
   if (assetClass === "fx") {
-    return band === "fast"
+    return band === "scalp"
       ? {
-        upColor: "rgba(43, 177, 221, 0.96)",
-        downColor: "rgba(255, 128, 133, 0.97)",
-        wickUpColor: "rgba(205, 238, 255, 0.96)",
-        wickDownColor: "rgba(255, 216, 216, 0.96)",
-        borderUpColor: "rgba(228, 246, 255, 0.98)",
-        borderDownColor: "rgba(255, 229, 229, 0.98)",
+        upColor: "rgba(86, 220, 255, 1)",
+        downColor: "rgba(255, 104, 122, 1)",
+        wickUpColor: "rgba(86, 220, 255, 1)",
+        wickDownColor: "rgba(255, 104, 122, 1)",
+        borderUpColor: "rgba(245, 252, 255, 1)",
+        borderDownColor: "rgba(255, 241, 244, 1)",
+      }
+      : band === "fast"
+      ? {
+        upColor: "rgba(58, 191, 236, 1)",
+        downColor: "rgba(255, 118, 124, 1)",
+        wickUpColor: "rgba(58, 191, 236, 1)",
+        wickDownColor: "rgba(255, 118, 124, 1)",
+        borderUpColor: "rgba(240, 250, 255, 1)",
+        borderDownColor: "rgba(255, 238, 238, 1)",
       }
       : {
-        upColor: "rgba(66, 170, 210, 0.92)",
-        downColor: "rgba(236, 129, 129, 0.94)",
-        wickUpColor: "rgba(197, 231, 248, 0.9)",
-        wickDownColor: "rgba(246, 206, 206, 0.92)",
-        borderUpColor: "rgba(223, 243, 253, 0.94)",
-        borderDownColor: "rgba(252, 225, 225, 0.94)",
+        upColor: "rgba(74, 182, 224, 0.98)",
+        downColor: "rgba(242, 136, 136, 0.98)",
+        wickUpColor: "rgba(74, 182, 224, 0.98)",
+        wickDownColor: "rgba(242, 136, 136, 0.98)",
+        borderUpColor: "rgba(232, 247, 255, 1)",
+        borderDownColor: "rgba(255, 232, 232, 1)",
       };
   }
   return {};
+}
+
+function resolveTimeScaleOptions(mode: Props["mode"], isLiteMode: boolean, timeframe: string) {
+  if (mode === "candles") {
+    if (timeframe === "1m") {
+      return {
+        rightOffset: isLiteMode ? 1.2 : 3,
+        barSpacing: isLiteMode ? 9 : 11,
+        minBarSpacing: isLiteMode ? 6 : 7,
+      };
+    }
+    return {
+      rightOffset: isLiteMode ? 1.1 : 3,
+      barSpacing: isLiteMode ? 11 : 13,
+      minBarSpacing: isLiteMode ? 5 : 6,
+    };
+  }
+  if (mode === "footprint") {
+    return {
+      rightOffset: isLiteMode ? 1.2 : 3,
+      barSpacing: isLiteMode ? 8 : 10,
+      minBarSpacing: isLiteMode ? 3 : 3,
+    };
+  }
+  return {
+    rightOffset: isLiteMode ? 1.5 : 3,
+    barSpacing: isLiteMode ? 8 : 10,
+    minBarSpacing: isLiteMode ? 3 : 3,
+  };
+}
+
+function resolveInitialVisibleBars(mode: Props["mode"], isLiteMode: boolean, containerWidth: number): number {
+  if (mode === "candles") {
+    if (containerWidth <= 520) {
+      return 40;
+    }
+    if (containerWidth <= 680) {
+      return 60;
+    }
+    if (containerWidth <= 860) {
+      return 80;
+    }
+    if (containerWidth <= 1200) {
+      return isLiteMode ? 100 : 120;
+    }
+    return isLiteMode ? 120 : 160;
+  }
+
+  return isLiteMode ? 120 : 180;
+}
+
+function chartCanvasBitmapLooksStale(host: HTMLDivElement, width: number, height: number): boolean {
+  if (width <= 320 && height <= 180) {
+    return false;
+  }
+
+  const canvases = Array.from(host.querySelectorAll("canvas"))
+    .filter((canvas) => canvas.clientWidth > 0 && canvas.clientHeight > 0)
+    .sort((left, right) => (right.clientWidth * right.clientHeight) - (left.clientWidth * left.clientHeight));
+
+  const plotCanvases = canvases.filter((canvas) => (
+    canvas.clientWidth >= width * 0.55
+    && canvas.clientHeight >= height * 0.55
+  ));
+
+  return plotCanvases.some((canvas) => (
+    canvas.width < Math.floor(canvas.clientWidth * 0.85)
+    || canvas.height < Math.floor(canvas.clientHeight * 0.85)
+  ));
+}
+
+function resolveManagedPriceLines(
+  activeSeries: ISeriesApi<"Area"> | ISeriesApi<"Candlestick">,
+  specs: ManagedPriceLineSpec[],
+  mode: Props["mode"],
+  lastValue: number | null,
+  maxRelativeDistance: number | null = null,
+  preferCompactTitles = false,
+  maxVisibleLines: number | null = null,
+) {
+  const crowdedLabelGapPx = mode === "candles" ? 22 : 16;
+  const nearLastLabelGapPx = mode === "candles" ? 26 : 18;
+  const lastY = Number.isFinite(lastValue) ? activeSeries.priceToCoordinate(Number(lastValue)) : null;
+  const placedLabelYs: number[] = [];
+
+  const filteredSpecs = Number.isFinite(lastValue) && Number.isFinite(maxRelativeDistance) && maxRelativeDistance !== null && maxRelativeDistance > 0
+    ? specs.filter((spec) => {
+      const relativeDistance = Math.abs(spec.price - Number(lastValue)) / Math.max(1, Math.abs(Number(lastValue)));
+      return relativeDistance <= maxRelativeDistance || (spec.priority >= 5 && relativeDistance <= maxRelativeDistance * 1.35);
+    })
+    : specs;
+
+  const rankedSpecs = [...filteredSpecs]
+    .sort((left, right) => {
+      if (right.priority !== left.priority) {
+        return right.priority - left.priority;
+      }
+      if (Number.isFinite(lastValue)) {
+        return Math.abs(left.price - Number(lastValue)) - Math.abs(right.price - Number(lastValue));
+      }
+      return right.price - left.price;
+    });
+
+  const visibleSpecs = Number.isFinite(maxVisibleLines) && maxVisibleLines !== null && maxVisibleLines > 0
+    ? rankedSpecs.slice(0, maxVisibleLines)
+    : rankedSpecs;
+
+  return visibleSpecs
+    .map((spec) => {
+      const y = activeSeries.priceToCoordinate(spec.price);
+      const nearLast = y !== null && lastY !== null && Math.abs(y - lastY) < nearLastLabelGapPx;
+      const crowded = y !== null && placedLabelYs.some((placedY) => Math.abs(placedY - y) < crowdedLabelGapPx);
+      const axisLabelVisible = y === null
+        ? true
+        : spec.preserveNearLastLabel && nearLast
+          ? !crowded
+          : !(crowded || (nearLast && (spec.hideNearLastLabel || spec.priority < 4)));
+      if (axisLabelVisible && y !== null) {
+        placedLabelYs.push(y);
+      }
+
+      const compact = nearLast || crowded;
+      return {
+        price: spec.price,
+        color: compact ? spec.fadedColor : spec.color,
+        lineStyle: spec.lineStyle,
+        lineWidth: compact ? Math.max(1, spec.lineWidth - 1) : spec.lineWidth,
+        title: axisLabelVisible ? ((preferCompactTitles || compact) ? spec.compactTitle : spec.title) : "",
+        axisLabelVisible,
+        lineVisible: true,
+      };
+    });
 }
 
 function timeframeSeconds(timeframe: string): number {
@@ -372,10 +570,30 @@ function normalizeTimes(labels: string[], timeframe: string): UTCTimestamp[] {
   });
 }
 
-function estimateRecentVolatility(candles: CandlePoint[], points: QuotePoint[]): number {
-  const source = candles.length > 1
-    ? candles.slice(-120).map((c) => c.close)
-    : points.slice(-120).map((p) => p.value);
+function buildSeriesAutoscaleInfo(
+  baseImplementation: (() => { margins?: { above: number; below: number } } | null) | undefined,
+  range: { min: number; max: number } | null,
+) {
+  const baseInfo = baseImplementation?.() ?? null;
+  if (!range || !Number.isFinite(range.min) || !Number.isFinite(range.max)) {
+    return baseInfo;
+  }
+
+  const rawSpan = Math.max(0, range.max - range.min);
+  const baseline = Math.max(Math.abs(range.max), Math.abs(range.min), 1);
+  const padding = Math.max(rawSpan * 0.08, baseline * 0.0006, 0.01);
+
+  return {
+    priceRange: {
+      minValue: range.min - padding,
+      maxValue: range.max + padding,
+    },
+    margins: baseInfo?.margins,
+  };
+}
+
+function estimateRecentVolatility(candles: CandlePoint[]): number {
+  const source = candles.slice(-120).map((c) => c.close);
   if (source.length < 6) {
     return 0;
   }
@@ -869,7 +1087,7 @@ export default function InstitutionalChart({
   interactionMode = "full",
   frozen = false,
   chartMotionPreset = "auto",
-  points,
+  visualMode = "auto",
   candles,
   overlayZones,
   liquidityZones,
@@ -898,11 +1116,11 @@ export default function InstitutionalChart({
     const previousMode = autoMotionModeRef.current && autoMotionModeRef.current.key === autoKey
       ? autoMotionModeRef.current.mode
       : undefined;
-    const sigma = estimateRecentVolatility(candles, points);
+    const sigma = estimateRecentVolatility(candles);
     const nextMode = resolveAutoMotionPreset(symbol, timeframe, sigma, previousMode);
     autoMotionModeRef.current = { key: autoKey, mode: nextMode };
     return nextMode;
-  }, [candles, chartMotionPreset, points, symbol, timeframe]);
+  }, [candles, chartMotionPreset, symbol, timeframe]);
   const motionTuning = useMemo(() => getChartMotionTuning(resolvedMotionPreset), [resolvedMotionPreset]);
   const [autoStabilityMetrics, setAutoStabilityMetrics] = useState<AutoStabilityMetrics>({
     switches5m: 0,
@@ -978,7 +1196,9 @@ export default function InstitutionalChart({
   const [domTouchPrimedKey, setDomTouchPrimedKey] = useState<string | null>(null);
   const [vpHoverKey, setVpHoverKey] = useState<string | null>(null);
   const [domToast, setDomToast] = useState<{ id: number; message: string } | null>(null);
+  const [isUserInteracting, setIsUserInteracting] = useState(false);
   const [workerLatencyMs, setWorkerLatencyMs] = useState<number | null>(null);
+  const [gpuSafeMode, setGpuSafeMode] = useState(false);
   const densityConfig = useMemo(() => getDensityConfig(densityLevel), [densityLevel]);
   const dragStateRef = useRef<DragState | null>(null);
   const candleStepPxRef = useRef(12);
@@ -988,12 +1208,16 @@ export default function InstitutionalChart({
   const interactionRafRef = useRef<number | null>(null);
   const hasInitializedRangeRef = useRef(false);
   const lastRangeIdentityRef = useRef("");
+  const userAdjustedTimeScaleRef = useRef(false);
   const schedulerRef = useRef<RenderScheduler | null>(null);
+  const chartGenerationRef = useRef(0);
   const dirtyStateRef = useRef(createDirtyState());
   // sqrt curve + tanh soft-cap → TradingView-like velocity feel
   const interactionXRef = useRef(createInteractionEngine({ friction: 0.9, sensitivity: 0.002, curve: "sqrt", maxVelocity: 0.9 }));
   const interactionYRef = useRef(createInteractionEngine({ friction: 0.92, sensitivity: 0.0024, curve: "sqrt", maxVelocity: 0.7 }));
   const wheelCursorXRef = useRef(0.5);
+  const rightDragActiveRef = useRef(false);
+  const rightDragLastXRef = useRef(0);
   const densityLevelRef = useRef<DensityLevel>("normal");
   const prevCandleLengthRef = useRef(0);
   const renderUpdateCountsRef = useRef<RenderUpdateCounts>({ candle: 0, indicator: 0, overlay: 0 });
@@ -1005,23 +1229,52 @@ export default function InstitutionalChart({
   const toastSeqRef = useRef(0);
   const domHoldTimerRef = useRef<number | null>(null);
   const domPressHandledRef = useRef(false);
+  const interactionIdleTimerRef = useRef<number | null>(null);
+  const overlayLastUpdateTsRef = useRef(0);
+  const overlayContextKeyRef = useRef("");
+  const heatmapLastComputeTsRef = useRef(0);
+  const domLastComputeTsRef = useRef(0);
+  const footprintLastComputeTsRef = useRef(0);
+  const volumeProfileLastComputeTsRef = useRef(0);
+  const lastSeriesUpdateTsRef = useRef(0);
+  const candleAutoscaleRangeRef = useRef<{ min: number; max: number } | null>(null);
+  const areaAutoscaleRangeRef = useRef<{ min: number; max: number } | null>(null);
+  const markUserInteraction = useCallback((holdMs = 900) => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    setIsUserInteracting(true);
+    if (interactionIdleTimerRef.current !== null) {
+      window.clearTimeout(interactionIdleTimerRef.current);
+    }
+    interactionIdleTimerRef.current = window.setTimeout(() => {
+      setIsUserInteracting(false);
+      interactionIdleTimerRef.current = null;
+    }, holdMs);
+  }, []);
+
 
   // ── Partial update tracking (setData vs update) ──────────────────────────────
   const prevCandlesRef = useRef<Array<{ time: number; open: number; high: number; low: number; close: number }> | null>(null);
   const prevAreaDataRef = useRef<Array<{ time: number; value: number }> | null>(null);
+  const hasSeededSeriesRef = useRef(false);
 
   const overlayStorageKey = `${OVERLAY_OFFSET_STORAGE_PREFIX}.${symbol}.${timeframe}`;
   const domLockStorageKey = `${DOM_LOCK_STORAGE_PREFIX}.${symbol}.${timeframe}`;
 
   useEffect(() => {
     if (!schedulerRef.current) {
-      schedulerRef.current = new RenderScheduler({ frameBudgetMs: 16.7 });
+      schedulerRef.current = new RenderScheduler({ frameBudgetMs: 16 });
     }
     return () => {
       schedulerRef.current?.clear();
       if (interactionRafRef.current) {
         window.cancelAnimationFrame(interactionRafRef.current);
         interactionRafRef.current = null;
+      }
+      if (interactionIdleTimerRef.current !== null) {
+        window.clearTimeout(interactionIdleTimerRef.current);
+        interactionIdleTimerRef.current = null;
       }
       if (intraCandleRafRef.current) {
         window.cancelAnimationFrame(intraCandleRafRef.current);
@@ -1087,7 +1340,7 @@ export default function InstitutionalChart({
       return;
     }
     indicatorRequestTsRef.current = performance.now();
-  }, [candles, frozen, isLiteMode, points, symbol, timeframe]);
+  }, [candles, frozen, isLiteMode, symbol, timeframe]);
 
   useEffect(() => {
     if (typeof performance === "undefined") {
@@ -1641,6 +1894,10 @@ export default function InstitutionalChart({
       return undefined;
     }
 
+    if (USE_NATIVE_WHEEL_NAV) {
+      return undefined;
+    }
+
     const host = containerRef.current;
     if (!host) {
       return undefined;
@@ -1670,10 +1927,12 @@ export default function InstitutionalChart({
           const adaptiveK = zoomingOut
             ? 0.00315 + Math.log1p(width) * 0.00037
             : 0.00245 + Math.log1p(width) * 0.00031;
-          const zoomFactor = Math.exp(zoomImpulse * adaptiveK);
+          // Stronger zoom multiplier for responsive wheel feel
+          const boostK = adaptiveK * 1.6;
+          const zoomFactor = Math.exp(zoomImpulse * boostK);
           let nextWidth = clamp(width * zoomFactor, 8, 600);
-          // Contextual snap on bar spacing: lock to common readable steps when close.
-          const spacingTargets = [3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 40, 52, 64];
+          // Soft snap: finer grid with very tight threshold (almost free zoom)
+          const spacingTargets = [3, 3.5, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 20, 24, 28, 32, 40, 52, 64];
           const nextStepPx = clamp(containerWidth / nextWidth, 2, 80);
           let bestStep = nextStepPx;
           let bestGap = Number.POSITIVE_INFINITY;
@@ -1684,7 +1943,7 @@ export default function InstitutionalChart({
               bestStep = step;
             }
           }
-          const snapThreshold = clamp(stepPxCurrent * 0.1, 0.35, 1.8);
+          const snapThreshold = clamp(stepPxCurrent * 0.04, 0.15, 0.6);
           if (bestGap <= snapThreshold) {
             nextWidth = clamp(containerWidth / bestStep, 8, 600);
           }
@@ -1730,19 +1989,146 @@ export default function InstitutionalChart({
 
     const onWheel = (event: WheelEvent) => {
       event.preventDefault();
-      // Track cursor position for cursor-centered zoom
+      markUserInteraction(920);
+      const chart = chartRef.current;
+      if (!chart) return;
       const rect = host.getBoundingClientRect();
-      wheelCursorXRef.current = clamp(event.clientX - rect.left, 0, rect.width);
-      interactionXRef.current.onWheel(-event.deltaX);
-      interactionYRef.current.onWheel(-event.deltaY);
-      if (!interactionRafRef.current) {
-        interactionRafRef.current = window.requestAnimationFrame(settle);
+      const cursorX = clamp(event.clientX - rect.left, 0, rect.width);
+      const containerWidth = Math.max(1, rect.width);
+      wheelCursorXRef.current = cursorX;
+
+      const adx = Math.abs(event.deltaX);
+      const ady = Math.abs(event.deltaY);
+
+      // ── Trackpad: pick dominant axis so pan ≠ zoom simultaneously ──
+      const isHorizontalDominant = adx > ady && adx > 1;
+      const isVerticalDominant = ady > adx && ady > 0.5;
+      // When both axes are nearly equal (diagonal), prefer horizontal (pan)
+      const isBothActive = adx > 1 && ady > 1;
+
+      // ── Horizontal scroll (panning) with inertia ──
+      if (isHorizontalDominant || (isBothActive && adx >= ady)) {
+        userAdjustedTimeScaleRef.current = true;
+        interactionXRef.current.onWheel(-event.deltaX);
+        if (!interactionRafRef.current) {
+          const scrollSettle = () => {
+            const x = interactionXRef.current.update();
+            if (Math.abs(x.velocity) < 0.0002) {
+              interactionRafRef.current = null;
+              return;
+            }
+            const scrollDrift = clamp(x.delta * 35, -motionTuning.inertiaDriftClampX, motionTuning.inertiaDriftClampX);
+            if (Math.abs(scrollDrift) > 0.001) {
+              const ts = chart.timeScale();
+              const curPos = ts.scrollPosition();
+              const impulse = Math.sign(scrollDrift) * Math.pow(Math.abs(scrollDrift), 0.92);
+              ts.scrollToPosition(curPos + impulse * 0.022, false);
+            }
+            interactionRafRef.current = window.requestAnimationFrame(scrollSettle);
+          };
+          interactionRafRef.current = window.requestAnimationFrame(scrollSettle);
+        }
+        return; // don't also zoom when panning
+      }
+
+      // ── Vertical zoom (direct, NO inertia — sticks where you leave it) ──
+      if (isVerticalDominant) {
+        const ts = chart.timeScale();
+        const range = ts.getVisibleLogicalRange();
+        if (range) {
+          userAdjustedTimeScaleRef.current = true;
+          const width = Math.max(1, range.to - range.from);
+          // Zoom direction: scroll-up (deltaY<0) = zoom IN (fewer bars); scroll-down = zoom OUT
+          const zoomDelta = -event.deltaY;
+          const zoomK = 0.0012;
+          const zoomFactor = Math.exp(zoomDelta * zoomK);
+          const nextWidth = clamp(width * zoomFactor, 6, 800);
+          // Cursor-centered zoom
+          const cursorFrac = clamp(cursorX / containerWidth, 0, 1);
+          const cursorLogical = range.from + cursorFrac * width;
+          const leftFrac = (cursorLogical - range.from) / width;
+          const rightFrac = (range.to - cursorLogical) / width;
+          ts.setVisibleLogicalRange({
+            from: cursorLogical - leftFrac * nextWidth,
+            to: cursorLogical + rightFrac * nextWidth,
+          });
+        }
+      }
+    };
+
+    const stopRightDrag = () => {
+      if (!rightDragActiveRef.current) {
+        return;
+      }
+      rightDragActiveRef.current = false;
+      host.classList.remove("chart-time-pan-active");
+    };
+
+    const onMouseDown = (event: MouseEvent) => {
+      if (event.button !== 2) {
+        return;
+      }
+      rightDragActiveRef.current = true;
+      rightDragLastXRef.current = event.clientX;
+      userAdjustedTimeScaleRef.current = true;
+      markUserInteraction(1200);
+      host.classList.add("chart-time-pan-active");
+      event.preventDefault();
+    };
+
+    const onMouseMove = (event: MouseEvent) => {
+      if (rightDragActiveRef.current) {
+        event.preventDefault();
+        const chart = chartRef.current;
+        if (!chart) {
+          return;
+        }
+        const deltaX = event.clientX - rightDragLastXRef.current;
+        rightDragLastXRef.current = event.clientX;
+        if (Math.abs(deltaX) > 0.25) {
+          userAdjustedTimeScaleRef.current = true;
+          markUserInteraction(1200);
+          const timeScale = chart.timeScale();
+          const currentScroll = timeScale.scrollPosition();
+          const impulse = clamp(deltaX / 10, -5, 5);
+          timeScale.scrollToPosition(currentScroll - impulse, false);
+        }
+        return;
+      }
+
+      if ((event.buttons & 1) === 1) {
+        userAdjustedTimeScaleRef.current = true;
+        markUserInteraction(900);
+      }
+    };
+
+    const onMouseUp = (event: MouseEvent) => {
+      if (event.button === 2 || rightDragActiveRef.current) {
+        stopRightDrag();
+      }
+    };
+
+    const onContextMenu = (event: MouseEvent) => {
+      if (rightDragActiveRef.current) {
+        event.preventDefault();
       }
     };
 
     host.addEventListener("wheel", onWheel, { passive: false });
+    host.addEventListener("mousedown", onMouseDown);
+    host.addEventListener("contextmenu", onContextMenu);
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    window.addEventListener("blur", stopRightDrag);
+
     return () => {
       host.removeEventListener("wheel", onWheel);
+      host.removeEventListener("mousedown", onMouseDown);
+      host.removeEventListener("contextmenu", onContextMenu);
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+      window.removeEventListener("blur", stopRightDrag);
+      stopRightDrag();
       if (interactionRafRef.current) {
         window.cancelAnimationFrame(interactionRafRef.current);
         interactionRafRef.current = null;
@@ -1750,7 +2136,7 @@ export default function InstitutionalChart({
       interactionXRef.current.reset();
       interactionYRef.current.reset();
     };
-  }, [frozen, isLiteMode, motionTuning]);
+  }, [frozen, isLiteMode, markUserInteraction, motionTuning]);
 
   // ── Indicator series lifecycle with viewport culling ─────────────────────────
   // Sync the indicatorSeriesMap with the current `indicatorSeries` prop.
@@ -1762,11 +2148,13 @@ export default function InstitutionalChart({
       return;
     }
 
+    const suppressMainPaneIndicators = mode === "candles" && chartViewportWidth < 480;
+
     // Filter: overlay indicators, but SKIP if in lite mode (viewport culling)
     // Only render overlays in full mode
     const overlayOnly = (indicatorSeries ?? [])
       .filter((s) => s.pane === "main")
-      .filter((s) => !isLiteMode); // ← VIEWPORT CULLING: skip overlay indicators if lite
+      .filter((s) => !isLiteMode && !suppressMainPaneIndicators); // ← VIEWPORT CULLING: skip overlay indicators if lite or compact mobile
 
     // Filter: sub-chart indicators, but SKIP if frozen (viewport culling)
     // Sub-charts don't render if not visible
@@ -1797,13 +2185,16 @@ export default function InstitutionalChart({
     for (const s of allDesiredSeries) {
       const key = `${s.indicatorId}:${s.outputKey}`;
       let lwSeries = existingMap.get(key) as ISeriesApi<"Line"> | undefined;
-      const options: LineSeriesPartialOptions = {
+      const options: LineSeriesPartialOptions & {
+        autoscaleInfoProvider?: (baseImplementation: (() => { margins?: { above: number; below: number } } | null) | undefined) => { priceRange?: { minValue: number; maxValue: number }; margins?: { above: number; below: number } } | null;
+      } = {
         color: s.color,
         lineWidth: (s.lineWidth ?? 1) as 1 | 2 | 3 | 4,
         priceLineVisible: false,
         lastValueVisible: false,
         crosshairMarkerVisible: false,
         priceScaleId: "right",
+        autoscaleInfoProvider: (baseImplementation) => buildSeriesAutoscaleInfo(baseImplementation, candleAutoscaleRangeRef.current),
       };
 
       if (!lwSeries) {
@@ -1823,8 +2214,12 @@ export default function InstitutionalChart({
     if (pendingIndicatorUpdates.length > 0) {
       dirtyStateRef.current.indicator = true;
       const scheduler = schedulerRef.current;
+      const chartGeneration = chartGenerationRef.current;
       const applyUpdates = () => {
         if (!dirtyStateRef.current.indicator) {
+          return;
+        }
+        if (chartGenerationRef.current !== chartGeneration || chartRef.current !== chart) {
           return;
         }
         for (const update of pendingIndicatorUpdates) {
@@ -1843,38 +2238,51 @@ export default function InstitutionalChart({
         applyUpdates();
       }
     }
-  }, [frozen, isLiteMode, indicatorSeries]);
+  }, [frozen, isLiteMode, indicatorSeries, mode, chartViewportWidth]);
 
   useEffect(() => {
     if (!containerRef.current) {
       return undefined;
     }
 
+    const chartGeneration = chartGenerationRef.current + 1;
+    chartGenerationRef.current = chartGeneration;
+
+    const timeScaleOptions = resolveTimeScaleOptions(mode, isLiteMode, timeframe);
+
+    const initialRect = containerRef.current.getBoundingClientRect();
+    const initialWidth = Math.max(1, Math.floor(initialRect.width || containerRef.current.clientWidth || 1));
+    const initialHeight = Math.max(1, Math.floor(initialRect.height || containerRef.current.clientHeight || 1));
+
     const chart = createChart(containerRef.current, {
-      width: containerRef.current.clientWidth,
-      height: containerRef.current.clientHeight,
+      width: initialWidth,
+      height: initialHeight,
       layout: {
         background: { type: ColorType.Solid, color: "rgba(7,11,18,0.01)" },
         textColor: "rgba(232,240,249,0.86)",
         fontSize: 12,
       },
       grid: {
-        vertLines: { color: "rgba(120,147,188,0.12)" },
-        horzLines: { color: "rgba(120,147,188,0.16)" },
+        vertLines: { color: "rgba(255,255,255,0.05)" },
+        horzLines: { color: "rgba(255,255,255,0.05)" },
       },
       rightPriceScale: {
         borderColor: "rgba(120,147,188,0.24)",
         scaleMargins: { top: 0.1, bottom: 0.12 },
       },
       timeScale: {
+        visible: true,
         borderColor: "rgba(120,147,188,0.24)",
         timeVisible: true,
-        secondsVisible: false,
-        fixLeftEdge: true,
+        secondsVisible: true,
+        ticksVisible: true,
+        fixLeftEdge: false,
         fixRightEdge: false,
-        rightOffset: isLiteMode ? 1.5 : 4,
-        barSpacing: isLiteMode ? 9.5 : 13.8,
-        minBarSpacing: isLiteMode ? 5.5 : 7.2,
+        rightOffset: timeScaleOptions.rightOffset,
+        barSpacing: timeScaleOptions.barSpacing,
+        minBarSpacing: timeScaleOptions.minBarSpacing,
+        minimumHeight: isLiteMode ? 24 : 30,
+        tickMarkFormatter: (time: Time) => formatCursorTime(time),
       },
       localization: {
         priceFormatter: formatCompactPrice,
@@ -1893,35 +2301,83 @@ export default function InstitutionalChart({
         },
       },
       handleScroll: {
-        mouseWheel: false,
+        mouseWheel: USE_NATIVE_WHEEL_NAV,
         pressedMouseMove: !isLiteMode,
         horzTouchDrag: true,
         vertTouchDrag: false,
       },
       handleScale: {
-        mouseWheel: false,
+        mouseWheel: USE_NATIVE_WHEEL_NAV,
         pinch: !isLiteMode,
         axisPressedMouseMove: !isLiteMode,
       },
     });
 
-    const areaSeries = chart.addAreaSeries(AREA_OPTIONS);
-    const candleSeries = chart.addCandlestickSeries(CANDLE_OPTIONS);
+    const candleSeries = chart.addCandlestickSeries({
+      ...CANDLE_OPTIONS,
+      autoscaleInfoProvider: (baseImplementation: (() => { margins?: { above: number; below: number } } | null) | undefined) => (
+        buildSeriesAutoscaleInfo(baseImplementation, candleAutoscaleRangeRef.current)
+      ),
+    } as any);
+    const areaSeries = chart.addAreaSeries({
+      ...AREA_OPTIONS,
+      autoscaleInfoProvider: (baseImplementation: (() => { margins?: { above: number; below: number } } | null) | undefined) => (
+        buildSeriesAutoscaleInfo(baseImplementation, areaAutoscaleRangeRef.current)
+      ),
+    } as any);
+    if (typeof (candleSeries as any).setSeriesOrder === "function") {
+      (candleSeries as any).setSeriesOrder(10);
+    }
+    if (typeof (areaSeries as any).setSeriesOrder === "function") {
+      (areaSeries as any).setSeriesOrder(5);
+    }
     chartRef.current = chart;
     areaSeriesRef.current = areaSeries;
     candleSeriesRef.current = candleSeries;
+
+    let resizeRecoveryRaf: number | null = null;
+
+    const resizeChart = (liveChart: IChartApi, width: number, height: number) => {
+      try {
+        (liveChart as IChartApi & { resize: (width: number, height: number, forceRepaint?: boolean) => void }).resize(width, height, true);
+      } catch {
+        liveChart.resize(width, height);
+      }
+    };
+
+    const syncChartSize = (attempt = 0) => {
+      const host = containerRef.current;
+      const liveChart = chartRef.current;
+      if (!host || !liveChart) {
+        return;
+      }
+      const rect = host.getBoundingClientRect();
+      const width = Math.max(1, Math.floor(rect.width || host.clientWidth || 1));
+      const height = Math.max(1, Math.floor(rect.height || host.clientHeight || 1));
+      setChartViewportWidth(width);
+      resizeChart(liveChart, width, height);
+
+      if (chartCanvasBitmapLooksStale(host, width, height) && attempt < 5) {
+        resizeRecoveryRaf = window.requestAnimationFrame(() => syncChartSize(attempt + 1));
+      }
+    };
+
+    syncChartSize();
+    const initialResizeRaf = window.requestAnimationFrame(syncChartSize);
+    const secondResizeRaf = window.requestAnimationFrame(() => syncChartSize(1));
 
     const resizeObserver = new ResizeObserver((entries) => {
       const entry = entries[0];
       if (!entry || !chartRef.current) {
         return;
       }
-      setChartViewportWidth(Math.floor(entry.contentRect.width));
-      chartRef.current.applyOptions({
-        width: Math.floor(entry.contentRect.width),
-        height: Math.floor(entry.contentRect.height),
-      });
-      chartRef.current.timeScale().fitContent();
+      const width = Math.max(1, Math.floor(entry.contentRect.width));
+      const height = Math.max(1, Math.floor(entry.contentRect.height));
+      setChartViewportWidth(width);
+      resizeChart(chartRef.current, width, height);
+      if (!hasInitializedRangeRef.current) {
+        chartRef.current.timeScale().fitContent();
+      }
     });
     resizeObserver.observe(containerRef.current);
 
@@ -1998,6 +2454,12 @@ export default function InstitutionalChart({
     chart.timeScale().subscribeVisibleLogicalRangeChange(handleRangeChange);
 
     return () => {
+      schedulerRef.current?.clear();
+      window.cancelAnimationFrame(initialResizeRaf);
+      window.cancelAnimationFrame(secondResizeRaf);
+      if (resizeRecoveryRaf !== null) {
+        window.cancelAnimationFrame(resizeRecoveryRaf);
+      }
       resizeObserver.disconnect();
       chart.timeScale().unsubscribeVisibleLogicalRangeChange(handleRangeChange);
       if (intraCandleRafRef.current) {
@@ -2013,9 +2475,15 @@ export default function InstitutionalChart({
       // Clear all indicator series refs; the chart will be destroyed anyway
       indicatorSeriesMapRef.current.clear();
       chart.remove();
+      if (chartGenerationRef.current === chartGeneration) {
+        chartGenerationRef.current = chartGeneration + 1;
+      }
       chartRef.current = null;
       areaSeriesRef.current = null;
       candleSeriesRef.current = null;
+      prevCandlesRef.current = null;
+      prevAreaDataRef.current = null;
+      hasSeededSeriesRef.current = false;
     };
   }, [frozen, isLiteMode, mode, onCrosshairMove, timeframe]);
 
@@ -2032,17 +2500,18 @@ export default function InstitutionalChart({
       return;
     }
 
-    const pointTimes = normalizeTimes(points.map((point) => point.label), timeframe);
-    const candleLabels = candles.length > 0 ? candles.map((candle) => candle.label) : points.map((point) => point.label);
+    const lineSource = candles.map((candle) => ({ label: candle.label, value: candle.close }));
+    const pointTimes = normalizeTimes(lineSource.map((point) => point.label), timeframe);
+    const candleLabels = candles.map((candle) => candle.label);
     const candleTimes = normalizeTimes(candleLabels, timeframe);
 
-    const areaData = points.map((point, index) => ({
+    const areaData = lineSource.map((point, index) => ({
       time: pointTimes[index],
       value: point.value,
     }));
 
     // Build raw OHLCV array then apply LOD + transform if requested
-    const rawCandleSource = (candles.length > 0 ? candles : points.map((point) => ({
+    const rawCandleSource = (candles.length > 0 ? candles : lineSource.map((point) => ({
       label: point.label,
       open: point.value,
       high: point.value,
@@ -2053,14 +2522,23 @@ export default function InstitutionalChart({
 
     const rawBarsForRender = rawCandleSource.map((c, i) => ({
       time: Number(candleTimes[i]),
-      open: c.open,
-      high: c.high,
-      low: c.low,
-      close: c.close,
-      volume: c.volume,
+      open: Number.isFinite(c.open) ? c.open : c.close ?? 0,
+      high: Number.isFinite(c.high) ? c.high : c.close ?? 0,
+      low: Number.isFinite(c.low) ? c.low : c.close ?? 0,
+      close: Number.isFinite(c.close) ? c.close : 0,
+      volume: Number.isFinite(c.volume) ? c.volume : 0,
     }));
 
+    const range = chart.timeScale().getVisibleLogicalRange();
+    const visibleBars = range ? Math.max(1, Math.ceil(range.to - range.from)) : rawBarsForRender.length;
+    const shouldGpuSafe = densityLevel === "micro" || visibleBars > 150;
+    setGpuSafeMode((current) => (current === shouldGpuSafe ? current : shouldGpuSafe));
+
     const densityBlocksVolumeProfile = densityLevel === "micro";
+    const isScalpingCandleMode = mode === "candles" && timeframe === "1m";
+    const scalpingPerfOverBudget = framePerf.frameTimeMs > 16 || framePerf.fps < 55;
+    const prioritizeCandleLegibility = isScalpingCandleMode && densityLevel !== "expanded";
+    const suppressHeavyCandlesOverlays = prioritizeCandleLegibility || (isScalpingCandleMode && scalpingPerfOverBudget);
     const perfBusy =
       framePerf.frameTimeMs > overlayPerfProfile.busyFrameMs
       || framePerf.fps < overlayPerfProfile.busyMinFps
@@ -2069,13 +2547,44 @@ export default function InstitutionalChart({
       framePerf.frameTimeMs > overlayPerfProfile.criticalFrameMs
       || framePerf.fps < overlayPerfProfile.criticalMinFps
       || framePerf.cpuLoad > overlayPerfProfile.criticalCpuLoad;
-    const canRenderVolumeProfile = !isLiteMode && !frozen && mode !== "line" && mode !== "footprint" && !densityBlocksVolumeProfile && !perfCritical;
-    const canRenderFootprint = !isLiteMode && !frozen && mode === "footprint" && !densityBlocksVolumeProfile && !perfCritical;
-    const canRenderDom = !isLiteMode && !frozen && mode === "candles" && !densityBlocksVolumeProfile && !perfCritical;
-    const canRenderHeatmap = !isLiteMode && !frozen && mode === "candles" && !densityBlocksVolumeProfile && !perfCritical;
+    const canRenderVolumeProfile = !isLiteMode && !frozen && mode !== "line" && mode !== "footprint" && !densityBlocksVolumeProfile && !perfCritical && !suppressHeavyCandlesOverlays && !shouldGpuSafe;
+    const canRenderFootprint = !isLiteMode && !frozen && mode === "footprint" && !densityBlocksVolumeProfile && !perfCritical && !suppressHeavyCandlesOverlays && !shouldGpuSafe;
+    const canRenderDom = !isLiteMode && !frozen && mode === "candles" && !densityBlocksVolumeProfile && !perfCritical && !suppressHeavyCandlesOverlays && !shouldGpuSafe;
+    const canRenderHeatmap = !isLiteMode && !frozen && mode === "candles" && !densityBlocksVolumeProfile && !perfCritical && !suppressHeavyCandlesOverlays && !shouldGpuSafe;
+    const overlayContextKey = `${symbol}|${timeframe}|${mode}|${isLiteMode ? 1 : 0}|${frozen ? 1 : 0}|${densityLevel}|${chartViewportWidth}`;
+    const forceOverlayCompute = overlayContextKeyRef.current !== overlayContextKey;
+    if (forceOverlayCompute) {
+      overlayContextKeyRef.current = overlayContextKey;
+    }
+    const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
+    const allowOverlayCompute = forceOverlayCompute || nowMs - overlayLastUpdateTsRef.current >= OVERLAY_UPDATE_INTERVAL_MS;
+    if (allowOverlayCompute) {
+      overlayLastUpdateTsRef.current = nowMs;
+    }
 
-    if (canRenderHeatmap && heatmapLevels && heatmapLevels.length > 0) {
-      const referencePrice = rawBarsForRender[rawBarsForRender.length - 1]?.close ?? points[points.length - 1]?.value ?? 0;
+    const overlayBudgetStartMs = nowMs;
+    const overlayBudgetMs = shouldGpuSafe ? 1.4 : 2.6;
+    const hasOverlayHeadroom = () => {
+      const ts = typeof performance !== "undefined" ? performance.now() : Date.now();
+      return ts - overlayBudgetStartMs <= overlayBudgetMs;
+    };
+
+    const allowHeatmapComputeThisCycle = allowOverlayCompute
+      && (forceOverlayCompute || nowMs - heatmapLastComputeTsRef.current >= HEATMAP_UPDATE_INTERVAL_MS)
+      && hasOverlayHeadroom();
+    const allowDomComputeThisCycle = allowOverlayCompute
+      && (forceOverlayCompute || nowMs - domLastComputeTsRef.current >= DOM_UPDATE_INTERVAL_MS)
+      && hasOverlayHeadroom();
+    const allowFootprintComputeThisCycle = allowOverlayCompute
+      && (forceOverlayCompute || nowMs - footprintLastComputeTsRef.current >= FOOTPRINT_UPDATE_INTERVAL_MS)
+      && hasOverlayHeadroom();
+    const allowVolumeProfileComputeThisCycle = allowOverlayCompute
+      && (forceOverlayCompute || nowMs - volumeProfileLastComputeTsRef.current >= VOLUME_PROFILE_UPDATE_INTERVAL_MS)
+      && hasOverlayHeadroom();
+
+    if (allowHeatmapComputeThisCycle && canRenderHeatmap && heatmapLevels && heatmapLevels.length > 0) {
+      heatmapLastComputeTsRef.current = nowMs;
+      const referencePrice = rawBarsForRender[rawBarsForRender.length - 1]?.close ?? lineSource[lineSource.length - 1]?.value ?? 0;
       const maxBands = perfBusy ? overlayPerfProfile.heatmapBandsBusy : overlayPerfProfile.heatmapBandsNormal;
       const levels = [...heatmapLevels]
         .sort((left, right) => right.intensity - left.intensity)
@@ -2112,7 +2621,7 @@ export default function InstitutionalChart({
         degraded: perfBusy,
         pausedReason: null,
       });
-    } else {
+    } else if (allowOverlayCompute && !canRenderHeatmap) {
       const pausedReason: HeatmapOverlayState["pausedReason"] = isLiteMode
         ? "lite"
         : frozen
@@ -2125,7 +2634,8 @@ export default function InstitutionalChart({
       setHeatmapOverlay({ bands: [], degraded: false, pausedReason });
     }
 
-    if (canRenderDom && domLevels && domLevels.length > 0) {
+    if (allowDomComputeThisCycle && canRenderDom && domLevels && domLevels.length > 0) {
+      domLastComputeTsRef.current = nowMs;
       const levelsLimit = perfBusy ? overlayPerfProfile.domLevelsBusy : overlayPerfProfile.domLevelsNormal;
       const perSide = Math.max(4, Math.floor(levelsLimit / 2));
       const asks = domLevels
@@ -2158,7 +2668,7 @@ export default function InstitutionalChart({
         degraded: perfBusy,
         pausedReason: null,
       });
-    } else {
+    } else if (allowOverlayCompute && !canRenderDom) {
       const pausedReason: DomOverlayState["pausedReason"] = isLiteMode
         ? "lite"
         : frozen
@@ -2171,7 +2681,8 @@ export default function InstitutionalChart({
       setDomOverlay({ levels: [], imbalanceRatio: 0, degraded: false, pausedReason });
     }
 
-    if (canRenderFootprint) {
+    if (allowFootprintComputeThisCycle && canRenderFootprint) {
+      footprintLastComputeTsRef.current = nowMs;
       const fallbackRows = rawBarsForRender.slice(-(perfBusy ? 6 : 8)).map((bar) => {
         const bullish = bar.close >= bar.open;
         const buyVolume = (bullish ? 0.62 : 0.38) * Math.max(0, bar.volume || 0);
@@ -2242,7 +2753,7 @@ export default function InstitutionalChart({
         degraded: perfBusy,
         pausedReason: null,
       });
-    } else {
+    } else if (allowOverlayCompute && !canRenderFootprint) {
       const pausedReason: FootprintOverlayState["pausedReason"] = isLiteMode
         ? "lite"
         : frozen
@@ -2255,13 +2766,14 @@ export default function InstitutionalChart({
       setFootprintOverlay({ rows: [], degraded: false, pausedReason });
     }
 
-    if (canRenderVolumeProfile) {
+    if (allowVolumeProfileComputeThisCycle && canRenderVolumeProfile) {
+      volumeProfileLastComputeTsRef.current = nowMs;
       const profileLookback = perfBusy
-        ? (densityLevel === "expanded" ? 96 : densityLevel === "normal" ? 80 : 64)
-        : (densityLevel === "expanded" ? 160 : densityLevel === "normal" ? 128 : 96);
+        ? (densityLevel === "expanded" ? 88 : densityLevel === "normal" ? 72 : 56)
+        : (densityLevel === "expanded" ? 120 : densityLevel === "normal" ? 96 : 72);
       const profileBins = perfBusy
-        ? (densityLevel === "expanded" ? 18 : densityLevel === "normal" ? 16 : 12)
-        : (densityLevel === "expanded" ? 28 : densityLevel === "normal" ? 24 : 18);
+        ? (densityLevel === "expanded" ? 16 : densityLevel === "normal" ? 14 : 10)
+        : (densityLevel === "expanded" ? 22 : densityLevel === "normal" ? 18 : 14);
       const profileBars = rawBarsForRender.slice(-profileLookback);
       const profile = volumeProfile(profileBars, profileBins);
       const profileRows: VolumeProfileOverlayRow[] = [];
@@ -2390,7 +2902,7 @@ export default function InstitutionalChart({
         degraded: perfBusy,
         pausedReason: null,
       });
-    } else {
+    } else if (allowOverlayCompute && !canRenderVolumeProfile) {
       const pausedReason: VolumeProfileOverlayState["pausedReason"] = isLiteMode
         ? "lite"
         : frozen
@@ -2403,9 +2915,13 @@ export default function InstitutionalChart({
       setVolumeProfileOverlay({ rows: [], vahY: null, valY: null, pocY: null, degraded: false, pausedReason });
     }
 
-    const range = chart.timeScale().getVisibleLogicalRange();
-    const visibleBars = range ? Math.max(1, Math.ceil(range.to - range.from)) : rawBarsForRender.length;
-    const lodBars = applyDynamicLod(rawBarsForRender, visibleBars);
+    const compactRecentBarLimit = mode === "candles"
+      ? Math.max(resolveInitialVisibleBars(mode, isLiteMode, container.clientWidth) + 10, 32)
+      : rawBarsForRender.length;
+    const barsForRender = mode === "candles" && container.clientWidth < 860
+      ? rawBarsForRender.slice(-compactRecentBarLimit)
+      : rawBarsForRender;
+    const lodBars = applyDynamicLod(barsForRender, visibleBars);
 
     let candleData: Array<{ time: UTCTimestamp; open: number; high: number; low: number; close: number }>;
 
@@ -2427,6 +2943,45 @@ export default function InstitutionalChart({
         close: bar.close,
       }));
     }
+
+    // Guard: keep only finite, strictly increasing-time bars for LWC.
+    // Duplicate / out-of-order timestamps can still crash candlestick rendering.
+    const sanitizedCandleData: Array<{ time: UTCTimestamp; open: number; high: number; low: number; close: number }> = [];
+    let prevTime = Number.NEGATIVE_INFINITY;
+    for (const bar of candleData) {
+      const time = Number(bar.time as number);
+      const open = Number(bar.open);
+      const close = Number(bar.close);
+      const high = Math.max(Number(bar.high), open, close);
+      const low = Math.min(Number(bar.low), open, close);
+      if (!Number.isFinite(time) || !Number.isFinite(open) || !Number.isFinite(high) || !Number.isFinite(low) || !Number.isFinite(close)) {
+        continue;
+      }
+      if (time <= prevTime) {
+        continue;
+      }
+      sanitizedCandleData.push({ time: time as UTCTimestamp, open, high, low, close });
+      prevTime = time;
+    }
+    candleData = sanitizedCandleData;
+
+    const candleLows = candleData.map((bar) => bar.low).filter((value) => Number.isFinite(value));
+    const candleHighs = candleData.map((bar) => bar.high).filter((value) => Number.isFinite(value));
+    candleAutoscaleRangeRef.current = candleLows.length > 0 && candleHighs.length > 0
+      ? {
+        min: Math.min(...candleLows),
+        max: Math.max(...candleHighs),
+      }
+      : null;
+
+    const areaValues = areaData.map((point) => point.value).filter((value) => Number.isFinite(value));
+    areaAutoscaleRangeRef.current = areaValues.length > 0
+      ? {
+        min: Math.min(...areaValues),
+        max: Math.max(...areaValues),
+      }
+      : null;
+
     // ── New candle flash: detect when a new bar opens ──────────────────
     if (prevCandleLengthRef.current > 0 && candleData.length > prevCandleLengthRef.current) {
       setNewCandleFlash((v) => v + 1);
@@ -2444,16 +2999,42 @@ export default function InstitutionalChart({
       intraCandleFrameTsRef.current = 0;
     };
 
+    const safeSeriesUpdate = (next: CandleRenderPoint, force = false): boolean => {
+      const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
+      if (!force && nowMs - lastSeriesUpdateTsRef.current < CANDLE_UPDATE_INTERVAL_MS) {
+        return false;
+      }
+      try {
+        candleSeries.update(next as any);
+        lastSeriesUpdateTsRef.current = nowMs;
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
     const startIntraCandleInterpolation = () => {
       if (intraCandleRafRef.current) {
         return;
       }
+
+      const chartGeneration = chartGenerationRef.current;
 
       const animate = (frameTs: number) => {
         const target = intraCandleTargetRef.current;
         const current = intraCandleCurrentRef.current;
         const series = candleSeriesRef.current;
         if (!target || !current || !series || mode === "line") {
+          intraCandleRafRef.current = null;
+          intraCandleFrameTsRef.current = 0;
+          return;
+        }
+        if (!isFiniteCandleRenderPoint(target) || !isFiniteCandleRenderPoint(current)) {
+          intraCandleRafRef.current = null;
+          intraCandleFrameTsRef.current = 0;
+          return;
+        }
+        if (chartGenerationRef.current !== chartGeneration || series !== candleSeriesRef.current) {
           intraCandleRafRef.current = null;
           intraCandleFrameTsRef.current = 0;
           return;
@@ -2481,10 +3062,20 @@ export default function InstitutionalChart({
         };
         next.high = Math.max(next.high, next.open, next.close);
         next.low = Math.min(next.low, next.open, next.close);
+        if (!isFiniteCandleRenderPoint(next)) {
+          intraCandleRafRef.current = null;
+          intraCandleFrameTsRef.current = 0;
+          return;
+        }
 
-        try {
-          series.update(next as any);
-        } catch {
+        const committed = safeSeriesUpdate(next, false);
+        if (!committed) {
+          intraCandleCurrentRef.current = next;
+          intraCandleRafRef.current = window.requestAnimationFrame(animate);
+          return;
+        }
+
+        if (!isFiniteCandleRenderPoint(next)) {
           intraCandleRafRef.current = null;
           intraCandleFrameTsRef.current = 0;
           return;
@@ -2511,41 +3102,101 @@ export default function InstitutionalChart({
       intraCandleRafRef.current = window.requestAnimationFrame(animate);
     };
 
+    const safeSetCandleData = (source: Array<{ time: UTCTimestamp; open: number; high: number; low: number; close: number }>) => {
+      const sanitized: Array<{ time: UTCTimestamp; open: number; high: number; low: number; close: number }> = [];
+      let prevTime = Number.NEGATIVE_INFINITY;
+      for (const bar of source) {
+        const time = Number(bar.time as number);
+        const open = Number(bar.open);
+        const close = Number(bar.close);
+        const high = Math.max(Number(bar.high), open, close);
+        const low = Math.min(Number(bar.low), open, close);
+        if (!Number.isFinite(time) || !Number.isFinite(open) || !Number.isFinite(high) || !Number.isFinite(low) || !Number.isFinite(close)) {
+          continue;
+        }
+        if (time <= prevTime) {
+          continue;
+        }
+        sanitized.push({ time: time as UTCTimestamp, open, high, low, close });
+        prevTime = time;
+      }
+
+      try {
+        candleSeries.setData(sanitized as any);
+        lastSeriesUpdateTsRef.current = typeof performance !== "undefined" ? performance.now() : Date.now();
+      } catch {
+        // Last-resort fallback: clear malformed frame instead of crashing render loop.
+        candleSeries.setData([] as any);
+        lastSeriesUpdateTsRef.current = typeof performance !== "undefined" ? performance.now() : Date.now();
+      }
+    };
+
     const applyCandleUpdate = () => {
       if (!dirtyStateRef.current.candle) {
         return;
       }
+      if (
+        chartRef.current !== chart
+        || areaSeriesRef.current !== areaSeries
+        || candleSeriesRef.current !== candleSeries
+      ) {
+        return;
+      }
 
+      if (mode === "line") {
+        try {
+          areaSeries.setData(areaData);
+        } catch {
+          // Ignore transient line-series ordering issues; the candlestick path remains authoritative.
+        }
+      }
+
+      // Partial updates (series.update) are 60x faster than setData and prevent flicker.
+      // Always prefer partial when possible — no forced full redraw on narrow viewports.
+      const forceFullCandleSetData = false;
       const { useUpdate, lastCandle } = shouldUsePartialUpdate(candleData as any, prevCandlesRef.current);
-      if (useUpdate && lastCandle && mode !== "line") {
-        const lastPoint = {
+      const lastCandleValid = lastCandle && Number.isFinite(lastCandle.open) && Number.isFinite(lastCandle.high) && Number.isFinite(lastCandle.low) && Number.isFinite(lastCandle.close) && Number.isFinite(lastCandle.time as number);
+      if (!forceFullCandleSetData && useUpdate && lastCandleValid && mode !== "line" && hasSeededSeriesRef.current) {
+        const rawLastPoint = {
           time: Number(lastCandle.time),
           open: Number(lastCandle.open),
           high: Number(lastCandle.high),
           low: Number(lastCandle.low),
           close: Number(lastCandle.close),
         } as CandleRenderPoint;
+        const lastPoint = normalizeRenderPoint(rawLastPoint);
+        if (!isFiniteCandleRenderPoint(lastPoint)) {
+          stopIntraCandleInterpolation();
+          safeSetCandleData(candleData as any);
+          hasSeededSeriesRef.current = true;
+          return;
+        }
         const previousPoint = intraCandleCurrentRef.current;
         try {
-          if (previousPoint && previousPoint.time === lastPoint.time) {
+          if (isFiniteCandleRenderPoint(previousPoint) && previousPoint.time === lastPoint.time) {
             intraCandleTargetRef.current = lastPoint;
             startIntraCandleInterpolation();
           } else {
             stopIntraCandleInterpolation();
-            candleSeries.update(lastPoint as any);
+            safeSeriesUpdate(lastPoint, true);
+            hasSeededSeriesRef.current = true;
             intraCandleCurrentRef.current = lastPoint;
             intraCandleTargetRef.current = lastPoint;
           }
         } catch {
           stopIntraCandleInterpolation();
-          candleSeries.setData(candleData as any);
+          safeSetCandleData(candleData as any);
+          hasSeededSeriesRef.current = true;
           intraCandleCurrentRef.current = lastPoint;
           intraCandleTargetRef.current = lastPoint;
         }
       } else {
         stopIntraCandleInterpolation();
-        areaSeries.setData(areaData);
-        candleSeries.setData(candleData as any);
+        if (mode === "line") {
+          areaSeries.setData(areaData);
+        }
+        safeSetCandleData(candleData as any);
+        hasSeededSeriesRef.current = true;
         const finalPoint = candleData.length > 0 ? candleData[candleData.length - 1] : null;
         intraCandleCurrentRef.current = finalPoint
           ? {
@@ -2559,11 +3210,21 @@ export default function InstitutionalChart({
         intraCandleTargetRef.current = intraCandleCurrentRef.current;
       }
 
-      areaSeries.applyOptions({ visible: mode === "line" });
-      candleSeries.applyOptions({
-        ...resolveCandleContrastOptions(symbol, timeframe),
-        visible: mode !== "line",
-      });
+      const seriesStyleKey = `${mode}|${symbol}|${timeframe}`;
+      if ((candleSeries as any).__prevStyleKey !== seriesStyleKey) {
+        areaSeries.applyOptions({
+          visible: mode === "line",
+          lineWidth: mode === "line" ? 3 : 2,
+          lineColor: mode === "line" ? "#7ed7ff" : "rgba(126, 215, 255, 0.92)",
+          topColor: mode === "line" ? "rgba(88,199,255,0.38)" : "rgba(88,199,255,0.12)",
+          bottomColor: mode === "line" ? "rgba(88,199,255,0.03)" : "rgba(88,199,255,0.01)",
+        });
+        candleSeries.applyOptions({
+          ...resolveCandleContrastOptions(symbol, timeframe),
+          visible: mode !== "line",
+        });
+        (candleSeries as any).__prevStyleKey = seriesStyleKey;
+      }
       prevCandlesRef.current = candleData as any;
       prevAreaDataRef.current = areaData;
       renderUpdateCountsRef.current.candle += 1;
@@ -2586,19 +3247,41 @@ export default function InstitutionalChart({
       ? areaData.map((entry) => entry.value)
       : candleData.map((entry) => entry.close);
 
-    const rangeIdentity = `${symbol}|${timeframe}|${mode}|${candleTransform}`;
+    // rangeIdentity ne contient QUE symbol|timeframe — changer mode ou transform
+    // ne réinitialise PAS la caméra (évite le snap-back lors des changements d'affichage).
+    const rangeIdentity = `${symbol}|${timeframe}`;
     if (lastRangeIdentityRef.current !== rangeIdentity) {
       hasInitializedRangeRef.current = false;
+      userAdjustedTimeScaleRef.current = false;
       lastRangeIdentityRef.current = rangeIdentity;
     }
 
     if (!hasInitializedRangeRef.current && activeTimes.length > 12) {
       const rightPad = isLiteMode ? 1 : 2;
-      const visibleBars = isLiteMode ? 96 : 150;
+      const visibleBars = resolveInitialVisibleBars(mode, isLiteMode, container.clientWidth);
       const to = activeTimes.length - 1 + rightPad;
       const from = Math.max(0, to - visibleBars);
       chart.timeScale().setVisibleLogicalRange({ from, to });
       hasInitializedRangeRef.current = true;
+    }
+
+    // Self-heal : récupère uniquement les cas vraiment cassés (< 4 barres visibles)
+    // sans jamais interférer avec un zoom utilisateur intentionnel.
+    if (!userAdjustedTimeScaleRef.current && activeTimes.length > 24) {
+      const currentRange = chart.timeScale().getVisibleLogicalRange();
+      if (currentRange) {
+        const visibleNow = Math.max(1, Math.ceil(currentRange.to - currentRange.from));
+        // Seuil très bas : intervient uniquement si vraiment cassé (layout collapse)
+        const minExpectedVisible = 4;
+        if (visibleNow < minExpectedVisible) {
+          const baselineVisible = resolveInitialVisibleBars(mode, isLiteMode, container.clientWidth);
+          const rightPad = isLiteMode ? 1 : 2;
+          const to = activeTimes.length - 1 + rightPad;
+          const from = Math.max(0, to - baselineVisible);
+          chart.timeScale().setVisibleLogicalRange({ from, to });
+          hasInitializedRangeRef.current = true;
+        }
+      }
     }
 
     const coordinates = activeTimes.reduce<number[]>((acc, time) => {
@@ -2618,7 +3301,7 @@ export default function InstitutionalChart({
       }
       if (deltas.length > 0) {
         const avgDelta = deltas.reduce((sum, value) => sum + value, 0) / deltas.length;
-        candleStepPxRef.current = clamp(avgDelta, 8, 64);
+        candleStepPxRef.current = clamp(avgDelta, mode === "candles" ? 10 : 8, 64);
       }
     }
 
@@ -2739,9 +3422,14 @@ export default function InstitutionalChart({
       }
     }
 
-    dirtyStateRef.current.overlay = true;
+    if (allowOverlayCompute) {
+      dirtyStateRef.current.overlay = true;
+    }
     const schedulerForOverlay = schedulerRef.current;
     const applyOverlayUpdate = () => {
+      if (!allowOverlayCompute) {
+        return;
+      }
       if (!dirtyStateRef.current.overlay) {
         return;
       }
@@ -2751,32 +3439,86 @@ export default function InstitutionalChart({
       }
       priceLinesRef.current = [];
 
-      for (const [value, color, title] of [
-        [dayVwap, "#67e8a5", "VWAP D"],
-        [weekVwap, "#58c7ff", "VWAP W"],
-        [monthVwap, "#ffd166", "VWAP M"],
-      ] as Array<[number, string, string]>) {
+      const lineSpecs: ManagedPriceLineSpec[] = [];
+
+      for (const [value, color, fadedColor, title, compactTitle, priority, preserveNearLastLabel, hideNearLastLabel] of [
+        [dayVwap, "#67e8a5", "rgba(103, 232, 165, 0.58)", "VWAP D", "VD", 4, true, false],
+        [weekVwap, "#58c7ff", "rgba(88, 199, 255, 0.56)", "VWAP W", "VW", 2, false, true],
+        [monthVwap, "#ffd166", "rgba(255, 209, 102, 0.54)", "VWAP M", "VM", 1, false, true],
+      ] as Array<[number, string, string, string, string, number, boolean, boolean]>) {
         if (value > 0) {
-          priceLinesRef.current.push(activeSeries.createPriceLine({ price: value, color, lineStyle: 2, lineWidth: 1, title }));
+          lineSpecs.push({
+            price: value,
+            color,
+            fadedColor,
+            title,
+            compactTitle,
+            lineStyle: 2,
+            lineWidth: 1,
+            priority,
+            preserveNearLastLabel,
+            hideNearLastLabel,
+          });
         }
       }
+
       for (const zone of liquidityZones) {
-        priceLinesRef.current.push(activeSeries.createPriceLine({
+        const compactTitle = /resting/i.test(zone.label)
+          ? "RL"
+          : /pool/i.test(zone.label)
+            ? "LQ"
+            : "LIQ";
+        lineSpecs.push({
           price: zone.level,
           color: "#ff8d8d",
+          fadedColor: "rgba(255, 141, 141, 0.52)",
+          title: zone.label,
+          compactTitle,
           lineStyle: 1,
           lineWidth: 1,
-          title: zone.label,
-        }));
+          priority: 4,
+        });
       }
+
       if (domAnchorPrice !== null && domAnchorSide) {
-        priceLinesRef.current.push(activeSeries.createPriceLine({
+        lineSpecs.push({
           price: domAnchorPrice,
           color: domAnchorSide === "ask" ? "#ff8f8f" : "#7beab4",
+          fadedColor: domAnchorSide === "ask" ? "rgba(255, 143, 143, 0.58)" : "rgba(123, 234, 180, 0.58)",
+          title: domAnchorSide === "ask" ? "DOM ASK" : "DOM BID",
+          compactTitle: domAnchorSide === "ask" ? "DA" : "DB",
           lineStyle: 2,
           lineWidth: 2,
-          title: domAnchorSide === "ask" ? "DOM ASK" : "DOM BID",
-        }));
+          priority: 5,
+        });
+      }
+
+      const managedPriceLines = resolveManagedPriceLines(
+        activeSeries,
+        lineSpecs,
+        mode,
+        Number.isFinite(lastValue) ? Number(lastValue) : null,
+        mode === "candles"
+          ? (chartViewportWidth < 680 || densityLevel === "micro"
+            ? 0.0018
+            : chartViewportWidth < 860
+              ? 0.0022
+            : densityLevel === "compact" || chartViewportWidth < 1180
+              ? 0.0038
+              : null)
+          : null,
+        mode === "candles" && (chartViewportWidth < 860 || densityLevel === "compact" || densityLevel === "micro"),
+        mode === "candles"
+          ? (chartViewportWidth < 680 || densityLevel === "micro"
+            ? 2
+            : chartViewportWidth < 860 || densityLevel === "compact"
+              ? 3
+              : null)
+          : null,
+      );
+
+      for (const line of managedPriceLines) {
+        priceLinesRef.current.push(activeSeries.createPriceLine(line as any));
       }
 
       setOverlayBadges(resolveBadgeCollisions(nextBadges, container.clientWidth, container.clientHeight));
@@ -2784,10 +3526,12 @@ export default function InstitutionalChart({
       dirtyStateRef.current.overlay = false;
     };
 
-    if (schedulerForOverlay) {
-      schedulerForOverlay.enqueue({ type: "overlay", priority: LAYER_PRIORITY.overlay, callback: applyOverlayUpdate });
-    } else {
-      applyOverlayUpdate();
+    if (allowOverlayCompute) {
+      if (schedulerForOverlay) {
+        schedulerForOverlay.enqueue({ type: "overlay", priority: LAYER_PRIORITY.overlay, callback: applyOverlayUpdate });
+      } else {
+        applyOverlayUpdate();
+      }
     }
   }, [
     frozen,
@@ -2815,7 +3559,6 @@ export default function InstitutionalChart({
     overlayPerfProfile.heatmapBandsBusy,
     overlayPerfProfile.heatmapBandsNormal,
     overlayZones,
-    points,
     footprintRows,
     domLevels,
     heatmapLevels,
@@ -2824,9 +3567,11 @@ export default function InstitutionalChart({
     weekVwap,
     domAnchorPrice,
     domAnchorSide,
+    chartViewportWidth,
   ]);
 
   const handleDomRowClick = (level: DomOverlayLevel) => {
+    markUserInteraction(1000);
     if (domPressHandledRef.current) {
       domPressHandledRef.current = false;
       return;
@@ -2854,6 +3599,7 @@ export default function InstitutionalChart({
   };
 
   const handleDomRowDoubleClick = () => {
+    markUserInteraction(1000);
     setDomSelectedKey(null);
     setDomAnchorPrice(null);
     setDomAnchorSide(null);
@@ -2862,6 +3608,7 @@ export default function InstitutionalChart({
   };
 
   const handleDomResetLocks = () => {
+    markUserInteraction(1000);
     setDomLockedWalls({});
     toastSeqRef.current += 1;
     setDomToast({ id: toastSeqRef.current, message: "locks reset" });
@@ -2875,6 +3622,7 @@ export default function InstitutionalChart({
   };
 
   const handleDomRowPointerDown = (level: DomOverlayLevel, event: ReactPointerEvent<HTMLButtonElement>) => {
+    markUserInteraction(1100);
     if (event.pointerType !== "touch" && event.pointerType !== "pen") {
       return;
     }
@@ -2913,6 +3661,7 @@ export default function InstitutionalChart({
   };
 
   const handleDomRowPointerUp = () => {
+    markUserInteraction(750);
     clearDomHoldTimer();
     setDomTouchPrimedKey(null);
   };
@@ -2966,6 +3715,7 @@ export default function InstitutionalChart({
   const handleBadgePointerDown = (badgeKey: string) => (event: ReactPointerEvent<HTMLSpanElement>) => {
     event.preventDefault();
     event.stopPropagation();
+    markUserInteraction(1100);
     const offset = overlayOffsets[badgeKey] || { x: 0, y: 0 };
     dragStateRef.current = {
       key: badgeKey,
@@ -2979,6 +3729,7 @@ export default function InstitutionalChart({
   };
 
   const nudgeBadge = (badgeKey: string, deltaX: number, deltaY: number) => {
+    markUserInteraction(1000);
     setOverlayOffsets((current) => {
       const prev = current[badgeKey] || { x: 0, y: 0 };
       return {
@@ -3003,10 +3754,91 @@ export default function InstitutionalChart({
     `dernier switch: ${autoStabilityMetrics.lastSwitchAgoSec === null ? "-" : `il y a ${formatCompactDuration(autoStabilityMetrics.lastSwitchAgoSec)}`}`,
   ].join("\n");
 
+  const cleanPresetBand = (() => {
+    const basePreset = chartMotionPreset === "auto" ? resolvedMotionPreset : chartMotionPreset;
+    if (basePreset === "scalping" || basePreset === "aggressive") {
+      return "aggressive" as const;
+    }
+    if (basePreset === "swing" || basePreset === "stable") {
+      return "stable" as const;
+    }
+    return "balanced" as const;
+  })();
+
+  const cleanThresholds = cleanPresetBand === "stable"
+    ? {
+      hardWidth: 840,
+      softWidth: 1080,
+      hardFrameMs: overlayPerfProfile.criticalFrameMs * 1.08,
+      softFrameMs: overlayPerfProfile.busyFrameMs * 1.1,
+      hardMinFps: Math.max(overlayPerfProfile.criticalMinFps - 3, 18),
+      softMinFps: Math.max(overlayPerfProfile.busyMinFps - 2, 26),
+      softCpuLoad: overlayPerfProfile.busyCpuLoad * 1.06,
+    }
+    : cleanPresetBand === "aggressive"
+      ? {
+        hardWidth: 1040,
+        softWidth: 1340,
+        hardFrameMs: overlayPerfProfile.criticalFrameMs * 0.9,
+        softFrameMs: overlayPerfProfile.busyFrameMs * 0.92,
+        hardMinFps: overlayPerfProfile.criticalMinFps + 4,
+        softMinFps: overlayPerfProfile.busyMinFps + 3,
+        softCpuLoad: overlayPerfProfile.busyCpuLoad * 0.92,
+      }
+      : {
+        hardWidth: 920,
+        softWidth: 1180,
+        hardFrameMs: overlayPerfProfile.criticalFrameMs,
+        softFrameMs: overlayPerfProfile.busyFrameMs,
+        hardMinFps: overlayPerfProfile.criticalMinFps,
+        softMinFps: overlayPerfProfile.busyMinFps,
+        softCpuLoad: overlayPerfProfile.busyCpuLoad,
+      };
+
   const overlayLayoutMode = chartViewportWidth < 860 ? "compact" : chartViewportWidth < 1080 ? "tight" : "full";
-  const hideDomOverlay = overlayLayoutMode === "compact";
-  const hideFootprintOverlay = chartViewportWidth < 980;
-  const hideVolumeProfileOverlay = chartViewportWidth < 920;
+  const isTradingFocus = mode === "candles" && timeframe === "1m";
+  const focusOverlayAlpha = isTradingFocus
+    ? (isUserInteracting ? 0.03 : 0.25)
+    : densityConfig.overlayAlpha;
+  const overBudgetFrame = framePerf.frameTimeMs > 16 || framePerf.fps < 55;
+  const candlesCleanLevel: "off" | "soft" | "hard" = (() => {
+    if (visualMode === "full") {
+      return "off";
+    }
+    if (isLiteMode || frozen || mode !== "candles") {
+      return "off";
+    }
+    if (visualMode === "clean") {
+      return densityLevel === "micro" || chartViewportWidth < cleanThresholds.softWidth ? "hard" : "soft";
+    }
+    if (
+      densityLevel === "micro"
+      || chartViewportWidth < cleanThresholds.hardWidth
+      || framePerf.frameTimeMs > cleanThresholds.hardFrameMs
+      || framePerf.fps < cleanThresholds.hardMinFps
+    ) {
+      return "hard";
+    }
+    if (
+      densityLevel === "compact"
+      || chartViewportWidth < cleanThresholds.softWidth
+      || framePerf.frameTimeMs > cleanThresholds.softFrameMs
+      || framePerf.fps < cleanThresholds.softMinFps
+      || framePerf.cpuLoad > cleanThresholds.softCpuLoad
+    ) {
+      return "soft";
+    }
+    return "off";
+  })();
+  const hideDomOverlay = gpuSafeMode || overlayLayoutMode === "compact" || candlesCleanLevel === "hard" || (isTradingFocus && overBudgetFrame);
+  const hideFootprintOverlay = gpuSafeMode || chartViewportWidth < 980 || candlesCleanLevel !== "off" || (isTradingFocus && overBudgetFrame);
+  const hideVolumeProfileOverlay = gpuSafeMode || chartViewportWidth < 920 || candlesCleanLevel === "hard" || (isTradingFocus && overBudgetFrame);
+  const suppressHeatmapOverlay = gpuSafeMode || candlesCleanLevel === "hard" || (isTradingFocus && overBudgetFrame);
+  const ultraCleanCandles = visualMode === "clean" && mode === "candles";
+  const suppressLivePulse = gpuSafeMode || candlesCleanLevel !== "off" || (isTradingFocus && overBudgetFrame);
+  const suppressNewCandleFlash = gpuSafeMode || candlesCleanLevel !== "off" || (isTradingFocus && overBudgetFrame);
+  const suppressFormingCandle = gpuSafeMode || candlesCleanLevel === "hard" || (isTradingFocus && overBudgetFrame);
+  const showOverlayBadges = densityConfig.showBadges && candlesCleanLevel === "off";
   const visibleWallKeys = domOverlay.levels.filter((level) => level.isWall).map((level) => level.lockKey);
   const lockedVisibleWallCount = visibleWallKeys.reduce((count, key) => count + (domLockedWalls[key] ? 1 : 0), 0);
   const vpHoverIndex = vpHoverKey ? volumeProfileOverlay.rows.findIndex((row) => row.key === vpHoverKey) : -1;
@@ -3018,10 +3850,17 @@ export default function InstitutionalChart({
   const vpConfidenceTone = vpHoverRow
     ? (vpHoverRow.sessionConfidence >= 0.66 ? "high" : vpHoverRow.sessionConfidence >= 0.5 ? "medium" : "low")
     : "low";
-  const collapsedOverlays: string[] = [];
-  if (hideDomOverlay && domOverlay.levels.length > 0) collapsedOverlays.push("DOM");
-  if (hideFootprintOverlay && footprintOverlay.rows.length > 0) collapsedOverlays.push("FP");
-  if (hideVolumeProfileOverlay && volumeProfileOverlay.rows.length > 0) collapsedOverlays.push("VP");
+  const collapsedOverlaySet = new Set<string>();
+  if (candlesCleanLevel !== "off") {
+    if (heatmapOverlay.bands.length > 0) collapsedOverlaySet.add("HEAT");
+    if (domOverlay.levels.length > 0) collapsedOverlaySet.add("DOM");
+    if (volumeProfileOverlay.rows.length > 0) collapsedOverlaySet.add("VP");
+    if (footprintOverlay.rows.length > 0) collapsedOverlaySet.add("FP");
+  }
+  if (hideDomOverlay && domOverlay.levels.length > 0) collapsedOverlaySet.add("DOM");
+  if (hideFootprintOverlay && footprintOverlay.rows.length > 0) collapsedOverlaySet.add("FP");
+  if (hideVolumeProfileOverlay && volumeProfileOverlay.rows.length > 0) collapsedOverlaySet.add("VP");
+  const collapsedOverlays = [...collapsedOverlaySet];
 
   const assetContrastClass = inferAssetContrastClass(symbol);
   const timeframeContrastBand = inferTimeframeContrastBand(timeframe);
@@ -3033,6 +3872,9 @@ export default function InstitutionalChart({
       `contrast-${assetContrastClass}-${timeframeContrastBand}`,
       `density-${densityLevel}`,
       `overlay-layout-${overlayLayoutMode}`,
+      `candles-clean-${candlesCleanLevel}`,
+      gpuSafeMode ? "gpu-safe" : "",
+      isTradingFocus ? "price-first-focus" : "",
       className,
     ].filter(Boolean).join(" ")}>
       <div className="chart-sessions-layer" aria-hidden="true">
@@ -3044,24 +3886,31 @@ export default function InstitutionalChart({
           </>
         ) : null}
       </div>
+      <div className="chart-underlay-layer">
+        <div className="chart-underlay-inner" style={{ "--overlay-alpha": focusOverlayAlpha } as CSSProperties}>
+          {!isLiteMode && heatmapOverlay.bands.length > 0 && !suppressHeatmapOverlay ? (
+            <div className={`chart-heatmap-minimal-grid ${heatmapOverlay.degraded ? "chart-heatmap-minimal-grid-degraded" : ""}`} aria-hidden="true">
+              {heatmapOverlay.bands.map((band) => (
+                <div
+                  key={band.key}
+                  className={`chart-heatmap-minimal-band ${band.side} focus-${band.focus}`}
+                  style={{ top: band.top, height: band.height, opacity: band.opacity }}
+                />
+              ))}
+            </div>
+          ) : null}
+        </div>
+      </div>
       <div ref={containerRef} className="chart-canvas-host" aria-label={`${symbol} chart`} />
-      <div className="chart-overlay-layer" style={{ "--overlay-alpha": densityConfig.overlayAlpha } as CSSProperties}>
-        {!isLiteMode && heatmapOverlay.bands.length > 0 ? (
-          <div className={`chart-heatmap-minimal-grid ${heatmapOverlay.degraded ? "chart-heatmap-minimal-grid-degraded" : ""}`} aria-hidden="true">
-            {heatmapOverlay.bands.map((band) => (
-              <div
-                key={band.key}
-                className={`chart-heatmap-minimal-band ${band.side} focus-${band.focus}`}
-                style={{ top: band.top, height: band.height, opacity: band.opacity }}
-              />
-            ))}
-          </div>
-        ) : null}
-        {!isLiteMode && heatmapOverlay.pausedReason === "perf" && mode === "candles" ? (
-          <div className="chart-heatmap-minimal-paused" aria-live="polite">Heatmap paused: frame budget</div>
-        ) : null}
-        {!isLiteMode && domOverlay.levels.length > 0 && !hideDomOverlay ? (
-          <div className={`chart-dom-ladder-lite ${domOverlay.degraded ? "chart-dom-ladder-lite-degraded" : ""}`}>
+      <div className="chart-timezone-pill" aria-hidden="true">UTC | RMB drag pan</div>
+      <div className="chart-microstructure-layer">
+        <div className="chart-microstructure-inner" style={{ "--overlay-alpha": focusOverlayAlpha } as CSSProperties}>
+        <div className="chart-microstructure-right-rail">
+          {!isLiteMode && !ultraCleanCandles && heatmapOverlay.pausedReason === "perf" && mode === "candles" ? (
+            <div className="chart-heatmap-minimal-paused" aria-live="polite">Heatmap paused: frame budget</div>
+          ) : null}
+          {!isLiteMode && domOverlay.levels.length > 0 && !hideDomOverlay ? (
+            <div className={`chart-dom-ladder-lite ${domOverlay.degraded ? "chart-dom-ladder-lite-degraded" : ""}`}>
             <div className="chart-dom-ladder-lite-head">
               <span className="chart-dom-ladder-lite-kicker">DOM LITE</span>
               <span className={`chart-dom-ladder-lite-imbalance ${domOverlay.imbalanceRatio >= 0 ? "pos" : "neg"}`}>
@@ -3091,12 +3940,69 @@ export default function InstitutionalChart({
                 </button>
               ))}
             </div>
-          </div>
-        ) : null}
-        {!isLiteMode && domOverlay.pausedReason === "perf" && mode === "candles" && !hideDomOverlay ? (
-          <div className="chart-dom-ladder-lite-paused" aria-live="polite">DOM paused: frame budget</div>
-        ) : null}
-        {!isLiteMode && domToast ? <div className="chart-dom-action-toast" aria-live="polite">{domToast.message}</div> : null}
+            </div>
+          ) : null}
+          {!isLiteMode && domOverlay.pausedReason === "perf" && mode === "candles" && !hideDomOverlay ? (
+            <div className="chart-dom-ladder-lite-paused" aria-live="polite">DOM paused: frame budget</div>
+          ) : null}
+          {!isLiteMode && domToast ? <div className="chart-dom-action-toast" aria-live="polite">{domToast.message}</div> : null}
+          {!isLiteMode && volumeProfileOverlay.rows.length > 0 && !hideVolumeProfileOverlay ? (
+            <div
+              className={`chart-volume-profile ${volumeProfileOverlay.degraded ? "chart-volume-profile-degraded" : ""}`}
+              onMouseMove={handleVpPointerMove}
+              onMouseLeave={() => setVpHoverKey(null)}
+            >
+              <div className="chart-volume-profile-kicker">VP{volumeProfileOverlay.degraded ? " LITE" : ""}</div>
+              <div className="chart-volume-profile-session-split" aria-hidden="true">
+                <span className="asia">ASIA</span>
+                <span className="london">LON</span>
+                <span className="newyork">NY</span>
+              </div>
+              {volumeProfileOverlay.vahY !== null ? (
+                <span className="chart-volume-profile-guide chart-volume-profile-guide-vah" style={{ top: volumeProfileOverlay.vahY }}>VAH</span>
+              ) : null}
+              {volumeProfileOverlay.valY !== null ? (
+                <span className="chart-volume-profile-guide chart-volume-profile-guide-val" style={{ top: volumeProfileOverlay.valY }}>VAL</span>
+              ) : null}
+              {volumeProfileOverlay.pocY !== null ? (
+                <span className="chart-volume-profile-guide chart-volume-profile-guide-poc" style={{ top: volumeProfileOverlay.pocY }}>POC</span>
+              ) : null}
+              {volumeProfileOverlay.rows.map((row) => (
+                <div
+                  key={row.key}
+                  className={`chart-volume-profile-row ${vpHoverKey === row.key ? "chart-volume-profile-row-hovered" : ""} ${row.isPoc ? "chart-volume-profile-row-poc" : ""} ${row.isVah ? "chart-volume-profile-row-vah" : ""} ${row.isVal ? "chart-volume-profile-row-val" : ""} chart-volume-profile-row-session-${row.sessionBias}`}
+                  title={`price ${formatCompactPrice(row.priceMid)} · buy ${(row.buyPct * 100).toFixed(0)}% · ${row.sessionBias}`}
+                  style={{ top: row.top, height: row.height, width: `${Math.round(row.widthPct * 100)}%` }}
+                  onMouseEnter={() => setVpHoverKey(row.key)}
+                >
+                  <span className="chart-volume-profile-row-buy" style={{ width: `${Math.round(row.buyPct * 100)}%` }} />
+                  <span className="chart-volume-profile-row-sell" style={{ width: `${Math.round((1 - row.buyPct) * 100)}%` }} />
+                </div>
+              ))}
+              {vpHoverRow ? (
+                <div className={`chart-volume-profile-hover-panel tone-${vpConfidenceTone} session-${vpHoverRow.sessionBias}`} style={{ top: vpHoverRow.top + vpHoverRow.height * 0.5 }}>
+                  <strong>{formatCompactPrice(vpHoverRow.priceMid)}</strong>
+                  <span>total: {Math.round(vpHoverRow.totalVol)}</span>
+                  <span>buy/sell: {(vpHoverRow.buyPct * 100).toFixed(0)}% / {(100 - vpHoverRow.buyPct * 100).toFixed(0)}%</span>
+                  <span>imbalance: {vpHoverRow.imbalance >= 0 ? "+" : ""}{(vpHoverRow.imbalance * 100).toFixed(1)}%</span>
+                  <span>session: {vpHoverRow.sessionBias} ({(vpHoverRow.sessionConfidence * 100).toFixed(0)}%)</span>
+                  <span className={`chart-volume-profile-confidence chart-volume-profile-confidence-${vpConfidenceTone}`}>confidence {vpConfidenceTone}</span>
+                  {vpNeighborhoodRows.length > 1 ? (
+                    <span className="chart-volume-profile-mini-sparkline" aria-hidden="true">
+                      <svg viewBox="0 0 64 18" preserveAspectRatio="none">
+                        <path d={vpNeighborhoodPath} />
+                      </svg>
+                    </span>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+          {!isLiteMode && volumeProfileOverlay.pausedReason === "perf" && !hideVolumeProfileOverlay ? (
+            <div className="chart-volume-profile-paused" aria-live="polite">VP paused: frame budget</div>
+          ) : null}
+        </div>
+        <div className="chart-microstructure-left-rail">
         {!isLiteMode && footprintOverlay.rows.length > 0 && !hideFootprintOverlay ? (
           <div className={`chart-footprint-compact-overlay ${footprintOverlay.degraded ? "chart-footprint-compact-overlay-degraded" : ""}`} aria-hidden="true">
             <div className="chart-footprint-compact-kicker">FP{footprintOverlay.degraded ? " LITE" : ""}</div>
@@ -3140,63 +4046,9 @@ export default function InstitutionalChart({
             ))}
           </div>
         ) : null}
+        </div>
         {!isLiteMode && footprintOverlay.pausedReason === "perf" && mode === "footprint" && !hideFootprintOverlay ? (
           <div className="chart-footprint-compact-paused" aria-live="polite">Footprint paused: frame budget</div>
-        ) : null}
-        {!isLiteMode && volumeProfileOverlay.rows.length > 0 && !hideVolumeProfileOverlay ? (
-          <div
-            className={`chart-volume-profile ${volumeProfileOverlay.degraded ? "chart-volume-profile-degraded" : ""}`}
-            onMouseMove={handleVpPointerMove}
-            onMouseLeave={() => setVpHoverKey(null)}
-          >
-            <div className="chart-volume-profile-kicker">VP{volumeProfileOverlay.degraded ? " LITE" : ""}</div>
-            <div className="chart-volume-profile-session-split" aria-hidden="true">
-              <span className="asia">ASIA</span>
-              <span className="london">LON</span>
-              <span className="newyork">NY</span>
-            </div>
-            {volumeProfileOverlay.vahY !== null ? (
-              <span className="chart-volume-profile-guide chart-volume-profile-guide-vah" style={{ top: volumeProfileOverlay.vahY }}>VAH</span>
-            ) : null}
-            {volumeProfileOverlay.valY !== null ? (
-              <span className="chart-volume-profile-guide chart-volume-profile-guide-val" style={{ top: volumeProfileOverlay.valY }}>VAL</span>
-            ) : null}
-            {volumeProfileOverlay.pocY !== null ? (
-              <span className="chart-volume-profile-guide chart-volume-profile-guide-poc" style={{ top: volumeProfileOverlay.pocY }}>POC</span>
-            ) : null}
-            {volumeProfileOverlay.rows.map((row) => (
-              <div
-                key={row.key}
-                className={`chart-volume-profile-row ${vpHoverKey === row.key ? "chart-volume-profile-row-hovered" : ""} ${row.isPoc ? "chart-volume-profile-row-poc" : ""} ${row.isVah ? "chart-volume-profile-row-vah" : ""} ${row.isVal ? "chart-volume-profile-row-val" : ""} chart-volume-profile-row-session-${row.sessionBias}`}
-                title={`price ${formatCompactPrice(row.priceMid)} · buy ${(row.buyPct * 100).toFixed(0)}% · ${row.sessionBias}`}
-                style={{ top: row.top, height: row.height, width: `${Math.round(row.widthPct * 100)}%` }}
-                onMouseEnter={() => setVpHoverKey(row.key)}
-              >
-                <span className="chart-volume-profile-row-buy" style={{ width: `${Math.round(row.buyPct * 100)}%` }} />
-                <span className="chart-volume-profile-row-sell" style={{ width: `${Math.round((1 - row.buyPct) * 100)}%` }} />
-              </div>
-            ))}
-            {vpHoverRow ? (
-              <div className={`chart-volume-profile-hover-panel tone-${vpConfidenceTone} session-${vpHoverRow.sessionBias}`} style={{ top: vpHoverRow.top + vpHoverRow.height * 0.5 }}>
-                <strong>{formatCompactPrice(vpHoverRow.priceMid)}</strong>
-                <span>total: {Math.round(vpHoverRow.totalVol)}</span>
-                <span>buy/sell: {(vpHoverRow.buyPct * 100).toFixed(0)}% / {(100 - vpHoverRow.buyPct * 100).toFixed(0)}%</span>
-                <span>imbalance: {vpHoverRow.imbalance >= 0 ? "+" : ""}{(vpHoverRow.imbalance * 100).toFixed(1)}%</span>
-                <span>session: {vpHoverRow.sessionBias} ({(vpHoverRow.sessionConfidence * 100).toFixed(0)}%)</span>
-                <span className={`chart-volume-profile-confidence chart-volume-profile-confidence-${vpConfidenceTone}`}>confidence {vpConfidenceTone}</span>
-                {vpNeighborhoodRows.length > 1 ? (
-                  <span className="chart-volume-profile-mini-sparkline" aria-hidden="true">
-                    <svg viewBox="0 0 64 18" preserveAspectRatio="none">
-                      <path d={vpNeighborhoodPath} />
-                    </svg>
-                  </span>
-                ) : null}
-              </div>
-            ) : null}
-          </div>
-        ) : null}
-        {!isLiteMode && volumeProfileOverlay.pausedReason === "perf" && !hideVolumeProfileOverlay ? (
-          <div className="chart-volume-profile-paused" aria-live="polite">VP paused: frame budget</div>
         ) : null}
         {!isLiteMode && collapsedOverlays.length > 0 ? (
           <div className="chart-overlay-collapse-hint" aria-live="polite">
@@ -3231,6 +4083,10 @@ export default function InstitutionalChart({
             </span>
           </div>
         ) : null}
+        </div>
+      </div>
+      <div className="chart-execution-layer">
+        <div className="chart-execution-inner" style={{ "--overlay-alpha": focusOverlayAlpha } as CSSProperties}>
         {!isLiteMode ? (
           <div
             className="chart-inertia-layer"
@@ -3250,10 +4106,10 @@ export default function InstitutionalChart({
             <span className="chart-active-candle-core" />
           </div>
         ) : null}
-        {newCandleFlash > 0 && !isLiteMode ? (
+        {newCandleFlash > 0 && !isLiteMode && !suppressNewCandleFlash ? (
           <div key={`ncf-${newCandleFlash}`} className="chart-new-candle-flash" aria-hidden="true" />
         ) : null}
-        {!isLiteMode && formingCandle && densityConfig.showFormingCandle ? (
+        {!isLiteMode && formingCandle && densityConfig.showFormingCandle && !suppressFormingCandle ? (
           <div
             className={`chart-forming-candle chart-forming-candle-${formingCandle.direction} ${Math.abs(formingCandle.closeY - formingCandle.openY) >= 14 ? "is-volatile" : "is-calm"}`}
             style={{ left: formingCandle.left }}
@@ -3271,7 +4127,7 @@ export default function InstitutionalChart({
             <span className="chart-forming-candle-label">forming</span>
           </div>
         ) : null}
-        {!isLiteMode && smoothedLivePulse ? (
+        {!isLiteMode && smoothedLivePulse && !suppressLivePulse ? (
           <div
             key={`live-pulse-${smoothedLivePulse.tick}`}
             className="chart-live-pulse"
@@ -3284,7 +4140,7 @@ export default function InstitutionalChart({
             <span className="chart-live-pulse-label"><strong>LIVE</strong><em>{smoothedLivePulse.priceLabel}</em></span>
           </div>
         ) : null}
-        {!isLiteMode && densityConfig.showBadges ? overlayBadges.map((badge) => {
+        {!isLiteMode && showOverlayBadges ? overlayBadges.map((badge) => {
           const offset = overlayOffsets[badge.key] || { x: 0, y: 0 };
           const anchorPrice = lastPriceRef.current ?? badge.price;
           const relativeDistance = Math.abs(badge.price - anchorPrice) / Math.max(1, Math.abs(anchorPrice) * 0.0045);
@@ -3341,15 +4197,25 @@ export default function InstitutionalChart({
             </button>
           );
         }) : null}
-        {cursor.visible ? (
-          <>
-            <div className="chart-cursor-v" style={{ left: cursor.left }} />
-            <div className="chart-cursor-h" style={{ top: cursor.top }} />
-            <div className="chart-cursor-focus" style={{ left: cursor.left, top: cursor.top }} />
-            <div className="chart-cursor-price" style={{ top: cursor.priceTop }}>{cursor.price}</div>
-            <div className="chart-cursor-time" style={{ left: cursor.timeLeft }}>{cursor.time}</div>
-          </>
-        ) : null}
+        </div>
+      </div>
+      <div className="chart-overlay-layer">
+        <div className="chart-overlay-inner">
+          {cursor.visible ? (
+            <>
+              <div className="chart-cursor-v" style={{ left: cursor.left }} />
+              <div className="chart-cursor-h" style={{ top: cursor.top }} />
+              <div className="chart-cursor-focus" style={{ left: cursor.left, top: cursor.top }} />
+              <div className="chart-cursor-price" style={{ top: cursor.priceTop }}>{cursor.price}</div>
+              <div className="chart-cursor-time" style={{ left: cursor.timeLeft }}>{cursor.time}</div>
+            </>
+          ) : null}
+        </div>
+      </div>
+      {/* TXT branded watermark — replaces TV attribution */}
+      <div className="chart-txt-watermark" aria-hidden="true">
+        <span className="chart-txt-watermark-logo">TXT</span>
+        <span className="chart-txt-watermark-sub">INSTITUTIONAL</span>
       </div>
     </div>
   );

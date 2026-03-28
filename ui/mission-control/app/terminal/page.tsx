@@ -2,8 +2,8 @@
 
 import Link from "next/link";
 import JSZip from "jszip";
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ComponentProps, ReactNode } from "react";
 import { Panel, PanelGroup, PanelResizeHandle, type ImperativePanelGroupHandle } from "react-resizable-panels";
 
 import HelpHint from "../../components/HelpHint";
@@ -25,12 +25,136 @@ import {
   useUiMode,
 } from "../../lib/userUiPrefs";
 import type { ChartMotionPreset, ChartReleaseSendMode, ChartSnapPriority, UserUiPreferencesProfile } from "../../lib/userUiPrefs";
+import {
+  computeChartRoundMagnetStep,
+  computeChartSnapThreshold,
+  getPriceStepDecimals,
+  inferChartPriceStep,
+  moveChartOrderLineTicket,
+  quantizePriceToStep,
+  resolveSnappedChartOrderPrice,
+} from "../../lib/chartOrderMath";
+import {
+  buildDomLevels,
+  buildDomLevelsFromDepth,
+  buildFootprint,
+  buildFootprintFromOhlcv,
+  buildLiquidityZones,
+  buildOverlayZones,
+  buildTape,
+  buildTapeFromTrades,
+  resolveSignalCalibration,
+} from "../../lib/chartViewTransforms";
+import { analyzeOhlcvRows, normalizeOhlcvRows } from "../../lib/ohlcvIntegrity";
+import {
+  DomTapeSidecarCard,
+  ExecutionSidecarCard,
+  ForensicReplaySidecarCard,
+  FootprintHeatSidecarCard,
+  LocalFeedSidecarCard,
+  PolicySidecarCard,
+} from "./ChartSidecarCards";
+import {
+  CHART_SIDECAR_PROFILE_IDS,
+  type ChartSidecarLayoutState,
+  type ChartSidecarId,
+  type ChartSidecarLayoutMode,
+  type ChartSidecarProfile,
+  type DetachedChartSidecarState,
+} from "./chartSidecarTypes";
+import {
+  buildDetachedChartSidecarLayout,
+  CHART_SIDECAR_FLOATING_DEFAULTS,
+  CHART_SIDECAR_PROFILE_LAYOUTS,
+  clampDetachedChartSidecar,
+  defaultChartSidecarLayoutForPreset,
+  inferChartSidecarLayoutMode,
+  normalizeChartSidecarLayout,
+} from "./chartSidecarLayout";
+import {
+  buildLayoutExportPayload,
+  buildLayoutPreset,
+  buildTerminalLayoutStorageKeys,
+  clampFloatingPanel,
+  DEFAULT_HARD_ALERT_RATIO_PCT,
+  DEFAULT_LAYOUT_WORKSPACE_NAME,
+  DEFAULT_LAYOUT_WORKSPACE_OPTIONS,
+  DEFAULT_RISK_ALERT_MISS_THRESHOLD,
+  DEFAULT_RISK_ALERT_WINDOW,
+  DEFAULT_RISK_REFRESH_SEC,
+  LOWER_PANEL_IDS,
+  mergeFloatingPresetsIntoWorkspaceBundle,
+  MICRO_PANEL_IDS,
+  MONITORING_PANEL_IDS,
+  normalizeDockLayout,
+  orderMap,
+  parseImportedTerminalLayouts,
+  readTerminalWorkspaceBundle,
+  reorderIds,
+  riskAlertDefaultsForPreset,
+  screenLayoutProfile,
+  type DockPanelId,
+  type DockZone,
+  type FloatingPanelState,
+  type LayoutPreset,
+  type TerminalLayoutConfig,
+  type TerminalWorkspaceBundle,
+} from "./terminalLayoutWorkspace";
+import {
+  fetchTerminalAuthStatus,
+  isGtixPublicHost,
+  isGtixPublicBrowserHost,
+  PUBLIC_AUTH_STATUS_CACHE_MS,
+  PUBLIC_AUTH_STATUS_SYNC_MS,
+  PUBLIC_TERMINAL_BACKGROUND_REFRESH_MS,
+  PUBLIC_TERMINAL_FALLBACK_POLL_MS,
+  PUBLIC_TERMINAL_GOVERNANCE_REFRESH_MS,
+  shouldPausePublicOpsRefresh,
+  type AuthSessionStatus,
+} from "./terminalPublicRuntime";
+import {
+  classifyFreshnessTone,
+  deriveTerminalMarketHealth,
+  formatFreshness,
+  streamStateTone,
+} from "./terminalMarketHealth";
+import { buildLocalTerminalRuntimeCapture, type LocalTerminalRuntimeCapture } from "../../lib/localTerminalCapture";
+import ChartExecutionHud from "./ChartExecutionHud";
+import { buildChartOrderTicketPriceLabels, buildChartSnapEnabledLabel } from "./chartHudHelpers";
+import ChartHudOrderRiskPanel from "./ChartHudOrderRiskPanel";
+import ChartHudSignalDecisionPanel from "./ChartHudSignalDecisionPanel";
+import GpuChartV4Surface from "./GpuChartV4Surface";
 import InstitutionalChart from "./InstitutionalChart";
+import TerminalChartV2 from "./TerminalChartV2";
+import { isWebGL2Available } from "../../lib/engine/gpu-chart/context";
+import {
+  AlertsDockPanel,
+  BlotterDockPanel,
+  BrokersDockPanel,
+  DomDockPanel,
+  FootprintDockPanel,
+  GovernanceMonitoringPanel,
+  GovernanceDockPanel,
+  HeatmapDockPanel,
+  IncidentsMonitoringPanel,
+  IncidentsDockPanel,
+  ReadinessMonitoringPanel,
+  ReadinessDockPanel,
+  RiskTimelineBody,
+  RiskTimelineMonitoringPanel,
+  TapeDockPanel,
+  AlertsMonitoringPanel,
+} from "./TerminalSecondaryPanels";
 import { barArrayHash, type Bar } from "../../lib/dataEngine";
 import { indicatorWorkerAdapter } from "../../lib/indicators/workerAdapter";
 import type { ActiveIndicator, IndicatorSeriesData } from "../../lib/indicators/engine";
+import { createMarketDataBus, type OhlcvBar } from "../../lib/marketDataBus";
+import type { SelfLearningV4Regime, SelfLearningV4Scenario } from "../../lib/selfLearningV4Store";
+import { useChartExecutionHud } from "../../lib/useChartExecutionHud";
 
 type JsonMap = Record<string, unknown>;
+type LearningRegimeV4 = SelfLearningV4Regime;
+type MarketDecisionScenario = SelfLearningV4Scenario;
 type QuotePoint = { label: string; value: number };
 type QuoteHistoryMap = Record<string, QuotePoint[]>;
 type OverlayZone = {
@@ -48,6 +172,7 @@ type FootprintRow = { low: number; high: number; buyVolume: number; sellVolume: 
 type TapePrint = { label: string; price: number; delta: number; side: "buy" | "sell" | "flat"; volume: number; timeKey?: string };
 type MarketSignalDirection = "buy" | "sell" | "neutral";
 type MarketSignalSeverity = "info" | "warn" | "critical";
+type AutoExecutionMode = "assisted" | "semi-auto" | "full-auto";
 type MarketSignalEvent = {
   id: "imbalance" | "absorption" | "fake-breakout" | "liquidity-trap" | "continuation" | "exhaustion";
   label: string;
@@ -81,13 +206,15 @@ type MarketEvidenceComponent = {
   direction: MarketSignalDirection;
   detail: string;
 };
+type MarketConfluenceWeights = {
+  dom: number;
+  footprint: number;
+  liquidity: number;
+  "price-action": number;
+};
 type MarketEvidenceWeightKey = MarketEvidenceComponent["id"];
-type MarketConfluenceWeights = Record<MarketEvidenceWeightKey, number>;
-type MarketDecisionScenario = "continuation" | "reversal" | "balance";
-type LearningRegimeV4 = "trend" | "chop" | "volatile";
 type SignalDisplayMode = "classic" | "augmented" | "ai-dominant";
 type ExecutionAdaptMode = "auto" | "confirm" | "manual";
-type AutoExecutionMode = "assisted" | "semi-auto" | "full-auto";
 type MarketSuggestedBracket = {
   side: "buy" | "sell";
   entry: number;
@@ -198,13 +325,43 @@ type MarketMetric = {
   volume: number;
   depthImbalance: number;
   tapeAcceleration: number;
+  // V4 microstructure
+  cvd: number;
+  cvdDelta: number;
+  cvdTrend: "rising" | "falling" | "flat";
+  flowImbalance: number;
+  spreadBps: number;
+  tradeAggressiveness: number;
+  avgLatencyMs: number;
+  latencyTier: "fast" | "normal" | "slow";
+  activeEventCount: number;
+  lastEventType: string | null;
+};
+type LocalFeedFallbackSuggestion = {
+  key: string;
+  symbol: string;
+  instrument: string;
+  venue: string;
+  timeframe: string;
+  autoApplyAtMs: number;
+};
+type LocalTerminalCapturePersistenceStatus = {
+  clientId: string | null;
+  updatedAt: string | null;
+  healthy: boolean;
+  detail: string;
+  historyCount: number;
+  autoIncidentTicketKey: string | null;
+  autoIncidentStatus: string | null;
+  captureHistory: LocalTerminalRuntimeCapture[];
+};
+type MarketMetricsUniverseEntry = {
+  symbolKey: string;
+  venue: string;
+  instrument: string;
 };
 type GovernanceSort = "severity" | "label" | "value";
 type IncidentSort = "severity" | "status" | "sla";
-type LayoutPreset = "scalp" | "swing" | "monitoring";
-type DockZone = "micro" | "lower" | "monitoring";
-type DockPanelId = "dom" | "footprint" | "tape" | "heatmap" | "blotter" | "brokers" | "alerts" | "incidents" | "governance" | "readiness" | "risktimeline";
-type FloatingPanelState = { id: DockPanelId; fromZone: DockZone; x: number; y: number; w: number; h: number };
 type ReplaySpeed = 1 | 2 | 4 | 8;
 type ReplayFrame = {
   timeKey: string;
@@ -365,52 +522,16 @@ type RollbackGuardSession = {
   }>;
 };
 
-type TerminalLayoutConfig = {
-  preset: LayoutPreset;
-  coreSplit: number;
-  microOrder: DockPanelId[];
-  lowerOrder: DockPanelId[];
-  monitoringOrder: DockPanelId[];
-  floatingPanels: FloatingPanelState[];
-  chartLink: {
-    symbol: boolean;
-    timeframe: boolean;
-  };
-  riskAlert: {
-    window: number;
-    missThreshold: number;
-    refreshSec: 5 | 15 | 30;
-    hardAlertEnabled: boolean;
-    hardAlertThresholdPct: number;
-  };
-};
-
-type TerminalWorkspaceBundle = {
-  active: string;
-  workspaces: Record<string, TerminalLayoutConfig>;
-};
-
 const AUTO_TUNING_WRITEBACK_ENABLED = process.env.NEXT_PUBLIC_AUTO_TUNING_WRITEBACK === "1";
 const ROLLBACK_GUARD_WINDOW_MIN = Number(process.env.NEXT_PUBLIC_ROLLBACK_GUARD_WINDOW_MIN || 90);
 const ROLLBACK_GUARD_HEALTH_DROP = Number(process.env.NEXT_PUBLIC_ROLLBACK_GUARD_HEALTH_DROP || 0.08);
 const ROLLBACK_GUARD_BRIER_RISE = Number(process.env.NEXT_PUBLIC_ROLLBACK_GUARD_BRIER_RISE || 0.035);
+const TERMINAL_V2_DEFAULT = process.env.NEXT_PUBLIC_TERMINAL_V2 === "1";
+const TERMINAL_CHART_ENGINE_DEFAULT: "v3" | "v4" = process.env.NEXT_PUBLIC_TERMINAL_ENGINE_V4 === "1" ? "v4" : "v3";
+const TERMINAL_SMOOTHING_DEFAULT_MS: 0 | 80 | 140 | 220 = 140;
 
 const DEBUG_TIME_SYNC = process.env.NEXT_PUBLIC_DEBUG_TIME_SYNC === "1";
-const TERMINAL_LAYOUT_STORAGE_PREFIX = "txt.terminal.layout.v1";
-const TERMINAL_WORKSPACES_STORAGE_PREFIX = "txt.terminal.workspaces.v1";
-const TERMINAL_CHART_LINK_STORAGE_PREFIX = "txt.terminal.chart-link.v1";
-const DEFAULT_RISK_ALERT_WINDOW = 10;
-const DEFAULT_RISK_ALERT_MISS_THRESHOLD = 3;
-const DEFAULT_RISK_REFRESH_SEC: 5 | 15 | 30 = 15;
-const DEFAULT_HARD_ALERT_RATIO_PCT = 60;
-const FLOATING_GRID_SIZE = 16;
-const FLOATING_MIN_W = 260;
-const FLOATING_MIN_H = 180;
-const LEGACY_PRIMARY_CHART_LINK_SCOPE = "A";
-const DEFAULT_CHART_LINK = {
-  symbol: true,
-  timeframe: true,
-};
+const MARKET_SNAPSHOT_CACHE_TTL_MS = 20_000;
 const CHART_ORDER_PRESETS: Record<Exclude<ChartOrderPreset, "custom">, { slPct: number; tpPct: number; notional: number; maxSpread: number }> = {
   scalp: { slPct: 0.003, tpPct: 0.006, notional: 10000, maxSpread: 10 },
   swing: { slPct: 0.008, tpPct: 0.016, notional: 15000, maxSpread: 18 },
@@ -442,6 +563,36 @@ const HYBRID_MODE_INDICATORS: ActiveIndicator[] = [
   { id: "supertrend", params: {} },
 ];
 
+function buildMarketMetricsUniverse(quotes: JsonMap[], symbolFilter: string, marketFilter: string): MarketMetricsUniverseEntry[] {
+  const normalizedSymbolFilter = symbolFilter.trim().toLowerCase();
+  const deduped = new Map<string, MarketMetricsUniverseEntry>();
+
+  for (const quote of quotes) {
+    const symbolKey = instrumentLabel(quote);
+    const market = classifyInstrument(symbolKey);
+    const matchesSymbol = !normalizedSymbolFilter || symbolKey.toLowerCase().includes(normalizedSymbolFilter);
+    const matchesMarket = marketFilter === "all" || market === marketFilter;
+    if (!matchesSymbol || !matchesMarket) {
+      continue;
+    }
+
+    const venue = String(quote.venue || "binance-public");
+    const instrument = normalizeInstrument(String(quote.instrument || symbolKey));
+    const dedupeKey = `${symbolKey}|${venue}|${instrument}`;
+    if (!deduped.has(dedupeKey)) {
+      deduped.set(dedupeKey, { symbolKey, venue, instrument });
+    }
+  }
+
+  return [...deduped.values()]
+    .sort((left, right) => (
+      left.symbolKey.localeCompare(right.symbolKey)
+      || left.venue.localeCompare(right.venue)
+      || left.instrument.localeCompare(right.instrument)
+    ))
+    .slice(0, 7);
+}
+
 function cloneIndicatorPreset(preset: ActiveIndicator[]): ActiveIndicator[] {
   return preset.map((indicator) => ({
     id: indicator.id,
@@ -449,296 +600,99 @@ function cloneIndicatorPreset(preset: ActiveIndicator[]): ActiveIndicator[] {
   }));
 }
 
-function riskAlertDefaultsForPreset(preset: LayoutPreset): { window: number; missThreshold: number; refreshSec: 5 | 15 | 30; hardAlertEnabled: boolean; hardAlertThresholdPct: number } {
-  if (preset === "scalp") {
-    return { window: 12, missThreshold: 4, refreshSec: DEFAULT_RISK_REFRESH_SEC, hardAlertEnabled: false, hardAlertThresholdPct: DEFAULT_HARD_ALERT_RATIO_PCT };
-  }
-  if (preset === "monitoring") {
-    return { window: 8, missThreshold: 2, refreshSec: DEFAULT_RISK_REFRESH_SEC, hardAlertEnabled: false, hardAlertThresholdPct: DEFAULT_HARD_ALERT_RATIO_PCT };
-  }
-  return { window: 10, missThreshold: 3, refreshSec: DEFAULT_RISK_REFRESH_SEC, hardAlertEnabled: false, hardAlertThresholdPct: DEFAULT_HARD_ALERT_RATIO_PCT };
-}
-
-const MICRO_PANEL_IDS: DockPanelId[] = ["dom", "footprint", "tape", "heatmap"];
-const LOWER_PANEL_IDS: DockPanelId[] = ["blotter", "brokers"];
-const MONITORING_PANEL_IDS: DockPanelId[] = ["alerts", "incidents", "governance", "readiness", "risktimeline"];
-const ALL_DOCK_PANEL_IDS: DockPanelId[] = [
-  "dom",
-  "footprint",
-  "tape",
-  "heatmap",
-  "blotter",
-  "brokers",
-  "alerts",
-  "incidents",
-  "governance",
-  "readiness",
-  "risktimeline",
-];
-
-function getPriceStepDecimals(step: number): number {
-  if (!Number.isFinite(step) || step >= 1) {
-    return 0;
-  }
-  const serialized = step.toString();
-  if (serialized.includes("e-")) {
-    const exponent = Number(serialized.split("e-")[1] || 0);
-    return Number.isFinite(exponent) ? exponent : 0;
-  }
-  const fraction = serialized.split(".")[1];
-  return fraction ? fraction.length : 0;
-}
-
-function inferChartPriceStep(symbol: string, referencePrice: number): number {
-  const normalizedSymbol = symbol.toUpperCase();
-  if (normalizedSymbol.includes("JPY")) {
-    return 0.01;
-  }
-  if (referencePrice >= 50000) {
-    return 5;
-  }
-  if (referencePrice >= 5000) {
-    return 1;
-  }
-  if (referencePrice >= 500) {
-    return 0.1;
-  }
-  if (referencePrice >= 50) {
-    return 0.01;
-  }
-  if (referencePrice >= 5) {
-    return 0.001;
-  }
-  if (referencePrice >= 0.5) {
-    return 0.0001;
-  }
-  return 0.00001;
-}
-
-function screenLayoutProfile(width: number): "sm" | "md" | "lg" | "xl" {
-  if (width < 900) return "sm";
-  if (width < 1300) return "md";
-  if (width < 1760) return "lg";
-  return "xl";
-}
-
-function quantizePriceToStep(price: number, step: number): number {
-  const safeStep = Math.max(0.00000001, step);
-  const decimals = getPriceStepDecimals(safeStep);
-  return Number((Math.round(price / safeStep) * safeStep).toFixed(decimals));
-}
-
-function buildLayoutPreset(preset: LayoutPreset, novice: boolean): TerminalLayoutConfig {
-  const defaultRiskAlert = riskAlertDefaultsForPreset(preset);
-  if (preset === "scalp") {
-    return {
-      preset,
-      coreSplit: novice ? 70 : 76,
-      microOrder: ["dom", "tape", "footprint", "heatmap"],
-      lowerOrder: ["blotter", "brokers"],
-      monitoringOrder: ["alerts", "governance", "incidents", "readiness", "risktimeline"],
-      floatingPanels: [],
-      chartLink: { ...DEFAULT_CHART_LINK },
-      riskAlert: defaultRiskAlert,
-    };
-  }
-  if (preset === "monitoring") {
-    return {
-      preset,
-      coreSplit: novice ? 62 : 66,
-      microOrder: ["heatmap", "dom", "footprint", "tape"],
-      lowerOrder: ["brokers", "blotter"],
-      monitoringOrder: ["governance", "incidents", "alerts", "readiness", "risktimeline"],
-      floatingPanels: [],
-      chartLink: { ...DEFAULT_CHART_LINK },
-      riskAlert: defaultRiskAlert,
-    };
-  }
-  return {
-    preset: "swing",
-    coreSplit: novice ? 72 : 78,
-    microOrder: ["dom", "footprint", "tape", "heatmap"],
-    lowerOrder: ["blotter", "brokers"],
-    monitoringOrder: ["alerts", "incidents", "governance", "readiness", "risktimeline"],
-    floatingPanels: [],
-    chartLink: { ...DEFAULT_CHART_LINK },
-    riskAlert: defaultRiskAlert,
-  };
-}
-
-function normalizeChartLinkConfig(raw: unknown, fallback: TerminalLayoutConfig["chartLink"]): TerminalLayoutConfig["chartLink"] {
-  if (!raw || typeof raw !== "object") {
-    return fallback;
-  }
-  const entry = raw as Partial<TerminalLayoutConfig["chartLink"]>;
-  return {
-    symbol: typeof entry.symbol === "boolean" ? entry.symbol : fallback.symbol,
-    timeframe: typeof entry.timeframe === "boolean" ? entry.timeframe : fallback.timeframe,
-  };
-}
-
-function reorderIds(ids: DockPanelId[], sourceId: DockPanelId, targetId: DockPanelId): DockPanelId[] {
-  if (sourceId === targetId) {
-    return ids;
-  }
-  const sourceIndex = ids.indexOf(sourceId);
-  const targetIndex = ids.indexOf(targetId);
-  if (sourceIndex < 0 || targetIndex < 0) {
-    return ids;
-  }
-  const next = [...ids];
-  const [moved] = next.splice(sourceIndex, 1);
-  next.splice(targetIndex, 0, moved);
-  return next;
-}
-
-function orderMap(ids: DockPanelId[]): Record<string, number> {
-  return ids.reduce<Record<string, number>>((acc, id, index) => {
-    acc[id] = index;
-    return acc;
-  }, {});
-}
-
-function snapFloatingValue(value: number): number {
-  return Math.round(value / FLOATING_GRID_SIZE) * FLOATING_GRID_SIZE;
-}
-
-function clampFloatingPanel(panel: FloatingPanelState): FloatingPanelState {
-  if (typeof window === "undefined") {
-    return {
-      ...panel,
-      x: snapFloatingValue(Math.max(0, panel.x)),
-      y: snapFloatingValue(Math.max(0, panel.y)),
-      w: snapFloatingValue(Math.max(FLOATING_MIN_W, panel.w)),
-      h: snapFloatingValue(Math.max(FLOATING_MIN_H, panel.h)),
-    };
-  }
-  const maxW = Math.max(FLOATING_MIN_W, window.innerWidth - 32);
-  const maxH = Math.max(FLOATING_MIN_H, window.innerHeight - 48);
-  const nextW = Math.min(maxW, Math.max(FLOATING_MIN_W, panel.w));
-  const nextH = Math.min(maxH, Math.max(FLOATING_MIN_H, panel.h));
-  const maxX = Math.max(0, window.innerWidth - nextW - 16);
-  const maxY = Math.max(0, window.innerHeight - nextH - 16);
-  return {
-    ...panel,
-    x: snapFloatingValue(Math.min(maxX, Math.max(0, panel.x))),
-    y: snapFloatingValue(Math.min(maxY, Math.max(0, panel.y))),
-    w: snapFloatingValue(nextW),
-    h: snapFloatingValue(nextH),
-  };
-}
-
-function normalizeFloatingPanels(input: unknown): FloatingPanelState[] {
-  if (!Array.isArray(input)) {
-    return [];
-  }
-  const used = new Set<DockPanelId>();
-  const next: FloatingPanelState[] = [];
-  for (const raw of input) {
-    if (!raw || typeof raw !== "object") {
-      continue;
-    }
-    const entry = raw as Partial<FloatingPanelState>;
-    const id = entry.id as DockPanelId | undefined;
-    const fromZone = entry.fromZone as DockZone | undefined;
-    if (!id || used.has(id) || !ALL_DOCK_PANEL_IDS.includes(id)) {
-      continue;
-    }
-    if (fromZone !== "micro" && fromZone !== "lower" && fromZone !== "monitoring") {
-      continue;
-    }
-    used.add(id);
-    next.push(clampFloatingPanel({
-      id,
-      fromZone,
-      x: Number.isFinite(entry.x) ? Number(entry.x) : 128,
-      y: Number.isFinite(entry.y) ? Number(entry.y) : 96,
-      w: Number.isFinite(entry.w) ? Number(entry.w) : 368,
-      h: Number.isFinite(entry.h) ? Number(entry.h) : 320,
-    }));
-  }
-  return next;
-}
-
-function normalizeDockLayout(parsed: Partial<TerminalLayoutConfig>, fallback: TerminalLayoutConfig): TerminalLayoutConfig {
-  const used = new Set<DockPanelId>();
-  const floatingPanels = normalizeFloatingPanels(parsed.floatingPanels);
-  for (const panel of floatingPanels) {
-    used.add(panel.id);
-  }
-  const pickZone = (input: unknown, fallbackZone: DockPanelId[]): DockPanelId[] => {
-    const source = Array.isArray(input) ? input : fallbackZone;
-    const next: DockPanelId[] = [];
-    for (const raw of source) {
-      const id = raw as DockPanelId;
-      if (!ALL_DOCK_PANEL_IDS.includes(id)) {
-        continue;
-      }
-      if (used.has(id)) {
-        continue;
-      }
-      used.add(id);
-      next.push(id);
-    }
-    return next;
-  };
-
-  const microOrder = pickZone(parsed.microOrder, fallback.microOrder);
-  const lowerOrder = pickZone(parsed.lowerOrder, fallback.lowerOrder);
-  const monitoringOrder = pickZone(parsed.monitoringOrder, fallback.monitoringOrder);
-
-  for (const panelId of ALL_DOCK_PANEL_IDS) {
-    if (used.has(panelId)) {
-      continue;
-    }
-    if (microOrder.length <= lowerOrder.length && microOrder.length <= monitoringOrder.length) {
-      microOrder.push(panelId);
-    } else if (lowerOrder.length <= monitoringOrder.length) {
-      lowerOrder.push(panelId);
-    } else {
-      monitoringOrder.push(panelId);
-    }
-  }
-
-  const resolvedPreset: LayoutPreset = parsed.preset === "scalp" || parsed.preset === "monitoring"
-    ? parsed.preset
-    : (parsed.preset === "swing" ? "swing" : fallback.preset);
-  const riskDefaults = riskAlertDefaultsForPreset(resolvedPreset);
-  const riskWindow = Number.isFinite(parsed.riskAlert?.window)
-    ? Math.max(3, Math.min(100, Number(parsed.riskAlert?.window)))
-    : riskDefaults.window;
-  const riskThresholdRaw = Number.isFinite(parsed.riskAlert?.missThreshold)
-    ? Math.max(1, Math.min(100, Number(parsed.riskAlert?.missThreshold)))
-    : riskDefaults.missThreshold;
-  const refreshRaw = Number(parsed.riskAlert?.refreshSec);
-  const riskRefreshSec: 5 | 15 | 30 = refreshRaw === 5 || refreshRaw === 30 ? refreshRaw : 15;
-  const riskHardAlertEnabled = typeof parsed.riskAlert?.hardAlertEnabled === "boolean"
-    ? parsed.riskAlert.hardAlertEnabled
-    : riskDefaults.hardAlertEnabled;
-  const riskHardAlertThresholdPct = Number.isFinite(parsed.riskAlert?.hardAlertThresholdPct)
-    ? Math.max(20, Math.min(95, Number(parsed.riskAlert?.hardAlertThresholdPct)))
-    : riskDefaults.hardAlertThresholdPct;
-
-  return {
-    preset: parsed.preset === "scalp" || parsed.preset === "monitoring" ? parsed.preset : fallback.preset,
-    coreSplit: Number.isFinite(parsed.coreSplit) ? Math.max(52, Math.min(85, Number(parsed.coreSplit))) : fallback.coreSplit,
-    microOrder,
-    lowerOrder,
-    monitoringOrder,
-    floatingPanels,
-    chartLink: normalizeChartLinkConfig(parsed.chartLink, fallback.chartLink),
-    riskAlert: {
-      window: riskWindow,
-      missThreshold: Math.min(riskWindow, riskThresholdRaw),
-      refreshSec: riskRefreshSec,
-      hardAlertEnabled: riskHardAlertEnabled,
-      hardAlertThresholdPct: riskHardAlertThresholdPct,
-    },
-  };
-}
-
 function normalizeInstrument(symbol: string): string {
   return symbol.replace("-PERP", "").replace("/", "").replace(/-/g, "").toUpperCase();
+}
+
+function buildIdempotencyKey(): string {
+  return typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : `${Date.now()}-idempotency`;
+}
+
+function buildChartSymbolCandidates(symbol: string): string[] {
+  const normalized = normalizeInstrument(symbol);
+  if (!normalized) {
+    return [];
+  }
+
+  const candidates = new Set<string>([normalized]);
+  if (classifyInstrument(normalized) === "crypto") {
+    if (normalized.endsWith("USD") && !normalized.endsWith("USDT")) {
+      candidates.add(`${normalized}T`);
+    }
+    if (normalized.endsWith("USDT")) {
+      candidates.add(normalized.slice(0, -1));
+    }
+  }
+
+  return [...candidates];
+}
+
+function chartInstrumentsMatch(left: string, right: string): boolean {
+  const leftCandidates = new Set(buildChartSymbolCandidates(left));
+  for (const candidate of buildChartSymbolCandidates(right)) {
+    if (leftCandidates.has(candidate)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function chartQuotePriority(item: JsonMap, preferredSymbols: string[]): number {
+  const instrument = normalizeInstrument(String(item.instrument || instrumentLabel(item)));
+  const venue = String(item.venue || "").toLowerCase();
+  const source = String(item.source || "").toLowerCase();
+  let score = 0;
+
+  if (instrument === preferredSymbols[0]) {
+    score += 80;
+  } else if (preferredSymbols.includes(instrument)) {
+    score += 60;
+  }
+  if (venue === "binance-public") {
+    score += 40;
+  } else if (!venue.startsWith("paper-")) {
+    score += 20;
+  }
+  if (instrument.endsWith("USDT")) {
+    score += 10;
+  }
+  if (source.includes("binance")) {
+    score += 4;
+  }
+  if (toNumber(item.last, 0) > 0) {
+    score += 2;
+  }
+
+  return score;
+}
+
+function pickPreferredChartQuote(quotes: JsonMap[], symbol: string, preferredVenue?: string | null): JsonMap | null {
+  const preferredSymbols = buildChartSymbolCandidates(symbol);
+  if (preferredSymbols.length === 0) {
+    return null;
+  }
+
+  return [...quotes]
+    .filter((quote) => preferredSymbols.includes(normalizeInstrument(String(quote.instrument || instrumentLabel(quote)))))
+    .sort((left, right) => {
+      const leftVenue = String(left.venue || "");
+      const rightVenue = String(right.venue || "");
+      const venueBias = preferredVenue
+        ? (rightVenue === preferredVenue ? 1 : 0) - (leftVenue === preferredVenue ? 1 : 0)
+        : 0;
+      if (venueBias !== 0) {
+        return venueBias;
+      }
+      return chartQuotePriority(right, preferredSymbols) - chartQuotePriority(left, preferredSymbols);
+    })[0] || null;
+}
+
+function pickDefaultChartQuote(quotes: JsonMap[]): JsonMap | null {
+  const defaultSymbols = ["BTCUSDT", "BTCUSD"];
+  return [...quotes]
+    .sort((left, right) => chartQuotePriority(right, defaultSymbols) - chartQuotePriority(left, defaultSymbols))[0] || null;
 }
 
 const TEAM_PRESETS: Record<string, TerminalLayoutConfig> = {
@@ -747,6 +701,7 @@ const TEAM_PRESETS: Record<string, TerminalLayoutConfig> = {
   "⬡ Risk Monitor": buildLayoutPreset("monitoring", false),
 };
 const TEAM_PRESET_NAMES = Object.keys(TEAM_PRESETS);
+
 function toNumber(value: unknown, fallback = 0): number {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : fallback;
@@ -1240,194 +1195,6 @@ function weightedVwap(points: QuotePoint[]): number {
   return weightedVolume === 0 ? points[points.length - 1].value : weightedPrice / weightedVolume;
 }
 
-function buildOverlayZones(points: QuotePoint[]): OverlayZone[] {
-  if (points.length < 6) {
-    return [];
-  }
-
-  const values = points.map((point) => point.value);
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const range = Math.max(max - min, 1);
-  const zones: OverlayZone[] = [];
-
-  for (let index = 2; index < points.length - 1; index += 1) {
-    const previous = points[index - 1].value;
-    const current = points[index].value;
-    const next = points[index + 1].value;
-    const jump = current - previous;
-    if (Math.abs(jump) > range * 0.11) {
-      const low = Math.min(previous, current);
-      const high = Math.max(previous, current);
-      zones.push({
-        kind: "fvg",
-        label: jump > 0 ? "FVG up" : "FVG down",
-        x1: index - 1,
-        x2: Math.min(index + 2, points.length - 1),
-        low,
-        high,
-        tone: jump > 0 ? "rgba(103, 232, 165, 0.18)" : "rgba(255, 209, 102, 0.18)",
-      });
-    }
-
-    const reversal = (current - previous) * (next - current) < 0;
-    if (reversal && zones.filter((zone) => zone.kind === "ob").length < 2) {
-      const window = points.slice(Math.max(0, index - 2), Math.min(points.length, index + 2));
-      zones.push({
-        kind: "ob",
-        label: next > current ? "Bullish OB" : "Bearish OB",
-        x1: Math.max(0, index - 2),
-        x2: Math.min(points.length - 1, index + 3),
-        low: Math.min(...window.map((point) => point.value)),
-        high: Math.max(...window.map((point) => point.value)),
-        tone: next > current ? "rgba(88, 199, 255, 0.14)" : "rgba(255, 125, 125, 0.14)",
-      });
-    }
-  }
-
-  return zones.slice(0, 4);
-}
-
-function buildLiquidityZones(points: QuotePoint[]): LiquidityZone[] {
-  if (points.length === 0) {
-    return [];
-  }
-  const counts = new Map<number, number>();
-  for (const point of points) {
-    const bucket = Number(point.value.toFixed(1));
-    counts.set(bucket, (counts.get(bucket) || 0) + 1);
-  }
-  return [...counts.entries()]
-    .sort((left, right) => right[1] - left[1])
-    .slice(0, 2)
-    .map(([level], index) => ({ level, label: index === 0 ? "Liquidity pool" : "Resting liquidity" }));
-}
-
-function buildTape(points: QuotePoint[], timeframe: string): TapePrint[] {
-  return points.slice(-12).map((point, index, array) => {
-    const previous = index === 0 ? point.value : array[index - 1].value;
-    const delta = point.value - previous;
-    const side: TapePrint["side"] = delta > 0 ? "buy" : delta < 0 ? "sell" : "flat";
-    return {
-      label: point.label,
-      price: point.value,
-      delta,
-      side,
-      volume: volumeFromDelta(delta, index),
-      timeKey: toTimeBucketKey(point.label, timeframe),
-    };
-  }).reverse();
-}
-
-function buildFootprint(points: QuotePoint[]): FootprintRow[] {
-  if (points.length === 0) {
-    return [];
-  }
-  const values = points.map((point) => point.value);
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const range = Math.max(max - min, 1);
-  const step = range / 6;
-  const rows: FootprintRow[] = Array.from({ length: 6 }, (_, index) => ({
-    low: min + step * index,
-    high: min + step * (index + 1),
-    buyVolume: 0,
-    sellVolume: 0,
-    delta: 0,
-  }));
-
-  for (let index = 1; index < points.length; index += 1) {
-    const price = points[index].value;
-    const delta = price - points[index - 1].value;
-    const volume = volumeFromDelta(delta, index);
-    const bucket = Math.min(rows.length - 1, Math.max(0, Math.floor(((price - min) / range) * rows.length)));
-    if (delta >= 0) {
-      rows[bucket].buyVolume += volume;
-    } else {
-      rows[bucket].sellVolume += volume;
-    }
-    rows[bucket].delta = rows[bucket].buyVolume - rows[bucket].sellVolume;
-  }
-
-  return rows.reverse();
-}
-
-function buildDomLevels(orderbook: JsonMap | null): DomLevel[] {
-  const bid = toNumber(orderbook?.bid, 0);
-  const ask = toNumber(orderbook?.ask, 0);
-  const mid = bid > 0 && ask > 0 ? (bid + ask) / 2 : Math.max(bid, ask, 1);
-  const spread = Math.max(Math.abs(ask - bid), mid * 0.0004);
-  const levels: DomLevel[] = [];
-
-  for (let index = 0; index < 8; index += 1) {
-    const bidDistance = spread * (index + 0.5);
-    const askDistance = spread * (index + 0.5);
-    const bidSize = Math.round(80 - index * 8 + (index % 3) * 6);
-    const askSize = Math.round(78 - index * 7 + ((index + 1) % 3) * 7);
-    levels.push({ side: "bid", price: Number((mid - bidDistance).toFixed(2)), size: bidSize, intensity: Math.max(0.2, bidSize / 90) });
-    levels.push({ side: "ask", price: Number((mid + askDistance).toFixed(2)), size: askSize, intensity: Math.max(0.2, askSize / 90) });
-  }
-
-  return levels.sort((left, right) => right.price - left.price);
-}
-
-function buildDomLevelsFromDepth(depth: JsonMap | null): DomLevel[] {
-  const payload = (depth?.depth_payload as JsonMap | undefined) || {};
-  const bids = (payload.bids as unknown[] | undefined) || [];
-  const asks = (payload.asks as unknown[] | undefined) || [];
-  const toLevels = (rows: unknown[], side: "bid" | "ask") => rows.slice(0, 12).map((row) => {
-    const level = Array.isArray(row) ? row : [];
-    const price = toNumber(level[0], 0);
-    const size = toNumber(level[1], 0);
-    return {
-      side,
-      price,
-      size,
-      intensity: Math.max(0.15, Math.min(1, size / 40)),
-    };
-  });
-  return [...toLevels(asks, "ask"), ...toLevels(bids, "bid")].sort((left, right) => right.price - left.price);
-}
-
-function buildTapeFromTrades(trades: JsonMap[], timeframe: string): TapePrint[] {
-  return trades.slice(0, 18).map((trade) => {
-    const sideRaw = String(trade.side || "flat").toLowerCase();
-    const side: TapePrint["side"] = sideRaw === "buy" || sideRaw === "sell" ? sideRaw : "flat";
-    const label = String(trade.traded_at || "-");
-    return {
-      label,
-      price: toNumber(trade.price, 0),
-      delta: 0,
-      side,
-      volume: Math.max(1, Math.round(toNumber(trade.size, 0) * 1000)),
-      timeKey: toTimeBucketKey(label, timeframe),
-    };
-  });
-}
-
-function buildFootprintFromOhlcv(rows: JsonMap[], timeframe: string): FootprintRow[] {
-  return rows.slice(-8).map((row) => {
-    const low = toNumber(row.low, 0);
-    const high = toNumber(row.high, low);
-    const volume = Math.max(0, toNumber(row.volume, 0));
-    const open = toNumber(row.open, low);
-    const close = toNumber(row.close, low);
-    const bullish = close >= open;
-    const buyVolume = bullish ? volume * 0.62 : volume * 0.38;
-    const sellVolume = volume - buyVolume;
-    const sourceTime = String(row.bucket_start || "-");
-    return {
-      low,
-      high,
-      buyVolume,
-      sellVolume,
-      delta: buyVolume - sellVolume,
-      timeLabel: formatClock(sourceTime),
-      timeKey: toTimeBucketKey(sourceTime, timeframe),
-    };
-  }).reverse();
-}
-
 async function fetchJson(path: string, options?: { allowUnauthorized?: boolean }): Promise<unknown | null> {
   const response = await fetch(path, { cache: "no-store" });
   if (response.status === 401 && options?.allowUnauthorized) {
@@ -1439,118 +1206,59 @@ async function fetchJson(path: string, options?: { allowUnauthorized?: boolean }
   return response.json();
 }
 
+class WSCircuitBreaker {
+  private static MAX_401_RETRIES = 5;
+  private static COOLDOWN_MS = 60_000;
+  private static LOCKED_UNTIL = 0;
+  private static FAILURES_401 = 0;
+
+  static isLocked(): boolean {
+    if (Date.now() < this.LOCKED_UNTIL) {
+      return true;
+    }
+    if (this.LOCKED_UNTIL > 0) {
+      this.LOCKED_UNTIL = 0;
+      this.FAILURES_401 = 0;
+    }
+    return false;
+  }
+
+  static report401() {
+    this.FAILURES_401++;
+    if (this.FAILURES_401 >= this.MAX_401_RETRIES) {
+      this.LOCKED_UNTIL = Date.now() + this.COOLDOWN_MS;
+      console.warn(`[WSCircuitBreaker] 401 storm detected. Locking WS auth for ${this.COOLDOWN_MS}ms.`);
+    }
+  }
+
+  static reportSuccess() {
+    this.FAILURES_401 = 0;
+    this.LOCKED_UNTIL = 0;
+  }
+}
+
 async function fetchWsToken(): Promise<string | null> {
-  const response = await fetch("/api/auth/ws-token", { cache: "no-store" });
-  if (response.status === 401) {
-    return "__UNAUTHORIZED__";
-  }
-  if (!response.ok) {
+  if (WSCircuitBreaker.isLocked()) {
     return null;
   }
-  const payload = await response.json();
-  return typeof payload?.token === "string" && payload.token ? payload.token : null;
-}
-
-function depthRowToTuple(row: unknown): [number, number] | null {
-  if (!Array.isArray(row)) {
+  try {
+    const response = await fetch("/api/auth/ws-token", { cache: "no-store" });
+    if (response.status === 401) {
+      WSCircuitBreaker.report401();
+      return "__UNAUTHORIZED__";
+    }
+    if (!response.ok) {
+      return null;
+    }
+    const payload = await response.json();
+    const token = typeof payload?.token === "string" && payload.token ? payload.token : null;
+    if (token) {
+      WSCircuitBreaker.reportSuccess();
+    }
+    return token;
+  } catch {
     return null;
   }
-  const price = toNumber(row[0], 0);
-  const size = toNumber(row[1], 0);
-  if (price <= 0) {
-    return null;
-  }
-  return [price, Math.max(0, size)];
-}
-
-function depthRowsToMap(rows: unknown[]): Map<string, number> {
-  const levels = new Map<string, number>();
-  for (const row of rows) {
-    const parsed = depthRowToTuple(row);
-    if (!parsed) {
-      continue;
-    }
-    const [price, size] = parsed;
-    levels.set(price.toFixed(8), size);
-  }
-  return levels;
-}
-
-function mapToDepthRows(levels: Map<string, number>, side: "bid" | "ask"): number[][] {
-  const rows = [...levels.entries()]
-    .map(([price, size]) => [toNumber(price, 0), size] as number[])
-    .filter((row) => row[0] > 0 && row[1] > 0)
-    .sort((left, right) => (side === "bid" ? right[0] - left[0] : left[0] - right[0]));
-  return rows.slice(0, 40);
-}
-
-function mergeDepthDelta(currentDepth: JsonMap | null, deltaPayload: JsonMap): JsonMap {
-  const currentPayload = (currentDepth?.depth_payload as JsonMap | undefined) || {};
-  const bidsMap = depthRowsToMap((currentPayload.bids as unknown[] | undefined) || []);
-  const asksMap = depthRowsToMap((currentPayload.asks as unknown[] | undefined) || []);
-
-  for (const row of ((deltaPayload.bids as unknown[] | undefined) || [])) {
-    const parsed = depthRowToTuple(row);
-    if (!parsed) {
-      continue;
-    }
-    const [price, size] = parsed;
-    const key = price.toFixed(8);
-    if (size <= 0) {
-      bidsMap.delete(key);
-    } else {
-      bidsMap.set(key, size);
-    }
-  }
-
-  for (const row of ((deltaPayload.asks as unknown[] | undefined) || [])) {
-    const parsed = depthRowToTuple(row);
-    if (!parsed) {
-      continue;
-    }
-    const [price, size] = parsed;
-    const key = price.toFixed(8);
-    if (size <= 0) {
-      asksMap.delete(key);
-    } else {
-      asksMap.set(key, size);
-    }
-  }
-
-  const bids = mapToDepthRows(bidsMap, "bid");
-  const asks = mapToDepthRows(asksMap, "ask");
-  const bestBid = bids.length > 0 ? toNumber(bids[0][0], 0) : 0;
-  const bestAsk = asks.length > 0 ? toNumber(asks[0][0], 0) : 0;
-  const mid = bestBid > 0 && bestAsk > 0 ? (bestBid + bestAsk) / 2 : 0;
-  const spreadBps = mid > 0 ? ((bestAsk - bestBid) / mid) * 10_000 : 0;
-  const eventTime = toNumber(deltaPayload.event_time, Date.now());
-
-  return {
-    ...(currentDepth || {}),
-    venue: String(deltaPayload.venue || currentDepth?.venue || "binance-public"),
-    instrument: String(deltaPayload.instrument || currentDepth?.instrument || "UNKNOWN"),
-    snapshot_at: new Date(eventTime).toISOString(),
-    best_bid: bestBid,
-    best_ask: bestAsk,
-    spread_bps: spreadBps,
-    depth_payload: {
-      bids,
-      asks,
-      lastUpdateId: toNumber(deltaPayload.update_id, toNumber((currentPayload as JsonMap).lastUpdateId, 0)),
-      event_time: eventTime,
-      reason: "ws-delta",
-    },
-    source: "depth-ws-delta",
-  };
-}
-
-function buildMarketDepthWsUrl(instrument: string, venue: string): string {
-  if (typeof window === "undefined") {
-    return "";
-  }
-  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  const base = `${protocol}://${window.location.host}`;
-  return `${base}/ws/v1/market/orderbook/depth/${encodeURIComponent(instrument)}?venue=${encodeURIComponent(venue)}`;
 }
 
 function buildExecutionTelemetryWsUrl(
@@ -1567,8 +1275,7 @@ function buildExecutionTelemetryWsUrl(
   if (typeof window === "undefined") {
     return "";
   }
-  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  const base = `${protocol}://${window.location.host}`;
+  const base = buildControlPlaneWsBase();
   const params = new URLSearchParams({
     token,
     limit: String(limit),
@@ -1582,17 +1289,30 @@ function buildExecutionTelemetryWsUrl(
 }
 
 function buildControlPlaneWsBase(): string {
+  if (typeof window === "undefined") {
+    return "ws://localhost:8000";
+  }
+
+  const currentProtocol = window.location.protocol === "https:" ? "wss" : "ws";
+  const currentBase = `${currentProtocol}://${window.location.host}`;
   const configured =
     process.env.NEXT_PUBLIC_CONTROL_PLANE_WS_BASE?.trim() ||
     process.env.NEXT_PUBLIC_CONTROL_PLANE_URL?.trim() ||
-    "http://localhost:8000";
+    "";
+
+  if (!configured) {
+    return currentBase;
+  }
 
   try {
     const parsed = new URL(configured);
+    if (["localhost", "127.0.0.1", "0.0.0.0", "control-plane"].includes(parsed.hostname)) {
+      return currentBase;
+    }
     const protocol = parsed.protocol === "https:" ? "wss" : "ws";
     return `${protocol}://${parsed.host}`;
   } catch {
-    return "ws://localhost:8000";
+    return currentBase;
   }
 }
 
@@ -1603,47 +1323,6 @@ function buildMarketQuotesWsUrl(token: string, instrument?: string): string {
   const base = buildControlPlaneWsBase();
   const instrumentPart = instrument ? `&instrument=${encodeURIComponent(instrument)}` : "";
   return `${base}/ws/v1/market/quotes?token=${encodeURIComponent(token)}${instrumentPart}`;
-}
-
-function resolveSignalCalibration(symbol: string, timeframe: string): {
-  assetClass: "crypto" | "fx" | "index" | "other";
-  label: string;
-  imbalanceRatio: number;
-  absorptionDeltaRatio: number;
-  absorptionMovePctMax: number;
-  continuationDeltaRatio: number;
-  continuationMovePctMin: number;
-  breakoutPct: number;
-  trapSweepPct: number;
-} {
-  const upper = symbol.toUpperCase();
-  const assetClass =
-    /(BTC|ETH|SOL|XRP|DOGE|ADA|AVAX|BNB)/.test(upper) ? "crypto"
-      : /^[A-Z]{6}$/.test(upper) || /(EUR|USD|JPY|GBP|CHF|AUD|NZD|CAD)/.test(upper) ? "fx"
-        : /(NAS|SPX|DAX|DJI|NQ|US30|GER40|XAU|XAG)/.test(upper) ? "index"
-          : "other";
-
-  const base =
-    assetClass === "crypto"
-      ? { imbalanceRatio: 2.7, absorptionDeltaRatio: 0.17, absorptionMovePctMax: 0.0009, continuationDeltaRatio: 0.2, continuationMovePctMin: 0.0011, breakoutPct: 0.0008, trapSweepPct: 0.00115 }
-      : assetClass === "fx"
-        ? { imbalanceRatio: 3.25, absorptionDeltaRatio: 0.22, absorptionMovePctMax: 0.00045, continuationDeltaRatio: 0.25, continuationMovePctMin: 0.0007, breakoutPct: 0.00045, trapSweepPct: 0.0007 }
-        : assetClass === "index"
-          ? { imbalanceRatio: 2.95, absorptionDeltaRatio: 0.2, absorptionMovePctMax: 0.00065, continuationDeltaRatio: 0.23, continuationMovePctMin: 0.00095, breakoutPct: 0.00065, trapSweepPct: 0.00095 }
-          : { imbalanceRatio: 3, absorptionDeltaRatio: 0.2, absorptionMovePctMax: 0.0006, continuationDeltaRatio: 0.22, continuationMovePctMin: 0.0009, breakoutPct: 0.0006, trapSweepPct: 0.0009 };
-
-  const tfFactor = timeframe === "1m" ? 0.94 : timeframe === "5m" ? 1 : 1.1;
-  return {
-    assetClass,
-    label: `${assetClass.toUpperCase()} ${timeframe}`,
-    imbalanceRatio: base.imbalanceRatio * tfFactor,
-    absorptionDeltaRatio: base.absorptionDeltaRatio * (timeframe === "15m" ? 1.08 : 1),
-    absorptionMovePctMax: base.absorptionMovePctMax * (timeframe === "1m" ? 1.15 : timeframe === "15m" ? 0.9 : 1),
-    continuationDeltaRatio: base.continuationDeltaRatio * (timeframe === "1m" ? 0.96 : 1.05),
-    continuationMovePctMin: base.continuationMovePctMin * (timeframe === "15m" ? 1.12 : 1),
-    breakoutPct: base.breakoutPct * (timeframe === "15m" ? 1.15 : 1),
-    trapSweepPct: base.trapSweepPct * (timeframe === "15m" ? 1.1 : 1),
-  };
 }
 
 function decisionIdFrom(item: JsonMap): string {
@@ -1689,6 +1368,7 @@ function pickTimestamp(item: JsonMap, candidates: string[]): string {
 
 export default function TradingTerminalPage() {
   const [layoutEditMode, setLayoutEditMode] = useState(false);
+  const [isHydrated, setIsHydrated] = useState(false);
   const [snapshot, setSnapshot] = useState<JsonMap | null>(null);
   const [readiness, setReadiness] = useState<JsonMap | null>(null);
   const [aiHealth, setAiHealth] = useState<JsonMap | null>(null);
@@ -1703,18 +1383,23 @@ export default function TradingTerminalPage() {
   const [orderbook, setOrderbook] = useState<JsonMap | null>(null);
   const [marketDepth, setMarketDepth] = useState<JsonMap | null>(null);
   const [marketMicro, setMarketMicro] = useState<JsonMap | null>(null);
-  const [ohlcvBars, setOhlcvBars] = useState<JsonMap[]>([]);
+  const [ohlcvBars, setOhlcvBars] = useState<OhlcvBar[]>([]);
   const [nativeTrades, setNativeTrades] = useState<JsonMap[]>([]);
   const [sessionState, setSessionState] = useState<JsonMap | null>(null);
+  const [marketBusMeta, setMarketBusMeta] = useState<JsonMap | null>(null);
+  const [marketBusLastSyncAt, setMarketBusLastSyncAt] = useState<string | null>(null);
   const [routingScore, setRoutingScore] = useState<JsonMap | null>(null);
   const [executionTelemetry, setExecutionTelemetry] = useState<JsonMap[]>([]);
+  const [ohlcvStreamState, setOhlcvStreamState] = useState<"offline" | "connecting" | "live">("offline");
   const [depthStreamState, setDepthStreamState] = useState<"offline" | "connecting" | "live">("offline");
   const [telemetryStreamState, setTelemetryStreamState] = useState<"offline" | "connecting" | "live">("offline");
   const [replayDecisionId, setReplayDecisionId] = useState("");
   const [replayPayload, setReplayPayload] = useState<JsonMap | null>(null);
   const [replayLoading, setReplayLoading] = useState(false);
   const [replayError, setReplayError] = useState<string | null>(null);
-  const [authSessionRequired, setAuthSessionRequired] = useState(false);
+  const [authStatus, setAuthStatus] = useState<AuthSessionStatus>("unknown");
+  const [authSessionRequired, setAuthSessionRequired] = useState(true);
+  const [publicOpsRefreshPaused, setPublicOpsRefreshPaused] = useState(false);
   const [quoteHistory, setQuoteHistory] = useState<QuoteHistoryMap>({});
   const [error, setError] = useState<string | null>(null);
   const [signalActionToast, setSignalActionToast] = useState<MarketSignalAlertToast | null>(null);
@@ -1741,10 +1426,22 @@ export default function TradingTerminalPage() {
   const [chartReleaseSendMode, setChartReleaseSendMode] = useChartReleaseSendMode();
   const [chartHapticMode, setChartHapticMode] = useChartHapticMode();
   const [layoutPreset, setLayoutPreset] = useState<LayoutPreset>("swing");
-  const [layoutWorkspaceName, setLayoutWorkspaceName] = useState("Swing-NY");
-  const [layoutWorkspaceOptions, setLayoutWorkspaceOptions] = useState<string[]>(["Scalp-1", "Swing-NY", "Monitoring-Risk"]);
+  const [layoutWorkspaceName, setLayoutWorkspaceName] = useState(DEFAULT_LAYOUT_WORKSPACE_NAME);
+  const [layoutWorkspaceOptions, setLayoutWorkspaceOptions] = useState<string[]>(DEFAULT_LAYOUT_WORKSPACE_OPTIONS);
   const [workspaceHintBadge, setWorkspaceHintBadge] = useState<string | null>(null);
-    const [layoutScreenProfile, setLayoutScreenProfile] = useState<"sm" | "md" | "lg" | "xl">("lg");
+  const [localFeedFallbackSuggestion, setLocalFeedFallbackSuggestion] = useState<LocalFeedFallbackSuggestion | null>(null);
+  const [localTerminalCaptureClientId, setLocalTerminalCaptureClientId] = useState<string | null>(null);
+  const [localTerminalCapturePersistenceStatus, setLocalTerminalCapturePersistenceStatus] = useState<LocalTerminalCapturePersistenceStatus>({
+    clientId: null,
+    updatedAt: null,
+    healthy: false,
+    detail: "pending",
+    historyCount: 0,
+    autoIncidentTicketKey: null,
+    autoIncidentStatus: null,
+    captureHistory: [],
+  });
+  const [layoutScreenProfile, setLayoutScreenProfile] = useState<"sm" | "md" | "lg" | "xl">("lg");
   const [layoutCoreSplit, setLayoutCoreSplit] = useState(uiMode === "novice" ? 72 : 78);
   const [layoutMicroOrder, setLayoutMicroOrder] = useState<DockPanelId[]>([...MICRO_PANEL_IDS]);
   const [layoutLowerOrder, setLayoutLowerOrder] = useState<DockPanelId[]>([...LOWER_PANEL_IDS]);
@@ -1752,9 +1449,17 @@ export default function TradingTerminalPage() {
   const [floatingPanels, setFloatingPanels] = useState<FloatingPanelState[]>([]);
   const [layoutDropPreview, setLayoutDropPreview] = useState<{ zone: DockZone; targetId?: DockPanelId; mode: "zone" | "panel" } | null>(null);
   const [selectedChartSymbol, setSelectedChartSymbol] = useState("BTCUSD");
+  const [chartVenueOverride, setChartVenueOverride] = useState<string | null>(null);
   const [chartLinkSymbolEnabled, setChartLinkSymbolEnabled] = useState(true);
   const [chartLinkTimeframeEnabled, setChartLinkTimeframeEnabled] = useState(true);
   const [chartPerfMode, setChartPerfMode] = useState<"auto" | "balanced" | "ultra">("auto");
+  const [chartVisualMode, setChartVisualMode] = useState<"auto" | "clean" | "full">("auto");
+  const [terminalV2Enabled, setTerminalV2Enabled] = useState(TERMINAL_V2_DEFAULT);
+  const [chartEngineMode, setChartEngineMode] = useState<"v3" | "v4">(TERMINAL_CHART_ENGINE_DEFAULT);
+  const [gpuViewportGrid, setGpuViewportGrid] = useState<1 | 4 | 16 | "auto">("auto");
+  const [chartSmoothingMs, setChartSmoothingMs] = useState<0 | 80 | 140 | 220>(TERMINAL_SMOOTHING_DEFAULT_MS);
+  const [chartSidecarProfile, setChartSidecarProfile] = useState<ChartSidecarProfile>("intraday");
+  const [detachedChartSidecars, setDetachedChartSidecars] = useState<DetachedChartSidecarState[]>([]);
   const [activeIndicators, setActiveIndicators] = useState<ActiveIndicator[]>([]);
   const [showIndicatorPanel, setShowIndicatorPanel] = useState(false);
   const [indicatorSeriesForChart, setIndicatorSeriesForChart] = useState<IndicatorSeriesData[]>([]);
@@ -1762,6 +1467,10 @@ export default function TradingTerminalPage() {
   const signalAlertSignatureRef = useRef("");
   const signalConfidenceTrailRef = useRef<number[]>([]);
   const executionAdaptationSignatureRef = useRef("");
+  const localTerminalCapturePayloadRef = useRef<LocalTerminalRuntimeCapture | null>(null);
+  const localTerminalCaptureLastPostedSignatureRef = useRef("");
+  const localTerminalCaptureLastPostedAtRef = useRef(0);
+  const localTerminalCaptureLastIncidentTicketKeyRef = useRef("");
 
   const INDICATOR_CATALOG = [
     { category: "trend",      ids: ["ema9","ema21","ema50","ema200","sma","wma","dema","vwap"] },
@@ -1787,6 +1496,10 @@ export default function TradingTerminalPage() {
   const [chartMode, setChartMode] = useState<"line" | "candles" | "footprint">("candles");
   const [chartTimeframe, setChartTimeframe] = useState("1m");
   const [chartWindow, setChartWindow] = useState(80);
+  // Virtual viewport ref : évite un re-render React complet à chaque pan/zoom
+  // Le scroll/zoom LightweightCharts est géré internalement ; on conserve
+  // chartWindow comme source de vérité pour la fenêtre de bars visible.
+  const chartViewportRef = useRef<{ window: number }>({ window: 80 });
   const [chartLoading, setChartLoading] = useState(false);
   const [chartOrderTicket, setChartOrderTicket] = useState<ChartOrderTicket>({
     side: "buy",
@@ -1844,6 +1557,42 @@ export default function TradingTerminalPage() {
     plan: MarketDecisionSnapshot["executionPlan"];
   } | null>(null);
   const [chartHudConfirmArmed, setChartHudConfirmArmed] = useState(false);
+
+  const handleV2AutoReduce = useCallback(() => {
+    setNotional((value) => Math.max(1000, Math.round(value * 0.75)));
+  }, []);
+
+  const handleV2AutoClose = useCallback(() => {
+    setChartOrderTicket((current) => ({ ...current, active: false }));
+    setAutoExecutionKillSwitch(true);
+  }, []);
+
+  const handleV2DomEntryFromLevel = useCallback((price: number, sideLabel: "bid" | "ask") => {
+    const entry = Math.max(0.0000001, Number(price));
+    const ticketSide: "buy" | "sell" = sideLabel === "ask" ? "buy" : "sell";
+    const sl = ticketSide === "buy" ? entry * (1 - 0.003) : entry * (1 + 0.003);
+    const tp = ticketSide === "buy" ? entry * (1 + 0.006) : entry * (1 - 0.006);
+    setChartOrderTicket((current) => ({
+      ...current,
+      side: ticketSide,
+      entry,
+      sl,
+      tp,
+      active: true,
+    }));
+    setSymbol(selectedChartSymbol);
+    setSide(ticketSide);
+  }, [selectedChartSymbol]);
+
+  const handleV2DomExitFromLevel = useCallback((price: number, _sideLabel: "bid" | "ask") => {
+    const target = Math.max(0.0000001, Number(price));
+    setChartOrderTicket((current) => {
+      if (!current.active || current.entry <= 0) {
+        return current;
+      }
+      return { ...current, tp: target };
+    });
+  }, []);
   const [chartSendHistory, setChartSendHistory] = useState<ChartSendHistoryEntry[]>([]);
   const [chartSendHistoryBackend, setChartSendHistoryBackend] = useState<ChartSendHistoryEntry[]>([]);
   const [riskTimelineFilter, setRiskTimelineFilter] = useState<RiskTimelineFilter>("all");
@@ -1891,9 +1640,7 @@ export default function TradingTerminalPage() {
   const [autoTuningBusy, setAutoTuningBusy] = useState(false);
   const [autoTuningStatus, setAutoTuningStatus] = useState("");
   const [autoTuningAdminKey, setAutoTuningAdminKey] = useState("");
-  const [autoTuningIdempotencyKey, setAutoTuningIdempotencyKey] = useState(() =>
-    typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}-idempotency`,
-  );
+  const [autoTuningIdempotencyKey, setAutoTuningIdempotencyKey] = useState("");
   const [autoTuningMinConfidence, setAutoTuningMinConfidence] = useState(0.35);
   const [autoTuningMaxRecommendations, setAutoTuningMaxRecommendations] = useState(8);
   const [autoTuningWeightFloorPct, setAutoTuningWeightFloorPct] = useState(0);
@@ -1911,19 +1658,16 @@ export default function TradingTerminalPage() {
     Number.isFinite(ROLLBACK_GUARD_BRIER_RISE) ? Math.max(0.005, Math.min(0.2, ROLLBACK_GUARD_BRIER_RISE)) : 0.035,
   );
   const rollbackGuardClosedRef = useRef<string>("");
-  const chartStageRef = useRef<HTMLDivElement | null>(null);
   const decisionSecondaryRef = useRef<HTMLDivElement | null>(null);
   const chartOrderDragRef = useRef<ChartDragState | null>(null);
   const chartLongPressTimerRef = useRef<number | null>(null);
   const chartOrderTicketRef = useRef<ChartOrderTicket>(chartOrderTicket);
   const chartSnapStateRef = useRef<ChartSnapState>(null);
   const chartSnapHapticSignatureRef = useRef("");
-  const marketBurstAbortRef = useRef<AbortController | null>(null);
-  const marketBurstTimerRef = useRef<number | null>(null);
-  const marketBurstLastKeyRef = useRef("");
-  const marketBurstLastStartedAtRef = useRef(0);
-  const routingScoreCacheRef = useRef<Map<string, { timestamp: number; promise: Promise<JsonMap | null> }>>(new Map());
   const marketMetricsAbortRef = useRef<AbortController | null>(null);
+  const marketSnapshotCacheRef = useRef(new Map<string, { fetchedAt: number; payload: JsonMap | null }>());
+  const marketSnapshotInflightRef = useRef(new Map<string, Promise<JsonMap | null>>());
+  const marketDataBusRef = useRef<ReturnType<typeof createMarketDataBus> | null>(null);
   const quotesRef = useRef<JsonMap[]>([]);
   const backendPrefsReadyRef = useRef(false);
   const backendUpdatedAtRef = useRef<string | null>(null);
@@ -1947,14 +1691,17 @@ export default function TradingTerminalPage() {
     venueLabel: string;
   } | null>(null);
 
-  const layoutStorageKey = `${TERMINAL_LAYOUT_STORAGE_PREFIX}.${accountId || "default"}`;
-  const layoutWorkspaceStorageKey = `${TERMINAL_WORKSPACES_STORAGE_PREFIX}.${accountId || "default"}`;
-  const chartLinkStorageKey = `${TERMINAL_CHART_LINK_STORAGE_PREFIX}.${accountId || "default"}`;
-  const legacyChartLinkStorageKey = `${TERMINAL_CHART_LINK_STORAGE_PREFIX}.${accountId || "default"}.${LEGACY_PRIMARY_CHART_LINK_SCOPE}`;
-  const coreSplitByScreenStorageKey = `${layoutStorageKey}.core-split-by-screen.v1`;
-  const signalEngineStorageKey = `${layoutStorageKey}.signal-engine.v1.${layoutWorkspaceName}`;
+  const {
+    chartLinkStorageKey,
+    chartSidecarStorageKey,
+    coreSplitByScreenStorageKey,
+    layoutStorageKey,
+    layoutWorkspaceStorageKey,
+    legacyChartLinkStorageKey,
+    signalEngineStorageKey,
+    termCoreAutoSaveId,
+  } = buildTerminalLayoutStorageKeys(accountId, layoutWorkspaceName, layoutScreenProfile);
   const reasonLegendStorageKey = `${signalEngineStorageKey}.reason-codes-legend.v1`;
-  const termCoreAutoSaveId = `txt-terminal-core-split-v2.${accountId || "default"}.${layoutWorkspaceName}.${layoutScreenProfile}`;
   const autoExecutionSignatureRef = useRef("");
   const autoExecutionLastAtRef = useRef(0);
   const autoExecutionAuditSignatureRef = useRef("");
@@ -1964,10 +1711,202 @@ export default function TradingTerminalPage() {
   const selfLearningBackendReadyRef = useRef(false);
   const selfLearningBackendScopeRef = useRef("");
   const authBackoffUntilRef = useRef(0);
+  const authStatusSyncedAtRef = useRef(0);
+  const authStatusRef = useRef<AuthSessionStatus>("unknown");
+  const authStatusRequestRef = useRef<Promise<boolean> | null>(null);
+  const chartRestFallbackKeyRef = useRef("");
+  const chartEmptyRecoveryKeyRef = useRef("");
+  const localFeedDismissedFallbackKeyRef = useRef("");
+  const activeChartConfigRef = useRef<{ instrument: string; venue: string; timeframe: string }>({
+    instrument: "BTCUSD",
+    venue: "binance-public",
+    timeframe: "1m",
+  });
+  const chartSidecarDragRef = useRef<{ id: ChartSidecarId; startX: number; startY: number; origX: number; origY: number } | null>(null);
+
+  const {
+    chartHudBounds,
+    chartHudDragging,
+    chartHudMinimized,
+    chartHudPosition,
+    chartOrderHudRef,
+    chartStageRef,
+    beginChartHudDrag,
+    resetChartHud,
+    setChartHudMinimized,
+  } = useChartExecutionHud({ layoutScreenProfile, signalDisplayMode });
+
+  useEffect(() => {
+    setAutoTuningIdempotencyKey((current) => current || buildIdempotencyKey());
+  }, []);
+
+  useEffect(() => {
+    setIsHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return undefined;
+    }
+
+    const syncLayoutScreenProfile = () => {
+      const width = window.innerWidth;
+      setLayoutScreenProfile(
+        width <= 680
+          ? "sm"
+          : width <= 1120
+            ? "md"
+            : width <= 1560
+              ? "lg"
+              : "xl",
+      );
+    };
+
+    syncLayoutScreenProfile();
+    window.addEventListener("resize", syncLayoutScreenProfile);
+    return () => {
+      window.removeEventListener("resize", syncLayoutScreenProfile);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const query = new URLSearchParams(window.location.search);
+    const forced = query.get("v2");
+    const persisted = window.localStorage.getItem("txt.terminal.v2");
+    const forcedEngine = query.get("engine");
+    const persistedEngine = window.localStorage.getItem("txt.terminal.engine");
+    const forcedGpuGrid = query.get("gpuGrid");
+    const persistedGpuGrid = window.localStorage.getItem("txt.terminal.gpu-grid");
+    const forcedSmoothing = query.get("smoothingMs");
+    const persistedSmoothing = window.localStorage.getItem("txt.terminal.smoothing-ms");
+    const webgl2 = isWebGL2Available();
+    if (forced === "1" || persisted === "1") {
+      setTerminalV2Enabled(true);
+    } else if (forced === "0" || persisted === "0") {
+      setTerminalV2Enabled(false);
+    }
+
+    const requestedEngine = forcedEngine === "v4" || persistedEngine === "v4"
+      ? "v4"
+      : forcedEngine === "v3" || persistedEngine === "v3"
+        ? "v3"
+        : TERMINAL_CHART_ENGINE_DEFAULT;
+
+    const effectiveEngine = requestedEngine === "v4" && !webgl2 ? "v3" : requestedEngine;
+    setChartEngineMode(effectiveEngine);
+
+    if (effectiveEngine !== requestedEngine) {
+      window.localStorage.setItem("txt.terminal.engine", effectiveEngine);
+    }
+
+    console.info("[terminal] engine runtime selection", {
+      requestedEngine,
+      effectiveEngine,
+      webgl2,
+    });
+
+    const parsedGrid = parseGpuViewportGrid(forcedGpuGrid) ?? parseGpuViewportGrid(persistedGpuGrid);
+    if (parsedGrid) {
+      setGpuViewportGrid(parsedGrid);
+    }
+
+    const parsedSmoothing = parseChartSmoothingMs(forcedSmoothing) ?? parseChartSmoothingMs(persistedSmoothing);
+    if (parsedSmoothing !== null) {
+      setChartSmoothingMs(parsedSmoothing);
+    }
+  }, []);
+
+  const toggleTerminalV2 = useCallback(() => {
+    setTerminalV2Enabled((current) => {
+      const next = !current;
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem("txt.terminal.v2", next ? "1" : "0");
+      }
+      return next;
+    });
+  }, []);
+
+  const toggleChartEngineMode = useCallback(() => {
+    setChartEngineMode((current) => {
+      const next = current === "v4" ? "v3" : "v4";
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem("txt.terminal.engine", next);
+      }
+      return next;
+    });
+  }, []);
+
+  const setGpuViewportGridMode = useCallback((next: 1 | 4 | 16 | "auto") => {
+    setGpuViewportGrid(next);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem("txt.terminal.gpu-grid", String(next));
+    }
+  }, []);
+
+  const setChartSmoothingMode = useCallback((next: 0 | 80 | 140 | 220) => {
+    setChartSmoothingMs(next);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem("txt.terminal.smoothing-ms", String(next));
+    }
+  }, []);
 
   const markUnauthorizedBackoff = () => {
     authBackoffUntilRef.current = Date.now() + 30_000;
+    authStatusSyncedAtRef.current = Date.now();
+    authStatusRef.current = "unauthenticated";
+    setAuthStatus("unauthenticated");
     setAuthSessionRequired(true);
+  };
+
+  const refreshAuthSession = async (force = false): Promise<boolean> => {
+    const isPublicHost = isGtixPublicBrowserHost();
+    const wasAuthenticated = authStatusRef.current === "authenticated";
+    if (!force && authStatusRequestRef.current) {
+      return authStatusRequestRef.current;
+    }
+    if (!force && authStatusRef.current === "unauthenticated" && Date.now() < authBackoffUntilRef.current) {
+      setAuthSessionRequired(true);
+      return false;
+    }
+    if (
+      !force
+      && isPublicHost
+      && authStatusRef.current !== "unknown"
+      && Date.now() - authStatusSyncedAtRef.current < PUBLIC_AUTH_STATUS_CACHE_MS
+    ) {
+      const authenticated = authStatusRef.current === "authenticated";
+      setAuthSessionRequired(!authenticated);
+      return authenticated;
+    }
+    const request = fetchTerminalAuthStatus(wasAuthenticated)
+      .then(({ authenticated, definitive }) => {
+        if (!definitive) {
+          if (wasAuthenticated) {
+            setAuthStatus("authenticated");
+            setAuthSessionRequired(false);
+            return true;
+          }
+          return false;
+        }
+        authStatusSyncedAtRef.current = Date.now();
+        authStatusRef.current = authenticated ? "authenticated" : "unauthenticated";
+        setAuthStatus(authenticated ? "authenticated" : "unauthenticated");
+        setAuthSessionRequired(!authenticated);
+        if (authenticated) {
+          authBackoffUntilRef.current = 0;
+        } else {
+          authBackoffUntilRef.current = Math.max(authBackoffUntilRef.current, Date.now() + 15_000);
+        }
+        return authenticated;
+      })
+      .finally(() => {
+        authStatusRequestRef.current = null;
+      });
+    authStatusRequestRef.current = request;
+    return request;
   };
 
   const buildRoutingRequestHeaders = (requestType: "ui" | "ai" | "execution", symbolValue: string): HeadersInit => {
@@ -1991,59 +1930,266 @@ export default function TradingTerminalPage() {
     };
   };
 
-  const fetchRoutingScoreCached = (symbolValue: string, requestType: "ui" | "ai" | "execution" = "ui"): Promise<JsonMap | null> => {
-    const key = symbolValue.trim().toUpperCase();
-    const now = Date.now();
-    const ttlMs = 1500;
-    const cache = routingScoreCacheRef.current;
-    if (requestType === "execution") {
-      return fetch(`/api/execution/routing/score?symbol=${encodeURIComponent(symbolValue)}`, {
-        cache: "no-store",
-        headers: buildRoutingRequestHeaders("execution", symbolValue),
-      }).then((response) => (response.ok ? response.json() : null)).catch(() => null) as Promise<JsonMap | null>;
-    }
-    const cached = cache.get(key);
-    if (cached && now - cached.timestamp < ttlMs) {
-      return cached.promise;
-    }
-
-    const contextualPromise = fetch(`/api/execution/routing/score?symbol=${encodeURIComponent(symbolValue)}`, {
-      cache: "no-store",
-      headers: buildRoutingRequestHeaders(requestType, symbolValue),
-    })
-      .then((response) => (response.ok ? response.json() : null))
-      .catch(() => null) as Promise<JsonMap | null>;
-
-    cache.set(key, { timestamp: now, promise: contextualPromise });
-    if (cache.size > 32) {
-      for (const [cacheKey, value] of cache.entries()) {
-        if (now - value.timestamp > ttlMs) {
-          cache.delete(cacheKey);
-        }
-        if (cache.size <= 24) {
-          break;
-        }
-      }
-    }
-    return contextualPromise;
-  };
-
   useEffect(() => {
     chartOrderTicketRef.current = chartOrderTicket;
   }, [chartOrderTicket]);
+
+  useEffect(() => {
+    authStatusRef.current = authStatus;
+  }, [authStatus]);
 
   useEffect(() => {
     chartSnapStateRef.current = chartSnapState;
   }, [chartSnapState]);
 
   useEffect(() => {
+    if (typeof window === "undefined" || typeof document === "undefined") {
+      return;
+    }
+    if (!isGtixPublicBrowserHost()) {
+      setPublicOpsRefreshPaused(false);
+      return;
+    }
+    const syncPausedState = () => {
+      setPublicOpsRefreshPaused(shouldPausePublicOpsRefresh());
+    };
+    syncPausedState();
+    document.addEventListener("visibilitychange", syncPausedState);
+    window.addEventListener("focus", syncPausedState);
+    window.addEventListener("blur", syncPausedState);
+    window.addEventListener("pageshow", syncPausedState);
+    return () => {
+      document.removeEventListener("visibilitychange", syncPausedState);
+      window.removeEventListener("focus", syncPausedState);
+      window.removeEventListener("blur", syncPausedState);
+      window.removeEventListener("pageshow", syncPausedState);
+    };
+  }, []);
+
+  useEffect(() => {
     quotesRef.current = quotes;
   }, [quotes]);
+
+  const selectedChartQuote = useMemo(
+    () => pickPreferredChartQuote(quotes, selectedChartSymbol, chartVenueOverride),
+    [chartVenueOverride, quotes, selectedChartSymbol],
+  );
+
+  const selectedChartVenue = String(selectedChartQuote?.venue || "binance-public");
+  const selectedChartInstrument = normalizeInstrument(String(selectedChartQuote?.instrument || selectedChartSymbol || "BTCUSD"));
+  const selectedChartMetricSymbol = selectedChartQuote ? instrumentLabel(selectedChartQuote) : selectedChartInstrument;
+  const selectedChartMetricCandidates = useMemo(() => {
+    const candidates = new Set<string>();
+    for (const candidate of buildChartSymbolCandidates(selectedChartSymbol)) {
+      candidates.add(candidate);
+    }
+    for (const candidate of buildChartSymbolCandidates(selectedChartInstrument)) {
+      candidates.add(candidate);
+    }
+    candidates.add(selectedChartInstrument);
+    candidates.add(normalizeInstrument(selectedChartMetricSymbol));
+    return candidates;
+  }, [selectedChartInstrument, selectedChartMetricSymbol, selectedChartSymbol]);
+  const selectedChartMetric = useMemo<MarketMetric | null>(() => {
+    if (!marketMicro) {
+      return null;
+    }
+    const activeEvents = Array.isArray(marketMicro.active_events) ? marketMicro.active_events as {type: string}[] : [];
+    return {
+      fundingRate: toNumber(marketMicro.funding_rate, 0),
+      openInterest: toNumber(marketMicro.open_interest, 0),
+      volume: toNumber(marketMicro.buy_volume, 0) + toNumber(marketMicro.sell_volume, 0),
+      depthImbalance: toNumber(marketMicro.depth_imbalance, 0),
+      tapeAcceleration: toNumber(marketMicro.tape_acceleration, 0),
+      cvd: toNumber(marketMicro.cvd, 0),
+      cvdDelta: toNumber(marketMicro.cvd_delta, 0),
+      cvdTrend: (String(marketMicro.cvd_trend || "flat") as MarketMetric["cvdTrend"]),
+      flowImbalance: toNumber(marketMicro.flow_imbalance, 0),
+      spreadBps: toNumber(marketMicro.spread_bps, 0),
+      tradeAggressiveness: toNumber(marketMicro.trade_aggressiveness, 0),
+      avgLatencyMs: toNumber(marketMicro.avg_latency_ms, 0),
+      latencyTier: (String(marketMicro.latency_tier || "normal") as MarketMetric["latencyTier"]),
+      activeEventCount: activeEvents.length,
+      lastEventType: activeEvents.length > 0 ? String(activeEvents[activeEvents.length - 1].type) : null,
+    };
+  }, [marketMicro]);
+
+  useEffect(() => {
+    activeChartConfigRef.current = {
+      instrument: selectedChartInstrument,
+      venue: selectedChartVenue,
+      timeframe: chartTimeframe,
+    };
+  }, [chartTimeframe, selectedChartInstrument, selectedChartVenue]);
+
+  useEffect(() => {
+    if (!selectedChartMetric) {
+      return;
+    }
+    setMarketMetricsBySymbol((current) => {
+      const existing = current[selectedChartMetricSymbol];
+      if (
+        existing
+        && existing.fundingRate === selectedChartMetric.fundingRate
+        && existing.openInterest === selectedChartMetric.openInterest
+        && existing.volume === selectedChartMetric.volume
+        && existing.depthImbalance === selectedChartMetric.depthImbalance
+        && existing.tapeAcceleration === selectedChartMetric.tapeAcceleration
+        && existing.cvd === selectedChartMetric.cvd
+        && existing.flowImbalance === selectedChartMetric.flowImbalance
+      ) {
+        return current;
+      }
+      return {
+        ...current,
+        [selectedChartMetricSymbol]: selectedChartMetric,
+      };
+    });
+  }, [selectedChartMetric, selectedChartMetricSymbol]);
+
+  useEffect(() => {
+    if (
+      authSessionRequired
+      || authStatus !== "authenticated"
+      || chartMode !== "candles"
+      || chartLoading
+      || ohlcvBars.length > 0
+      || quotes.length === 0
+      || classifyInstrument(selectedChartSymbol) !== "crypto"
+    ) {
+      return;
+    }
+
+    const recoveryQuote = pickDefaultChartQuote(quotes);
+    if (!recoveryQuote) {
+      return;
+    }
+
+    const recoverySymbol = instrumentLabel(recoveryQuote);
+    if (!recoverySymbol || normalizeInstrument(recoverySymbol) === normalizeInstrument(selectedChartSymbol)) {
+      return;
+    }
+
+    const recoveryKey = `${normalizeInstrument(selectedChartSymbol)}|${chartTimeframe}|${normalizeInstrument(recoverySymbol)}`;
+    if (chartEmptyRecoveryKeyRef.current === recoveryKey) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      chartEmptyRecoveryKeyRef.current = recoveryKey;
+      setSelectedChartSymbol(recoverySymbol);
+      setWorkspaceHintBadge(`Chart source recovered: ${recoverySymbol}`);
+    }, 2500);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [authSessionRequired, authStatus, chartLoading, chartMode, chartTimeframe, ohlcvBars.length, quotes, selectedChartSymbol]);
+
+  const marketMetricsUniverseKey = useMemo(() => {
+    return buildMarketMetricsUniverse(quotes, symbolFilter, marketFilter)
+      .map((quote) => `${quote.symbolKey}|${quote.venue}|${quote.instrument}`)
+      .join(",");
+  }, [marketFilter, quotes, symbolFilter]);
+
+  const fetchMarketBusSnapshot = useCallback(async (instrument: string, venue: string, timeframe: string) => {
+    const cacheKey = `${instrument}|${venue}|${timeframe}`;
+    const cached = marketSnapshotCacheRef.current.get(cacheKey);
+    if (cached && Date.now() - cached.fetchedAt < MARKET_SNAPSHOT_CACHE_TTL_MS) {
+      return cached.payload;
+    }
+
+    const inFlight = marketSnapshotInflightRef.current.get(cacheKey);
+    if (inFlight) {
+      return inFlight;
+    }
+
+    const request = fetch(`/api/market/bus/snapshot?instrument=${encodeURIComponent(instrument)}&venue=${encodeURIComponent(venue)}&timeframe=${encodeURIComponent(timeframe)}&lookback_minutes=60&trade_limit=200`, {
+      cache: "no-store",
+      headers: buildRoutingRequestHeaders("ui", instrument),
+    })
+      .then((response) => (response.ok ? response.json() : null))
+      .then((payload) => {
+        const normalizedPayload = payload && typeof payload === "object" && !Array.isArray(payload)
+          ? (payload as JsonMap)
+          : null;
+        marketSnapshotCacheRef.current.set(cacheKey, { fetchedAt: Date.now(), payload: normalizedPayload });
+        return normalizedPayload;
+      })
+      .catch(() => null)
+      .finally(() => {
+        marketSnapshotInflightRef.current.delete(cacheKey);
+      });
+
+    marketSnapshotInflightRef.current.set(cacheKey, request);
+    return request;
+  }, []);
 
   useEffect(() => () => {
     if (chartLongPressTimerRef.current !== null) {
       window.clearTimeout(chartLongPressTimerRef.current);
     }
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    const syncAuthStatus = async (force = false) => {
+      const authenticated = await refreshAuthSession(force);
+      if (!active || authenticated) {
+        return;
+      }
+      setOhlcvStreamState("offline");
+      setDepthStreamState("offline");
+      setTelemetryStreamState("offline");
+    };
+    void syncAuthStatus(true);
+    const intervalMs = isGtixPublicBrowserHost() ? PUBLIC_AUTH_STATUS_SYNC_MS : 15_000;
+    const timer = window.setInterval(() => {
+      void syncAuthStatus(false);
+    }, intervalMs);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleFloatingMove = (event: MouseEvent) => {
+      const floatingDrag = floatingDragRef.current;
+      if (floatingDrag) {
+        setFloatingPanels((current) => current.map((panel) => (
+          panel.id === floatingDrag.id
+            ? clampFloatingPanel({
+                ...panel,
+                x: floatingDrag.origX + event.clientX - floatingDrag.startX,
+                y: floatingDrag.origY + event.clientY - floatingDrag.startY,
+              })
+            : panel
+        )));
+      }
+      const sidecarDrag = chartSidecarDragRef.current;
+      if (sidecarDrag) {
+        setDetachedChartSidecars((current) => current.map((panel) => (
+          panel.id === sidecarDrag.id
+            ? clampDetachedChartSidecar({
+                ...panel,
+                x: sidecarDrag.origX + event.clientX - sidecarDrag.startX,
+                y: sidecarDrag.origY + event.clientY - sidecarDrag.startY,
+              })
+            : panel
+        )));
+      }
+    };
+    const handleFloatingUp = () => {
+      floatingDragRef.current = null;
+      chartSidecarDragRef.current = null;
+    };
+    window.addEventListener("mousemove", handleFloatingMove);
+    window.addEventListener("mouseup", handleFloatingUp);
+    return () => {
+      window.removeEventListener("mousemove", handleFloatingMove);
+      window.removeEventListener("mouseup", handleFloatingUp);
+    };
   }, []);
 
   useEffect(() => {
@@ -2077,45 +2223,6 @@ export default function TradingTerminalPage() {
   useEffect(() => {
     if (typeof window === "undefined") {
       return undefined;
-    }
-    const refreshProfile = () => {
-      setLayoutScreenProfile(screenLayoutProfile(window.innerWidth));
-    };
-    refreshProfile();
-    window.addEventListener("resize", refreshProfile);
-    return () => {
-      window.removeEventListener("resize", refreshProfile);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-    try {
-      const serialized = window.localStorage.getItem(coreSplitByScreenStorageKey);
-      if (!serialized) {
-        return;
-      }
-      const parsed = JSON.parse(serialized) as Record<string, number>;
-      const key = `${layoutWorkspaceName}::${layoutScreenProfile}`;
-      const stored = parsed[key];
-      if (!Number.isFinite(stored)) {
-        return;
-      }
-      const next = Math.max(52, Math.min(85, Number(stored)));
-      setLayoutCoreSplit(next);
-      if (termCoreGroupRef.current) {
-        termCoreGroupRef.current.setLayout([next, 100 - next]);
-      }
-    } catch {
-      // noop
-    }
-  }, [coreSplitByScreenStorageKey, layoutScreenProfile, layoutWorkspaceName]);
-
-  useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
     }
     try {
       const raw = window.localStorage.getItem(signalEngineStorageKey);
@@ -2483,6 +2590,11 @@ export default function TradingTerminalPage() {
     lowerOrder: layoutLowerOrder,
     monitoringOrder: layoutMonitoringOrder,
     floatingPanels,
+    chartSidecar: {
+      profile: chartSidecarProfile,
+      detached: detachedChartSidecars,
+      previewOpen: chartOrderPreviewOpen,
+    },
     chartLink: {
       symbol: chartLinkSymbolEnabled,
       timeframe: chartLinkTimeframeEnabled,
@@ -2496,20 +2608,7 @@ export default function TradingTerminalPage() {
     },
   });
 
-  const readCurrentAccountWorkspaceBundle = (): TerminalWorkspaceBundle | null => {
-    if (typeof window === "undefined") {
-      return null;
-    }
-    try {
-      const raw = window.localStorage.getItem(layoutWorkspaceStorageKey);
-      if (!raw) {
-        return null;
-      }
-      return JSON.parse(raw) as TerminalWorkspaceBundle;
-    } catch {
-      return null;
-    }
-  };
+  const readCurrentAccountWorkspaceBundle = (): TerminalWorkspaceBundle | null => readTerminalWorkspaceBundle(layoutWorkspaceStorageKey);
 
   const applyBackendTerminalProfile = (profile: Partial<UserUiPreferencesProfile>): void => {
     if (typeof window === "undefined") {
@@ -2537,25 +2636,7 @@ export default function TradingTerminalPage() {
     const layoutPayload = layoutMap && typeof layoutMap[accountKey] === "object" ? layoutMap[accountKey] : null;
     const workspacePayloadRaw = workspaceMap && typeof workspaceMap[accountKey] === "object" ? workspaceMap[accountKey] : null;
     const floatingPayload = floatingPresetMap && typeof floatingPresetMap[accountKey] === "object" ? floatingPresetMap[accountKey] : null;
-    let workspacePayload = workspacePayloadRaw;
-    if (workspacePayloadRaw && floatingPayload) {
-      const source = workspacePayloadRaw as { active?: string; workspaces?: Record<string, { floatingPanels?: unknown[] }> };
-      const floatingByWorkspace = floatingPayload as Record<string, unknown[]>;
-      const mergedWorkspaces = Object.entries(source.workspaces || {}).reduce<Record<string, unknown>>((acc, [name, layout]) => {
-        const floatingPanels = Array.isArray(layout?.floatingPanels) && layout.floatingPanels.length > 0
-          ? layout.floatingPanels
-          : (Array.isArray(floatingByWorkspace[name]) ? floatingByWorkspace[name] : []);
-        acc[name] = {
-          ...(layout || {}),
-          floatingPanels,
-        };
-        return acc;
-      }, {});
-      workspacePayload = {
-        active: source.active,
-        workspaces: mergedWorkspaces,
-      };
-    }
+    const workspacePayload = mergeFloatingPresetsIntoWorkspaceBundle(workspacePayloadRaw, floatingPayload) || workspacePayloadRaw;
     if (layoutPayload) {
       window.localStorage.setItem(layoutStorageKey, JSON.stringify(layoutPayload));
     }
@@ -2571,6 +2652,9 @@ export default function TradingTerminalPage() {
     setLayoutLowerOrder(normalized.lowerOrder);
     setLayoutMonitoringOrder(normalized.monitoringOrder);
     setFloatingPanels(normalized.floatingPanels);
+    setChartSidecarProfile(normalized.chartSidecar.profile);
+    setDetachedChartSidecars(normalized.chartSidecar.detached);
+    setChartOrderPreviewOpen(normalized.chartSidecar.previewOpen);
     setChartLinkSymbolEnabled(normalized.chartLink.symbol);
     setChartLinkTimeframeEnabled(normalized.chartLink.timeframe);
     setRiskAlertWindow(normalized.riskAlert.window);
@@ -2603,6 +2687,9 @@ export default function TradingTerminalPage() {
     setLayoutLowerOrder(next.lowerOrder);
     setLayoutMonitoringOrder(next.monitoringOrder);
     setFloatingPanels(next.floatingPanels);
+    setChartSidecarProfile(next.chartSidecar.profile);
+    setDetachedChartSidecars(next.chartSidecar.detached);
+    setChartOrderPreviewOpen(next.chartSidecar.previewOpen);
     if (termCoreGroupRef.current) {
       termCoreGroupRef.current.setLayout([next.coreSplit, 100 - next.coreSplit]);
     }
@@ -2687,6 +2774,16 @@ export default function TradingTerminalPage() {
     setWorkspaceHintBadge(`Risk alert reset: ${defaults.missThreshold}/${defaults.window}`);
   };
 
+  const saveCustomChartSidecarLayout = () => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const payload = currentLayoutSnapshot();
+    window.localStorage.setItem(layoutStorageKey, JSON.stringify(payload));
+    saveWorkspaceBundle(layoutWorkspaceName, payload);
+    setWorkspaceHintBadge(`Custom sidecar saved: ${layoutWorkspaceName}`);
+  };
+
   const restoreWorkspaceBundle = () => {
     if (typeof window === "undefined") {
       return;
@@ -2694,15 +2791,15 @@ export default function TradingTerminalPage() {
     try {
       const raw = window.localStorage.getItem(layoutWorkspaceStorageKey);
       if (!raw) {
-        setLayoutWorkspaceOptions(["Scalp-1", "Swing-NY", "Monitoring-Risk"]);
-        setLayoutWorkspaceName("Swing-NY");
+        setLayoutWorkspaceOptions(DEFAULT_LAYOUT_WORKSPACE_OPTIONS);
+        setLayoutWorkspaceName(DEFAULT_LAYOUT_WORKSPACE_NAME);
         return;
       }
       const parsed = JSON.parse(raw) as TerminalWorkspaceBundle;
       const names = Object.keys(parsed.workspaces || {});
       if (names.length === 0) {
-        setLayoutWorkspaceOptions(["Scalp-1", "Swing-NY", "Monitoring-Risk"]);
-        setLayoutWorkspaceName("Swing-NY");
+        setLayoutWorkspaceOptions(DEFAULT_LAYOUT_WORKSPACE_OPTIONS);
+        setLayoutWorkspaceName(DEFAULT_LAYOUT_WORKSPACE_NAME);
         return;
       }
       setLayoutWorkspaceOptions(names);
@@ -2712,8 +2809,8 @@ export default function TradingTerminalPage() {
       const normalized = normalizeDockLayout(parsed.workspaces[active], fallback);
       applyNormalizedLayoutState(normalized);
     } catch {
-      setLayoutWorkspaceOptions(["Scalp-1", "Swing-NY", "Monitoring-Risk"]);
-      setLayoutWorkspaceName("Swing-NY");
+      setLayoutWorkspaceOptions(DEFAULT_LAYOUT_WORKSPACE_OPTIONS);
+      setLayoutWorkspaceName(DEFAULT_LAYOUT_WORKSPACE_NAME);
     }
   };
 
@@ -2733,6 +2830,16 @@ export default function TradingTerminalPage() {
       return;
     }
     setSelectedChartSymbol(nextSymbol);
+    setChartVenueOverride(null);
+  };
+
+  const setActiveChartSymbolVenue = (symbolValue: string, venueValue?: string) => {
+    const nextSymbol = symbolValue.trim();
+    if (!nextSymbol) {
+      return;
+    }
+    setSelectedChartSymbol(nextSymbol);
+    setChartVenueOverride(venueValue ? venueValue.trim() : null);
   };
 
   const setActiveChartTimeframe = (timeframeValue: "1m" | "5m" | "15m") => {
@@ -2758,7 +2865,7 @@ export default function TradingTerminalPage() {
     const payload = currentLayoutSnapshot();
     window.localStorage.setItem(layoutStorageKey, JSON.stringify(payload));
     saveWorkspaceBundle(layoutWorkspaceName, payload);
-  }, [chartLinkSymbolEnabled, chartLinkTimeframeEnabled, floatingPanels, layoutCoreSplit, layoutLowerOrder, layoutMicroOrder, layoutMonitoringOrder, layoutPreset, layoutStorageKey, riskAlertMissThreshold, riskAlertWindow, riskHardAlertEnabled, riskHardAlertThresholdPct, riskTimelineRefreshSec]);
+  }, [chartLinkSymbolEnabled, chartLinkTimeframeEnabled, chartOrderPreviewOpen, chartSidecarProfile, detachedChartSidecars, floatingPanels, layoutCoreSplit, layoutLowerOrder, layoutMicroOrder, layoutMonitoringOrder, layoutPreset, layoutStorageKey, riskAlertMissThreshold, riskAlertWindow, riskHardAlertEnabled, riskHardAlertThresholdPct, riskTimelineRefreshSec]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -2795,6 +2902,23 @@ export default function TradingTerminalPage() {
       // noop
     }
   }, [chartLinkStorageKey, chartLinkSymbolEnabled, chartLinkTimeframeEnabled, chartTimeframe, layoutWorkspaceName, selectedChartSymbol]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    try {
+      const payload = {
+        updatedAt: new Date().toISOString(),
+        profile: chartSidecarProfile,
+        previewOpen: chartOrderPreviewOpen,
+        detached: detachedChartSidecars,
+      };
+      window.localStorage.setItem(chartSidecarStorageKey, JSON.stringify(payload));
+    } catch {
+      // noop
+    }
+  }, [chartOrderPreviewOpen, chartSidecarProfile, chartSidecarStorageKey, detachedChartSidecars]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -2884,10 +3008,10 @@ export default function TradingTerminalPage() {
       }
       delete parsed.workspaces[name];
       const names = Object.keys(parsed.workspaces);
-      const nextActive = names.includes(parsed.active) ? parsed.active : names[0] || "Swing-NY";
+      const nextActive = names.includes(parsed.active) ? parsed.active : names[0] || DEFAULT_LAYOUT_WORKSPACE_NAME;
       parsed.active = nextActive;
       window.localStorage.setItem(layoutWorkspaceStorageKey, JSON.stringify(parsed));
-      setLayoutWorkspaceOptions(names.length > 0 ? names : ["Scalp-1", "Swing-NY", "Monitoring-Risk"]);
+      setLayoutWorkspaceOptions(names.length > 0 ? names : DEFAULT_LAYOUT_WORKSPACE_OPTIONS);
       setLayoutWorkspaceName(nextActive);
       if (names.length > 0) {
         loadNamedWorkspace(nextActive);
@@ -2904,46 +3028,25 @@ export default function TradingTerminalPage() {
       return;
     }
     const layout = currentLayoutSnapshot();
-    const payload = {
-      exportedAt: new Date().toISOString(),
-      activeWorkspace: layoutWorkspaceName,
-      currentLayout: layout,
-      workspaceStorageKey: layoutWorkspaceStorageKey,
-    };
+    const payload = buildLayoutExportPayload(accountId, layoutWorkspaceName, layout, layoutWorkspaceStorageKey);
     downloadJsonFile(`txt-layouts-${accountId || "default"}.json`, payload);
   };
 
   const importLayoutsJson = async (file: File) => {
     const text = await file.text();
-    const parsed = JSON.parse(text) as {
-      activeWorkspace?: string;
-      currentLayout?: Partial<TerminalLayoutConfig>;
-      workspaces?: Record<string, Partial<TerminalLayoutConfig>>;
-    };
     const fallback = buildLayoutPreset("swing", uiMode === "novice");
-    if (parsed.workspaces && Object.keys(parsed.workspaces).length > 0) {
-      const normalizedWorkspaces = Object.entries(parsed.workspaces).reduce<Record<string, TerminalLayoutConfig>>((acc, [name, layout]) => {
-        if (!name.trim()) {
-          return acc;
-        }
-        acc[name] = normalizeDockLayout(layout, fallback);
-        return acc;
-      }, {});
-      const names = Object.keys(normalizedWorkspaces);
-      const active = parsed.activeWorkspace && names.includes(parsed.activeWorkspace) ? parsed.activeWorkspace : names[0];
+    const imported = parseImportedTerminalLayouts(text, fallback);
+    if (imported.kind === "workspaces") {
       if (typeof window !== "undefined") {
-        window.localStorage.setItem(layoutWorkspaceStorageKey, JSON.stringify({ active, workspaces: normalizedWorkspaces } satisfies TerminalWorkspaceBundle));
+        window.localStorage.setItem(layoutWorkspaceStorageKey, JSON.stringify(imported.bundle));
       }
-      setLayoutWorkspaceOptions(names);
-      setLayoutWorkspaceName(active);
-      loadNamedWorkspace(active);
+      setLayoutWorkspaceOptions(imported.names);
+      setLayoutWorkspaceName(imported.active);
+      loadNamedWorkspace(imported.active);
       return;
     }
-    if (parsed.currentLayout) {
-      const normalized = normalizeDockLayout(parsed.currentLayout, fallback);
-      applyNormalizedLayoutState(normalized);
-      saveWorkspaceBundle(layoutWorkspaceName || "Imported", normalized);
-    }
+    applyNormalizedLayoutState(imported.layout);
+    saveWorkspaceBundle(layoutWorkspaceName || "Imported", imported.layout);
   };
 
   const removeDockPanel = (sourceZone: DockZone, panelId: DockPanelId) => {
@@ -3039,8 +3142,30 @@ export default function TradingTerminalPage() {
     insertDockPanel(fp.fromZone, id);
   };
 
-  const loadAll = async () => {
-    if (Date.now() < authBackoffUntilRef.current) {
+  const detachChartSidecar = (id: ChartSidecarId) => {
+    const defaults = CHART_SIDECAR_FLOATING_DEFAULTS[id];
+    const cx = typeof window !== "undefined" ? Math.max(60, window.innerWidth / 2 - defaults.w / 2) : 220;
+    const cy = typeof window !== "undefined" ? Math.max(60, window.innerHeight / 2 - defaults.h / 2) : 180;
+    setDetachedChartSidecars((current) => [
+      ...current.filter((panel) => panel.id !== id),
+      clampDetachedChartSidecar({ id, x: cx, y: cy, w: defaults.w, h: defaults.h }),
+    ]);
+  };
+
+  const dockChartSidecar = (id: ChartSidecarId) => {
+    setDetachedChartSidecars((current) => current.filter((panel) => panel.id !== id));
+  };
+
+  const applyChartSidecarLayout = (mode: Exclude<ChartSidecarLayoutMode, "custom">) => {
+    setDetachedChartSidecars(buildDetachedChartSidecarLayout(chartSidecarProfile, mode));
+  };
+
+  const loadAll = async (force = false) => {
+    if (!force && shouldPausePublicOpsRefresh()) {
+      return;
+    }
+    const authenticated = await refreshAuthSession();
+    if (!authenticated || Date.now() < authBackoffUntilRef.current) {
       return;
     }
 
@@ -3121,10 +3246,11 @@ export default function TradingTerminalPage() {
   };
 
   useEffect(() => {
-    loadAll().catch((err) => setError(err instanceof Error ? err.message : "Erreur inconnue"));
+    loadAll(true).catch((err) => setError(err instanceof Error ? err.message : "Erreur inconnue"));
+    const intervalMs = isGtixPublicBrowserHost() ? PUBLIC_TERMINAL_BACKGROUND_REFRESH_MS : 60_000;
     const timer = window.setInterval(() => {
       void loadAll().catch((err) => setError(err instanceof Error ? err.message : "Erreur inconnue"));
-    }, 60_000);
+    }, intervalMs);
     return () => window.clearInterval(timer);
   }, []);
 
@@ -3133,6 +3259,9 @@ export default function TradingTerminalPage() {
 
     let active = true;
     const refresh = async () => {
+      if (shouldPausePublicOpsRefresh()) {
+        return;
+      }
       try {
         const response = await fetch("/api/strategies/auto-tuning", { cache: "no-store" });
         if (!response.ok) return;
@@ -3146,9 +3275,10 @@ export default function TradingTerminalPage() {
     };
 
     void refresh();
+    const intervalMs = isGtixPublicBrowserHost() ? PUBLIC_TERMINAL_GOVERNANCE_REFRESH_MS : 45_000;
     const timer = window.setInterval(() => {
       void refresh();
-    }, 45_000);
+    }, intervalMs);
 
     return () => {
       active = false;
@@ -3160,18 +3290,71 @@ export default function TradingTerminalPage() {
     let socket: WebSocket | null = null;
     let reconnectTimer: number | null = null;
     let pingTimer: number | null = null;
+    let pollTimer: number | null = null;
     let closedByUnmount = false;
+
+    const usePollingFallback = typeof window !== "undefined" && isGtixPublicHost(window.location.hostname);
+
+    const applyQuoteSnapshot = (nextQuotes: JsonMap[]) => {
+      setQuotes(nextQuotes);
+      setQuoteHistory((current) => {
+        const updated: QuoteHistoryMap = { ...current };
+        const timestamp = new Date();
+        const label = `${String(timestamp.getHours()).padStart(2, "0")}:${String(timestamp.getMinutes()).padStart(2, "0")}:${String(timestamp.getSeconds()).padStart(2, "0")}`;
+        for (const quote of nextQuotes) {
+          const quoteSymbol = instrumentLabel(quote);
+          const nextPoint = { label, value: toNumber(quote.last, 0) };
+          const existing = updated[quoteSymbol] || [];
+          updated[quoteSymbol] = [...existing, nextPoint].slice(-160);
+        }
+        return updated;
+      });
+    };
+
+    const schedulePoll = (delayMs: number) => {
+      if (closedByUnmount) {
+        return;
+      }
+      if (pollTimer !== null) {
+        window.clearTimeout(pollTimer);
+      }
+      pollTimer = window.setTimeout(() => {
+        void connect();
+      }, delayMs);
+    };
 
     const connect = async () => {
       if (closedByUnmount) {
         return;
       }
+      const authenticated = await refreshAuthSession();
+      if (!authenticated) {
+        return;
+      }
+      setAuthSessionRequired(false);
+      if (usePollingFallback) {
+        const response = await fetch("/api/market/quotes", {
+          cache: "no-store",
+          headers: buildRoutingRequestHeaders("ui", selectedChartSymbol),
+        }).catch(() => null);
+        if (closedByUnmount) {
+          return;
+        }
+        if (!response?.ok) {
+          schedulePoll(PUBLIC_TERMINAL_FALLBACK_POLL_MS);
+          return;
+        }
+        const payload = await response.json().catch(() => null);
+        if (closedByUnmount) {
+          return;
+        }
+        applyQuoteSnapshot(Array.isArray(payload) ? (payload as JsonMap[]) : []);
+        schedulePoll(PUBLIC_TERMINAL_FALLBACK_POLL_MS);
+        return;
+      }
       const token = await fetchWsToken();
       if (token === "__UNAUTHORIZED__") {
         markUnauthorizedBackoff();
-        reconnectTimer = window.setTimeout(() => {
-          void connect();
-        }, 30_000);
         return;
       }
       if (!token) {
@@ -3180,7 +3363,6 @@ export default function TradingTerminalPage() {
         }, 4000);
         return;
       }
-      setAuthSessionRequired(false);
       socket = new WebSocket(buildMarketQuotesWsUrl(token));
 
       socket.onopen = () => {
@@ -3198,20 +3380,7 @@ export default function TradingTerminalPage() {
             return;
           }
           const nextQuotes = ((payload.items as JsonMap[] | undefined) || []);
-          setQuotes(nextQuotes);
-
-          setQuoteHistory((current) => {
-            const updated: QuoteHistoryMap = { ...current };
-            const timestamp = new Date();
-            const label = `${String(timestamp.getHours()).padStart(2, "0")}:${String(timestamp.getMinutes()).padStart(2, "0")}:${String(timestamp.getSeconds()).padStart(2, "0")}`;
-            for (const quote of nextQuotes) {
-              const quoteSymbol = instrumentLabel(quote);
-              const nextPoint = { label, value: toNumber(quote.last, 0) };
-              const existing = updated[quoteSymbol] || [];
-              updated[quoteSymbol] = [...existing, nextPoint].slice(-160);
-            }
-            return updated;
-          });
+          applyQuoteSnapshot(nextQuotes);
         } catch {
           // Ignore malformed websocket frames.
         }
@@ -3223,6 +3392,9 @@ export default function TradingTerminalPage() {
           pingTimer = null;
         }
         if (closedByUnmount) {
+          return;
+        }
+        if (authStatusRef.current !== "authenticated" || Date.now() < authBackoffUntilRef.current) {
           return;
         }
         reconnectTimer = window.setTimeout(() => {
@@ -3237,6 +3409,9 @@ export default function TradingTerminalPage() {
       closedByUnmount = true;
       if (reconnectTimer) {
         window.clearTimeout(reconnectTimer);
+      }
+      if (pollTimer) {
+        window.clearTimeout(pollTimer);
       }
       if (pingTimer) {
         window.clearInterval(pingTimer);
@@ -3253,150 +3428,214 @@ export default function TradingTerminalPage() {
   }, [quotes, selectedChartSymbol]);
 
   useEffect(() => {
+    if (!marketDataBusRef.current) {
+      marketDataBusRef.current = createMarketDataBus();
+    }
+    const unsubscribe = marketDataBusRef.current.subscribe((snapshot) => {
+      setOhlcvBars((current) => {
+          const activeConfig = activeChartConfigRef.current;
+        if (snapshot.ohlcvBars.length > 0) {
+            const snapshotInstrument = normalizeInstrument(String(snapshot.ohlcvBars[0]?.instrument || activeConfig.instrument));
+            const snapshotVenue = String(snapshot.ohlcvBars[0]?.venue || activeConfig.venue);
+            const snapshotTimeframe = String(snapshot.ohlcvBars[0]?.tf || activeConfig.timeframe);
+            return chartInstrumentsMatch(snapshotInstrument, activeConfig.instrument)
+              && snapshotVenue === activeConfig.venue
+              && snapshotTimeframe === activeConfig.timeframe
+              ? snapshot.ohlcvBars
+              : current;
+        }
+        if (current.length === 0) {
+          return current;
+        }
+
+        if (snapshot.chartLoading || snapshot.ohlcvStreamState !== "offline") {
+          return current;
+        }
+
+        const currentInstrument = normalizeInstrument(String(current[0]?.instrument || activeConfig.instrument));
+        const currentVenue = String(current[0]?.venue || activeConfig.venue);
+        const currentTimeframe = String(current[0]?.tf || activeConfig.timeframe);
+
+        return chartInstrumentsMatch(currentInstrument, activeConfig.instrument)
+          && currentVenue === activeConfig.venue
+          && currentTimeframe === activeConfig.timeframe
+          ? current
+          : snapshot.ohlcvBars;
+      });
+      setNativeTrades(snapshot.nativeTrades);
+      setMarketMicro(snapshot.marketMicro);
+      setSessionState(snapshot.sessionState);
+      setMarketBusMeta(snapshot.busMeta);
+      setMarketBusLastSyncAt(snapshot.lastSyncAt);
+      setRoutingScore(snapshot.routingScore);
+      setOrderbook(snapshot.orderbook);
+      setMarketDepth(snapshot.marketDepth);
+      setOhlcvStreamState(snapshot.ohlcvStreamState);
+      setChartLoading(snapshot.chartLoading);
+      setDepthStreamState(snapshot.depthStreamState);
+    });
+    return () => {
+      unsubscribe();
+      marketDataBusRef.current?.disconnect();
+    };
+  }, []);
+
+  useEffect(() => {
     if (authSessionRequired) {
       setOhlcvBars([]);
       setNativeTrades([]);
       setMarketMicro(null);
       setSessionState(null);
+      setMarketBusMeta(null);
+      setMarketBusLastSyncAt(null);
       setRoutingScore(null);
       setOrderbook(null);
+      setMarketDepth(null);
+      setOhlcvStreamState("offline");
+      setDepthStreamState("offline");
       setChartLoading(false);
+      marketDataBusRef.current?.disconnect();
       return;
     }
-    if (marketBurstTimerRef.current !== null) {
-      window.clearTimeout(marketBurstTimerRef.current);
-      marketBurstTimerRef.current = null;
-    }
-    marketBurstAbortRef.current?.abort();
-    const controller = new AbortController();
-    marketBurstAbortRef.current = controller;
-    const selectedQuote = quotes.find((quote) => instrumentLabel(quote) === selectedChartSymbol);
-    const venue = String(selectedQuote?.venue || "binance-public");
-    const instrument = normalizeInstrument(String(selectedQuote?.instrument || selectedChartSymbol || "BTCUSD"));
-    const burstKey = `${instrument}|${venue}|${chartTimeframe}`;
-    const now = Date.now();
-    if (marketBurstLastKeyRef.current === burstKey && now - marketBurstLastStartedAtRef.current < 350) {
-      return () => {
-        controller.abort();
-      };
-    }
-
-    setMarketDepth(null);
     setChartLoading(true);
-
-    marketBurstTimerRef.current = window.setTimeout(() => {
-      marketBurstTimerRef.current = null;
-      marketBurstLastKeyRef.current = burstKey;
-      marketBurstLastStartedAtRef.current = Date.now();
-
-      Promise.allSettled([
-        fetch(`/api/market/ohlcv?instrument=${encodeURIComponent(instrument)}&venue=${encodeURIComponent(venue)}&timeframe=${encodeURIComponent(chartTimeframe)}&limit=500`, {
-          cache: "no-store",
-          signal: controller.signal,
-          headers: buildRoutingRequestHeaders("ai", instrument),
-        }).then((response) => (response.ok ? response.json() : [])),
-        fetch(`/api/market/trades?instrument=${encodeURIComponent(instrument)}&venue=${encodeURIComponent(venue)}&limit=200`, {
-          cache: "no-store",
-          signal: controller.signal,
-          headers: buildRoutingRequestHeaders("ai", instrument),
-        }).then((response) => (response.ok ? response.json() : [])),
-        fetch(`/api/market/microstructure?instrument=${encodeURIComponent(instrument)}&venue=${encodeURIComponent(venue)}&lookback_minutes=60`, {
-          cache: "no-store",
-          signal: controller.signal,
-          headers: buildRoutingRequestHeaders("ai", instrument),
-        }).then((response) => (response.ok ? response.json() : null)),
-        fetch(`/api/market/session-state?instrument=${encodeURIComponent(instrument)}`, {
-          cache: "no-store",
-          signal: controller.signal,
-          headers: buildRoutingRequestHeaders("ai", instrument),
-        }).then((response) => (response.ok ? response.json() : null)),
-        fetchRoutingScoreCached(instrument, "ai"),
-        fetch(`/api/broker/orderbook/${encodeURIComponent(venue)}/${encodeURIComponent(instrument)}`, {
-          cache: "no-store",
-          signal: controller.signal,
-          headers: buildRoutingRequestHeaders("ai", instrument),
-        }).then((response) => (response.ok ? response.json() : null)),
-      ])
-        .then((results) => {
-          if (controller.signal.aborted) {
-            return;
-          }
-          const resolveResult = <T,>(index: number, fallback: T): T => {
-            const result = results[index];
-            return result?.status === "fulfilled" ? (result.value as T) : fallback;
-          };
-          setOhlcvBars((resolveResult<JsonMap[]>(0, []) as JsonMap[]) || []);
-          setNativeTrades((resolveResult<JsonMap[]>(1, []) as JsonMap[]) || []);
-          setMarketMicro(resolveResult<JsonMap | null>(2, null));
-          setSessionState(resolveResult<JsonMap | null>(3, null));
-          setRoutingScore(resolveResult<JsonMap | null>(4, null));
-          setOrderbook(resolveResult<JsonMap | null>(5, null));
-        })
-        .finally(() => {
-          if (!controller.signal.aborted) {
-            setChartLoading(false);
-          }
-        });
-    }, 180);
-
-    return () => {
-      if (marketBurstTimerRef.current !== null) {
-        window.clearTimeout(marketBurstTimerRef.current);
-        marketBurstTimerRef.current = null;
-      }
-      controller.abort();
-    };
-  }, [authSessionRequired, chartTimeframe, selectedChartSymbol]);
+    marketDataBusRef.current?.connect({ instrument: selectedChartInstrument, venue: selectedChartVenue, timeframe: chartTimeframe });
+  }, [authSessionRequired, chartTimeframe, selectedChartInstrument, selectedChartVenue]);
 
   useEffect(() => {
-    if (authSessionRequired) {
+    if (authSessionRequired || authStatus !== "authenticated") {
+      chartRestFallbackKeyRef.current = "";
       return;
     }
-  }, [authSessionRequired]);
+    if (ohlcvBars.length > 0) {
+      return;
+    }
+
+    const fallbackKey = `${selectedChartInstrument}|${selectedChartVenue}|${chartTimeframe}`;
+    if (chartRestFallbackKeyRef.current === fallbackKey) {
+      return;
+    }
+
+    let active = true;
+    chartRestFallbackKeyRef.current = fallbackKey;
+
+    const hydrateChartFallback = async () => {
+      try {
+        const [barsResponse, depthResponse] = await Promise.all([
+          fetch(`/api/market/ohlcv?instrument=${encodeURIComponent(selectedChartInstrument)}&venue=${encodeURIComponent(selectedChartVenue)}&timeframe=${encodeURIComponent(chartTimeframe)}&limit=500`, {
+            cache: "no-store",
+            headers: buildRoutingRequestHeaders("ui", selectedChartSymbol),
+          }),
+          fetch(`/api/market/orderbook/depth?instrument=${encodeURIComponent(selectedChartInstrument)}&venue=${encodeURIComponent(selectedChartVenue)}`, {
+            cache: "no-store",
+            headers: buildRoutingRequestHeaders("ui", selectedChartSymbol),
+          }),
+        ]);
+
+        if (!active) {
+          return;
+        }
+
+        const barsPayload = await barsResponse.json().catch(() => []);
+        const depthPayload = await depthResponse.json().catch(() => null);
+
+        if (Array.isArray(barsPayload) && barsPayload.length > 0) {
+            setOhlcvBars((current) => {
+              if (!active) {
+                return current;
+              }
+              if (current.length > 0) {
+                return current;
+              }
+
+              const activeConfig = activeChartConfigRef.current;
+              const payloadInstrument = normalizeInstrument(String((barsPayload[0] as OhlcvBar | undefined)?.instrument || activeConfig.instrument));
+              const payloadVenue = String((barsPayload[0] as OhlcvBar | undefined)?.venue || activeConfig.venue);
+              const payloadTimeframe = String((barsPayload[0] as OhlcvBar | undefined)?.tf || activeConfig.timeframe);
+
+              return chartInstrumentsMatch(payloadInstrument, activeConfig.instrument)
+                && payloadVenue === activeConfig.venue
+                && payloadTimeframe === activeConfig.timeframe
+                ? (barsPayload as OhlcvBar[])
+                : current;
+            });
+          setChartLoading(false);
+          setMarketBusLastSyncAt(new Date().toISOString());
+        }
+        if (depthPayload && typeof depthPayload === "object") {
+          setMarketDepth(depthPayload as JsonMap);
+          setDepthStreamState("live");
+        }
+      } catch {
+        chartRestFallbackKeyRef.current = "";
+      }
+    };
+
+    void hydrateChartFallback();
+
+    return () => {
+      active = false;
+    };
+  }, [
+    authSessionRequired,
+    authStatus,
+    chartTimeframe,
+    ohlcvBars.length,
+    selectedChartInstrument,
+    selectedChartSymbol,
+    selectedChartVenue,
+  ]);
 
   useEffect(() => {
     marketMetricsAbortRef.current?.abort();
     const controller = new AbortController();
     marketMetricsAbortRef.current = controller;
-    const matrixQuotes = quotes
-      .filter((quote) => {
-        const quoteSymbol = instrumentLabel(quote);
-        const market = classifyInstrument(quoteSymbol);
-        const matchesSymbol = !symbolFilter || quoteSymbol.toLowerCase().includes(symbolFilter.toLowerCase());
-        const matchesMarket = marketFilter === "all" || market === marketFilter;
-        return matchesSymbol && matchesMarket;
-      })
-      .filter((quote, index, rows) => rows.findIndex((candidate) => instrumentLabel(candidate) === instrumentLabel(quote)) === index)
-      .slice(0, 7);
-
-    if (matrixQuotes.length === 0) {
+    if (authSessionRequired || authStatus !== "authenticated" || Date.now() < authBackoffUntilRef.current) {
       controller.abort();
       return;
     }
-
     let closed = false;
-    Promise.all(matrixQuotes.map(async (quote) => {
-      const symbolKey = instrumentLabel(quote);
-      const venue = String(quote.venue || "binance-public");
-      const instrument = normalizeInstrument(String(quote.instrument || symbolKey));
-      const payload = await fetch(`/api/market/microstructure?instrument=${encodeURIComponent(instrument)}&venue=${encodeURIComponent(venue)}&lookback_minutes=60`, {
-        cache: "no-store",
-        signal: controller.signal,
-        headers: buildRoutingRequestHeaders("ui", instrument),
-      })
-        .then((response) => (response.ok ? response.json() : null))
-        .catch(() => null);
-      return {
-        symbolKey,
-        metric: {
-          fundingRate: toNumber((payload as JsonMap | null)?.funding_rate, 0),
-          openInterest: toNumber((payload as JsonMap | null)?.open_interest, 0),
-          volume: toNumber((payload as JsonMap | null)?.buy_volume, 0) + toNumber((payload as JsonMap | null)?.sell_volume, 0),
-          depthImbalance: toNumber((payload as JsonMap | null)?.depth_imbalance, 0),
-          tapeAcceleration: toNumber((payload as JsonMap | null)?.tape_acceleration, 0),
-        },
-      };
-    })).then((rows) => {
+    const loadMetrics = async () => {
+      const matrixQuotes = buildMarketMetricsUniverse(quotesRef.current, symbolFilter, marketFilter)
+        .filter((quote) => {
+          if (quote.venue !== selectedChartVenue) {
+            return true;
+          }
+          return !selectedChartMetricCandidates.has(quote.instrument)
+            && !selectedChartMetricCandidates.has(normalizeInstrument(quote.symbolKey));
+        });
+
+      if (matrixQuotes.length === 0) {
+        controller.abort();
+        return;
+      }
+
+      const rows = await Promise.all(matrixQuotes.map(async (quote) => {
+        const payload = await fetchMarketBusSnapshot(quote.instrument, quote.venue, chartTimeframe);
+        const microstructure = payload && typeof payload === "object" && !Array.isArray(payload)
+          ? ((payload as JsonMap).microstructure as JsonMap | null | undefined) || null
+          : null;
+        return {
+          symbolKey: quote.symbolKey,
+          metric: {
+            fundingRate: toNumber(microstructure?.funding_rate, 0),
+            openInterest: toNumber(microstructure?.open_interest, 0),
+            volume: toNumber(microstructure?.buy_volume, 0) + toNumber(microstructure?.sell_volume, 0),
+            depthImbalance: toNumber(microstructure?.depth_imbalance, 0),
+            tapeAcceleration: toNumber(microstructure?.tape_acceleration, 0),
+            cvd: toNumber(microstructure?.cvd, 0),
+            cvdDelta: toNumber(microstructure?.cvd_delta, 0),
+            cvdTrend: (String(microstructure?.cvd_trend || "flat") as MarketMetric["cvdTrend"]),
+            flowImbalance: toNumber(microstructure?.flow_imbalance, 0),
+            spreadBps: toNumber(microstructure?.spread_bps, 0),
+            tradeAggressiveness: toNumber(microstructure?.trade_aggressiveness, 0),
+            avgLatencyMs: toNumber(microstructure?.avg_latency_ms, 0),
+            latencyTier: (String(microstructure?.latency_tier || "normal") as MarketMetric["latencyTier"]),
+            activeEventCount: 0,
+            lastEventType: null,
+          },
+        };
+      }));
+
       if (closed || controller.signal.aborted) {
         return;
       }
@@ -3407,32 +3646,79 @@ export default function TradingTerminalPage() {
         }
         return next;
       });
-    });
+    };
+
+    void loadMetrics();
+    const intervalMs = isGtixPublicBrowserHost() ? PUBLIC_TERMINAL_GOVERNANCE_REFRESH_MS : 30_000;
+    const timer = window.setInterval(() => {
+      void loadMetrics();
+    }, intervalMs);
 
     return () => {
       closed = true;
+      window.clearInterval(timer);
       controller.abort();
     };
-  }, [marketFilter, quotes, symbolFilter]);
+  }, [authSessionRequired, authStatus, chartTimeframe, fetchMarketBusSnapshot, marketMetricsUniverseKey, marketFilter, selectedChartMetricCandidates, selectedChartVenue, symbolFilter]);
 
   useEffect(() => {
     let socket: WebSocket | null = null;
     let reconnectTimer: number | null = null;
     let pingTimer: number | null = null;
+    let pollTimer: number | null = null;
     let closedByUnmount = false;
+
+    const usePollingFallback = typeof window !== "undefined" && isGtixPublicHost(window.location.hostname);
+
+    const schedulePoll = (delayMs: number) => {
+      if (closedByUnmount) {
+        return;
+      }
+      if (pollTimer !== null) {
+        window.clearTimeout(pollTimer);
+      }
+      pollTimer = window.setTimeout(() => {
+        void connect();
+      }, delayMs);
+    };
 
     const connect = async () => {
       if (closedByUnmount) {
         return;
       }
       setTelemetryStreamState("connecting");
+      const authenticated = await refreshAuthSession();
+      if (!authenticated) {
+        setTelemetryStreamState("offline");
+        return;
+      }
+      setAuthSessionRequired(false);
+      if (usePollingFallback) {
+        const response = await fetch("/api/execution/telemetry/recent?limit=20", {
+          cache: "no-store",
+          headers: buildRoutingRequestHeaders("execution", selectedChartSymbol),
+        }).catch(() => null);
+        if (closedByUnmount) {
+          return;
+        }
+        if (!response?.ok) {
+          setTelemetryStreamState("offline");
+          schedulePoll(PUBLIC_TERMINAL_FALLBACK_POLL_MS);
+          return;
+        }
+        const payload = await response.json().catch(() => null);
+        if (closedByUnmount) {
+          return;
+        }
+        setExecutionTelemetry(Array.isArray(payload) ? (payload as JsonMap[]).slice(0, 20) : []);
+        setTelemetryStreamState("live");
+        schedulePoll(PUBLIC_TERMINAL_FALLBACK_POLL_MS);
+        return;
+      }
       const token = await fetchWsToken();
       if (token === "__UNAUTHORIZED__") {
         markUnauthorizedBackoff();
         setTelemetryStreamState("offline");
-        reconnectTimer = window.setTimeout(() => {
-          void connect();
-        }, 30_000);
         return;
       }
       if (!token) {
@@ -3442,7 +3728,6 @@ export default function TradingTerminalPage() {
         }, 4000);
         return;
       }
-      setAuthSessionRequired(false);
       const wsUrl = buildExecutionTelemetryWsUrl(token, 20, {
         requestType: "execution",
         priority: "high",
@@ -3500,6 +3785,9 @@ export default function TradingTerminalPage() {
           return;
         }
         setTelemetryStreamState("offline");
+        if (authStatusRef.current !== "authenticated" || Date.now() < authBackoffUntilRef.current) {
+          return;
+        }
         reconnectTimer = window.setTimeout(() => {
           void connect();
         }, 2500);
@@ -3513,92 +3801,15 @@ export default function TradingTerminalPage() {
       if (reconnectTimer) {
         window.clearTimeout(reconnectTimer);
       }
+      if (pollTimer) {
+        window.clearTimeout(pollTimer);
+      }
       if (pingTimer) {
         window.clearInterval(pingTimer);
       }
       socket?.close();
     };
   }, []);
-
-  useEffect(() => {
-    const selectedQuote = quotes.find((quote) => instrumentLabel(quote) === selectedChartSymbol);
-    const venue = String(selectedQuote?.venue || "binance-public");
-    const instrument = normalizeInstrument(String(selectedQuote?.instrument || selectedChartSymbol || "BTCUSD"));
-    const wsUrl = buildMarketDepthWsUrl(instrument, venue);
-    if (!wsUrl) {
-      setDepthStreamState("offline");
-      return;
-    }
-
-    let socket: WebSocket | null = null;
-    let reconnectTimer: number | null = null;
-    let pingTimer: number | null = null;
-    let closedByUnmount = false;
-
-    const connect = () => {
-      if (closedByUnmount) {
-        return;
-      }
-      setDepthStreamState("connecting");
-      socket = new WebSocket(wsUrl);
-
-      socket.onopen = () => {
-        setDepthStreamState("live");
-        pingTimer = window.setInterval(() => {
-          if (socket?.readyState === WebSocket.OPEN) {
-            socket.send("ping");
-          }
-        }, 20_000);
-      };
-
-      socket.onmessage = (event) => {
-        try {
-          const payload = JSON.parse(String(event.data || "{}"));
-          if (!payload || typeof payload !== "object") {
-            return;
-          }
-          if (payload.type === "snapshot") {
-            setMarketDepth(payload as JsonMap);
-            return;
-          }
-          if (payload.type === "delta") {
-            setMarketDepth((current) => mergeDepthDelta(current, payload as JsonMap));
-          }
-        } catch {
-          // Ignore malformed websocket frames.
-        }
-      };
-
-      socket.onerror = () => {
-        setDepthStreamState("offline");
-      };
-
-      socket.onclose = () => {
-        if (pingTimer) {
-          window.clearInterval(pingTimer);
-          pingTimer = null;
-        }
-        if (closedByUnmount) {
-          return;
-        }
-        setDepthStreamState("offline");
-        reconnectTimer = window.setTimeout(connect, 2500);
-      };
-    };
-
-    connect();
-
-    return () => {
-      closedByUnmount = true;
-      if (reconnectTimer) {
-        window.clearTimeout(reconnectTimer);
-      }
-      if (pingTimer) {
-        window.clearInterval(pingTimer);
-      }
-      socket?.close();
-    };
-  }, [selectedChartSymbol]);
 
   useEffect(() => {
     const candidateIds = (executionTelemetry.length > 0 ? executionTelemetry : outcomes)
@@ -3674,7 +3885,7 @@ export default function TradingTerminalPage() {
     setError(null);
     setTradeResult(null);
     try {
-      void fetchRoutingScoreCached(overrides?.symbol || symbol, "execution");
+      void marketDataBusRef.current?.refreshNow("execution");
       const response = await fetch("/api/mt5/orders/filter", {
         method: "POST",
         headers: {
@@ -3770,6 +3981,9 @@ export default function TradingTerminalPage() {
   const driftItems = (drift.items as JsonMap[] | undefined) || [];
   const memorySummary = (((readiness?.memory_kpi as JsonMap | undefined)?.summary as JsonMap | undefined) || {});
   const balances = ((balance?.balances as JsonMap[] | undefined) || []).slice(0, 6);
+  const publicOpsPanelBadge = isGtixPublicBrowserHost() && publicOpsRefreshPaused
+    ? <span className="monitoring-panel-state-badge paused">bg</span>
+    : null;
 
   const filteredQuotes = quotes.filter((quote) => {
     const quoteSymbol = instrumentLabel(quote);
@@ -3913,34 +4127,127 @@ export default function TradingTerminalPage() {
       .sort((left, right) => sortIsoAscending(left.timestamp, right.timestamp))
     : [];
 
-  const nativeSeries = ohlcvBars.map((bar) => ({ label: String(bar.bucket_start || "-"), value: toNumber(bar.close, 0) })).filter((point) => point.value > 0);
-  const chartSeriesRaw = nativeSeries.length > 0 ? nativeSeries : (quoteHistory[selectedChartSymbol] || []);
-  const chartSeries = chartSeriesRaw.slice(-Math.max(20, Math.min(chartWindow, 500)));
-  const ohlcvCandles = ohlcvBars.slice(-Math.max(20, Math.min(chartWindow, 500))).map((bar) => ({
-    label: String(bar.bucket_start || "-"),
-    open: toNumber(bar.open, 0),
-    high: toNumber(bar.high, 0),
-    low: toNumber(bar.low, 0),
-    close: toNumber(bar.close, 0),
-    volume: toNumber(bar.volume, 0),
-  }));
-  const chartCandles = ohlcvCandles.length > 0
-    ? ohlcvCandles
-    : chartSeries.map((point, index) => {
-      const previous = index > 0 ? chartSeries[index - 1].value : point.value;
-      const open = Number.isFinite(previous) && previous > 0 ? previous : point.value;
-      const close = point.value;
-      const high = Math.max(open, close);
-      const low = Math.min(open, close);
-      return {
-        label: point.label,
-        open,
-        high,
-        low,
-        close,
-        volume: 0,
+  const renderableOhlcvBars = useMemo(
+    () => normalizeOhlcvRows(ohlcvBars, {
+      instrument: selectedChartInstrument,
+      venue: selectedChartVenue,
+      timeframe: chartTimeframe,
+    }),
+    [chartTimeframe, ohlcvBars, selectedChartInstrument, selectedChartVenue],
+  );
+
+  // ── Engine V3 : tick injection via le bus (single source of truth) ────────
+  // Le bus déroute le tick au MarketDataEngineV3 qui met à jour la série
+  // canonique et émet → setOhlcvBars → renderableOhlcvBars se met à jour.
+  // On n'a plus besoin de liveTickBars (useMemo patch visuel supprimé).
+  useEffect(() => {
+    const liveQuote = quotes.find((q) => instrumentLabel(q) === selectedChartSymbol);
+    const tickPrice = liveQuote
+      ? toNumber(
+          (liveQuote as Record<string, unknown>).last
+            ?? (liveQuote as Record<string, unknown>).mid
+            ?? (liveQuote as Record<string, unknown>).ask,
+          0,
+        )
+      : 0;
+    if (tickPrice > 0) {
+      const updatedAt = typeof (liveQuote as Record<string, unknown>)?.updated_at === "string"
+        ? Date.parse((liveQuote as Record<string, unknown>).updated_at as string)
+        : undefined;
+      marketDataBusRef.current?.ingestPriceTick(tickPrice, updatedAt);
+    }
+  }, [quotes, selectedChartSymbol]);
+
+  const localOhlcvAnalysis = useMemo(
+    () => analyzeOhlcvRows(ohlcvBars, {
+      instrument: selectedChartInstrument,
+      venue: selectedChartVenue,
+      timeframe: chartTimeframe,
+    }),
+    [chartTimeframe, ohlcvBars, selectedChartInstrument, selectedChartVenue],
+  );
+  const localOhlcvFeedLabel = `${selectedChartInstrument} · ${selectedChartVenue} · ${chartTimeframe}`;
+  const localOhlcvSignalTone = localOhlcvAnalysis.signal === "OHLCV_RENDERABLE"
+    ? "good"
+    : localOhlcvAnalysis.signal === "OHLCV_PARTIAL"
+      ? "warn"
+      : "bad";
+  const localOhlcvAlertText = localOhlcvAnalysis.signal === "OHLCV_RENDERABLE"
+    ? ""
+    : localOhlcvAnalysis.signal === "OHLCV_PARTIAL"
+      ? `Feed local partiel: ${localOhlcvAnalysis.renderableRows}/${localOhlcvAnalysis.fetchedRows} bougies rendables sur ${localOhlcvFeedLabel}.`
+      : `Feed local inutilisable: 0/${localOhlcvAnalysis.fetchedRows} bougie rendable sur ${localOhlcvFeedLabel}.`;
+  const localOhlcvReasonsLabel = localOhlcvAnalysis.reasons.length > 0
+    ? localOhlcvAnalysis.reasons.join(" · ")
+    : "none";
+  const hasRenderableCandles = renderableOhlcvBars.length > 0;
+  const chartAuthBlocked = authSessionRequired || authStatus !== "authenticated";
+  const chartRenderBlocked = localOhlcvAnalysis.signal === "OHLCV_UNUSABLE" && !hasRenderableCandles;
+  const localFeedSidecarMessage = localOhlcvAnalysis.signal === "OHLCV_RENDERABLE"
+    ? "Ce chart et son feed local sont rendables."
+    : localOhlcvAnalysis.signal === "OHLCV_PARTIAL"
+      ? "Le chart peut dessiner, mais le feed local reste partiel sur cet instrument."
+      : "Ce chart est sain, mais ce feed local n’est pas rendable.";
+
+  const ohlcvCandles = useMemo(() => {
+    // Virtual window : on transmet toujours la série complète (max 500 bars) au chart.
+    // LightweightCharts gère son propre viewport → zéro re-render superflu sur pan/zoom.
+    // chartWindow reste utilisé comme hint pour la fenêtre initiale visible.
+    const windowSize = Math.max(20, Math.min(chartWindow, 500));
+    chartViewportRef.current.window = windowSize;
+    return renderableOhlcvBars.slice(-Math.max(windowSize, renderableOhlcvBars.length)).map((bar) => ({
+      label: String(bar.t || "-"),
+      open: toNumber(bar.o, 0),
+      high: toNumber(bar.h, 0),
+      low: toNumber(bar.l, 0),
+      close: toNumber(bar.c, 0),
+      volume: toNumber(bar.v, 0),
+    }));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [renderableOhlcvBars, chartTimeframe]);
+  const fallbackChartCandles = !hasRenderableCandles
+    ? (() => {
+      // Generate 80 plausible 1-minute preview bars so the chart looks sensible
+      // while market data is loading / offline. Uses a seeded pseudo-random walk
+      // so the shape is stable across renders rather than jumping on every tick.
+      const BARS = 80;
+      const INTERVAL_MS = 60_000;
+      const base = 100;
+      const now = Math.floor(Date.now() / INTERVAL_MS) * INTERVAL_MS;
+      const bars: Array<{ label: string; open: number; high: number; low: number; close: number; volume: number }> = [];
+      let price = base;
+      // Deterministic LCG seeded on the day so shape is stable for a session
+      let seed = Math.floor(now / 86_400_000) % 65536;
+      const rand = () => {
+        seed = (seed * 1664525 + 1013904223) & 0xffffffff;
+        return (seed >>> 0) / 0xffffffff;
       };
-    });
+      for (let i = BARS - 1; i >= 0; i--) {
+        const t = now - i * INTERVAL_MS;
+        const drift = (rand() - 0.495) * 0.003;
+        const open = price;
+        const close = open * (1 + drift);
+        const bodyHalf = Math.abs(close - open) * (0.5 + rand() * 0.8);
+        const high = Math.max(open, close) + bodyHalf;
+        const low = Math.min(open, close) - bodyHalf * 0.6;
+        price = close;
+        bars.push({
+          label: new Date(t).toISOString(),
+          open: +open.toFixed(5),
+          high: +high.toFixed(5),
+          low: +low.toFixed(5),
+          close: +close.toFixed(5),
+          volume: Math.round(50 + rand() * 200),
+        });
+      }
+      return bars;
+    })()
+    : [];
+  const chartCandles = ohlcvCandles;
+  const chartDisplayCandles = hasRenderableCandles ? chartCandles : fallbackChartCandles;
+  const chartPreviewModeActive = !hasRenderableCandles && chartDisplayCandles.length > 0;
+  const chartMaskActive = (chartRenderBlocked || (chartAuthBlocked && !hasRenderableCandles)) && !chartPreviewModeActive;
+  const chartSeries = chartCandles.map((candle) => ({ label: candle.label, value: candle.close }));
 
   // ── Memoized indicator computation (PERF) ──────────────────────────────────
   // Hash-based memoization: only recompute if bars or active indicators actually change
@@ -3989,7 +4296,7 @@ export default function TradingTerminalPage() {
     return () => {
       cancelled = true;
     };
-  }, [barHash, activeIndicatorKey, barsForIndicators, activeIndicators]);
+    }, [barHash, activeIndicatorKey, activeIndicators]);
   const latestQuote = filteredQuotes.find((quote) => instrumentLabel(quote) === selectedChartSymbol) || quotes.find((quote) => instrumentLabel(quote) === selectedChartSymbol) || null;
   const selectedQuoteRows = quotes.filter((quote) => instrumentLabel(quote) === selectedChartSymbol);
   const chartValues = chartMode === "candles"
@@ -4063,8 +4370,8 @@ export default function TradingTerminalPage() {
   const liquidityZones = buildLiquidityZones(chartSeries);
   const chartPriceStep = inferChartPriceStep(selectedChartSymbol, chartAnchorPrice > 0 ? chartAnchorPrice : chartLastValue || chartFirstValue || 1);
   const chartPriceDigits = getPriceStepDecimals(chartPriceStep);
-  const chartRoundMagnetStep = Math.max(chartPriceStep, chartPriceStep >= 1 ? chartPriceStep * 10 : chartPriceStep * 50);
-  const chartSnapThreshold = Math.max(chartPriceStep * 4, (chartPriceRangeMax - chartPriceRangeMin) * 0.005);
+  const chartRoundMagnetStep = computeChartRoundMagnetStep(chartPriceStep);
+  const chartSnapThreshold = computeChartSnapThreshold(chartPriceStep, chartPriceRangeMin, chartPriceRangeMax);
   const chartAtrLocalPct = useMemo(() => {
     if (chartCandles.length < 3) {
       return 0;
@@ -4266,7 +4573,7 @@ export default function TradingTerminalPage() {
       if (authSessionRequired || Date.now() < authBackoffUntilRef.current) {
         return;
       }
-      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+      if (shouldPausePublicOpsRefresh()) {
         return;
       }
       inFlight = true;
@@ -4342,7 +4649,7 @@ export default function TradingTerminalPage() {
       if (authSessionRequired || Date.now() < authBackoffUntilRef.current) {
         return;
       }
-      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+      if (shouldPausePublicOpsRefresh()) {
         return;
       }
       inFlight = true;
@@ -5142,45 +5449,117 @@ export default function TradingTerminalPage() {
       return raw === "1m" || raw === "5m" || raw === "15m" ? raw : null;
     };
     return filteredOutcomes
+      .filter((item) => normalizeInstrument(instrumentLabel(item)) === normalizedSymbol)
       .filter((item) => {
-        if (normalizeInstrument(instrumentLabel(item)) !== normalizedSymbol) {
-          return false;
-        }
-        const timeframe = readOutcomeTf(item);
-        if (timeframe && timeframe !== chartTimeframe) {
-          return false;
-        }
-        return Number.isFinite(toNumber(item.pnl_usd, toNumber(item.net_result_usd, NaN)));
+        const itemTf = readOutcomeTf(item);
+        return itemTf === null || itemTf === chartTimeframe;
       })
-      .map((item) => {
-        const timestampIso = String(item.closed_at || item.executed_at || item.filled_at || item.timestamp || item.created_at || new Date().toISOString());
-        const timestampMs = Number.isFinite(Date.parse(timestampIso)) ? Date.parse(timestampIso) : 0;
+      .map((item, index) => {
+        const timestampIso = pickTimestamp(item, ["executed_at", "filled_at", "closed_at", "created_at"]) || new Date(0).toISOString();
         const pnl = toNumber(item.pnl_usd, toNumber(item.net_result_usd, 0));
-        const score = clamp(toNumber(item.ai_score ?? item.score, 0.5), 0, 1);
-        const regimeRaw = String(item.regime || item.market_regime || "").toLowerCase();
         return {
-          key: String(item.id || item.trade_id || item.position_id || item.execution_id || `${timestampIso}:${pnl.toFixed(2)}`),
+          key: String(item.decision_id || item.ticket_key || `${timestampIso}-${index}`),
           timestampIso,
-          timestampMs,
           pnl,
-          score,
+          mfe: toNumber(item.mfe_bps, 0),
+          mae: toNumber(item.mae_bps, 0),
+          score: clamp(toNumber(item.ai_score ?? item.score, 0.5), 0, 1),
           win: pnl >= 0,
-          mfe: Math.abs(toNumber(item.mfe_bps, 0)),
-          mae: Math.abs(toNumber(item.mae_bps, 0)),
-          regimeRaw,
+          regimeRaw: String(item.regime || item.market_regime || item.regime_label || "").toLowerCase(),
           raw: item,
         };
       })
-      .sort((a, b) => b.timestampMs - a.timestampMs)
-      .slice(0, 160);
+      .sort((left, right) => sortIsoAscending(right.timestampIso, left.timestampIso));
   }, [chartTimeframe, filteredOutcomes, selectedChartSymbol]);
+
+  useEffect(() => {
+    if (
+      authSessionRequired
+      || authStatus !== "authenticated"
+      || chartMode !== "candles"
+      || chartLoading
+      || quotes.length === 0
+      || classifyInstrument(selectedChartSymbol) !== "crypto"
+      || localOhlcvAnalysis.signal !== "OHLCV_UNUSABLE"
+    ) {
+      setLocalFeedFallbackSuggestion(null);
+      return;
+    }
+
+    const recoveryQuote = pickDefaultChartQuote(quotes);
+    if (!recoveryQuote) {
+      setLocalFeedFallbackSuggestion(null);
+      return;
+    }
+
+    const recoverySymbol = instrumentLabel(recoveryQuote);
+    const recoveryInstrument = normalizeInstrument(String(recoveryQuote.instrument || recoverySymbol));
+    const recoveryVenue = String(recoveryQuote.venue || "binance-public");
+    if (!recoverySymbol || recoveryInstrument === normalizeInstrument(selectedChartSymbol)) {
+      setLocalFeedFallbackSuggestion(null);
+      return;
+    }
+
+    const recoveryKey = `${normalizeInstrument(selectedChartSymbol)}|${selectedChartInstrument}|${selectedChartVenue}|${chartTimeframe}|${recoveryInstrument}`;
+    if (
+      chartEmptyRecoveryKeyRef.current === recoveryKey
+      || localFeedDismissedFallbackKeyRef.current === recoveryKey
+    ) {
+      return;
+    }
+
+    setLocalFeedFallbackSuggestion((current) => {
+      if (current?.key === recoveryKey) {
+        return current;
+      }
+      return {
+        key: recoveryKey,
+        symbol: recoverySymbol,
+        instrument: recoveryInstrument,
+        venue: recoveryVenue,
+        timeframe: chartTimeframe,
+        autoApplyAtMs: Date.now() + 3500,
+      };
+    });
+  }, [
+    authSessionRequired,
+    authStatus,
+    chartLoading,
+    chartMode,
+    chartTimeframe,
+    localOhlcvAnalysis.signal,
+    quotes,
+    selectedChartInstrument,
+    selectedChartSymbol,
+    selectedChartVenue,
+  ]);
+
+  useEffect(() => {
+    if (!localFeedFallbackSuggestion) {
+      return;
+    }
+    const delayMs = Math.max(0, localFeedFallbackSuggestion.autoApplyAtMs - Date.now());
+    const timer = window.setTimeout(() => {
+      chartEmptyRecoveryKeyRef.current = localFeedFallbackSuggestion.key;
+      setSelectedChartSymbol(localFeedFallbackSuggestion.symbol);
+      setLocalFeedFallbackSuggestion(null);
+      setWorkspaceHintBadge(`Fallback applied: ${localFeedFallbackSuggestion.symbol} (${selectedChartInstrument} unusable)`);
+    }, delayMs);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [localFeedFallbackSuggestion, selectedChartInstrument]);
+
   const selfLearningDriftV4 = useMemo(() => {
-    const samples = [...selfLearningScopedOutcomesV4].sort((a, b) => a.timestampMs - b.timestampMs);
-    const shortWindow = samples.slice(-8);
-    const longWindow = samples.slice(-24, -8);
-    const calcWinrate = (windowItems: typeof samples) => (
-      windowItems.length === 0 ? null : windowItems.filter((item) => item.win).length / windowItems.length
-    );
+    const samples = selfLearningScopedOutcomesV4;
+    const shortWindow = samples.slice(0, 10);
+    const longWindow = samples.slice(0, 24);
+    const calcWinrate = (windowItems: typeof samples) => {
+      if (windowItems.length === 0) {
+        return null;
+      }
+      return average(windowItems.map((item) => (item.win ? 1 : 0)));
+    };
     const calcBrier = (windowItems: typeof samples) => {
       if (windowItems.length === 0) {
         return null;
@@ -5219,144 +5598,37 @@ export default function TradingTerminalPage() {
   const selfLearningV4Active = selfLearningV4Enabled && selfLearningScopedOutcomesV4.length >= 4;
   const selfLearningV4WeightsLabel = selfLearningAutoAdaptEnabled ? "ADAPTED" : "MANUAL";
   const selfLearningV4ModelLabel = selfLearningModelUpdatedAt ? "UPDATED" : "BOOTING";
-  const suggestedBracketOverlay = (() => {
-    const bracket = marketDecisionV1?.suggestedBracket;
-    if (!bracket) {
-      return null;
-    }
-    const stageHeight = chartStageRef.current?.clientHeight || 500;
-    const entryY = chartPriceToY(bracket.entry, stageHeight);
-    const slY = chartPriceToY(bracket.sl, stageHeight);
-    const tpY = chartPriceToY(bracket.tp, stageHeight);
-    const liquidityY = suggestedLiquidityHighlight ? chartPriceToY(suggestedLiquidityHighlight.level, stageHeight) : null;
-    return {
-      entryY,
-      slY,
-      tpY,
-      liquidityY,
-      rewardTop: Math.min(entryY, tpY),
-      rewardHeight: Math.max(2, Math.abs(tpY - entryY)),
-      riskTop: Math.min(entryY, slY),
-      riskHeight: Math.max(2, Math.abs(slY - entryY)),
-    };
-  })();
 
   const snapChartOrderPrice = (rawPrice: number, line: ChartOrderLineKey, current: ChartOrderTicket): { price: number; label: string; family: ChartSnapFamily } => {
-    const clampedRawPrice = Math.max(chartPriceRangeMin, Math.min(chartPriceRangeMax, rawPrice));
-    const stepPrice = quantizePriceToStep(clampedRawPrice, chartPriceStep);
-    if (!chartSnapEnabled) {
-      return { price: stepPrice, label: `STEP ${chartPriceStep.toFixed(chartPriceDigits)}`, family: "manual" };
-    }
-
-    const roundPrice = quantizePriceToStep(Math.round(clampedRawPrice / chartRoundMagnetStep) * chartRoundMagnetStep, chartPriceStep);
-    const executionCandidates: Array<{ price: number; label: string }> = [
-      { price: quantizePriceToStep(chartAnchorPrice, chartPriceStep), label: "LIVE" },
-      { price: roundPrice, label: `ROUND ${roundPrice.toFixed(chartPriceDigits)}` },
-    ];
-    if (chartMode === "candles" && chartCandles.length > 0) {
-      for (const candle of chartCandles.slice(-36)) {
-        executionCandidates.push(
-          { price: quantizePriceToStep(candle.close, chartPriceStep), label: "CLOSE" },
-          { price: quantizePriceToStep(candle.high, chartPriceStep), label: "HIGH" },
-          { price: quantizePriceToStep(candle.low, chartPriceStep), label: "LOW" },
-        );
-      }
-    }
-    const vwapCandidates: Array<{ price: number; label: string }> = [];
-    const liquidityCandidates: Array<{ price: number; label: string }> = [];
-    if (showVwap) {
-      vwapCandidates.push(
-        { price: quantizePriceToStep(dayVwap, chartPriceStep), label: "VWAP D" },
-        { price: quantizePriceToStep(weekVwap, chartPriceStep), label: "VWAP W" },
-        { price: quantizePriceToStep(monthVwap, chartPriceStep), label: "VWAP M" },
-      );
-    }
-    if (showLiquidity) {
-      for (const zone of liquidityZones) {
-        liquidityCandidates.push({ price: quantizePriceToStep(zone.level, chartPriceStep), label: zone.label.toUpperCase() });
-      }
-    }
-    if (crosshair?.price) {
-      executionCandidates.push({ price: quantizePriceToStep(crosshair.price, chartPriceStep), label: "CURSOR" });
-    }
-
-    const candidateGroups: Record<ChartSnapPriority, Array<{ price: number; label: string }>> = {
-      execution: executionCandidates,
-      vwap: vwapCandidates,
-      liquidity: liquidityCandidates,
-    };
-    const priorityOrder: ChartSnapPriority[] = [
+    return resolveSnappedChartOrderPrice({
+      rawPrice,
+      line,
+      current,
+      chartPriceRangeMin,
+      chartPriceRangeMax,
+      chartPriceStep,
+      chartPriceDigits,
+      chartSnapEnabled,
+      chartRoundMagnetStep,
+      chartMode,
+      chartCandles,
+      showVwap,
+      dayVwap,
+      weekVwap,
+      monthVwap,
+      showLiquidity,
+      liquidityZones,
+      crosshair,
       chartSnapPriority,
-      ...(["execution", "vwap", "liquidity"] as const).filter((key) => key !== chartSnapPriority),
-    ];
-
-    let snapped = stepPrice;
-    let label = `STEP ${chartPriceStep.toFixed(chartPriceDigits)}`;
-    let family: ChartSnapFamily = "manual";
-    const atrWeight = clamp(1.16 - chartAtrLocalPct * 40, 0.52, 1.14);
-    const lineWeight = line === "entry" ? 0.9 : 1;
-    const adaptiveSnapThreshold = chartSnapThreshold * atrWeight * lineWeight;
-
-    for (const groupName of priorityOrder) {
-      let bestDistance = Number.POSITIVE_INFINITY;
-      let groupWinner: { price: number; label: string } | null = null;
-      for (const candidate of candidateGroups[groupName]) {
-        if (!Number.isFinite(candidate.price) || candidate.price <= 0) {
-          continue;
-        }
-        if (line !== "entry" && Math.abs(candidate.price - current.entry) < chartPriceStep) {
-          continue;
-        }
-        const distance = Math.abs(clampedRawPrice - candidate.price);
-        if (distance <= adaptiveSnapThreshold && distance < bestDistance) {
-          groupWinner = candidate;
-          bestDistance = distance;
-        }
-      }
-      if (groupWinner) {
-        snapped = groupWinner.price;
-        label = groupWinner.label;
-        family = groupName;
-        break;
-      }
-    }
-    return { price: snapped, label, family };
+      chartSnapThreshold,
+      chartAtrLocalPct,
+    });
   };
 
   const moveChartOrderLine = (current: ChartOrderTicket, line: ChartOrderLineKey, rawPrice: number): ChartOrderTicket => {
     const snapped = snapChartOrderPrice(rawPrice, line, current);
     const referencePrice = Math.max(0.0000001, current.entry || chartAnchorPrice || chartLastValue || 1);
-    const minGap = Math.max(chartPriceStep * 2, referencePrice * 0.0004);
-    const next: ChartOrderTicket = { ...current, preset: "custom" };
-
-    if (line === "entry") {
-      const delta = snapped.price - current.entry;
-      next.entry = snapped.price;
-      next.sl = current.sl + delta;
-      next.tp = current.tp + delta;
-    } else {
-      next[line] = snapped.price;
-    }
-
-    next.entry = Math.max(chartPriceStep, quantizePriceToStep(next.entry, chartPriceStep));
-    next.sl = Math.max(chartPriceStep, quantizePriceToStep(next.sl, chartPriceStep));
-    next.tp = Math.max(chartPriceStep, quantizePriceToStep(next.tp, chartPriceStep));
-
-    if (next.side === "buy") {
-      if (next.sl >= next.entry - minGap) {
-        next.sl = quantizePriceToStep(next.entry - minGap, chartPriceStep);
-      }
-      if (next.tp <= next.entry + minGap) {
-        next.tp = quantizePriceToStep(next.entry + minGap, chartPriceStep);
-      }
-    } else {
-      if (next.sl <= next.entry + minGap) {
-        next.sl = quantizePriceToStep(next.entry + minGap, chartPriceStep);
-      }
-      if (next.tp >= next.entry - minGap) {
-        next.tp = quantizePriceToStep(next.entry - minGap, chartPriceStep);
-      }
-    }
+    const next = moveChartOrderLineTicket({ current, line, rawPrice, referencePrice, chartPriceStep, snapped });
 
     chartOrderTicketRef.current = next;
     if (snapped.family !== "manual") {
@@ -5520,7 +5792,12 @@ export default function TradingTerminalPage() {
     };
   }, [chartPriceDigits, chartPriceRangeMax, chartPriceRangeMin, chartPriceStep, chartRoundMagnetStep, chartSnapEnabled, chartSnapThreshold, chartAnchorPrice, chartLastValue, crosshair, showLiquidity, showVwap, dayVwap, weekVwap, monthVwap, liquidityZones, chartSnapState]);
   const tape = nativeTrades.length > 0 ? buildTapeFromTrades(nativeTrades, chartTimeframe) : buildTape(chartSeries, chartTimeframe);
-  const footprintRows = ohlcvBars.length > 0 ? buildFootprintFromOhlcv(ohlcvBars, chartTimeframe) : buildFootprint(chartSeries);
+  const footprintRows = buildFootprintFromOhlcv(renderableOhlcvBars, chartTimeframe);
+  const displayDepthStreamState: "offline" | "connecting" | "live" = depthStreamState === "live"
+    || marketDepth !== null
+    || orderbook !== null
+    ? "live"
+    : depthStreamState;
   const domLevels = marketDepth ? buildDomLevelsFromDepth(marketDepth) : buildDomLevels(orderbook);
   const domDisplayLevels = domLevels.slice(0, 14);
   const buyLevels = domLevels.filter((level) => level.side === "bid");
@@ -6609,6 +6886,9 @@ export default function TradingTerminalPage() {
       };
     }
     const loadScopes = async () => {
+      if (shouldPausePublicOpsRefresh()) {
+        return;
+      }
       try {
         const result = await fetchSelfLearningV4Scopes({
           accountId: accountId || "default",
@@ -6638,9 +6918,10 @@ export default function TradingTerminalPage() {
       }
     };
     void loadScopes();
+    const intervalMs = isGtixPublicBrowserHost() ? PUBLIC_TERMINAL_GOVERNANCE_REFRESH_MS : 45000;
     const timer = window.setInterval(() => {
       void loadScopes();
-    }, 45000);
+    }, intervalMs);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -8622,7 +8903,7 @@ export default function TradingTerminalPage() {
         setAutoTuningAuditTrail(rows.slice(0, 20));
       }
       setAutoTuningIdempotencyKey(
-        typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}-idempotency`,
+        buildIdempotencyKey(),
       );
     } catch {
       setAutoTuningStatus("Write-back error");
@@ -8633,10 +8914,16 @@ export default function TradingTerminalPage() {
 
   useEffect(() => {
     if (!AUTO_TUNING_WRITEBACK_ENABLED) return;
-    void refreshRollbackGuardState();
-    const timer = window.setInterval(() => {
+    if (!shouldPausePublicOpsRefresh()) {
       void refreshRollbackGuardState();
-    }, 60_000);
+    }
+    const intervalMs = isGtixPublicBrowserHost() ? PUBLIC_TERMINAL_BACKGROUND_REFRESH_MS : 60_000;
+    const timer = window.setInterval(() => {
+      if (shouldPausePublicOpsRefresh()) {
+        return;
+      }
+      void refreshRollbackGuardState();
+    }, intervalMs);
     return () => window.clearInterval(timer);
   }, []);
 
@@ -8644,6 +8931,9 @@ export default function TradingTerminalPage() {
     if (!AUTO_TUNING_WRITEBACK_ENABLED || !rollbackGuardSession || rollbackGuardSession.status !== "active") return;
 
     const pushObservation = async () => {
+      if (shouldPausePublicOpsRefresh()) {
+        return;
+      }
       try {
         await fetch("/api/strategies/auto-tuning/rollback-guard", {
           method: "POST",
@@ -8671,9 +8961,10 @@ export default function TradingTerminalPage() {
     };
 
     void pushObservation();
+    const intervalMs = isGtixPublicBrowserHost() ? PUBLIC_TERMINAL_BACKGROUND_REFRESH_MS : 60_000;
     const timer = window.setInterval(() => {
       void pushObservation();
-    }, 60_000);
+    }, intervalMs);
     return () => window.clearInterval(timer);
   }, [
     autoTuningAdminKey,
@@ -8753,7 +9044,10 @@ export default function TradingTerminalPage() {
       const deltaPct = first > 0 ? ((last - first) / first) * 100 : 0;
       const spread = Math.max(0, toNumber(quote.ask, 0) - toNumber(quote.bid, 0));
       const regime = volatilityRegime(history);
-      const sentimentScore = (metrics?.depthImbalance ?? 0) + deltaPct / 100;
+      const sentimentScore = (metrics?.depthImbalance ?? 0)
+        + (metrics?.flowImbalance ?? 0) * 0.5
+        + (metrics?.cvdDelta ?? 0 > 0 ? 0.1 : metrics?.cvdDelta ?? 0 < 0 ? -0.1 : 0)
+        + deltaPct / 100;
       return {
         symbol,
         price: toNumber(quote.last, 0),
@@ -8767,6 +9061,379 @@ export default function TradingTerminalPage() {
         sentiment: sentimentScore >= 0 ? "risk-on" : "risk-off",
       };
     });
+  const gpuMatrixRows = filteredQuotes
+    .filter((quote, index, rows) => rows.findIndex((candidate) => instrumentLabel(candidate) === instrumentLabel(quote)) === index)
+    .slice(0, 16)
+    .map((quote) => {
+      const symbol = instrumentLabel(quote);
+      const history = quoteHistory[symbol] || [];
+      const first = history[0]?.value ?? toNumber(quote.last, 0);
+      const last = history[history.length - 1]?.value ?? toNumber(quote.last, 0);
+      const deltaPct = first > 0 ? ((last - first) / first) * 100 : 0;
+      const spread = Math.max(0, toNumber(quote.ask, 0) - toNumber(quote.bid, 0));
+      return {
+        symbol,
+        price: toNumber(quote.last, 0),
+        deltaPct,
+        spread,
+        venue: String(quote.venue || "-"),
+      };
+    });
+  const gpuMultiSymbolFeeds = useMemo(() => (
+    gpuMatrixRows.map((row) => {
+      const history = quoteHistory[row.symbol] || [];
+      const candles = history.length >= 4
+        ? history.map((point, index) => {
+            const prev = history[index - 1] || point;
+            const open = Number(prev.value);
+            const close = Number(point.value);
+            const high = Math.max(open, close) * 1.0006;
+            const low = Math.min(open, close) * 0.9994;
+            return {
+              label: point.label,
+              open,
+              high,
+              low,
+              close,
+              volume: Math.abs(close - open) * 1000 + 1,
+            };
+          })
+        : chartDisplayCandles;
+      return {
+        id: `${row.symbol}-${row.venue}`,
+        symbol: row.symbol,
+        candles,
+      };
+    })
+  ), [gpuMatrixRows, quoteHistory, chartDisplayCandles]);
+  const {
+    marketBusHealth,
+    marketBusHealthComponents,
+    marketBusSequencing,
+    marketBusOhlcvHealth,
+    marketBusDepthHealth,
+    marketBusTradesHealth,
+    marketBusHealthStatus,
+    marketBusHealthTone,
+    marketBusOhlcvLatestSeq,
+    marketBusDepthUpdateId,
+    marketBusOhlcvContiguous,
+    marketBusSyncLabel,
+    ohlcvFreshnessState,
+    depthFreshnessState,
+    tradesFreshnessState,
+    marketFlowAlerts,
+    chartOverlayCompactMode,
+    chartUltraCleanCandles,
+    publicHostAutoCleanCandles,
+    chartFlowAlertText,
+    chartCompactAlertLabel,
+  } = deriveTerminalMarketHealth({
+    marketBusMeta,
+    marketBusLastSyncAt,
+    chartMode,
+    chartVisualMode,
+    publicBrowserHost: isGtixPublicBrowserHost(),
+  });
+  const localTerminalCapturePayload = useMemo(
+    () => (localTerminalCaptureClientId ? buildLocalTerminalRuntimeCapture({
+      clientId: localTerminalCaptureClientId,
+      capturedAt: "",
+      authStatus,
+      authSessionRequired,
+      symbol: selectedChartSymbol,
+      instrument: selectedChartInstrument,
+      venue: selectedChartVenue,
+      timeframe: chartTimeframe,
+      chartMode,
+      chartVisualMode,
+      feedLabel: localOhlcvFeedLabel,
+      localFeedSignal: localOhlcvAnalysis.signal,
+      localFeedMessage: localFeedSidecarMessage,
+      fetchedRows: localOhlcvAnalysis.fetchedRows,
+      renderableRows: localOhlcvAnalysis.renderableRows,
+      droppedRows: localOhlcvAnalysis.droppedRows,
+      duplicateTimestamps: localOhlcvAnalysis.duplicateTimestamps,
+      firstTimestamp: localOhlcvAnalysis.firstTimestamp,
+      lastTimestamp: localOhlcvAnalysis.lastTimestamp,
+      reasons: localOhlcvAnalysis.reasons,
+      droppedReasonKinds: localOhlcvAnalysis.droppedReasonKinds,
+      marketBusHealthStatus,
+      marketBusHealthTone,
+      ohlcvStreamState,
+      displayDepthStreamState,
+      marketBusOhlcvContiguous,
+      marketBusOhlcvLatestSeq,
+      ohlcvFreshnessState,
+      depthFreshnessState,
+      tradesFreshnessState,
+      barsAge: formatFreshness(marketBusOhlcvHealth?.freshness_ms),
+      depthAge: formatFreshness(marketBusDepthHealth?.freshness_ms),
+      tradesAge: formatFreshness(marketBusTradesHealth?.freshness_ms),
+      chartCompactAlertLabel,
+      chartFlowAlertText,
+    }) : null),
+    [
+      authSessionRequired,
+      authStatus,
+      chartCompactAlertLabel,
+      chartFlowAlertText,
+      chartMode,
+      chartTimeframe,
+      chartVisualMode,
+      depthFreshnessState,
+      displayDepthStreamState,
+      localFeedSidecarMessage,
+      localOhlcvAnalysis,
+      localOhlcvFeedLabel,
+      localTerminalCaptureClientId,
+      marketBusDepthHealth,
+      marketBusHealthStatus,
+      marketBusHealthTone,
+      marketBusOhlcvContiguous,
+      marketBusOhlcvHealth,
+      marketBusOhlcvLatestSeq,
+      marketBusTradesHealth,
+      ohlcvFreshnessState,
+      ohlcvStreamState,
+      selectedChartInstrument,
+      selectedChartSymbol,
+      selectedChartVenue,
+      tradesFreshnessState,
+    ],
+  );
+  const localTerminalCapturePayloadSignature = useMemo(
+    () => (localTerminalCapturePayload ? JSON.stringify(localTerminalCapturePayload) : ""),
+    [localTerminalCapturePayload],
+  );
+
+  useEffect(() => {
+    try {
+      const storageKey = "mc_terminal_capture_client_id";
+      const existing = window.sessionStorage.getItem(storageKey);
+      if (existing) {
+        setLocalTerminalCaptureClientId(existing);
+        setLocalTerminalCapturePersistenceStatus((current) => ({ ...current, clientId: existing }));
+        return;
+      }
+      const generated = window.crypto?.randomUUID?.() || `terminal-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      window.sessionStorage.setItem(storageKey, generated);
+      setLocalTerminalCaptureClientId(generated);
+      setLocalTerminalCapturePersistenceStatus((current) => ({ ...current, clientId: generated }));
+    } catch {
+      const fallback = `terminal-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      setLocalTerminalCaptureClientId(fallback);
+      setLocalTerminalCapturePersistenceStatus((current) => ({ ...current, clientId: fallback, detail: "ephemeral" }));
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!localTerminalCaptureClientId || authStatus !== "authenticated") {
+      return;
+    }
+    let active = true;
+    void fetch(`/api/health/local-terminal?client_id=${encodeURIComponent(localTerminalCaptureClientId)}`, { cache: "no-store" })
+      .then((response) => response.json().catch(() => null))
+      .then((payload) => {
+        if (!active || !payload || typeof payload !== "object") {
+          return;
+        }
+        setLocalTerminalCapturePersistenceStatus((current) => ({
+          ...current,
+          historyCount: Array.isArray((payload as { capture_history?: unknown[] }).capture_history) ? ((payload as { capture_history?: unknown[] }).capture_history?.length || 0) : current.historyCount,
+          autoIncidentTicketKey: typeof (payload as { auto_incident?: { ticketKey?: unknown } }).auto_incident?.ticketKey === "string"
+            ? (payload as { auto_incident?: { ticketKey?: string } }).auto_incident?.ticketKey || null
+            : current.autoIncidentTicketKey,
+          autoIncidentStatus: typeof (payload as { auto_incident?: { status?: unknown } }).auto_incident?.status === "string"
+            ? (payload as { auto_incident?: { status?: string } }).auto_incident?.status || null
+            : current.autoIncidentStatus,
+          captureHistory: Array.isArray((payload as { capture_history?: LocalTerminalRuntimeCapture[] }).capture_history)
+            ? ((payload as { capture_history?: LocalTerminalRuntimeCapture[] }).capture_history || [])
+            : current.captureHistory,
+        }));
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [authStatus, localTerminalCaptureClientId]);
+
+  useEffect(() => {
+    localTerminalCapturePayloadRef.current = localTerminalCapturePayload;
+  }, [localTerminalCapturePayload]);
+
+  const persistLocalTerminalCapture = useCallback(async (baseCapture: LocalTerminalRuntimeCapture, force = false) => {
+    if (authStatus !== "authenticated" || authSessionRequired) {
+      setLocalTerminalCapturePersistenceStatus((current) => ({
+        ...current,
+        healthy: false,
+        detail: authSessionRequired ? "session-required" : `auth-${authStatus}`,
+      }));
+      return;
+    }
+
+    const signature = JSON.stringify(baseCapture);
+    const now = Date.now();
+    if (!force && signature === localTerminalCaptureLastPostedSignatureRef.current && now - localTerminalCaptureLastPostedAtRef.current < 15_000) {
+      return;
+    }
+
+    const snapshot: LocalTerminalRuntimeCapture = {
+      ...baseCapture,
+      capturedAt: new Date(now).toISOString(),
+    };
+
+    try {
+      const response = await fetch("/api/health/local-terminal", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(snapshot),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const detail = typeof payload?.detail === "string" ? payload.detail : `http-${response.status}`;
+        throw new Error(detail);
+      }
+      localTerminalCaptureLastPostedSignatureRef.current = signature;
+      localTerminalCaptureLastPostedAtRef.current = now;
+      setLocalTerminalCapturePersistenceStatus({
+        clientId: snapshot.clientId,
+        updatedAt: typeof payload?.updated_at === "string" ? payload.updated_at : snapshot.capturedAt,
+        healthy: true,
+        detail: "persisted",
+        historyCount: Array.isArray(payload?.capture_history) ? payload.capture_history.length : 0,
+        autoIncidentTicketKey: typeof payload?.auto_incident?.ticketKey === "string" ? payload.auto_incident.ticketKey : null,
+        autoIncidentStatus: typeof payload?.auto_incident?.status === "string" ? payload.auto_incident.status : null,
+        captureHistory: Array.isArray(payload?.capture_history) ? payload.capture_history : [],
+      });
+      if (typeof payload?.auto_incident?.ticketKey === "string"
+        && payload.auto_incident.ticketKey
+        && payload.auto_incident.ticketKey !== localTerminalCaptureLastIncidentTicketKeyRef.current) {
+        localTerminalCaptureLastIncidentTicketKeyRef.current = payload.auto_incident.ticketKey;
+        setWorkspaceHintBadge(`Incident opened: ${payload.auto_incident.ticketKey} (${snapshot.chart.instrument})`);
+      }
+    } catch (error) {
+      setLocalTerminalCapturePersistenceStatus((current) => ({
+        clientId: baseCapture.clientId,
+        updatedAt: current.updatedAt,
+        healthy: false,
+        detail: error instanceof Error ? error.message : "persist-failed",
+        historyCount: current.historyCount,
+        autoIncidentTicketKey: current.autoIncidentTicketKey,
+        autoIncidentStatus: current.autoIncidentStatus,
+        captureHistory: current.captureHistory,
+      }));
+    }
+  }, [authSessionRequired, authStatus]);
+
+  useEffect(() => {
+    if (!localTerminalCapturePayload || !localTerminalCaptureClientId) {
+      return;
+    }
+    if (authStatus !== "authenticated" || authSessionRequired) {
+      setLocalTerminalCapturePersistenceStatus((current) => ({
+        ...current,
+        clientId: localTerminalCaptureClientId,
+        healthy: false,
+        detail: authSessionRequired ? "session-required" : `auth-${authStatus}`,
+      }));
+      return;
+    }
+    const now = Date.now();
+    if (localTerminalCapturePayloadSignature === localTerminalCaptureLastPostedSignatureRef.current && now - localTerminalCaptureLastPostedAtRef.current < 15_000) {
+      return;
+    }
+    const timeoutId = window.setTimeout(() => {
+      void persistLocalTerminalCapture(localTerminalCapturePayload, false);
+    }, 2500);
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [
+    authSessionRequired,
+    authStatus,
+    localTerminalCaptureClientId,
+    localTerminalCapturePayload,
+    localTerminalCapturePayloadSignature,
+    persistLocalTerminalCapture,
+  ]);
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      if (!localTerminalCapturePayloadRef.current) {
+        return;
+      }
+      void persistLocalTerminalCapture(localTerminalCapturePayloadRef.current, true);
+    }, 30_000);
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [persistLocalTerminalCapture]);
+
+  useEffect(() => {
+    if (!publicHostAutoCleanCandles) {
+      return;
+    }
+    setChartVisualMode("clean");
+  }, [publicHostAutoCleanCandles]);
+
+  useEffect(() => {
+    if (!chartOverlayCompactMode) {
+      return;
+    }
+    setChartHudMinimized(true);
+  }, [chartOverlayCompactMode, setChartHudMinimized]);
+
+  const chartSnapEnabledLabel = buildChartSnapEnabledLabel(
+    chartSnapEnabled,
+    chartSnapPriority,
+    chartSnapState?.label,
+    chartAtrLocalPct,
+  );
+  const chartOrderTicketPriceLabels = buildChartOrderTicketPriceLabels(chartOrderTicket);
+
+  const handleConfluenceWeightChange = (key: MarketEvidenceWeightKey, next: number) => {
+    setConfluenceWeights((current) => ({ ...current, [key]: next }));
+  };
+
+  const handleToggleSelfLearningAutoAdaptEnabled = () => {
+    setSelfLearningAutoAdaptEnabled((value) => {
+      const next = !value;
+      if (next) {
+        selfLearningDriftSignatureRef.current = "";
+        setSelfLearningDriftAutoDemotedAt(null);
+      }
+      return next;
+    });
+  };
+
+  const handleApplyPendingExecutionAdaptation = () => {
+    if (!pendingExecutionAdaptation) {
+      return;
+    }
+    applyExecutionAdaptationPlan(pendingExecutionAdaptation.plan);
+    setPendingExecutionAdaptation(null);
+  };
+
+  const handleResetAutoSymbolLoss = () => {
+    setAutoSymbolAutoDisabled((current) => {
+      const next = { ...current };
+      delete next[autoSymbolLoss.normalizedSymbol];
+      return next;
+    });
+  };
+
+  const handleChartHudSubmit = () => {
+    if (chartEffectiveSendMode === "confirm-required" && !chartHudConfirmArmed) {
+      setError("Confirmation requise: armez d’abord l’envoi.");
+      return;
+    }
+    const ack = chartEffectiveSendMode !== "confirm-required" || chartHudConfirmArmed;
+    setChartHudConfirmArmed(false);
+    void submitChartOrder(ack);
+  };
 
   const healthyConnectors = connectors.filter((item) => Boolean(item.healthy)).length;
   const brokersDown = connectors.filter((item) => !Boolean(item.healthy)).length;
@@ -8844,300 +9511,485 @@ export default function TradingTerminalPage() {
   const highlightedTapeIndex = activeTimeKey
     ? activeTape.findIndex((print) => print.timeKey === activeTimeKey)
     : -1;
+  const chartVisualPresetLabel = chartMotionClass === "stable"
+    ? "stable"
+    : chartMotionClass === "aggressive"
+      ? "aggressive"
+      : "balanced";
+  const chartVisualPolicyLabel = chartVisualMode === "full"
+    ? "full overlays"
+    : chartVisualMode === "clean"
+      ? "forced clean"
+      : `auto ${chartVisualPresetLabel}`;
+  const chartSidecarVisible = layoutScreenProfile !== "sm";
+  const chartSidecarDomRows = activeDomLevels.slice(0, 6);
+  const chartSidecarTapeRows = activeTape.slice(0, 6);
+  const chartSidecarFootprintRows = activeFootprintRows.slice(0, 5);
+  const chartSidecarHeatRows = activeHeatmapLevels.slice(0, 5);
+  const chartSidecarBidDepth = chartSidecarDomRows
+    .filter((level) => level.side === "bid")
+    .reduce((sum, level) => sum + Math.max(0, level.size), 0);
+  const chartSidecarAskDepth = chartSidecarDomRows
+    .filter((level) => level.side === "ask")
+    .reduce((sum, level) => sum + Math.max(0, level.size), 0);
+  const chartSidecarDepthBias = chartSidecarBidDepth === chartSidecarAskDepth
+    ? "balanced"
+    : chartSidecarBidDepth > chartSidecarAskDepth
+      ? "bid"
+      : "ask";
+  const chartSidecarFootprintDelta = chartSidecarFootprintRows.reduce((sum, row) => sum + toNumber(row.delta, 0), 0);
+  const chartSidecarTapeDelta = chartSidecarTapeRows.reduce((sum, print) => sum + toNumber(print.delta, 0), 0);
+  const chartSidecarProfileConfig = CHART_SIDECAR_PROFILE_LAYOUTS[chartSidecarProfile];
+  const chartSidecarLayoutMode = inferChartSidecarLayoutMode(chartSidecarProfile, detachedChartSidecars);
+  const detachedChartSidecarIds = new Set(detachedChartSidecars.map((panel) => panel.id));
+  const dockedChartSidecarIds = chartSidecarProfileConfig.cards.filter((id) => !detachedChartSidecarIds.has(id));
 
-  const renderRiskTimelineBody = (rowLimit: number, keyPrefix: string): ReactNode => {
-    const thresholdAtLimit = riskAlertMissThreshold >= riskAlertWindow;
-    const pollingStale = riskPollingFailures > 2;
-    const hardAlertThreshold = Math.max(20, Math.min(95, riskHardAlertThresholdPct));
-    const hardAlertLocal = Boolean(riskHardAlertEnabled) && toNumber(riskSummary?.ratio_miss_window, 0) * 100 >= hardAlertThreshold;
-    const presetLabel = layoutPreset === "scalp" ? "Scalp 4/12" : layoutPreset === "monitoring" ? "Monitoring 2/8" : "Swing 3/10";
+  useEffect(() => {
+    const allowed = new Set(CHART_SIDECAR_PROFILE_LAYOUTS[chartSidecarProfile].cards);
+    setDetachedChartSidecars((current) => current.filter((panel) => allowed.has(panel.id)));
+  }, [chartSidecarProfile]);
+
+  const renderChartSidecarCard = (id: ChartSidecarId, floating = false): ReactNode => {
+    const headActions = floating ? null : (
+      <div className="chart-sidecar-actions">
+        <button type="button" className="chart-sidecar-head-btn" onClick={() => detachChartSidecar(id)}>Float</button>
+      </div>
+    );
+
+    const approveAllAndSendLabel = chartEffectiveSendMode === "confirm-required" && !chartHudConfirmArmed
+      ? "Approve + Arm Send"
+      : "Approve All + Send";
+
+    if (id === "policy") {
+      return (
+        <PolicySidecarCard
+          headActions={headActions}
+          profileLabel={chartSidecarProfileConfig.label}
+          profileOptions={CHART_SIDECAR_PROFILE_IDS.map((profile) => ({
+            id: profile,
+            label: CHART_SIDECAR_PROFILE_LAYOUTS[profile].label,
+            active: chartSidecarProfile === profile,
+            onSelect: () => setChartSidecarProfile(profile),
+          }))}
+          layoutMode={chartSidecarLayoutMode}
+          onApplyLayout={applyChartSidecarLayout}
+          onSaveCustom={saveCustomChartSidecarLayout}
+          pills={[
+            { text: `preset ${chartVisualPresetLabel}` },
+            { text: `perf ${chartPerfMode}` },
+            { text: `mode ${chartMode}` },
+            { text: `ind ${activeIndicators.length}` },
+            { text: `snap ${marketDecisionV1.executionPlan.snapPriority}` },
+            { text: `plan ${marketDecisionV1.executionPlan.preset}` },
+            { text: `guard ${marketDecisionV1.executionPlan.guardEnabled ? "on" : "off"}` },
+            { text: `ticket ${chartOrderTicket.active ? "on-chart" : "off"}`, className: chartOrderTicket.active ? "chart-action-pill-status good" : "chart-action-pill-status warn" },
+            { text: "SL/TP chart-native" },
+            {
+              text: `auth ${authStatus === "authenticated" ? "ready" : authStatus === "unknown" ? "check" : "session"}`,
+              className: authStatus === "authenticated"
+                ? "chart-action-pill-status good"
+                : authStatus === "unknown"
+                  ? "chart-action-pill-status warn"
+                  : "chart-action-pill-status bad",
+            },
+          ]}
+        />
+      );
+    }
+
+    if (id === "localFeed") {
+      return (
+        <LocalFeedSidecarCard
+          headActions={headActions}
+          message={localFeedSidecarMessage}
+          captureClientId={localTerminalCapturePersistenceStatus.clientId}
+          captureUpdatedAt={localTerminalCapturePersistenceStatus.updatedAt}
+          captureHealthy={localTerminalCapturePersistenceStatus.healthy}
+          captureDetail={localTerminalCapturePersistenceStatus.detail}
+          captureHistoryCount={localTerminalCapturePersistenceStatus.historyCount}
+          autoIncidentTicketKey={localTerminalCapturePersistenceStatus.autoIncidentTicketKey}
+          autoIncidentStatus={localTerminalCapturePersistenceStatus.autoIncidentStatus}
+          feedLabel={localOhlcvFeedLabel}
+          signal={localOhlcvAnalysis.signal}
+          fetchedRows={localOhlcvAnalysis.fetchedRows}
+          renderableRows={localOhlcvAnalysis.renderableRows}
+          droppedRows={localOhlcvAnalysis.droppedRows}
+          duplicateTimestamps={localOhlcvAnalysis.duplicateTimestamps}
+          firstTimestamp={localOhlcvAnalysis.firstTimestamp}
+          lastTimestamp={localOhlcvAnalysis.lastTimestamp}
+          reasons={localOhlcvAnalysis.reasons}
+          droppedReasonKinds={localOhlcvAnalysis.droppedReasonKinds}
+          fallbackSuggestion={localFeedFallbackSuggestion ? {
+            symbol: localFeedFallbackSuggestion.symbol,
+            instrument: localFeedFallbackSuggestion.instrument,
+            venue: localFeedFallbackSuggestion.venue,
+            timeframe: localFeedFallbackSuggestion.timeframe,
+            autoFallback: true,
+          } : null}
+          onApplyFallback={() => {
+            if (!localFeedFallbackSuggestion) {
+              return;
+            }
+            chartEmptyRecoveryKeyRef.current = localFeedFallbackSuggestion.key;
+            setSelectedChartSymbol(localFeedFallbackSuggestion.symbol);
+            setLocalFeedFallbackSuggestion(null);
+            setWorkspaceHintBadge(`Fallback applied: ${localFeedFallbackSuggestion.symbol}`);
+          }}
+          onDismissFallback={() => {
+            if (!localFeedFallbackSuggestion) {
+              return;
+            }
+            localFeedDismissedFallbackKeyRef.current = localFeedFallbackSuggestion.key;
+            setLocalFeedFallbackSuggestion(null);
+            setWorkspaceHintBadge(`Fallback dismissed: ${selectedChartSymbol}`);
+          }}
+        />
+      );
+    }
+
+    if (id === "forensic") {
+      return (
+        <ForensicReplaySidecarCard
+          headActions={headActions}
+          captureClientId={localTerminalCapturePersistenceStatus.clientId}
+          autoIncidentTicketKey={localTerminalCapturePersistenceStatus.autoIncidentTicketKey}
+          autoIncidentStatus={localTerminalCapturePersistenceStatus.autoIncidentStatus}
+          frames={localTerminalCapturePersistenceStatus.captureHistory
+            .slice(-12)
+            .reverse()
+            .map((capture) => ({
+              capturedAt: capture.capturedAt,
+              feedLabel: capture.chart.feedLabel,
+              signal: capture.localFeed.signal,
+              blockedByFiveStateFailure: capture.runtime.blockedByFiveStateFailure,
+              noCandlesExpected: capture.runtime.noCandlesExpected,
+              exactStateVector: capture.runtime.exactStateVector,
+            }))}
+        />
+      );
+    }
+
+    if (id === "domTape") {
+      return (
+        <DomTapeSidecarCard
+          headActions={headActions}
+          depthBias={chartSidecarDepthBias}
+          bidDepth={chartSidecarBidDepth}
+          askDepth={chartSidecarAskDepth}
+          tapeDelta={chartSidecarTapeDelta}
+          domRows={chartSidecarDomRows.map((level, index) => ({
+            key: `side-dom-${index}-${level.price}`,
+            side: level.side,
+            price: level.price,
+            size: level.size,
+            intensity: level.intensity,
+            highlighted: highlightedDomIndex === index,
+          }))}
+          tapeRows={chartSidecarTapeRows.map((print, index) => ({
+            key: `side-tape-${index}-${print.label}`,
+            side: print.side,
+            label: print.label,
+            price: print.price,
+            volume: print.volume,
+            highlighted: highlightedTapeIndex === index,
+          }))}
+        />
+      );
+    }
+
+    if (id === "footprintHeat") {
+      return (
+        <FootprintHeatSidecarCard
+          headActions={headActions}
+          footprintDelta={chartSidecarFootprintDelta}
+          strictDepthTimeMatch={strictDepthTimeMatch}
+          footprintRows={chartSidecarFootprintRows.map((row, index) => ({
+            key: `side-fp-${index}-${row.low}-${row.high}`,
+            timeLabel: row.timeLabel || "",
+            buyVolume: row.buyVolume,
+            sellVolume: row.sellVolume,
+            delta: row.delta,
+            highlighted: highlightedFootprintIndex === index,
+          }))}
+          heatRows={chartSidecarHeatRows.map((level, index) => ({
+            key: `side-heat-${index}-${level.price}`,
+            side: level.side,
+            price: level.price,
+            size: level.size,
+            intensity: level.intensity,
+            highlighted: highlightedHeatmapIndex === index,
+          }))}
+        />
+      );
+    }
 
     return (
-      <>
-        {hardAlertLocal ? <div className="hard-alert-inline">Hard alert actif dans ce panel</div> : null}
-        <div className="risk-timeline-toolbar">
-          <button type="button" className={`chart-chip ${riskTimelineFilter === "all" ? "active" : ""}`} onClick={() => setRiskTimelineFilter("all")}>all</button>
-          <button type="button" className={`chart-chip ${riskTimelineFilter === "compliant" ? "active" : ""}`} onClick={() => setRiskTimelineFilter("compliant")}>ok</button>
-          <button type="button" className={`chart-chip ${riskTimelineFilter === "miss" ? "active" : ""}`} onClick={() => setRiskTimelineFilter("miss")}>miss</button>
-        </div>
-        <div className="risk-summary-kpis">
-          <span className="kpi">ok {riskSummary?.count_ok ?? 0}</span>
-          <span className={`kpi ${(riskSummary?.count_miss || 0) > 0 ? "warn" : ""}`}>miss {riskSummary?.count_miss ?? 0}</span>
-          <span className="kpi gtix-ellipsis">reason {riskSummary?.last_block_reason || "none"}</span>
-          <span className={`kpi ${thresholdAtLimit ? "warn" : ""}`}>ratio {((toNumber(riskSummary?.ratio_miss_window, 0) * 100)).toFixed(0)}%</span>
-                  <span className={`kpi gtix-ellipsis ${pollingStale ? "warn" : ""}`}>poll {riskPollingStatus.lastRefreshIso ? `${formatClock(riskPollingStatus.lastRefreshIso)} · ${Math.max(0, Math.round(toNumber(riskPollingStatus.latencyMs, 0)))}ms · ${riskPollingStatus.source || "-"} · ${riskPollAgeSec}s` : "pending"}</span>
-        </div>
-        <div className="risk-timeline-controls">
-          <label className="risk-control-field"><span>From</span><input type="datetime-local" value={riskTimelineFrom} onChange={(event) => setRiskTimelineFrom(event.target.value)} /></label>
-          <label className="risk-control-field"><span>To</span><input type="datetime-local" value={riskTimelineTo} onChange={(event) => setRiskTimelineTo(event.target.value)} /></label>
-          <label className="risk-control-field"><span>Window</span><input
-            type="number"
-            min={3}
-            max={100}
-            value={riskAlertWindow}
-            onChange={(event) => {
-              const nextWindow = Math.max(3, Math.min(100, Number(event.target.value) || DEFAULT_RISK_ALERT_WINDOW));
-              setRiskAlertWindow(nextWindow);
-              setRiskAlertMissThreshold((current) => Math.min(nextWindow, Math.max(1, current)));
-            }}
-          /></label>
-          <label className={`risk-control-field ${thresholdAtLimit ? "risk-threshold-guard" : ""}`}><span>Threshold</span><input
-            type="number"
-            min={1}
-            max={riskAlertWindow}
-            value={riskAlertMissThreshold}
-            onChange={(event) => {
-              const nextThreshold = Math.max(1, Math.min(riskAlertWindow, Number(event.target.value) || DEFAULT_RISK_ALERT_MISS_THRESHOLD));
-              setRiskAlertMissThreshold(nextThreshold);
-            }}
-          /></label>
-          <label className="risk-control-field"><span>Refresh</span><select value={String(riskTimelineRefreshSec)} onChange={(event) => {
-            const nextValue = Number(event.target.value);
-            setRiskTimelineRefreshSec(nextValue === 5 || nextValue === 30 ? nextValue : 15);
-          }}>
-            <option value="5">5s</option>
-            <option value="15">15s</option>
-            <option value="30">30s</option>
-          </select></label>
-          <label className="risk-control-field"><span>Hard alert</span><select value={riskHardAlertEnabled ? "on" : "off"} onChange={(event) => {
-            setRiskHardAlertEnabled(event.target.value === "on");
-          }}>
-            <option value="off">off</option>
-            <option value="on">on</option>
-          </select></label>
-          <label className="risk-control-field"><span>Hard %</span><input
-            type="number"
-            min={20}
-            max={95}
-            value={Math.round(riskHardAlertThresholdPct)}
-            onChange={(event) => {
-              const nextHardThreshold = Math.max(20, Math.min(95, Number(event.target.value) || DEFAULT_HARD_ALERT_RATIO_PCT));
-              setRiskHardAlertThresholdPct(nextHardThreshold);
-            }}
-          /></label>
-          <button type="button" className="chart-chip" onClick={() => { void exportRiskHistory("json"); }}>export json</button>
-          <button type="button" className="chart-chip" onClick={() => { void exportRiskHistory("csv"); }}>export csv</button>
-          <button type="button" className="chart-chip" onClick={() => { void exportComplianceZip(); }}>export zip</button>
-          <button type="button" className="chart-chip" onClick={resetWorkspaceRiskAlert}>reset</button>
-        </div>
-        {pollingStale ? <p className="subtle mini warn">Polling stale: plus de 2 cycles sans succes.</p> : null}
-        {thresholdAtLimit ? <p className="subtle mini warn">Guardrail: threshold a atteint la fenetre (alerte au moindre miss).</p> : null}
-        <p className="subtle mini">preset actif: {presetLabel}</p>
-        {riskTimelineRows.length === 0 ? <p className="subtle mini">Aucun event risque.</p> : null}
-        {riskTimelineRows.slice(0, rowLimit).map((entry, ri) => (
-          <div key={`${keyPrefix}-${ri}-${entry.atIso}`} className="risk-timeline-row">
-            <span>{formatClock(entry.atIso)}</span>
-            <span className="gtix-ellipsis">{entry.symbol}</span>
-            <span>{entry.side.toUpperCase()}</span>
-            <span>RR {entry.rr.toFixed(2)}</span>
-            <span className={entry.compliant ? "good" : "warn"}>{entry.compliant ? "ok" : "miss"}</span>
-            <span className="subtle mini">{entry.source || "local"}</span>
-            <span className="subtle mini">{entry.outcome === "confirmation-required" ? "confirm" : entry.outcome}</span>
-          </div>
-        ))}
-      </>
+      <ExecutionSidecarCard
+        headActions={headActions}
+        sideLabel={chartOrderTicket.side.toUpperCase()}
+        entry={chartOrderTicket.entry}
+        sl={chartOrderTicket.sl}
+        tp={chartOrderTicket.tp}
+        chartPriceDigits={chartPriceDigits}
+        chartRiskReward={chartRiskReward}
+        chartRiskUsd={chartRiskUsd}
+        chartMaxLossUsd={chartMaxLossUsd}
+        chartRewardUsd={chartRewardUsd}
+        chartTargetGainUsd={chartTargetGainUsd}
+        suggestedBracket={marketDecisionV1.suggestedBracket}
+        suggestedLiquidityHighlight={suggestedLiquidityHighlight ? { level: suggestedLiquidityHighlight.level, exactTpMatch: suggestedLiquidityExactTpMatch } : null}
+        onApplyBracket={() => {
+          if (marketDecisionV1.suggestedBracket) {
+            applySuggestedScenarioBracket(marketDecisionV1.suggestedBracket);
+          }
+        }}
+        onApproveAll={() => {
+          if (!marketDecisionV1.suggestedBracket) {
+            return;
+          }
+          applySuggestedScenarioBracket(marketDecisionV1.suggestedBracket);
+          applyExecutionAdaptationPlan(marketDecisionV1.executionPlan);
+          setPendingExecutionAdaptation(null);
+        }}
+        onApproveAllAndSend={() => {
+          void approveAllAndSend();
+        }}
+        approveAllAndSendLabel={approveAllAndSendLabel}
+        showCriticalActions={marketDecisionV1.criticalConfirmed}
+        previewOpen={chartOrderPreviewOpen}
+        onTogglePreview={() => setChartOrderPreviewOpen((value) => !value)}
+        selectedChartSymbol={selectedChartSymbol}
+        ocoEnabled={chartOrderTicket.oco}
+        chartSnapEnabled={chartSnapEnabled}
+        chartSnapPriorityLabel={chartSnapPriority.toUpperCase()}
+      />
     );
   };
+
+  const buildRiskTimelineBodyProps = (rowLimit: number, keyPrefix: string): ComponentProps<typeof RiskTimelineBody> => ({
+    hardAlertLocal: Boolean(riskHardAlertEnabled) && toNumber(riskSummary?.ratio_miss_window, 0) * 100 >= Math.max(20, Math.min(95, riskHardAlertThresholdPct)),
+    riskTimelineFilter,
+    onSetRiskTimelineFilter: setRiskTimelineFilter,
+    riskSummary,
+    thresholdAtLimit: riskAlertMissThreshold >= riskAlertWindow,
+    pollingStale: riskPollingFailures > 2,
+    riskPollingStatus,
+    riskPollAgeSec,
+    riskTimelineFrom,
+    onRiskTimelineFromChange: setRiskTimelineFrom,
+    riskTimelineTo,
+    onRiskTimelineToChange: setRiskTimelineTo,
+    riskAlertWindow,
+    onRiskAlertWindowChange: (value) => {
+      const nextWindow = Math.max(3, Math.min(100, value || DEFAULT_RISK_ALERT_WINDOW));
+      setRiskAlertWindow(nextWindow);
+      setRiskAlertMissThreshold((current) => Math.min(nextWindow, Math.max(1, current)));
+    },
+    riskAlertMissThreshold,
+    onRiskAlertMissThresholdChange: (value) => {
+      const nextThreshold = Math.max(1, Math.min(riskAlertWindow, value || DEFAULT_RISK_ALERT_MISS_THRESHOLD));
+      setRiskAlertMissThreshold(nextThreshold);
+    },
+    riskTimelineRefreshSec,
+    onRiskTimelineRefreshSecChange: setRiskTimelineRefreshSec,
+    riskHardAlertEnabled,
+    onRiskHardAlertEnabledChange: setRiskHardAlertEnabled,
+    riskHardAlertThresholdPct,
+    onRiskHardAlertThresholdPctChange: (value) => {
+      const nextHardThreshold = Math.max(20, Math.min(95, value || DEFAULT_HARD_ALERT_RATIO_PCT));
+      setRiskHardAlertThresholdPct(nextHardThreshold);
+    },
+    onExportRiskHistoryJson: () => { void exportRiskHistory("json"); },
+    onExportRiskHistoryCsv: () => { void exportRiskHistory("csv"); },
+    onExportComplianceZip: () => { void exportComplianceZip(); },
+    onResetWorkspaceRiskAlert: resetWorkspaceRiskAlert,
+    presetLabel: layoutPreset === "scalp" ? "Scalp 4/12" : layoutPreset === "monitoring" ? "Monitoring 2/8" : "Swing 3/10",
+    riskTimelineRows,
+    rowLimit,
+    keyPrefix,
+    formatClock,
+  });
+
+  const renderRiskTimelineBody = (rowLimit: number, keyPrefix: string): ReactNode => {
+    return <RiskTimelineBody {...buildRiskTimelineBodyProps(rowLimit, keyPrefix)} />;
+  };
+
+  const chartExecutionHudPanel = (
+    <ChartExecutionHud
+      chartHudDragging={chartHudDragging}
+      chartHudMinimized={chartHudMinimized}
+      chartHudPosition={chartHudPosition}
+      chartMotionClass={chartMotionClass}
+      chartMotionPreset={chartMotionPreset}
+      chartOrderHudRef={chartOrderHudRef}
+      compactMode={chartOverlayCompactMode}
+      detached={chartOverlayCompactMode}
+      layoutScreenProfile={layoutScreenProfile}
+      modeShortLabel={modeUxProfile.shortLabel}
+      onBeginChartHudDrag={beginChartHudDrag}
+      onResetChartHud={resetChartHud}
+      onToggleChartHudMinimized={() => setChartHudMinimized((value) => !value)}
+      signalDisplayMode={signalDisplayMode}
+      signalFocusMode={marketSignalV1.focusMode}
+    >
+      <ChartHudSignalDecisionPanel
+        signalDisplayMode={signalDisplayMode}
+        marketSignal={marketSignalV1}
+        perceptionMotionClass={perceptionMotionClass}
+        perceptionSetupReady={perceptionSetupReady}
+        perceptionCoreLabel={perceptionCoreLabel}
+        perceptionReasonCode={perceptionReasonCode}
+        showReasonLegend={showReasonLegend}
+        onToggleShowReasonLegend={() => setShowReasonLegend((value) => !value)}
+        perceptionReasonLegend={perceptionReasonLegend}
+        perceptionTargetLabel={perceptionTargetLabel}
+        perceptionActionLabel={perceptionActionLabel}
+        signalConfidenceDrift={signalConfidenceDrift}
+        marketDecision={marketDecisionV1}
+        showConfluenceTune={showConfluenceTune}
+        onToggleShowConfluenceTune={() => setShowConfluenceTune((value) => !value)}
+        showDecisionSecondary={showDecisionSecondary}
+        onToggleShowDecisionSecondary={() => setShowDecisionSecondary((value) => !value)}
+        confluenceWeights={confluenceWeights}
+        onChangeConfluenceWeight={handleConfluenceWeightChange}
+        decisionSecondaryRef={decisionSecondaryRef}
+        entryTimingV3={entryTimingV3}
+        tradeManagementV3={tradeManagementV3}
+        intelligentExitV3={intelligentExitV3}
+        trailingV3={trailingV3}
+        confidencePillTone={confidencePillTone}
+        autoExecutionMode={autoExecutionMode}
+        onSetAutoExecutionMode={setAutoExecutionMode}
+        autoExecutionKillSwitch={autoExecutionKillSwitch}
+        onToggleAutoExecutionKillSwitch={() => setAutoExecutionKillSwitch((value) => !value)}
+        autoSessionGuardEnabled={autoSessionGuardEnabled}
+        onToggleAutoSessionGuardEnabled={() => setAutoSessionGuardEnabled((value) => !value)}
+        autoSessionStartHour={autoSessionStartHour}
+        onSetAutoSessionStartHour={(value) => setAutoSessionStartHour(Math.max(0, Math.min(23, value)))}
+        autoSessionEndHour={autoSessionEndHour}
+        onSetAutoSessionEndHour={(value) => setAutoSessionEndHour(Math.max(0, Math.min(23, value)))}
+        autoSymbolLossCapUsd={autoSymbolLossCapUsd}
+        onSetAutoSymbolLossCapUsd={(value) => setAutoSymbolLossCapUsd(Math.max(50, value))}
+        autoSymbolLoss={autoSymbolLoss}
+        onResetAutoSymbolLoss={handleResetAutoSymbolLoss}
+        autoExecutionGate={autoExecutionGate}
+        autoMetaPass={autoMetaFilter.pass}
+        autoRiskEngine={autoRiskEngine}
+        openTradesCount={openTradesCount}
+        exposureRatio={exposureRatio}
+        dailyDrawdownPct={dailyDrawdownPct}
+        autoSessionGuard={autoSessionGuard}
+        filteredAutoExecutionAuditTrail={filteredAutoExecutionAuditTrail}
+        autoExecutionAuditTrailLength={autoExecutionAuditTrail.length}
+        autoExecutionAuditStateFilter={autoExecutionAuditStateFilter}
+        onSetAutoExecutionAuditStateFilter={setAutoExecutionAuditStateFilter}
+        autoExecutionAuditReasonSearch={autoExecutionAuditReasonSearch}
+        onSetAutoExecutionAuditReasonSearch={setAutoExecutionAuditReasonSearch}
+        onExportAutoExecutionAuditJson={() => exportAutoExecutionAudit("json")}
+        onExportAutoExecutionAuditCsv={() => exportAutoExecutionAudit("csv")}
+        onClearAutoExecutionAuditTrail={() => setAutoExecutionAuditTrail([])}
+        formatClock={formatClock}
+        selfLearningV4Enabled={selfLearningV4Enabled}
+        onToggleSelfLearningV4Enabled={() => setSelfLearningV4Enabled((value) => !value)}
+        selfLearningAutoAdaptEnabled={selfLearningAutoAdaptEnabled}
+        onToggleSelfLearningAutoAdaptEnabled={handleToggleSelfLearningAutoAdaptEnabled}
+        selfLearningDriftV4={selfLearningDriftV4}
+        selfLearningV4DriftLabel={selfLearningV4DriftLabel}
+        filteredSelfLearningJournalV4Trail={filteredSelfLearningJournalV4Trail}
+        selfLearningJournalV4TrailLength={selfLearningJournalV4Trail.length}
+        onExportSelfLearningJournalV4Json={() => exportSelfLearningJournalV4("json")}
+        onExportSelfLearningJournalV4Csv={() => exportSelfLearningJournalV4("csv")}
+        onClearSelfLearningJournalV4Trail={() => setSelfLearningJournalV4Trail([])}
+        selfLearningJournalV4RegimeFilter={selfLearningJournalV4RegimeFilter}
+        onSetSelfLearningJournalV4RegimeFilter={setSelfLearningJournalV4RegimeFilter}
+        selfLearningJournalV4ScenarioFilter={selfLearningJournalV4ScenarioFilter}
+        onSetSelfLearningJournalV4ScenarioFilter={setSelfLearningJournalV4ScenarioFilter}
+        selfLearningV4Active={selfLearningV4Active}
+        selfLearningStorageTone={selfLearningStorageTone}
+        selfLearningStorageLabel={selfLearningStorageLabel}
+        selfLearningV4PersistenceStatus={selfLearningV4PersistenceStatus}
+        selfLearningCurrentScopeCount={selfLearningCurrentScopeCount}
+        selfLearningRegimeV4={selfLearningRegimeV4}
+        selfLearningV4WeightsLabel={selfLearningV4WeightsLabel}
+        selfLearningV4ModelLabel={selfLearningV4ModelLabel}
+        selfLearningProfile={selfLearningProfile}
+        selfLearningModelUpdatedAt={selfLearningModelUpdatedAt}
+        selfLearningDriftAutoDemotedAt={selfLearningDriftAutoDemotedAt}
+        selfLearningAdaptiveWeights={selfLearningAdaptiveWeights}
+        executionAdaptMode={executionAdaptMode}
+        onSetExecutionAdaptMode={setExecutionAdaptMode}
+        pendingExecutionAdaptation={pendingExecutionAdaptation}
+        onApplyPendingExecutionAdaptation={handleApplyPendingExecutionAdaptation}
+      />
+      <ChartHudOrderRiskPanel
+        chartOrderTicket={chartOrderTicket}
+        onApplyChartOrderPreset={applyChartOrderPreset}
+        onToggleChartOrderOco={() => setChartOrderTicket((value) => ({ ...value, oco: !value.oco }))}
+        chartSnapEnabled={chartSnapEnabled}
+        onToggleChartSnapEnabled={() => setChartSnapEnabled(!chartSnapEnabled)}
+        chartSnapPriority={chartSnapPriority}
+        onSetChartSnapPriority={setChartSnapPriority}
+        chartRiskUsd={chartRiskUsd}
+        chartRewardUsd={chartRewardUsd}
+        chartRiskReward={chartRiskReward}
+        chartMaxLossUsd={chartMaxLossUsd}
+        onSetChartMaxLossUsd={setChartMaxLossUsd}
+        chartTargetGainUsd={chartTargetGainUsd}
+        onSetChartTargetGainUsd={setChartTargetGainUsd}
+        chartRiskGuardEnabled={chartRiskGuardEnabled}
+        onToggleChartRiskGuardEnabled={() => setChartRiskGuardEnabled((value) => !value)}
+        uiMode={uiMode}
+        onApplySafeRiskPreset={() => { setChartMaxLossUsd(80); setChartTargetGainUsd(160); }}
+        onApplyBalancedRiskPreset={() => { setChartMaxLossUsd(120); setChartTargetGainUsd(240); }}
+        onApplyDeskRiskPreset={() => { setChartMaxLossUsd(250); setChartTargetGainUsd(500); }}
+        chartRiskLossExceeded={chartRiskLossExceeded}
+        chartRiskTargetMiss={chartRiskTargetMiss}
+        chartRiskTargetRr={chartRiskTargetRr}
+        chartPriceStep={chartPriceStep}
+        chartPriceDigits={chartPriceDigits}
+        chartSnapEnabledLabel={chartSnapEnabledLabel}
+        chartSnapState={chartSnapState}
+        chartOrderTicketEntryLabel={chartOrderTicketPriceLabels.entry}
+        chartOrderTicketSlLabel={chartOrderTicketPriceLabels.sl}
+        chartOrderTicketTpLabel={chartOrderTicketPriceLabels.tp}
+        chartEffectiveSendMode={chartEffectiveSendMode}
+        chartHudConfirmArmed={chartHudConfirmArmed}
+        onToggleChartHudConfirmArmed={() => setChartHudConfirmArmed((value) => !value)}
+        onSubmitChartOrder={handleChartHudSubmit}
+        mergedChartSendHistory={mergedChartSendHistory}
+        formatClock={formatClock}
+      />
+    </ChartExecutionHud>
+  );
 
   // ─── Floating panel content renderer ─────────────────────────────────────
   function renderDockPanelContent(id: DockPanelId): ReactNode {
     switch (id) {
       case "dom":
-        return (
-          <div style={{ height: "100%", overflow: "auto" }}>
-          <PanelShell className="panel micro-panel">
-            <div className="eyebrow micro-panel-title">DOM <span className={`micro-stream-badge micro-stream-${depthStreamState}`}>{depthStreamState}</span></div>
-            <div className="dom-table-compact">
-              <div className="dom-header-row"><span>Side</span><span>Prix</span><span>Taille</span><span>Profondeur</span></div>
-              {activeDomLevels.map((lvl, di) => (
-                <div key={`fdom-${di}`} className={`dom-row-compact ${lvl.side}`}>
-                  <span className={`dom-side-label ${lvl.side}`}>{lvl.side === "ask" ? "A" : "B"}</span>
-                  <span className="dom-price">{lvl.price.toFixed(1)}</span>
-                  <span className="dom-size">{lvl.size}</span>
-                  <span className="dom-bar-cell"><span style={{ width: `${Math.min(100, lvl.intensity * 100)}%` }} /></span>
-                </div>
-              ))}
-            </div>
-          </PanelShell>
-          </div>
-        );
+        return <DomDockPanel depthStreamState={displayDepthStreamState} activeDomLevels={activeDomLevels} />;
       case "footprint":
-        return (
-          <div style={{ height: "100%", overflow: "auto" }}>
-          <PanelShell className="panel micro-panel">
-            <div className="eyebrow micro-panel-title">Footprint</div>
-            <div className="footprint-compact">
-              <div className="fp-header-row"><span>Niveau</span><span className="good">Buy</span><span className="warn">Sell</span><span>Δ</span></div>
-              {activeFootprintRows.map((row, fpi) => (
-                <div key={`ffp-${fpi}`} className="fp-row-compact">
-                  <span className="fp-level">{row.timeLabel ? `${row.timeLabel} · ` : ""}{row.high.toFixed(0)}–{row.low.toFixed(0)}</span>
-                  <span className="good fp-num">{row.buyVolume.toFixed(0)}</span>
-                  <span className="warn fp-num">{row.sellVolume.toFixed(0)}</span>
-                  <span className={`fp-num ${row.delta >= 0 ? "good" : "warn"}`}>{row.delta.toFixed(0)}</span>
-                </div>
-              ))}
-            </div>
-          </PanelShell>
-          </div>
-        );
+        return <FootprintDockPanel activeFootprintRows={activeFootprintRows} />;
       case "tape":
-        return (
-          <div style={{ height: "100%", overflow: "auto" }}>
-          <PanelShell className="panel micro-panel">
-            <div className="eyebrow micro-panel-title">Tape</div>
-            <div className="tape-compact">
-              {activeTape.map((print, ti) => (
-                <div key={`ftp-${ti}`} className={`tape-row-compact ${print.side}`}>
-                  <span className="tape-time">{print.label.slice(-8)}</span>
-                  <span className="tape-price">{print.price.toFixed(1)}</span>
-                  <span className="tape-vol">{print.volume}</span>
-                  <span className={`tape-badge ${print.side}`}>{print.side === "buy" ? "B" : print.side === "sell" ? "S" : "–"}</span>
-                </div>
-              ))}
-            </div>
-          </PanelShell>
-          </div>
-        );
+        return <TapeDockPanel activeTape={activeTape} />;
       case "heatmap":
-        return (
-          <div style={{ height: "100%", overflow: "auto" }}>
-          <PanelShell className="panel micro-panel">
-            <div className="eyebrow micro-panel-title">Heatmap <span className="subtle mini" style={{ marginLeft: 6 }}>{String(sessionState?.session || "–")}</span></div>
-            <div className="heatmap-compact">
-              {activeHeatmapLevels.map((lvl, hi) => (
-                <div key={`fhm-${hi}`} className={`hm-row ${lvl.side}`} style={{ opacity: Math.max(0.2, lvl.intensity) }}>
-                  <span className="hm-price">{lvl.price.toFixed(1)}</span>
-                  <div className="hm-bar-wrap"><div className={`hm-bar ${lvl.side}`} style={{ width: `${Math.min(100, lvl.intensity * 100)}%` }} /></div>
-                  <span className="hm-size">{lvl.size}</span>
-                </div>
-              ))}
-            </div>
-          </PanelShell>
-          </div>
-        );
+        return <HeatmapDockPanel activeHeatmapLevels={activeHeatmapLevels} sessionLabel={String(sessionState?.session || "–")} />;
       case "blotter":
-        return (
-          <div style={{ height: "100%", overflow: "auto" }}>
-          <PanelShell className="panel term-blotter-panel">
-            <div className="eyebrow">Blotter d'exécution</div>
-            {filteredOutcomes.length === 0 ? <p className="subtle mini" style={{ marginTop: 8 }}>Aucune exécution.</p> : null}
-            {filteredOutcomes.length > 0 ? (
-              <div className="blotter-scroll">
-                <table className="blotter-table" style={{ marginTop: 8 }}>
-                  <thead><tr><th>Time</th><th>Symbol</th><th>PnL</th><th>Slip</th><th>Status</th></tr></thead>
-                  <tbody>
-                    {filteredOutcomes.slice(0, 8).map((item, bi) => (
-                      <tr key={`fbl-${bi}`}>
-                        <td>{String(item.created_at || "–").slice(11, 19)}</td>
-                        <td>{instrumentLabel(item)}</td>
-                        <td className={toNumber(item.net_result_usd, 0) >= 0 ? "good" : "warn"}>{toNumber(item.net_result_usd, 0).toFixed(2)}</td>
-                        <td>{toNumber(item.slippage_real_bps, 0).toFixed(1)}bps</td>
-                        <td>{String(item.status || "–").slice(0, 8)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            ) : null}
-          </PanelShell>
-          </div>
-        );
+        return <BlotterDockPanel filteredOutcomes={filteredOutcomes} instrumentLabel={instrumentLabel} />;
       case "brokers":
-        return (
-          <div style={{ height: "100%", overflow: "auto" }}>
-          <PanelShell className="panel term-brokers-panel">
-            <div className="eyebrow">Brokers · Agents · Capital</div>
-            <div className="brokers-grid">
-              <div className="brokers-section">
-                <div className="chart-stat-label" style={{ marginBottom: 6 }}>Agents IA</div>
-                {providerRows.slice(0, 5).map((item, agI) => (
-                  <div key={`fbr-ag-${agI}`} className="agent-row">
-                    <span className="agent-name gtix-ellipsis">{String(item.route || "–").slice(0, 14)}</span>
-                    <span className={Boolean(item.available) ? "good mini" : "warn mini"}>{Boolean(item.available) ? "●" : "○"}</span>
-                  </div>
-                ))}
-              </div>
-              <div className="brokers-section">
-                <div className="chart-stat-label" style={{ marginBottom: 6 }}>Capital</div>
-                {balances.slice(0, 5).map((item) => (
-                  <div key={String(item.currency || "")} className="balance-row">
-                    <span className="balance-ccy">{String(item.currency || "–")}</span>
-                    <span className="balance-val gtix-ellipsis">{String(item.free || "–")}</span>
-                  </div>
-                ))}
-              </div>
-              <div className="brokers-section">
-                <div className="chart-stat-label" style={{ marginBottom: 6 }}>Positions</div>
-                {positions.slice(0, 5).map((item) => (
-                  <div key={instrumentLabel(item)} className="pos-row">
-                    <span className="pos-sym gtix-ellipsis">{instrumentLabel(item).slice(0, 10)}</span>
-                    <span className="balance-val">{toNumber(item.net_notional_usd, 0).toFixed(0)}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </PanelShell>
-          </div>
-        );
+        return <BrokersDockPanel providerRows={providerRows} balances={balances} positions={positions} instrumentLabel={instrumentLabel} />;
       case "alerts":
-        return (
-          <div className="monitoring-col" style={{ height: "100%", overflow: "auto" }}>
-            <div className="eyebrow" style={{ marginBottom: 8 }}>Alertes actives</div>
-            {filteredAlerts.length === 0 ? <p className="subtle mini">Aucune alerte.</p> : null}
-            {filteredAlerts.slice(0, 10).map((item, ali) => (
-              <div key={`fal-${ali}`} className="mon-row">
-                <span className={String(item.level) === "critical" ? "warn" : ""}>{String(item.type || "–")}</span>
-                <span className="subtle mini">{String(item.message || "").slice(0, 48)}</span>
-              </div>
-            ))}
-          </div>
-        );
+        return <AlertsDockPanel filteredAlerts={filteredAlerts} />;
       case "incidents":
-        return (
-          <div className="monitoring-col" style={{ height: "100%", overflow: "auto" }}>
-            <div className="eyebrow" style={{ marginBottom: 8 }}>Incidents</div>
-            {incidents.length === 0 ? <p className="subtle mini">Aucun incident.</p> : null}
-            {incidentRows.slice(0, 8).map(({ item, status, severityLabel, slaLabel }) => (
-              <div key={String(item.ticket_key || "")} className="mon-row incident-row">
-                <span>{String(item.ticket_key || "–")}</span>
-                <span className="subtle mini">{String(item.title || "–").slice(0, 28)}</span>
-                <span className="incident-meta-strip">
-                  <span className={`incident-chip incident-chip-status-${status.toLowerCase()}`}>{status}</span>
-                  <span className={`incident-chip incident-chip-severity-${severityLabel}`}>{severityLabel}</span>
-                  <span className={`incident-chip ${slaLabel === "breach" ? "incident-chip-sla-breach" : "incident-chip-sla-ok"}`}>sla {slaLabel}</span>
-                </span>
-              </div>
-            ))}
-          </div>
-        );
+        return <IncidentsDockPanel incidentRows={incidentRows} />;
       case "governance":
-        return (
-          <div className="monitoring-col" style={{ height: "100%", overflow: "auto" }}>
-            <div className="eyebrow" style={{ marginBottom: 8 }}>Governance</div>
-            {governanceFiltered.slice(0, 12).map((row) => (
-              <div key={row.label} className="mon-row">
-                <span>{row.label}</span>
-                <span className={row.severity >= 3 ? "warn" : row.severity >= 2 ? "subtle" : "good"}>{row.value}</span>
-              </div>
-            ))}
-          </div>
-        );
+        return <GovernanceDockPanel governanceFiltered={governanceFiltered} />;
       case "readiness":
-        return (
-          <div className="monitoring-col" style={{ height: "100%", overflow: "auto" }}>
-            <div className="eyebrow" style={{ marginBottom: 8 }}>Readiness</div>
-            <div className="mon-row"><span>Drift détecté</span><span>{driftItems.filter((d) => Boolean(d.drift_detected)).length}</span></div>
-            <div className="mon-row"><span>Suspendues</span><span className={suspended.length > 0 ? "warn" : "good"}>{suspended.length}</span></div>
-            <div className="mon-row"><span>Similarity</span><span>{String(memorySummary.avg_final_similarity || "–")}</span></div>
-            <div className="mon-row"><span>Memory impact</span><span>{String(memorySummary.avg_memory_impact || "–")}</span></div>
-            <div className="mon-row"><span>SLA breach</span><span className={incidents.some((i) => Boolean(i.sla_breached)) ? "warn" : "good"}>{incidents.filter((i) => Boolean(i.sla_breached)).length}</span></div>
-          </div>
-        );
+        return <ReadinessDockPanel driftItems={driftItems} suspendedCount={suspended.length} memorySummary={memorySummary} incidents={incidents} />;
       case "risktimeline":
         return (
           <div className="monitoring-col" style={{ height: "100%", overflow: "auto" }}>
             <div className="eyebrow" style={{ marginBottom: 8 }}>Risk Compliance Timeline</div>
-            {renderRiskTimelineBody(10, "rt")}
+            <RiskTimelineBody {...buildRiskTimelineBodyProps(10, "rt")} />
           </div>
         );
       default:
@@ -9147,6 +9999,19 @@ export default function TradingTerminalPage() {
 
   const hardAlertThreshold = Math.max(20, Math.min(95, riskHardAlertThresholdPct));
   const hardAlertActive = Boolean(riskHardAlertEnabled) && toNumber(riskSummary?.ratio_miss_window, 0) * 100 >= hardAlertThreshold;
+
+  if (!isHydrated) {
+    return (
+      <main className={`term-root ui-${uiMode}`}>
+        <header className="term-topbar gtix-panel-shell">
+          <span className="eyebrow term-topbar-brand">TXT Trading Terminal</span>
+        </header>
+        <div className="gtix-panel-shell" style={{ margin: "18px 22px", minHeight: 240, display: "grid", placeItems: "center" }}>
+          <div className="term-empty-state">Loading terminal...</div>
+        </div>
+      </main>
+    );
+  }
 
   return (
     <main className={`term-root ui-${uiMode}`}>
@@ -9283,7 +10148,7 @@ export default function TradingTerminalPage() {
           <div className="synth-item"><span className="synth-icon">↔</span><span className="synth-label">Spread</span><span className={`synth-val ${preferredSpread > 2 ? "warn" : "good"}`}>{preferredSpread.toFixed(4)}</span></div>
           <div className="synth-item"><span className="synth-icon">≈</span><span className="synth-label">Slip</span><span className={`synth-val ${avgSlippage > 15 ? "warn" : "good"}`}>{avgSlippage.toFixed(1)} bps</span></div>
           <div className="synth-item"><span className="synth-icon">◔</span><span className="synth-label">Latence</span><span className={`synth-val ${avgLatency > 200 ? "warn" : "good"}`}>{avgLatency.toFixed(0)} ms</span></div>
-          <div className="synth-item"><span className="synth-icon">▤</span><span className="synth-label">DOM</span><span className={`synth-val ${depthStreamState === "live" ? "good" : "warn"}`}>{depthStreamState}</span></div>
+          <div className="synth-item"><span className="synth-icon">▤</span><span className="synth-label">DOM</span><span className={`synth-val ${displayDepthStreamState === "live" ? "good" : "warn"}`}>{displayDepthStreamState}</span></div>
           <div className="synth-item"><span className="synth-icon">Δ</span><span className="synth-label">Footprint</span><span className={`synth-val ${toNumber(dominantFootprint?.delta, 0) >= 0 ? "good" : "warn"}`}>{toNumber(dominantFootprint?.delta, 0).toFixed(0)}</span></div>
           <div className="synth-item"><span className="synth-icon">!</span><span className="synth-label">Incidents</span><span className={`synth-val ${openIncidents > 0 ? "warn" : "good"}`}>{openIncidents}</span></div>
           <div className="synth-item"><span className="synth-icon">×</span><span className="synth-label">Kill</span><span className={`synth-val ${String(overview?.kill_switch_active) === "true" ? "warn" : "good"}`}>{String(overview?.kill_switch_active || "off")}</span></div>
@@ -9352,8 +10217,29 @@ export default function TradingTerminalPage() {
                   {mode === "auto" ? "Perf:A" : mode === "balanced" ? "Perf:B" : "Perf:U"}
                 </button>
               ))}
+              {(["auto", "clean", "full"] as const).map((mode) => (
+                <button
+                  key={`visual-${mode}`}
+                  type="button"
+                  className={`chart-chip ${chartVisualMode === mode ? "active" : ""}`}
+                  title={mode === "auto" ? "Adaptive clean policy driven by preset and viewport" : mode === "clean" ? "Force cleaner chart view and rely on sidecars" : "Keep premium overlays visible"}
+                  onClick={() => setChartVisualMode(mode)}
+                >
+                  {mode === "auto" ? "View:A" : mode === "clean" ? "View:C" : "View:F"}
+                </button>
+              ))}
               {(["line", "candles", "footprint"] as const).map((m) => (
-                <button key={m} type="button" className={`chart-chip ${chartMode === m ? "active" : ""}`} onClick={() => setChartMode(m)}>
+                <button
+                  key={m}
+                  type="button"
+                  className={`chart-chip ${chartMode === m ? "active" : ""}`}
+                  onClick={() => {
+                    setChartMode(m);
+                    if (m === "candles" && isGtixPublicBrowserHost() && chartVisualMode !== "full") {
+                      setChartVisualMode("clean");
+                    }
+                  }}
+                >
                   {m === "line" ? "L" : m === "candles" ? "C" : "FP"}
                 </button>
               ))}
@@ -9425,6 +10311,8 @@ export default function TradingTerminalPage() {
           <div className={`chart-meta-strip ${marketSignalV1.focusMode ? "signal-focus" : ""}`}>
             <span className="chart-overlay-chip chart-overlay-chip-emphasis">{selectedChartSymbol}</span>
             <span className="chart-overlay-chip">{chartTimeframe}</span>
+            <span className={`chart-overlay-chip ${localOhlcvAnalysis.signal === "OHLCV_RENDERABLE" ? "chart-overlay-chip-good" : "chart-overlay-chip-warn"}`}>Feed {selectedChartInstrument} @ {selectedChartVenue}</span>
+            <span className={`chart-overlay-chip ${localOhlcvAnalysis.signal === "OHLCV_RENDERABLE" ? "chart-overlay-chip-good" : "chart-overlay-chip-warn"}`}>OHLCV {localOhlcvAnalysis.signal === "OHLCV_RENDERABLE" ? "RENDERABLE" : localOhlcvAnalysis.signal === "OHLCV_PARTIAL" ? "PARTIAL" : "UNUSABLE"}</span>
             <span className={`chart-overlay-chip chart-overlay-chip-signal chart-overlay-chip-signal-${marketSignalV1.dominantDirection}`}>{marketSignalV1.headline}</span>
             <span className="chart-overlay-chip chart-overlay-chip-good">Buy Pressure {marketSignalV1.buyPressurePct.toFixed(0)}%</span>
             <span className={`chart-overlay-chip chart-overlay-chip-signal chart-overlay-chip-signal-${marketDecisionV1.biasDirection}`}>{marketDecisionV1.scenarioLabel} {marketDecisionV1.scenarioProbabilityPct}%</span>
@@ -9551,7 +10439,117 @@ export default function TradingTerminalPage() {
             why="Il permet de confirmer rapidement si le signal reste cohérent avec la structure et le flux d'exécution."
             example="Si le prix reprend la VWAP, défend une zone de liquidité et garde un delta positif, le contexte reste plus favorable."
           />
-          <div className={`chart-shell chart-shell-premium chart-shell-${chartMotionClass} chart-shell-signal-mode-${signalDisplayMode}`}>
+          <div className="chart-v2-flag-row">
+            <button type="button" className={`chart-chip ${terminalV2Enabled ? "active" : ""}`} onClick={toggleTerminalV2}>
+              V2 Surface {terminalV2Enabled ? "ON" : "OFF"}
+            </button>
+            <button type="button" className={`chart-chip ${chartEngineMode === "v4" ? "active" : ""}`} onClick={toggleChartEngineMode}>
+              Engine {chartEngineMode.toUpperCase()}
+            </button>
+            <button type="button" className={`chart-chip ${gpuViewportGrid === "auto" ? "active" : ""}`} onClick={() => setGpuViewportGridMode("auto")}>
+              Grid AUTO
+            </button>
+            <button type="button" className={`chart-chip ${gpuViewportGrid === 1 ? "active" : ""}`} onClick={() => setGpuViewportGridMode(1)}>
+              Grid 1x1
+            </button>
+            <button type="button" className={`chart-chip ${gpuViewportGrid === 4 ? "active" : ""}`} onClick={() => setGpuViewportGridMode(4)}>
+              Grid 2x2
+            </button>
+            <button type="button" className={`chart-chip ${gpuViewportGrid === 16 ? "active" : ""}`} onClick={() => setGpuViewportGridMode(16)}>
+              Grid 4x4
+            </button>
+            <button type="button" className={`chart-chip ${chartSmoothingMs === 0 ? "active" : ""}`} onClick={() => setChartSmoothingMode(0)}>
+              Smooth OFF
+            </button>
+            <button type="button" className={`chart-chip ${chartSmoothingMs === 80 ? "active" : ""}`} onClick={() => setChartSmoothingMode(80)}>
+              Smooth 80ms
+            </button>
+            <button type="button" className={`chart-chip ${chartSmoothingMs === 140 ? "active" : ""}`} onClick={() => setChartSmoothingMode(140)}>
+              Smooth 140ms
+            </button>
+            <button type="button" className={`chart-chip ${chartSmoothingMs === 220 ? "active" : ""}`} onClick={() => setChartSmoothingMode(220)}>
+              Smooth 220ms
+            </button>
+            <span className="chart-overlay-chip">Feature flag: NEXT_PUBLIC_TERMINAL_V2 or ?v2=1</span>
+            <span className="chart-overlay-chip">Engine flag: NEXT_PUBLIC_TERMINAL_ENGINE_V4 or ?engine=v4</span>
+          </div>
+
+          {terminalV2Enabled ? (
+            <TerminalChartV2
+              enabled={terminalV2Enabled}
+              onToggleEnabled={toggleTerminalV2}
+              symbol={selectedChartSymbol}
+              timeframe={chartTimeframe}
+              onTimeframeChange={setActiveChartTimeframe}
+              chartWindow={chartWindow}
+              onZoomIn={() => setChartWindow((value) => Math.max(30, value - 20))}
+              onZoomOut={() => setChartWindow((value) => Math.min(500, value + 20))}
+              candles={chartDisplayCandles}
+              fallbackPrice={chartAnchorPrice > 0 ? chartAnchorPrice : (chartLastValue > 0 ? chartLastValue : 1)}
+              loading={chartLoading}
+              uiMode={uiMode}
+              onUiModeChange={setUiMode}
+              autoExecutionMode={autoExecutionMode}
+              onAutoExecutionModeChange={setAutoExecutionMode}
+              routingCandidates={routeCandidates.map((route) => ({
+                venue: String(route.venue || "unknown"),
+                instrument: String(route.instrument || selectedChartSymbol),
+                spread: Number.isFinite(route.spread) ? route.spread : Number.MAX_SAFE_INTEGER,
+                last: Number.isFinite(route.last) ? route.last : 0,
+                score: Number.isFinite((route as JsonMap).score as number)
+                  ? Number((route as JsonMap).score)
+                  : Number.isFinite(route.spread) && route.spread > 0
+                    ? Math.max(0, Math.min(100, 100 - route.spread * 10))
+                    : 0,
+              }))}
+              routeVenue={preferredRoute ? String(preferredRoute.venue || "--") : "--"}
+              routeScorePct={toNumber((preferredRoute as JsonMap | null)?.score, NaN)}
+              depthState={displayDepthStreamState}
+              domLevels={activeDomLevels}
+              heatmapLevels={activeHeatmapLevels}
+              riskMissRatioPct={toNumber(riskSummary?.ratio_miss_window, 0) * 100}
+              riskHardAlert={hardAlertActive}
+              riskGuardEnabled={chartRiskGuardEnabled}
+              onToggleRiskGuard={() => setChartRiskGuardEnabled((value) => !value)}
+              maxLossUsd={chartMaxLossUsd}
+              onSetMaxLossUsd={setChartMaxLossUsd}
+              targetGainUsd={chartTargetGainUsd}
+              onSetTargetGainUsd={setChartTargetGainUsd}
+              riskLossExceeded={chartRiskLossExceeded}
+              riskTargetMiss={chartRiskTargetMiss}
+              strategyLabel={chartOrderTicket.preset}
+              onAutoReduce={handleV2AutoReduce}
+              onAutoClose={handleV2AutoClose}
+              onDomEntryFromLevel={handleV2DomEntryFromLevel}
+              onDomExitFromLevel={handleV2DomExitFromLevel}
+              chartLinkSymbolEnabled={chartLinkSymbolEnabled}
+              onToggleChartLinkSymbol={() => setChartLinkSymbolEnabled((value) => !value)}
+              chartLinkTimeframeEnabled={chartLinkTimeframeEnabled}
+              onToggleChartLinkTimeframe={() => setChartLinkTimeframeEnabled((value) => !value)}
+              selectedVenue={selectedChartVenue}
+              availableVenues={Array.from(new Set(selectedQuoteRows.map((row) => String(row.venue || ""))).values()).filter(Boolean)}
+              onSelectVenue={(venue) => setChartVenueOverride(venue || null)}
+              multiChartRows={gpuMatrixRows.map((row) => ({
+                symbol: row.symbol,
+                price: row.price,
+                deltaPct: row.deltaPct,
+                spread: row.spread,
+                venue: row.venue,
+              }))}
+              quoteHistory={quoteHistory}
+              gpuViewportGrid={gpuViewportGrid}
+              onSelectSymbol={setActiveChartSymbol}
+              onSelectSymbolVenue={setActiveChartSymbolVenue}
+              aiHeadline={marketSignalV1.headline}
+              aiScenario={`${marketDecisionV1.scenarioLabel} ${marketDecisionV1.scenarioProbabilityPct}%`}
+              aiConfidencePct={marketDecisionV1.globalConfidencePct}
+              aiExplanation={overlayDecisionRationale || marketSignalV1.signals[0]?.detail || "No contextual explanation available."}
+              indicatorSeries={indicatorSeriesForChart}
+              chartEngineMode={chartEngineMode}
+              chartSmoothingMs={chartSmoothingMs}
+            />
+          ) : (
+            <div className={`chart-shell chart-shell-premium chart-shell-${chartMotionClass} chart-shell-signal-mode-${signalDisplayMode}`}>
             <aside className="chart-tools-panel" aria-label="Chart tools">
               <div className="chart-signal-kicker">1 CHART - 3 MODES</div>
               <div className="chart-mode-switch" role="group" aria-label="Execution mode">
@@ -9561,6 +10559,12 @@ export default function TradingTerminalPage() {
               </div>
               <div className="chart-mode-label">{modeUxProfile.shortLabel}</div>
               <div className="chart-action-pill">{modeUxProfile.summary}</div>
+              <div className="chart-tools-visual-group" role="group" aria-label="Chart visual mode">
+                <button type="button" className={`chart-tool-btn ${chartVisualMode === "auto" ? "active" : ""}`} onClick={() => setChartVisualMode("auto")}>AUTO</button>
+                <button type="button" className={`chart-tool-btn ${chartVisualMode === "clean" ? "active" : ""}`} onClick={() => setChartVisualMode("clean")}>CLEAN</button>
+                <button type="button" className={`chart-tool-btn ${chartVisualMode === "full" ? "active" : ""}`} onClick={() => setChartVisualMode("full")}>FULL</button>
+              </div>
+              <div className="chart-tools-visual-note">{chartVisualPolicyLabel}</div>
               <button type="button" className={`chart-tool-btn ${showVwap ? "active" : ""}`} onClick={() => setShowVwap((v) => !v)}>VWAP</button>
               <button type="button" className={`chart-tool-btn ${showFvgOb ? "active" : ""}`} onClick={() => setShowFvgOb((v) => !v)}>FVG/OB</button>
               <button type="button" className={`chart-tool-btn ${showLiquidity ? "active" : ""}`} onClick={() => setShowLiquidity((v) => !v)}>LIQ</button>
@@ -9575,41 +10579,116 @@ export default function TradingTerminalPage() {
                 <span className="chart-preset-reminder-value">{chartMotionPreset}</span>
               </Link>
             </aside>
-            <div className={`chart-stage-wrap chart-stage-wrap-premium chart-stage-wrap-${chartMotionClass} ${chartActiveSnapLine ? "is-execution-focus" : ""} ${marketSignalV1.focusMode ? "is-signal-focus" : ""}`} ref={chartStageRef}>
+            <div className={`chart-stage-wrap chart-stage-wrap-premium chart-stage-wrap-${chartMotionClass} ${chartOverlayCompactMode ? "chart-stage-wrap-compact-overlays" : ""} ${chartActiveSnapLine ? "is-execution-focus" : ""} ${marketSignalV1.focusMode ? "is-signal-focus" : ""} ${chartMaskActive ? "is-chart-invalid" : ""}`} ref={chartStageRef}>
+              {chartOverlayCompactMode ? (
+                <div className="chart-flow-banner chart-flow-banner-compact" aria-live="polite">
+                  <span className={`chart-flow-pill tone-${marketBusHealthTone}`}>BUS {marketBusHealthStatus.toUpperCase()}</span>
+                  <span className={`chart-flow-pill tone-${marketBusOhlcvContiguous ? "good" : "warn"}`}>{marketBusOhlcvContiguous ? "SEQ OK" : "SEQ GAP"} {marketBusOhlcvLatestSeq > 0 ? `#${marketBusOhlcvLatestSeq}` : "#-"}</span>
+                  <span className={`chart-flow-pill tone-${marketFlowAlerts.length > 0 ? "warn" : "good"}`}>{chartCompactAlertLabel}</span>
+                </div>
+              ) : (
+                <div className="chart-flow-banner" aria-live="polite">
+                  <span className={`chart-flow-pill tone-${marketBusHealthTone}`}>BUS {marketBusHealthStatus.toUpperCase()}</span>
+                  <span className={`chart-flow-pill tone-${streamStateTone(ohlcvStreamState)}`}>OHLCV {ohlcvStreamState.toUpperCase()}</span>
+                  <span className={`chart-flow-pill tone-${localOhlcvSignalTone}`}>LOCAL {localOhlcvAnalysis.signal === "OHLCV_RENDERABLE" ? "RENDERABLE" : localOhlcvAnalysis.signal === "OHLCV_PARTIAL" ? "PARTIAL" : "UNUSABLE"} {localOhlcvAnalysis.renderableRows}/{localOhlcvAnalysis.fetchedRows}</span>
+                  <span className={`chart-flow-pill tone-${marketBusOhlcvContiguous ? "good" : "warn"}`}>{marketBusOhlcvContiguous ? "SEQ OK" : "SEQ GAP"} {marketBusOhlcvLatestSeq > 0 ? `#${marketBusOhlcvLatestSeq}` : "#-"}</span>
+                  <span className={`chart-flow-pill tone-${streamStateTone(displayDepthStreamState)}`}>DOM {displayDepthStreamState.toUpperCase()}</span>
+                  <span className={`chart-flow-pill tone-${classifyFreshnessTone(ohlcvFreshnessState)}`}>BARS {ohlcvFreshnessState.toUpperCase()} {formatFreshness(marketBusOhlcvHealth?.freshness_ms)}</span>
+                  <span className={`chart-flow-pill tone-${classifyFreshnessTone(depthFreshnessState)}`}>DEPTH {depthFreshnessState.toUpperCase()} {formatFreshness(marketBusDepthHealth?.freshness_ms)}</span>
+                  <span className={`chart-flow-pill tone-${classifyFreshnessTone(tradesFreshnessState)}`}>TRADES {tradesFreshnessState.toUpperCase()} {formatFreshness(marketBusTradesHealth?.freshness_ms)}</span>
+                  <span className="chart-flow-pill tone-neutral">SYNC {marketBusSyncLabel}</span>
+                  <span className="chart-flow-pill tone-neutral">BOOK {marketBusDepthUpdateId > 0 ? marketBusDepthUpdateId : "-"}</span>
+                  <span className="chart-flow-pill tone-neutral" title={localTerminalCapturePersistenceStatus.clientId || "no-client-id"}>CLIENT {localTerminalCapturePersistenceStatus.clientId || "pending"}</span>
+                </div>
+              )}
+              {marketFlowAlerts.length > 0 && !chartUltraCleanCandles ? (
+                <div className={`chart-flow-alert ${chartOverlayCompactMode ? "chart-flow-alert-compact" : ""}`} aria-live="assertive">
+                  <strong>{chartOverlayCompactMode ? "Data" : "Market data alert"}</strong>
+                  <span>{chartFlowAlertText}</span>
+                </div>
+              ) : null}
+              {localOhlcvAnalysis.signal !== "OHLCV_RENDERABLE" && !chartUltraCleanCandles && !chartAuthBlocked ? (
+                <div className={`chart-flow-alert ${chartOverlayCompactMode ? "chart-flow-alert-compact" : ""}`} aria-live="assertive">
+                  <strong>Local OHLCV</strong>
+                  <span>{localOhlcvAlertText} Reasons: {localOhlcvReasonsLabel}. Feed: {localOhlcvFeedLabel}.</span>
+                </div>
+              ) : null}
+              {chartPreviewModeActive ? (
+                <div className={`chart-flow-alert ${chartOverlayCompactMode ? "chart-flow-alert-compact" : ""}`} aria-live="polite">
+                  <strong>Preview candles</strong>
+                  <span>{chartAuthBlocked ? "Session non authentifiee: affichage de bougies de previsualisation." : `Feed indisponible (${localOhlcvFeedLabel}): affichage de bougies de previsualisation.`}</span>
+                </div>
+              ) : null}
               {chartLoading ? <div className="chart-loader">Switching symbol…</div> : null}
-              <InstitutionalChart
-                className={`chart-stage-premium ${chartActiveSnapLine ? "execution-focus" : ""} ${marketSignalV1.focusMode ? "signal-focus" : ""}`}
-                symbol={selectedChartSymbol}
-                timeframe={chartTimeframe}
-                mode={chartMode}
-                chartMotionPreset={chartMotionPreset}
-                points={chartSeries}
-                candles={chartCandles}
-                overlayZones={activeOverlayZones}
-                liquidityZones={activeLiquidityZones}
-                domLevels={chartMode === "candles" ? activeDomLevels : undefined}
-                heatmapLevels={chartMode === "candles" ? activeHeatmapLevels : undefined}
-                dayVwap={showVwap ? dayVwap : 0}
-                weekVwap={showVwap ? weekVwap : 0}
-                monthVwap={showVwap ? monthVwap : 0}
-                showSessions={showSessions}
-                indicatorSeries={indicatorSeriesForChart}
-                footprintRows={chartMode === "footprint" ? activeFootprintRows : undefined}
-                candleTransform="none"
-                onCrosshairMove={(payload) => setCrosshair(payload)}
-              />
-              {suggestedBracketOverlay && !replayState.enabled ? (
-                <div className="chart-suggested-bracket-overlay" aria-hidden="true">
-                  <div className="chart-suggested-bracket-band reward" style={{ top: suggestedBracketOverlay.rewardTop, height: suggestedBracketOverlay.rewardHeight }} />
-                  <div className="chart-suggested-bracket-band risk" style={{ top: suggestedBracketOverlay.riskTop, height: suggestedBracketOverlay.riskHeight }} />
-                  <div className="chart-suggested-bracket-line entry" style={{ top: suggestedBracketOverlay.entryY }}><span>Suggested Entry</span></div>
-                  <div className="chart-suggested-bracket-line sl" style={{ top: suggestedBracketOverlay.slY }}><span>Suggested SL</span></div>
-                  <div className="chart-suggested-bracket-line tp" style={{ top: suggestedBracketOverlay.tpY }}><span>Suggested TP</span></div>
-                  {suggestedBracketOverlay.liquidityY !== null && suggestedLiquidityHighlight ? (
-                    <div className={`chart-suggested-liquidity-link ${suggestedLiquidityExactTpMatch ? "exact-tp-match" : ""}`} style={{ top: suggestedBracketOverlay.liquidityY }}>
-                      <span>{suggestedLiquidityExactTpMatch ? "TP=LIQ" : "LIQ"} {suggestedLiquidityHighlight.level.toFixed(chartPriceDigits)}</span>
-                    </div>
-                  ) : null}
+              {chartEngineMode === "v4" ? (
+                <GpuChartV4Surface
+                  className={`chart-stage-premium ${chartActiveSnapLine ? "execution-focus" : ""} ${marketSignalV1.focusMode ? "signal-focus" : ""}`}
+                  symbol={selectedChartSymbol}
+                  timeframe={chartTimeframe}
+                  mode={chartMode}
+                  chartMotionPreset={chartMotionPreset}
+                  visualMode={chartVisualMode}
+                  candles={chartDisplayCandles}
+                  overlayZones={activeOverlayZones}
+                  liquidityZones={activeLiquidityZones}
+                  domLevels={chartMode === "candles" ? activeDomLevels : undefined}
+                  heatmapLevels={chartMode === "candles" ? activeHeatmapLevels : undefined}
+                  dayVwap={showVwap ? dayVwap : 0}
+                  weekVwap={showVwap ? weekVwap : 0}
+                  monthVwap={showVwap ? monthVwap : 0}
+                  showSessions={showSessions}
+                  indicatorSeries={indicatorSeriesForChart}
+                  footprintRows={chartMode === "footprint" ? activeFootprintRows : undefined}
+                  candleTransform="none"
+                  onCrosshairMove={(payload) => setCrosshair(payload)}
+                  engineMode="v4"
+                  viewportGrid={gpuViewportGrid}
+                  smoothingMs={chartSmoothingMs}
+                  multiSymbolFeeds={gpuMultiSymbolFeeds}
+                />
+              ) : (
+                <InstitutionalChart
+                  className={`chart-stage-premium ${chartActiveSnapLine ? "execution-focus" : ""} ${marketSignalV1.focusMode ? "signal-focus" : ""}`}
+                  symbol={selectedChartSymbol}
+                  timeframe={chartTimeframe}
+                  mode={chartMode}
+                  chartMotionPreset={chartMotionPreset}
+                  visualMode={chartVisualMode}
+                  candles={chartDisplayCandles}
+                  overlayZones={activeOverlayZones}
+                  liquidityZones={activeLiquidityZones}
+                  domLevels={chartMode === "candles" ? activeDomLevels : undefined}
+                  heatmapLevels={chartMode === "candles" ? activeHeatmapLevels : undefined}
+                  dayVwap={showVwap ? dayVwap : 0}
+                  weekVwap={showVwap ? weekVwap : 0}
+                  monthVwap={showVwap ? monthVwap : 0}
+                  showSessions={showSessions}
+                  indicatorSeries={indicatorSeriesForChart}
+                  footprintRows={chartMode === "footprint" ? activeFootprintRows : undefined}
+                  candleTransform="none"
+                  onCrosshairMove={(payload) => setCrosshair(payload)}
+                />
+              )}
+              {chartMaskActive ? (
+                <div className="chart-render-blocked-state" data-render-blocked="true" role="status" aria-live="polite">
+                  <span className="chart-render-blocked-kicker">{chartAuthBlocked ? "Authentication required" : "Render blocked"}</span>
+                  <strong>{chartAuthBlocked ? "Session required" : "No renderable candles"}</strong>
+                  <span className="chart-render-blocked-summary">{chartAuthBlocked ? "Connectez-vous pour charger les flux marche et rendre les bougies du terminal." : (localOhlcvAlertText || `No renderable candles for ${localOhlcvFeedLabel}.`)}</span>
+                  <div className="chart-render-blocked-meta">
+                    {chartAuthBlocked ? (
+                      <>
+                        <span className="chart-flow-pill tone-warn">AUTH {authStatus === "unknown" ? "CHECK" : "SESSION"}</span>
+                        <span className="chart-flow-pill tone-neutral">LOGIN REQUIRED</span>
+                      </>
+                    ) : (
+                      <>
+                        <span className={`chart-flow-pill tone-${marketBusHealthTone}`}>BUS {marketBusHealthStatus.toUpperCase()}</span>
+                        <span className={`chart-flow-pill tone-${streamStateTone(ohlcvStreamState)}`}>OHLCV {ohlcvStreamState.toUpperCase()}</span>
+                        <span className={`chart-flow-pill tone-${localOhlcvSignalTone}`}>LOCAL UNUSABLE {localOhlcvAnalysis.renderableRows}/{localOhlcvAnalysis.fetchedRows}</span>
+                      </>
+                    )}
+                  </div>
+                  <span className="chart-render-blocked-reasons">{chartAuthBlocked ? "La session terminal n'est pas authentifiee. Le chart ne charge pas les endpoints marche tant que l'authentification n'est pas etablie." : `Reasons: ${localOhlcvReasonsLabel}. Feed: ${localOhlcvFeedLabel}.`}</span>
                 </div>
               ) : null}
               {signalActionToast && (signalDisplayMode !== "classic" || signalActionToast.critical) ? (
@@ -9624,690 +10703,141 @@ export default function TradingTerminalPage() {
               ) : null}
               {!replayState.enabled && chartOrderTicket.active && (
                 <>
-                  <div className={`chart-order-hud signal-ui-${signalDisplayMode} ${marketSignalV1.focusMode ? "signal-priority" : ""}`}>
-                    <div className="chart-order-hud-title">
-                      <span className="chart-order-hud-kicker">Execution Desk</span>
-                      <strong>Chart Trading</strong>
-                      <span className={`chart-order-hud-mode chart-order-hud-mode-${chartMotionClass}`}>{chartMotionPreset}</span>
-                    </div>
-                    <div className="chart-mode-label">{modeUxProfile.shortLabel}</div>
-                    {signalDisplayMode !== "classic" ? (
-                    <div className={`chart-signal-card chart-signal-card-${marketSignalV1.dominantDirection}`}>
-                      <div className={`chart-perception-layer direction-${marketSignalV1.dominantDirection} motion-${perceptionMotionClass} ${perceptionSetupReady ? "setup-ready" : ""}`}>
-                        <div className="chart-perception-line header">
-                          <span>LONG {marketSignalV1.directionalLongPct}% / SHORT {marketSignalV1.directionalShortPct}%</span>
-                          <span>CONF {marketSignalV1.directionalConfidenceLabel}</span>
+                  <div className="chart-trading-overlay" aria-hidden="true">
+                    {(["entry", "sl", "tp"] as const).map((lineKey) => {
+                      const value = chartOrderTicket[lineKey];
+                      const stageHeight = chartStageRef.current?.clientHeight || 500;
+                      const stageWidth = chartStageRef.current?.clientWidth || 0;
+                      const y = chartPriceToY(value, stageHeight);
+                      const lineLabel = lineKey === "entry" ? "ENTRY" : lineKey === "sl" ? "SL" : "TP";
+                      const activeSnapFamily = chartActiveSnapLine === lineKey ? chartSnapState?.family || null : null;
+                      const delta = lineKey === "entry"
+                        ? value - chartAnchorPrice
+                        : value - chartOrderTicket.entry;
+                      const pct = (lineKey === "entry" ? chartAnchorPrice : chartOrderTicket.entry) > 0
+                        ? (delta / Math.max(0.0000001, lineKey === "entry" ? chartAnchorPrice : chartOrderTicket.entry)) * 100
+                        : 0;
+                      const hudMaskPad = 10;
+                      const overlapsHud = Boolean(
+                        chartHudBounds
+                        && y >= chartHudBounds.top - 12
+                        && y <= chartHudBounds.top + chartHudBounds.height + 12,
+                      );
+                      const leftSegmentWidth = overlapsHud && chartHudBounds
+                        ? Math.max(0, chartHudBounds.left - hudMaskPad)
+                        : stageWidth;
+                      const rightSegmentLeft = overlapsHud && chartHudBounds
+                        ? Math.min(stageWidth, chartHudBounds.left + chartHudBounds.width + hudMaskPad)
+                        : stageWidth;
+                      const rightSegmentWidth = overlapsHud && chartHudBounds
+                        ? Math.max(0, stageWidth - rightSegmentLeft)
+                        : 0;
+                      return (
+                        <div
+                          key={`chart-line-${lineKey}`}
+                          className={[
+                            `chart-order-line chart-order-line-${lineKey}`,
+                            chartActiveSnapLine === lineKey ? "is-active" : "",
+                            chartSnapPulseLine === lineKey ? "is-snap-pulse" : "",
+                            activeSnapFamily && activeSnapFamily !== "manual" ? `snap-family-${activeSnapFamily}` : "",
+                          ].filter(Boolean).join(" ")}
+                          style={{ top: `${y}px` }}
+                          onPointerDown={(event) => beginChartOrderDrag(event, lineKey)}
+                        >
+                          <span className="chart-order-line-segment chart-order-line-segment-left" style={{ width: `${leftSegmentWidth}px` }} />
+                          {rightSegmentWidth > 0 ? (
+                            <span
+                              className="chart-order-line-segment chart-order-line-segment-right"
+                              style={{ left: `${rightSegmentLeft}px`, width: `${rightSegmentWidth}px` }}
+                            />
+                          ) : null}
+                          <span className={`chart-order-line-label ${chartOverlayCompactMode ? "is-compact-label" : ""}`}>
+                            <strong>
+                              {chartOverlayCompactMode
+                                ? `${lineKey === "entry" ? "E" : lineKey.toUpperCase()} ${value.toFixed(chartPriceDigits)}`
+                                : `${lineLabel} ${value.toFixed(2)}`}
+                            </strong>
+                            {!chartOverlayCompactMode ? <em>{delta >= 0 ? "+" : ""}{delta.toFixed(2)} · {pct >= 0 ? "+" : ""}{pct.toFixed(2)}%</em> : null}
+                            {!chartOverlayCompactMode && activeSnapFamily && activeSnapFamily !== "manual" ? <span className={`chart-order-line-snap-badge ${activeSnapFamily}`}>{activeSnapFamily}</span> : null}
+                            {!chartOverlayCompactMode ? (
+                              <button
+                                type="button"
+                                className="chart-order-line-handle"
+                                aria-label={`Fine drag ${lineLabel}`}
+                                onPointerDown={(event) => beginChartOrderDrag(event, lineKey, true)}
+                              >
+                                Fine
+                              </button>
+                            ) : null}
+                          </span>
                         </div>
-                        <div className="chart-perception-line core">{perceptionCoreLabel}</div>
-                        {perceptionReasonCode ? (
-                          <div className={`chart-perception-reason-wrap ${showReasonLegend ? "is-open" : ""}`}>
-                            <div className="chart-perception-line reason">{perceptionReasonCode}</div>
+                      );
+                    })}
+
+                    {chartReleaseTicket && (
+                      <div className={`chart-order-release-ticket${chartReleaseTicket.armed ? " is-armed" : ""}${chartReleaseValidationPulse ? " release-validate-pulse" : ""}`} style={{ top: `${chartReleaseTicket.top}px` }}>
+                        <div className="chart-order-release-title">{chartReleaseTicket.line.toUpperCase()} adjusted</div>
+                        <div className="chart-order-release-meta">
+                          <span>{chartReleaseTicket.price.toFixed(chartPriceDigits)}</span>
+                          <span>{chartReleaseTicket.snapLabel}</span>
+                          <span>{chartReleaseTicket.fineMode ? "Fine" : "Fast"}</span>
+                        </div>
+                        <div className="chart-order-release-actions chart-order-release-mode-row">
+                          <button type="button" className={`chart-chip ${chartReleaseSendMode === "one-click" ? "active" : ""}`} onClick={() => setChartReleaseSendMode("one-click")}>One-click</button>
+                          <button type="button" className={`chart-chip ${chartReleaseSendMode === "confirm-required" ? "active" : ""}`} onClick={() => setChartReleaseSendMode("confirm-required")}>Confirm-required</button>
+                        </div>
+                        <div className="chart-order-release-note">
+                          {chartEffectiveSendMode === "one-click"
+                            ? "Send lance l’ordre immédiatement depuis ce ticket."
+                            : chartReleaseTicket.armed
+                              ? "Deuxieme action activee: Send va confirmer l’ordre."
+                              : "Armez d’abord l’envoi avant confirmation finale."}
+                        </div>
+                        {chartRiskTargetMiss && (
+                          <div className="chart-order-release-note chart-order-release-note-warn">Auto confirm-required force tant que le gain cible n’est pas atteint.</div>
+                        )}
+                        <div className="chart-order-release-actions">
+                          {chartEffectiveSendMode === "confirm-required" ? (
                             <button
                               type="button"
-                              className="chart-perception-legend-trigger"
-                              aria-label="Reason code legend"
-                              aria-expanded={showReasonLegend}
-                              onClick={() => setShowReasonLegend((value) => !value)}
+                              className={`chart-chip ${chartReleaseTicket.armed ? "active" : ""}`}
+                              onClick={() => setChartReleaseTicket((current) => current ? { ...current, armed: !current.armed } : current)}
                             >
-                              ⓘ
+                              {chartReleaseTicket.armed ? "Armed" : "Arm Send"}
                             </button>
-                            <div className="chart-perception-legend" role="note">
-                              <span className="chart-perception-legend-line">{perceptionReasonLegend?.line1 || "signal context"}</span>
-                              {perceptionReasonLegend?.line2 ? <span className="chart-perception-legend-line sub">{perceptionReasonLegend.line2}</span> : null}
-                            </div>
-                          </div>
-                        ) : null}
-                        <div className="chart-perception-line target">{perceptionTargetLabel}</div>
-                        <div className="chart-perception-line action">{perceptionActionLabel}</div>
-                      </div>
-                      <div className="chart-signal-card-head">
-                        <span className="chart-signal-kicker">Signal Engine V2</span>
-                        <strong>{marketSignalV1.headline}</strong>
-                        <span className="chart-signal-directional-kpi">
-                          LONG {marketSignalV1.directionalLongPct}% / SHORT {marketSignalV1.directionalShortPct}% / CONF {marketSignalV1.directionalConfidenceLabel}
-                          <span className={`chart-signal-drift-badge ${signalConfidenceDrift.toLowerCase()}`}>
-                            <span className="chart-signal-drift-arrow" aria-hidden="true">{signalConfidenceDrift === "UP" ? "↑" : signalConfidenceDrift === "DOWN" ? "↓" : "→"}</span>
-                            <span>{signalConfidenceDrift}</span>
-                          </span>
-                        </span>
-                      </div>
-                      <div className="chart-signal-score-row">
-                        <span>Buy {marketSignalV1.buyPressurePct.toFixed(0)}%</span>
-                        <span>Sell {marketSignalV1.sellPressurePct.toFixed(0)}%</span>
-                        <span>{marketSignalV1.convictionLabel}</span>
-                      </div>
-                      <div className="chart-signal-tags">
-                        {marketSignalV1.signals.length === 0 ? (
-                          <span className="chart-signal-tag neutral">No dominant flow signal</span>
-                        ) : (
-                          marketSignalV1.signals.map((signal) => (
-                            <span
-                              key={`hud-signal-${signal.id}-${signal.direction}`}
-                              className={`chart-signal-tag ${signal.direction} ${signal.severity}`}
-                              title={signal.detail}
-                            >
-                              {signal.label}
-                            </span>
-                          ))
-                        )}
-                      </div>
-                      <div className={`chart-decision-card ${marketDecisionV1.criticalConfirmed ? "mobile-critical-sticky" : ""}`}>
-                        <div className="chart-decision-card-head">
-                          <span className="chart-signal-kicker">Decision Engine V1</span>
-                          <strong>{marketDecisionV1.scenarioLabel}</strong>
-                        </div>
-                        <div className="chart-signal-score-row">
-                          <span>Scenario {marketDecisionV1.scenarioProbabilityPct}%</span>
-                          <span>Confidence {marketDecisionV1.globalConfidencePct}%</span>
-                          <span>Confluence {marketDecisionV1.confluenceScorePct}%</span>
-                          <span>{marketDecisionV1.probableReversalZoneLabel}</span>
-                        </div>
-                        <div className="chart-learning-strip">
-                          <span>Learn {marketDecisionV1.historicalLearning.scopeLabel} · n={marketDecisionV1.historicalLearning.sampleSize} · WR {marketDecisionV1.historicalLearning.winratePct.toFixed(0)}%</span>
-                        </div>
-                        <div className="chart-decision-tools">
+                          ) : (
+                            <button type="button" className="chart-chip" onClick={() => setChartReleaseTicket(null)}>Close</button>
+                          )}
                           <button
                             type="button"
-                            className={`chart-chip ${showConfluenceTune ? "active" : ""}`}
-                            onClick={() => setShowConfluenceTune((value) => !value)}
+                            className="chart-chip chart-buy-btn"
+                            disabled={chartEffectiveSendMode === "confirm-required" && !chartReleaseTicket.armed}
+                            onClick={() => {
+                              setChartReleaseValidationPulse(true);
+                              setChartReleaseTicket(null);
+                              setChartHudConfirmArmed(false);
+                              const ack = chartEffectiveSendMode !== "confirm-required" || chartReleaseTicket.armed;
+                              void submitChartOrder(ack);
+                            }}
                           >
-                            {showConfluenceTune ? `Hide Tune ${marketDecisionV1.evidence.length}` : `Tune ${marketDecisionV1.evidence.length}`}
-                          </button>
-                          <button
-                            type="button"
-                            className={`chart-chip chart-decision-details-toggle ${showDecisionSecondary ? "active" : ""}`}
-                            onClick={() => setShowDecisionSecondary((value) => !value)}
-                          >
-                            {showDecisionSecondary ? "Hide Details" : "Details"}
+                            {chartEffectiveSendMode === "one-click" ? "Send Now" : "Confirm Send"}
                           </button>
                         </div>
-                        {showConfluenceTune ? (
-                          <div className="chart-confluence-controls">
-                            {marketDecisionV1.evidence.map((item) => (
-                              <label key={`weight-${item.id}`} className="chart-confluence-control">
-                                <span>{item.label} manual x{confluenceWeights[item.id].toFixed(2)} · learned x{marketDecisionV1.historicalLearning.learnedWeights[item.id].toFixed(2)}</span>
-                                <input
-                                  type="range"
-                                  min={0.5}
-                                  max={1.8}
-                                  step={0.05}
-                                  value={confluenceWeights[item.id]}
-                                  onChange={(event) => {
-                                    const next = Number(event.target.value || confluenceWeights[item.id]);
-                                    setConfluenceWeights((current) => ({ ...current, [item.id]: next }));
-                                  }}
-                                />
-                              </label>
-                            ))}
-                          </div>
-                        ) : null}
-                        <div ref={decisionSecondaryRef} className={`chart-decision-secondary ${showDecisionSecondary ? "open" : ""}`}>
-                          <div className="chart-evidence-grid">
-                            {marketDecisionV1.evidence.map((item) => (
-                              <div key={`evidence-${item.id}`} className={`chart-evidence-item ${item.direction}`}>
-                                <span className="chart-evidence-label">{item.label}</span>
-                                <strong>{item.scorePct}%</strong>
-                                <em>{item.detail}</em>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                        <div className={`chart-action-card chart-action-card-${marketDecisionV1.biasDirection}`}>
-                          <div className="chart-action-card-head">
-                            <span className="chart-signal-kicker">Action Card</span>
-                            <strong>{marketDecisionV1.actionTitle}</strong>
-                          </div>
-                          <div className="chart-action-card-body">{marketDecisionV1.actionBody}</div>
-                          <div className="chart-execution-brain-v3">
-                            <div className="chart-signal-kicker">Execution Brain V3</div>
-                            <div className="chart-execution-brain-v3-grid">
-                              <span className={`chart-action-pill chart-action-pill-status ${entryTimingV3.tone}`}>ENTRY {entryTimingV3.status}<span className={`chart-action-pill-conf ${confidencePillTone(entryTimingV3.confidence)}`}>{entryTimingV3.confidence.toFixed(2)}</span></span>
-                              <span className="chart-action-pill">{entryTimingV3.detail}</span>
-                              <span className={`chart-action-pill chart-action-pill-status ${tradeManagementV3.tone}`}>{tradeManagementV3.status}<span className={`chart-action-pill-conf ${confidencePillTone(tradeManagementV3.confidence)}`}>{tradeManagementV3.confidence.toFixed(2)}</span></span>
-                              <span className="chart-action-pill">{tradeManagementV3.detail}</span>
-                              <span className={`chart-action-pill chart-action-pill-status ${intelligentExitV3.tone}`}>{intelligentExitV3.status}<span className={`chart-action-pill-conf ${confidencePillTone(intelligentExitV3.confidence)}`}>{intelligentExitV3.confidence.toFixed(2)}</span></span>
-                              <span className="chart-action-pill">{intelligentExitV3.detail}</span>
-                              <span className={`chart-action-pill chart-action-pill-status ${trailingV3.tone}`}>TRAILING {trailingV3.status}</span>
-                              <span className="chart-action-pill">{trailingV3.detail}</span>
-                            </div>
-                          </div>
-                          <div className="chart-auto-exec-panel">
-                            <div className="chart-signal-kicker">Execution Modules</div>
-                            <div className="chart-auto-exec-mode-row">
-                              {(["assisted", "semi-auto", "full-auto"] as const).map((mode) => (
-                                <button
-                                  key={`auto-exec-${mode}`}
-                                  type="button"
-                                  className={`chart-chip ${autoExecutionMode === mode ? "active" : ""}`}
-                                  onClick={() => setAutoExecutionMode(mode)}
-                                >
-                                  {mode === "assisted" ? "Human" : mode === "semi-auto" ? "Hybrid" : "AI"}
-                                </button>
-                              ))}
-                              <button
-                                type="button"
-                                className={`chart-chip ${autoExecutionKillSwitch ? "active" : ""}`}
-                                onClick={() => setAutoExecutionKillSwitch((value) => !value)}
-                              >
-                                Kill Switch {autoExecutionKillSwitch ? "ON" : "OFF"}
-                              </button>
-                              <button
-                                type="button"
-                                className={`chart-chip ${autoSessionGuardEnabled ? "active" : ""}`}
-                                onClick={() => setAutoSessionGuardEnabled((value) => !value)}
-                              >
-                                Session Guard {autoSessionGuardEnabled ? "ON" : "OFF"}
-                              </button>
-                            </div>
-                            <div className="chart-auto-exec-controls-grid">
-                              <label className="chart-confluence-control chart-auto-exec-control-field">
-                                <span>Session start (hour)</span>
-                                <input
-                                  type="number"
-                                  min={0}
-                                  max={23}
-                                  step={1}
-                                  value={autoSessionStartHour}
-                                  onChange={(event) => setAutoSessionStartHour(Math.max(0, Math.min(23, Number(event.target.value || 0))))}
-                                />
-                              </label>
-                              <label className="chart-confluence-control chart-auto-exec-control-field">
-                                <span>Session end (hour)</span>
-                                <input
-                                  type="number"
-                                  min={0}
-                                  max={23}
-                                  step={1}
-                                  value={autoSessionEndHour}
-                                  onChange={(event) => setAutoSessionEndHour(Math.max(0, Math.min(23, Number(event.target.value || 0))))}
-                                />
-                              </label>
-                              <label className="chart-confluence-control chart-auto-exec-control-field">
-                                <span>Symbol loss cap (USD)</span>
-                                <input
-                                  type="number"
-                                  min={50}
-                                  step={25}
-                                  value={autoSymbolLossCapUsd}
-                                  onChange={(event) => setAutoSymbolLossCapUsd(Math.max(50, Number(event.target.value || 0)))}
-                                />
-                              </label>
-                              <button
-                                type="button"
-                                className="chart-chip"
-                                onClick={() => setAutoSymbolAutoDisabled((current) => {
-                                  const next = { ...current };
-                                  delete next[autoSymbolLoss.normalizedSymbol];
-                                  return next;
-                                })}
-                              >
-                                Reset {autoSymbolLoss.normalizedSymbol}
-                              </button>
-                            </div>
-                            <div className="chart-auto-exec-status-grid">
-                              <span className={`chart-action-pill chart-action-pill-status ${autoExecutionGate.autoState === "READY" ? "good" : autoExecutionGate.autoState === "KILLED" ? "bad" : "warn"}`}>AUTO {autoExecutionGate.autoState}</span>
-                              <span className="chart-action-pill">META {autoMetaFilter.pass ? "PASS" : "BLOCK"}</span>
-                              <span className={`chart-action-pill ${autoRiskEngine.hardPass ? "chart-action-pill-status good" : "chart-action-pill-status bad"}`}>RISK {autoExecutionGate.riskLabel}</span>
-                              <span className="chart-action-pill">SIZE {autoExecutionGate.sizeLabel}</span>
-                              <span className="chart-action-pill">OPEN {openTradesCount}/{autoRiskEngine.maxOpenTrades}</span>
-                              <span className="chart-action-pill">EXPO {(exposureRatio * 100).toFixed(1)}%/{autoRiskEngine.maxExposurePct}%</span>
-                              <span className="chart-action-pill">DD {dailyDrawdownPct.toFixed(1)}%/{autoRiskEngine.maxDailyLossPct}%</span>
-                              <span className="chart-action-pill">RULE {autoExecutionGate.ruleLabel}</span>
-                              <span className={`chart-action-pill ${autoSessionGuard.pass ? "chart-action-pill-status good" : "chart-action-pill-status warn"}`}>SESS {autoSessionGuard.pass ? "ON" : "OFF"} {autoSessionGuard.label}</span>
-                              <span className={`chart-action-pill ${autoSymbolLoss.pass ? "chart-action-pill-status good" : "chart-action-pill-status bad"}`}>SYM LOSS {autoSymbolLoss.cumulativeLossUsd.toFixed(0)}/{autoSymbolLossCapUsd.toFixed(0)}</span>
-                            </div>
-                            <div className="chart-auto-exec-audit-toolbar">
-                              <span className="chart-action-pill">Audit {filteredAutoExecutionAuditTrail.length}/{autoExecutionAuditTrail.length}</span>
-                              {(["all", "READY", "BLOCKED", "KILLED"] as const).map((stateKey) => (
-                                <button
-                                  key={`auto-audit-state-${stateKey}`}
-                                  type="button"
-                                  className={`chart-chip ${autoExecutionAuditStateFilter === stateKey ? "active" : ""}`}
-                                  onClick={() => setAutoExecutionAuditStateFilter(stateKey)}
-                                >
-                                  {stateKey}
-                                </button>
-                              ))}
-                              <input
-                                type="text"
-                                className="chart-auto-exec-reason-search"
-                                placeholder="reason search"
-                                value={autoExecutionAuditReasonSearch}
-                                onChange={(event) => setAutoExecutionAuditReasonSearch(event.target.value)}
-                              />
-                              <button type="button" className="chart-chip" onClick={() => exportAutoExecutionAudit("json")}>Export JSON</button>
-                              <button type="button" className="chart-chip" onClick={() => exportAutoExecutionAudit("csv")}>Export CSV</button>
-                              <button type="button" className="chart-chip" onClick={() => setAutoExecutionAuditTrail([])}>Clear</button>
-                            </div>
-                            <div className="chart-auto-exec-audit-list">
-                              {filteredAutoExecutionAuditTrail.slice(0, 8).map((event) => (
-                                <div key={event.id} className="chart-auto-exec-audit-row">
-                                  <span>{formatClock(event.timestampIso)}</span>
-                                  <span>{event.gateState}</span>
-                                  <span>{event.mode}</span>
-                                  <span>{event.sizeUsd.toFixed(0)} USD</span>
-                                  <span>{event.reasons.length > 0 ? event.reasons.join("+") : "ok"}</span>
-                                </div>
-                              ))}
-                              {filteredAutoExecutionAuditTrail.length === 0 ? <div className="chart-auto-exec-audit-empty">No audit row for current filter.</div> : null}
-                            </div>
-                          </div>
-                          <div className="chart-learning-v4-panel">
-                            <div className="chart-signal-kicker">Self Learning V4</div>
-                            <div className="chart-learning-v4-controls">
-                              <button
-                                type="button"
-                                className={`chart-chip ${selfLearningV4Enabled ? "active" : ""}`}
-                                onClick={() => setSelfLearningV4Enabled((value) => !value)}
-                              >
-                                Learning {selfLearningV4Enabled ? "ON" : "OFF"}
-                              </button>
-                              <button
-                                type="button"
-                                className={`chart-chip ${selfLearningAutoAdaptEnabled ? "active" : ""}`}
-                                onClick={() => setSelfLearningAutoAdaptEnabled((value) => {
-                                  const next = !value;
-                                  if (next) {
-                                    selfLearningDriftSignatureRef.current = "";
-                                    setSelfLearningDriftAutoDemotedAt(null);
-                                  }
-                                  return next;
-                                })}
-                              >
-                                Weights {selfLearningAutoAdaptEnabled ? "Auto" : "Manual"}
-                              </button>
-                            </div>
-                            <div className="chart-learning-v4-toolbar">
-                              <span className={`chart-action-pill chart-action-pill-status ${selfLearningDriftV4.shouldDemote ? "bad" : selfLearningDriftV4.enoughSamples ? "good" : "warn"}`}>Drift {selfLearningV4DriftLabel}</span>
-                              <span className="chart-action-pill">Journal {filteredSelfLearningJournalV4Trail.length}/{selfLearningJournalV4Trail.length}</span>
-                              <button type="button" className="chart-chip" onClick={() => exportSelfLearningJournalV4("json")}>Export V4 JSON</button>
-                              <button type="button" className="chart-chip" onClick={() => exportSelfLearningJournalV4("csv")}>Export V4 CSV</button>
-                              <button type="button" className="chart-chip" onClick={() => setSelfLearningJournalV4Trail([])}>Clear</button>
-                            </div>
-                            <div className="chart-learning-v4-filters">
-                              {(["all", "trend", "chop", "volatile"] as const).map((regime) => (
-                                <button
-                                  key={`sl-v4-regime-${regime}`}
-                                  type="button"
-                                  className={`chart-chip ${selfLearningJournalV4RegimeFilter === regime ? "active" : ""}`}
-                                  onClick={() => setSelfLearningJournalV4RegimeFilter(regime)}
-                                >
-                                  R:{regime}
-                                </button>
-                              ))}
-                              {(["all", "reversal", "continuation", "balance"] as const).map((scenario) => (
-                                <button
-                                  key={`sl-v4-scenario-${scenario}`}
-                                  type="button"
-                                  className={`chart-chip ${selfLearningJournalV4ScenarioFilter === scenario ? "active" : ""}`}
-                                  onClick={() => setSelfLearningJournalV4ScenarioFilter(scenario)}
-                                >
-                                  S:{scenario}
-                                </button>
-                              ))}
-                            </div>
-                            <div className="chart-learning-v4-grid">
-                              <span className={`chart-action-pill ${selfLearningV4Active ? "chart-action-pill-status good" : "chart-action-pill-status warn"}`}>Learning {selfLearningV4Active ? "ACTIVE" : "WARMUP"}</span>
-                              <span className={`chart-action-pill chart-action-pill-status ${selfLearningStorageTone}`}>Persist {selfLearningStorageLabel}</span>
-                              <span className="chart-action-pill">Scopes {selfLearningV4PersistenceStatus.scopeCount} · Active {selfLearningCurrentScopeCount}</span>
-                              <span className="chart-action-pill">Load {selfLearningV4PersistenceStatus.stateLoadedAt ? formatClock(selfLearningV4PersistenceStatus.stateLoadedAt) : "--"}</span>
-                              <span className="chart-action-pill">Save {selfLearningV4PersistenceStatus.stateSavedAt ? formatClock(selfLearningV4PersistenceStatus.stateSavedAt) : "--"}</span>
-                              <span className="chart-action-pill">Scan {selfLearningV4PersistenceStatus.scopesLoadedAt ? formatClock(selfLearningV4PersistenceStatus.scopesLoadedAt) : "--"}</span>
-                              <span className="chart-action-pill">Status {selfLearningV4PersistenceStatus.message}</span>
-                              <span className="chart-action-pill">Regime {selfLearningRegimeV4.toUpperCase()}</span>
-                              <span className="chart-action-pill">Weights {selfLearningV4WeightsLabel}</span>
-                              <span className="chart-action-pill">Model {selfLearningV4ModelLabel}</span>
-                              <span className="chart-action-pill">n {selfLearningProfile.sampleSize} · WR {selfLearningProfile.winratePct.toFixed(0)}%</span>
-                              <span className="chart-action-pill">Upd {selfLearningModelUpdatedAt ? formatClock(selfLearningModelUpdatedAt) : "--"}</span>
-                              <span className="chart-action-pill">WR {selfLearningDriftV4.longWinratePct.toFixed(0)}→{selfLearningDriftV4.shortWinratePct.toFixed(0)} (Δ{selfLearningDriftV4.winrateDropPct.toFixed(0)}%)</span>
-                              <span className="chart-action-pill">Brier {(selfLearningDriftV4.longBrier ?? 0).toFixed(3)}→{(selfLearningDriftV4.shortBrier ?? 0).toFixed(3)} (Δ{selfLearningDriftV4.brierRise.toFixed(3)})</span>
-                              <span className="chart-action-pill">Demoted {selfLearningDriftAutoDemotedAt ? formatClock(selfLearningDriftAutoDemotedAt) : "--"}</span>
-                              <span className="chart-action-pill">DOM x{selfLearningAdaptiveWeights.dom.toFixed(2)} · FP x{selfLearningAdaptiveWeights.footprint.toFixed(2)}</span>
-                              <span className="chart-action-pill">LIQ x{selfLearningAdaptiveWeights.liquidity.toFixed(2)} · PX x{selfLearningAdaptiveWeights["price-action"].toFixed(2)}</span>
-                            </div>
-                            <div className="chart-learning-v4-journal-list">
-                              {filteredSelfLearningJournalV4Trail.slice(0, 6).map((event) => (
-                                <div key={event.id} className="chart-learning-v4-journal-row">
-                                  <span>{formatClock(event.timestampIso)}</span>
-                                  <span>{event.regime}</span>
-                                  <span>{event.scenario}</span>
-                                  <span>{event.outcome}</span>
-                                  <span>{event.pnl >= 0 ? "+" : ""}{event.pnl.toFixed(0)} USD</span>
-                                </div>
-                              ))}
-                              {filteredSelfLearningJournalV4Trail.length === 0 ? <div className="chart-auto-exec-audit-empty">No V4 journal row for current filter.</div> : null}
-                            </div>
-                          </div>
-                          <div className="chart-action-card-plan">
-                            <span>Snap {marketDecisionV1.executionPlan.snapPriority}</span>
-                            <span>Preset {marketDecisionV1.executionPlan.preset}</span>
-                            <span>Guard {marketDecisionV1.executionPlan.guardEnabled ? "on" : "off"}</span>
-                          </div>
-                          {marketDecisionV1.suggestedBracket ? (
-                            <div className="chart-action-card-bracket">
-                              <span className="chart-action-pill">{marketDecisionV1.suggestedBracket.label}</span>
-                              <span className="chart-action-pill">{marketDecisionV1.suggestedBracket.side.toUpperCase()} · RR {marketDecisionV1.suggestedBracket.rr.toFixed(2)}</span>
-                              <span
-                                className="chart-action-pill chart-action-pill-mono"
-                                title={`E ${marketDecisionV1.suggestedBracket.entry.toFixed(chartPriceDigits)} / SL ${marketDecisionV1.suggestedBracket.sl.toFixed(chartPriceDigits)} / TP ${marketDecisionV1.suggestedBracket.tp.toFixed(chartPriceDigits)}`}
-                              >
-                                E {marketDecisionV1.suggestedBracket.entry.toFixed(chartPriceDigits)} · SL {marketDecisionV1.suggestedBracket.sl.toFixed(chartPriceDigits)} · TP {marketDecisionV1.suggestedBracket.tp.toFixed(chartPriceDigits)}
-                              </span>
-                              <button type="button" className="chart-chip" onClick={() => applySuggestedScenarioBracket(marketDecisionV1.suggestedBracket)}>Apply Bracket</button>
-                              {marketDecisionV1.criticalConfirmed ? (
-                                <>
-                                  <button
-                                    type="button"
-                                    className="chart-chip active"
-                                    onClick={() => {
-                                      applySuggestedScenarioBracket(marketDecisionV1.suggestedBracket);
-                                      applyExecutionAdaptationPlan(marketDecisionV1.executionPlan);
-                                      setPendingExecutionAdaptation(null);
-                                    }}
-                                  >
-                                    Approve All
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="chart-chip chart-buy-btn"
-                                    onClick={() => {
-                                      void approveAllAndSend();
-                                    }}
-                                  >
-                                    {chartEffectiveSendMode === "confirm-required" && !chartHudConfirmArmed ? "Approve + Arm Send" : "Approve All + Send"}
-                                  </button>
-                                </>
-                              ) : null}
-                            </div>
-                          ) : null}
-                          <div className="chart-adapt-mode-row">
-                            {(["auto", "confirm", "manual"] as const).map((mode) => (
-                              <button
-                                key={`adapt-${mode}`}
-                                type="button"
-                                className={`chart-chip ${executionAdaptMode === mode ? "active" : ""}`}
-                                onClick={() => setExecutionAdaptMode(mode)}
-                              >
-                                {mode === "auto" ? "Auto adapt" : mode === "confirm" ? "Confirm adapt" : "Manual adapt"}
-                              </button>
-                            ))}
-                          </div>
-                          {pendingExecutionAdaptation ? (
-                            <div className="chart-pending-adaptation">
-                              <span>Pending adapt: snap {pendingExecutionAdaptation.plan.snapPriority} / preset {pendingExecutionAdaptation.plan.preset} / guard {pendingExecutionAdaptation.plan.guardEnabled ? "on" : "off"}</span>
-                              <button
-                                type="button"
-                                className="chart-chip"
-                                onClick={() => {
-                                  applyExecutionAdaptationPlan(pendingExecutionAdaptation.plan);
-                                  setPendingExecutionAdaptation(null);
-                                }}
-                              >
-                                Apply Adaptation
-                              </button>
-                            </div>
-                          ) : null}
-                        </div>
-                        {marketDecisionV1.criticalConfirmed ? <div className="chart-decision-confirmed">Critical confirmation: 2 sources aligned</div> : null}
-                      </div>
-                    </div>
-                    ) : null}
-                    <div className="chart-order-preset-row">
-                      {(["scalp", "swing", "low-risk"] as const).map((presetKey) => (
-                        <button
-                          key={presetKey}
-                          type="button"
-                          className={`chart-chip${chartOrderTicket.preset === presetKey ? " active" : ""}`}
-                          onClick={() => applyChartOrderPreset(presetKey)}
-                        >
-                          {presetKey === "low-risk" ? "LowRisk" : presetKey}
-                        </button>
-                      ))}
-                    </div>
-                    <div className="chart-order-mini-row">
-                      <button type="button" className={`chart-chip ${chartOrderTicket.side === "buy" ? "chart-buy-btn" : ""}`} onClick={() => applyChartOrderPreset(chartOrderTicket.preset, "buy")}>Buy</button>
-                      <button type="button" className={`chart-chip ${chartOrderTicket.side === "sell" ? "chart-sell-btn" : ""}`} onClick={() => applyChartOrderPreset(chartOrderTicket.preset, "sell")}>Sell</button>
-                      <button type="button" className={`chart-chip ${chartOrderTicket.oco ? "active" : ""}`} onClick={() => setChartOrderTicket((v) => ({ ...v, oco: !v.oco }))}>OCO</button>
-                      <button type="button" className={`chart-chip ${chartSnapEnabled ? "active" : ""}`} onClick={() => setChartSnapEnabled(!chartSnapEnabled)}>{chartSnapEnabled ? "Snap On" : "Snap Off"}</button>
-                    </div>
-                    <div className="chart-order-mini-row">
-                      {(["execution", "vwap", "liquidity"] as const).map((priority) => (
-                        <button
-                          key={priority}
-                          type="button"
-                          className={`chart-chip ${chartSnapPriority === priority ? "active" : ""}`}
-                          onClick={() => setChartSnapPriority(priority)}
-                        >
-                          {priority === "execution" ? "Exec" : priority === "vwap" ? "VWAP" : "Liquidity"}
-                        </button>
-                      ))}
-                    </div>
-                    <div className="chart-order-risk-row">
-                      <span>Loss {chartRiskUsd.toFixed(2)}$</span>
-                      <span>Gain {chartRewardUsd.toFixed(2)}$</span>
-                      <span>RR {chartRiskReward.toFixed(2)}</span>
-                    </div>
-                    <div className="chart-order-risk-row chart-order-guard-row">
-                      <label className="chart-order-guard-field">
-                        <span>Perte max</span>
-                        <input
-                          type="number"
-                          min={1}
-                          step={10}
-                          value={chartMaxLossUsd}
-                          onChange={(event) => setChartMaxLossUsd(Math.max(1, Number(event.target.value || 0)))}
-                          className="chart-order-risk-input"
-                        />
-                      </label>
-                      <label className="chart-order-guard-field">
-                        <span>Gain cible</span>
-                        <input
-                          type="number"
-                          min={1}
-                          step={10}
-                          value={chartTargetGainUsd}
-                          onChange={(event) => setChartTargetGainUsd(Math.max(1, Number(event.target.value || 0)))}
-                          className="chart-order-risk-input"
-                        />
-                      </label>
-                    </div>
-                    <div className="chart-order-mini-row chart-order-guard-presets">
-                      <button type="button" className={`chart-chip ${chartRiskGuardEnabled ? "active" : ""}`} onClick={() => setChartRiskGuardEnabled((v) => !v)}>
-                        Guard {chartRiskGuardEnabled ? "On" : "Off"}
-                      </button>
-                      {uiMode === "novice" ? (
-                        <>
-                          <button type="button" className="chart-chip" onClick={() => { setChartMaxLossUsd(80); setChartTargetGainUsd(160); }}>Safe</button>
-                          <button type="button" className="chart-chip" onClick={() => { setChartMaxLossUsd(120); setChartTargetGainUsd(240); }}>Balanced</button>
-                        </>
-                      ) : (
-                        <button type="button" className="chart-chip" onClick={() => { setChartMaxLossUsd(250); setChartTargetGainUsd(500); }}>Desk</button>
-                      )}
-                      <span className={`chart-order-guard-status ${chartRiskLossExceeded ? "bad" : chartRiskTargetMiss ? "warn" : "ok"}`}>
-                        {chartRiskLossExceeded
-                          ? "loss-limit exceeded"
-                          : chartRiskTargetMiss
-                            ? "target gain below objective"
-                            : "risk profile aligned"}
-                      </span>
-                    </div>
-                    <div className="chart-order-risk-row chart-order-guard-kpi-row">
-                      <span>RR target {chartRiskTargetRr.toFixed(2)}</span>
-                      <span>{chartRiskGuardEnabled ? "guard active" : "guard bypass"}</span>
-                    </div>
-                    {chartRiskTargetMiss && (
-                      <div className="chart-order-auto-confirm-hint">Auto rule: confirm-required active (gain cible non atteint).</div>
-                    )}
-                    <div className="chart-order-risk-row chart-order-snap-row">
-                      <span>Step {chartPriceStep.toFixed(chartPriceDigits)}</span>
-                      <span>{chartSnapEnabled ? `${chartSnapPriority.toUpperCase()} · ${chartSnapState?.label || "LIVE/CURSOR/VWAP/ROUND/CANDLE"} · ATRx${(clamp(1.16 - chartAtrLocalPct * 40, 0.52, 1.14)).toFixed(2)}` : "FREE DRAG"}</span>
-                      <span>{chartSnapState ? chartSnapState.price.toFixed(chartPriceDigits) : ""}</span>
-                    </div>
-                    <div className="chart-order-risk-row chart-order-risk-sub">
-                      <span>Entry {chartOrderTicket.entry.toFixed(2)}</span>
-                      <span>SL {chartOrderTicket.sl.toFixed(2)}</span>
-                      <span>TP {chartOrderTicket.tp.toFixed(2)}</span>
-                    </div>
-                    {uiMode === "novice" && (
-                      <div className="chart-order-novice-tip">
-                        Stop Loss coupe la position pour limiter la perte. Fixe Perte max et Gain cible pour garder un profil RR clair avant envoi.
-                      </div>
-                    )}
-                    <div className="chart-order-mini-row">
-                      <button type="button" className="chart-chip" onClick={() => setChartOrderPreviewOpen((v) => !v)}>{chartOrderPreviewOpen ? "Hide Preview" : "Preview"}</button>
-                      {chartEffectiveSendMode === "confirm-required" && (
-                        <button type="button" className={`chart-chip ${chartHudConfirmArmed ? "active" : ""}`} onClick={() => setChartHudConfirmArmed((v) => !v)}>
-                          {chartHudConfirmArmed ? "Armed" : "Arm Send"}
-                        </button>
-                      )}
-                      <button
-                        type="button"
-                        className="chart-chip chart-buy-btn"
-                        onClick={() => {
-                          if (chartEffectiveSendMode === "confirm-required" && !chartHudConfirmArmed) {
-                            setError("Confirmation requise: armez d’abord l’envoi.");
-                            return;
-                          }
-                          const ack = chartEffectiveSendMode !== "confirm-required" || chartHudConfirmArmed;
-                          setChartHudConfirmArmed(false);
-                          void submitChartOrder(ack);
-                        }}
-                      >
-                        {chartEffectiveSendMode === "confirm-required" ? "Confirm Send" : "Send"}
-                      </button>
-                      <button type="button" className="chart-chip" onClick={() => applyChartOrderPreset("scalp")}>Reset</button>
-                    </div>
-                    {mergedChartSendHistory.length > 0 && (
-                      <div className="chart-order-send-history">
-                        <div className="chart-order-send-history-title">Last 5 sends</div>
-                        {mergedChartSendHistory.map((entry, index) => (
-                          <div key={`send-hist-${index}-${entry.atIso}`} className="chart-order-send-history-row">
-                            <span>{formatClock(entry.atIso)}</span>
-                            <span>{entry.symbol}</span>
-                            <span>{entry.side.toUpperCase()}</span>
-                            <span>RR {entry.rr.toFixed(2)}</span>
-                            <span className={entry.compliant ? "good" : "warn"}>{entry.compliant ? "limits_ok" : "limits_miss"}</span>
-                            <span className="subtle mini">{entry.source || "local"}</span>
-                            <span className={entry.outcome === "submitted" ? "good" : "warn"}>{entry.outcome === "confirmation-required" ? "confirm_required" : entry.outcome}</span>
-                          </div>
-                        ))}
                       </div>
                     )}
                   </div>
-
-                  {(["entry", "sl", "tp"] as const).map((lineKey) => {
-                    const value = chartOrderTicket[lineKey];
-                    const stageHeight = chartStageRef.current?.clientHeight || 500;
-                    const y = chartPriceToY(value, stageHeight);
-                    const lineLabel = lineKey === "entry" ? "ENTRY" : lineKey === "sl" ? "SL" : "TP";
-                    const activeSnapFamily = chartActiveSnapLine === lineKey ? chartSnapState?.family || null : null;
-                    const delta = lineKey === "entry"
-                      ? value - chartAnchorPrice
-                      : value - chartOrderTicket.entry;
-                    const pct = (lineKey === "entry" ? chartAnchorPrice : chartOrderTicket.entry) > 0
-                      ? (delta / Math.max(0.0000001, lineKey === "entry" ? chartAnchorPrice : chartOrderTicket.entry)) * 100
-                      : 0;
-                    return (
-                      <div
-                        key={`chart-line-${lineKey}`}
-                        className={[
-                          `chart-order-line chart-order-line-${lineKey}`,
-                          chartActiveSnapLine === lineKey ? "is-active" : "",
-                          chartSnapPulseLine === lineKey ? "is-snap-pulse" : "",
-                          activeSnapFamily && activeSnapFamily !== "manual" ? `snap-family-${activeSnapFamily}` : "",
-                        ].filter(Boolean).join(" ")}
-                        style={{ top: `${y}px` }}
-                        onPointerDown={(event) => beginChartOrderDrag(event, lineKey)}
-                      >
-                        <span className="chart-order-line-label">
-                          <strong>{lineLabel} {value.toFixed(2)}</strong>
-                          <em>{delta >= 0 ? "+" : ""}{delta.toFixed(2)} · {pct >= 0 ? "+" : ""}{pct.toFixed(2)}%</em>
-                          {activeSnapFamily && activeSnapFamily !== "manual" ? <span className={`chart-order-line-snap-badge ${activeSnapFamily}`}>{activeSnapFamily}</span> : null}
-                          <button
-                            type="button"
-                            className="chart-order-line-handle"
-                            aria-label={`Fine drag ${lineLabel}`}
-                            onPointerDown={(event) => beginChartOrderDrag(event, lineKey, true)}
-                          >
-                            Fine
-                          </button>
-                        </span>
-                      </div>
-                    );
-                  })}
-
-                  {chartReleaseTicket && (
-                    <div className={`chart-order-release-ticket${chartReleaseTicket.armed ? " is-armed" : ""}${chartReleaseValidationPulse ? " release-validate-pulse" : ""}`} style={{ top: `${chartReleaseTicket.top}px` }}>
-                      <div className="chart-order-release-title">{chartReleaseTicket.line.toUpperCase()} adjusted</div>
-                      <div className="chart-order-release-meta">
-                        <span>{chartReleaseTicket.price.toFixed(chartPriceDigits)}</span>
-                        <span>{chartReleaseTicket.snapLabel}</span>
-                        <span>{chartReleaseTicket.fineMode ? "Fine" : "Fast"}</span>
-                      </div>
-                      <div className="chart-order-release-actions chart-order-release-mode-row">
-                        <button type="button" className={`chart-chip ${chartReleaseSendMode === "one-click" ? "active" : ""}`} onClick={() => setChartReleaseSendMode("one-click")}>One-click</button>
-                        <button type="button" className={`chart-chip ${chartReleaseSendMode === "confirm-required" ? "active" : ""}`} onClick={() => setChartReleaseSendMode("confirm-required")}>Confirm-required</button>
-                      </div>
-                      <div className="chart-order-release-note">
-                        {chartEffectiveSendMode === "one-click"
-                          ? "Send lance l’ordre immédiatement depuis ce ticket."
-                          : chartReleaseTicket.armed
-                            ? "Deuxieme action activee: Send va confirmer l’ordre."
-                            : "Armez d’abord l’envoi avant confirmation finale."}
-                      </div>
-                      {chartRiskTargetMiss && (
-                        <div className="chart-order-release-note chart-order-release-note-warn">Auto confirm-required force tant que le gain cible n’est pas atteint.</div>
-                      )}
-                      <div className="chart-order-release-actions">
-                        {chartEffectiveSendMode === "confirm-required" ? (
-                          <button
-                            type="button"
-                            className={`chart-chip ${chartReleaseTicket.armed ? "active" : ""}`}
-                            onClick={() => setChartReleaseTicket((current) => current ? { ...current, armed: !current.armed } : current)}
-                          >
-                            {chartReleaseTicket.armed ? "Armed" : "Arm Send"}
-                          </button>
-                        ) : (
-                          <button type="button" className="chart-chip" onClick={() => setChartReleaseTicket(null)}>Close</button>
-                        )}
-                        <button type="button" className="chart-chip" onClick={() => { setChartOrderPreviewOpen(true); setChartReleaseTicket(null); }}>Preview</button>
-                        <button
-                          type="button"
-                          className="chart-chip chart-buy-btn"
-                          disabled={chartEffectiveSendMode === "confirm-required" && !chartReleaseTicket.armed}
-                          onClick={() => {
-                            setChartReleaseValidationPulse(true);
-                            setChartReleaseTicket(null);
-                            setChartHudConfirmArmed(false);
-                            const ack = chartEffectiveSendMode !== "confirm-required" || chartReleaseTicket.armed;
-                            void submitChartOrder(ack);
-                          }}
-                        >
-                          {chartEffectiveSendMode === "one-click" ? "Send Now" : "Confirm Send"}
-                        </button>
-                      </div>
-                    </div>
-                  )}
-
-                  {chartOrderPreviewOpen && (
-                    <div className="chart-order-preview-card">
-                      <div className="chart-order-preview-title">Bracket Preview</div>
-                      <div className="chart-order-preview-grid">
-                        <span>Side</span><strong>{chartOrderTicket.side.toUpperCase()}</strong>
-                        <span>Symbol</span><strong>{selectedChartSymbol}</strong>
-                        <span>Entry</span><strong>{chartOrderTicket.entry.toFixed(4)}</strong>
-                        <span>Stop Loss</span><strong>{chartOrderTicket.sl.toFixed(4)}</strong>
-                        <span>Take Profit</span><strong>{chartOrderTicket.tp.toFixed(4)}</strong>
-                        <span>OCO</span><strong>{chartOrderTicket.oco ? "ON" : "OFF"}</strong>
-                        <span>Perte max</span><strong className="warn">{chartRiskUsd.toFixed(2)} USD</strong>
-                        <span>Gain cible</span><strong className="good">{chartRewardUsd.toFixed(2)} USD</strong>
-                        <span>R/R</span><strong>{chartRiskReward.toFixed(2)}</strong>
-                      </div>
-                    </div>
-                  )}
+                  {!chartOverlayCompactMode ? chartExecutionHudPanel : null}
                 </>
               )}
             </div>
+            {chartOverlayCompactMode ? chartExecutionHudPanel : null}
+            {chartSidecarVisible ? (
+              <aside className="chart-sidecar-stack" aria-label="Market structure sidecars">
+                {dockedChartSidecarIds.map((id) => (
+                  <div key={`chart-sidecar-${id}`}>{renderChartSidecarCard(id)}</div>
+                ))}
+              </aside>
+            ) : null}
             {showDecisionOverlay && (
               <aside className="decision-overlay-panel" role="complementary" aria-label="AI Decision Analysis">
                 <div className="dov-header">
@@ -10483,16 +11013,17 @@ export default function TradingTerminalPage() {
               </aside>
             )}
           </div>
+          )}
 
-          <div className="overlay-legend-compact">
+          {!terminalV2Enabled ? <div className="overlay-legend-compact">
             <span className="olc">Route {preferredRoute ? String(preferredRoute.venue || "–") : "–"}</span>
-            <span className="olc">DOM {depthStreamState}</span>
+            <span className="olc">DOM {displayDepthStreamState}</span>
             <span className={`olc ${toNumber(marketMicro?.depth_imbalance, 0) >= 0 ? "olc-green" : "olc-red"}`}>Imb {toNumber(marketMicro?.depth_imbalance, 0).toFixed(3)}</span>
             <span className="olc">Tape {activeTape.length}</span>
             {uiMode === "expert" ? <span className="olc" style={{ marginLeft: "auto" }}>Bid {toNumber(orderbook?.bid, 0).toFixed(2)} / Ask {toNumber(orderbook?.ask, 0).toFixed(2)}</span> : null}
             <button type="button" className="chart-chip chart-buy-btn" onClick={() => applyChartOrderPreset(chartOrderTicket.preset === "custom" ? "scalp" : chartOrderTicket.preset, "buy")} disabled={replayState.enabled}>▲ Buy</button>
             <button type="button" className="chart-chip chart-sell-btn" onClick={() => applyChartOrderPreset(chartOrderTicket.preset === "custom" ? "scalp" : chartOrderTicket.preset, "sell")} disabled={replayState.enabled}>▼ Sell</button>
-          </div>
+          </div> : null}
         </PanelShell>
           </Panel>
           <PanelResizeHandle
@@ -10720,7 +11251,7 @@ export default function TradingTerminalPage() {
         >
         <PanelShell className="panel micro-panel gtix-panel-resizable-y">
           <div className="eyebrow micro-panel-title">
-            DOM <span className={`micro-stream-badge micro-stream-${depthStreamState}`}>{depthStreamState}</span>
+            DOM <span className={`micro-stream-badge micro-stream-${displayDepthStreamState}`}>{displayDepthStreamState}</span>
             <HelpTooltip termKey="dom" mode={uiMode} />
             {layoutEditMode && <button type="button" className="panel-detach-btn" title="Floating" onClick={() => detachPanel("dom", "micro")}>⤡</button>}
           </div>
@@ -10960,6 +11491,10 @@ export default function TradingTerminalPage() {
 
       {/* ═══════════════ MONITORING ════════════════════════════ */}
       <section className="panel term-monitoring">
+        <div className="term-monitoring-bar">
+          <span className="term-monitoring-title">Ops Widgets</span>
+          {publicOpsRefreshPaused ? <span className="monitoring-state-badge paused">background paused</span> : <span className="monitoring-state-badge live">live refresh</span>}
+        </div>
         <div
           className={`monitoring-cols${layoutDropPreview?.zone === "monitoring" ? " is-drop-zone-active" : ""}`}
           onDragOver={(event) => {
@@ -10984,18 +11519,7 @@ export default function TradingTerminalPage() {
             onDrop={() => handleLayoutDrop("monitoring", "alerts")}
             style={{ order: monitoringOrderById.alerts ?? 0, display: floatingPanels.some((fp) => fp.id === "alerts") ? "none" : undefined }}
           >
-          <div className="monitoring-col">
-            <div className="eyebrow" style={{ marginBottom: 8 }}>Alertes actives
-              {layoutEditMode && <button type="button" className="panel-detach-btn" title="Floating" onClick={() => detachPanel("alerts", "monitoring")}>⤡</button>}
-            </div>
-            {filteredAlerts.length === 0 ? <p className="subtle mini">Aucune alerte.</p> : null}
-            {filteredAlerts.slice(0, 5).map((item, ali) => (
-              <div key={`al-${ali}`} className="mon-row">
-                <span className={String(item.level) === "critical" ? "warn" : ""}>{String(item.type || "–")}</span>
-                <span className="subtle mini">{String(item.message || "").slice(0, 38)}</span>
-              </div>
-            ))}
-          </div>
+          <AlertsMonitoringPanel badge={publicOpsPanelBadge} layoutEditMode={layoutEditMode} onDetach={() => detachPanel("alerts", "monitoring")} filteredAlerts={filteredAlerts} />
           </div>
           <div
             className={`layout-draggable-card${layoutEditMode ? " is-edit" : ""}${layoutDropPreview?.zone === "monitoring" && layoutDropPreview.targetId === "incidents" ? " is-drop-target" : ""}`}
@@ -11006,23 +11530,7 @@ export default function TradingTerminalPage() {
             onDrop={() => handleLayoutDrop("monitoring", "incidents")}
             style={{ order: monitoringOrderById.incidents ?? 1, display: floatingPanels.some((fp) => fp.id === "incidents") ? "none" : undefined }}
           >
-          <div className="monitoring-col">
-            <div className="eyebrow" style={{ marginBottom: 8 }}>Incidents
-              {layoutEditMode && <button type="button" className="panel-detach-btn" title="Floating" onClick={() => detachPanel("incidents", "monitoring")}>⤡</button>}
-            </div>
-            {incidents.length === 0 ? <p className="subtle mini">Aucun incident.</p> : null}
-            {incidentRows.slice(0, 5).map(({ item, status, severityLabel, slaLabel }) => (
-              <div key={String(item.ticket_key || "")} className="mon-row incident-row">
-                <span>{String(item.ticket_key || "–")}</span>
-                <span className="subtle mini">{String(item.title || "–").slice(0, 22)}</span>
-                <span className="incident-meta-strip">
-                  <span className={`incident-chip incident-chip-status-${status.toLowerCase()}`}>{status}</span>
-                  <span className={`incident-chip incident-chip-severity-${severityLabel}`}>{severityLabel}</span>
-                  <span className={`incident-chip ${slaLabel === "breach" ? "incident-chip-sla-breach" : "incident-chip-sla-ok"}`}>sla {slaLabel}</span>
-                </span>
-              </div>
-            ))}
-          </div>
+          <IncidentsMonitoringPanel badge={publicOpsPanelBadge} layoutEditMode={layoutEditMode} onDetach={() => detachPanel("incidents", "monitoring")} incidents={incidents} incidentRows={incidentRows} />
           </div>
           <div
             className={`layout-draggable-card${layoutEditMode ? " is-edit" : ""}${layoutDropPreview?.zone === "monitoring" && layoutDropPreview.targetId === "governance" ? " is-drop-target" : ""}`}
@@ -11033,31 +11541,20 @@ export default function TradingTerminalPage() {
             onDrop={() => handleLayoutDrop("monitoring", "governance")}
             style={{ order: monitoringOrderById.governance ?? 2, display: floatingPanels.some((fp) => fp.id === "governance") ? "none" : undefined }}
           >
-          <div className="monitoring-col">
-            <div className="eyebrow" style={{ marginBottom: 8 }}>Governance
-              {layoutEditMode && <button type="button" className="panel-detach-btn" title="Floating" onClick={() => detachPanel("governance", "monitoring")}>⤡</button>}
-            </div>
-            <div className="governance-toolbar">
-              <select value={governanceSort} onChange={(event) => setGovernanceSort(event.target.value as GovernanceSort)}>
-                <option value="severity">tri: severity</option>
-                <option value="label">tri: label</option>
-                <option value="value">tri: value</option>
-              </select>
-              <select value={incidentSort} onChange={(event) => setIncidentSort(event.target.value as IncidentSort)}>
-                <option value="severity">incidents: severity</option>
-                <option value="status">incidents: status</option>
-                <option value="sla">incidents: SLA</option>
-              </select>
-              <label className="governance-check"><input type="checkbox" checked={governanceOnlyAlerts} onChange={(event) => setGovernanceOnlyAlerts(event.target.checked)} /> alerts only</label>
-            </div>
-            <input value={governanceFilterText} onChange={(event) => setGovernanceFilterText(event.target.value)} className="governance-search" placeholder="filtrer incidents / governance" />
-            {governanceFiltered.slice(0, 8).map((row) => (
-              <div key={row.label} className="mon-row">
-                <span>{row.label}</span>
-                <span className={row.severity >= 3 ? "warn" : row.severity >= 2 ? "subtle" : "good"}>{row.value}</span>
-              </div>
-            ))}
-          </div>
+          <GovernanceMonitoringPanel
+            badge={publicOpsPanelBadge}
+            layoutEditMode={layoutEditMode}
+            onDetach={() => detachPanel("governance", "monitoring")}
+            governanceSort={governanceSort}
+            onGovernanceSortChange={setGovernanceSort}
+            incidentSort={incidentSort}
+            onIncidentSortChange={setIncidentSort}
+            governanceOnlyAlerts={governanceOnlyAlerts}
+            onGovernanceOnlyAlertsChange={setGovernanceOnlyAlerts}
+            governanceFilterText={governanceFilterText}
+            onGovernanceFilterTextChange={setGovernanceFilterText}
+            governanceFiltered={governanceFiltered}
+          />
           </div>
           <div
             className={`layout-draggable-card${layoutEditMode ? " is-edit" : ""}${layoutDropPreview?.zone === "monitoring" && layoutDropPreview.targetId === "readiness" ? " is-drop-target" : ""}`}
@@ -11068,16 +11565,7 @@ export default function TradingTerminalPage() {
             onDrop={() => handleLayoutDrop("monitoring", "readiness")}
             style={{ order: monitoringOrderById.readiness ?? 3, display: floatingPanels.some((fp) => fp.id === "readiness") ? "none" : undefined }}
           >
-          <div className="monitoring-col">
-            <div className="eyebrow" style={{ marginBottom: 8 }}>Readiness
-              {layoutEditMode && <button type="button" className="panel-detach-btn" title="Floating" onClick={() => detachPanel("readiness", "monitoring")}>⤡</button>}
-            </div>
-            <div className="mon-row"><span>Drift</span><span>{driftItems.filter((d) => Boolean(d.drift_detected)).length}</span></div>
-            <div className="mon-row"><span>Suspendues</span><span className={suspended.length > 0 ? "warn" : "good"}>{suspended.length}</span></div>
-            <div className="mon-row"><span>Similarity</span><span>{String(memorySummary.avg_final_similarity || "–")}</span></div>
-            <div className="mon-row"><span>Memory impact</span><span>{String(memorySummary.avg_memory_impact || "–")}</span></div>
-            <div className="mon-row"><span>SLA breach</span><span className={incidents.some((i) => Boolean(i.sla_breached)) ? "warn" : "good"}>{incidents.filter((i) => Boolean(i.sla_breached)).length}</span></div>
-          </div>
+          <ReadinessMonitoringPanel badge={publicOpsPanelBadge} layoutEditMode={layoutEditMode} onDetach={() => detachPanel("readiness", "monitoring")} driftItems={driftItems} suspendedCount={suspended.length} memorySummary={memorySummary} incidents={incidents} />
           </div>
           <div
             className={`layout-draggable-card${layoutEditMode ? " is-edit" : ""}${layoutDropPreview?.zone === "monitoring" && layoutDropPreview.targetId === "risktimeline" ? " is-drop-target" : ""}`}
@@ -11088,12 +11576,7 @@ export default function TradingTerminalPage() {
             onDrop={() => handleLayoutDrop("monitoring", "risktimeline")}
             style={{ order: monitoringOrderById.risktimeline ?? 4, display: floatingPanels.some((fp) => fp.id === "risktimeline") ? "none" : undefined }}
           >
-          <div className="monitoring-col">
-            <div className="eyebrow" style={{ marginBottom: 8 }}>Risk Compliance Timeline
-              {layoutEditMode && <button type="button" className="panel-detach-btn" title="Floating" onClick={() => detachPanel("risktimeline", "monitoring")}>⤡</button>}
-            </div>
-            {renderRiskTimelineBody(6, "rt-mon")}
-          </div>
+          <RiskTimelineMonitoringPanel badge={publicOpsPanelBadge} layoutEditMode={layoutEditMode} onDetach={() => detachPanel("risktimeline", "monitoring")} body={renderRiskTimelineBody(6, "rt-mon")} />
           </div>
         </div>
       </section>
@@ -12224,6 +12707,96 @@ export default function TradingTerminalPage() {
           />
         </div>
       ))}
+      {detachedChartSidecars.map((panel) => (
+        <div
+          key={`chart-sidecar-float-${panel.id}`}
+          className="floating-panel-window chart-sidecar-floating-window"
+          style={{ left: panel.x, top: panel.y, width: panel.w, height: panel.h }}
+        >
+          <div
+            className="floating-panel-titlebar"
+            onMouseDown={(event) => {
+              event.preventDefault();
+              chartSidecarDragRef.current = { id: panel.id, startX: event.clientX, startY: event.clientY, origX: panel.x, origY: panel.y };
+            }}
+          >
+            <span className="floating-panel-title">{panel.id.toUpperCase()}</span>
+            <span className="floating-panel-zone-badge">chart sidecar</span>
+            <div className="floating-panel-actions">
+              <button
+                type="button"
+                className="floating-panel-resize-btn"
+                title="Agrandir"
+                onClick={() => setDetachedChartSidecars((current) => current.map((entry) => (
+                  entry.id === panel.id
+                    ? clampDetachedChartSidecar({ ...entry, w: Math.min(entry.w + 72, 920), h: Math.min(entry.h + 52, 720) })
+                    : entry
+                )))}
+              >□+</button>
+              <button type="button" className="floating-panel-dock-btn" title="Redocker" onClick={() => dockChartSidecar(panel.id)}>⤢ Dock</button>
+              <button type="button" className="floating-panel-close-btn" title="Fermer la fenêtre et redocker" onClick={() => dockChartSidecar(panel.id)}>✕</button>
+            </div>
+          </div>
+          <div className="floating-panel-body">
+            {renderChartSidecarCard(panel.id, true)}
+          </div>
+          <div
+            className="floating-panel-resize-handle"
+            onMouseDown={(event) => {
+              event.stopPropagation();
+              const startW = panel.w;
+              const startH = panel.h;
+              const startX = event.clientX;
+              const startY = event.clientY;
+              const onMove = (moveEvent: MouseEvent) => {
+                setDetachedChartSidecars((current) => current.map((entry) => (
+                  entry.id === panel.id
+                    ? clampDetachedChartSidecar({ ...entry, w: startW + moveEvent.clientX - startX, h: startH + moveEvent.clientY - startY })
+                    : entry
+                )));
+              };
+              const onUp = () => {
+                window.removeEventListener("mousemove", onMove);
+                window.removeEventListener("mouseup", onUp);
+              };
+              window.addEventListener("mousemove", onMove);
+              window.addEventListener("mouseup", onUp);
+            }}
+          />
+        </div>
+      ))}
     </main>
   );
+}
+
+function parseGpuViewportGrid(value: string | null): 1 | 4 | 16 | "auto" | null {
+  if (value === "auto") {
+    return "auto";
+  }
+  if (value === "1") {
+    return 1;
+  }
+  if (value === "4") {
+    return 4;
+  }
+  if (value === "16") {
+    return 16;
+  }
+  return null;
+}
+
+function parseChartSmoothingMs(value: string | null): 0 | 80 | 140 | 220 | null {
+  if (value === "off" || value === "0") {
+    return 0;
+  }
+  if (value === "80") {
+    return 80;
+  }
+  if (value === "140") {
+    return 140;
+  }
+  if (value === "220") {
+    return 220;
+  }
+  return null;
 }

@@ -2,8 +2,12 @@ import Link from "next/link";
 import { redirect } from "next/navigation";
 
 import { cpFetch } from "../lib/controlPlane";
+import { readHealthwatchDashboard } from "../lib/healthwatchDashboard";
+import { getLatestLocalTerminalCapture } from "../lib/localTerminalCapture";
+import { readLocalTerminalCaptureStore } from "../lib/localTerminalCaptureStore";
 import HelpHint from "../components/HelpHint";
 import TxtMiniGuide from "../components/ui/TxtMiniGuide";
+import { getRoleGroup, getRoleDisplayLabel, isClientRole } from "../lib/roleGroups";
 
 type RecordItem = Record<string, unknown>;
 
@@ -16,7 +20,7 @@ async function getJson(path: string): Promise<unknown> {
 }
 
 export default async function Page() {
-  const [me, overview, audit, positions, quotes, balances, pending, strategies] = await Promise.all([
+  const [me, overview, audit, positions, quotes, balances, pending, strategies, healthwatchDashboard, localTerminalCaptureStore] = await Promise.all([
     getJson("/v1/auth/me") as Promise<RecordItem | null>,
     getJson("/v1/dashboard/overview") as Promise<RecordItem | null>,
     getJson("/v1/audit") as Promise<RecordItem[] | null>,
@@ -25,6 +29,8 @@ export default async function Page() {
     getJson("/v1/broker/balance") as Promise<RecordItem | null>,
     getJson("/v1/intents/pending") as Promise<Record<string, RecordItem> | null>,
     getJson("/v1/strategies") as Promise<RecordItem[] | null>,
+    readHealthwatchDashboard(),
+    readLocalTerminalCaptureStore(),
   ]);
 
   if (!me) {
@@ -46,6 +52,16 @@ export default async function Page() {
     redirect("/change-password");
   }
 
+  // Clients should never reach this internal dashboard — middleware redirects
+  // them to /terminal. Enforce here as a defence-in-depth fallback.
+  const meRole = String(me.role || "");
+  if (isClientRole(meRole)) {
+    redirect("/terminal");
+  }
+
+  const meRoleGroup = getRoleGroup(meRole);
+  const meRoleLabel = getRoleDisplayLabel(meRole, meRoleGroup);
+
   const safeOverview = overview || {};
   const safeAudit = audit || [];
   const safePositions = positions || [];
@@ -53,6 +69,13 @@ export default async function Page() {
   const safeBalances = balances || { balances: [] };
   const safePending = pending || {};
   const safeStrategies = strategies || [];
+  const publicChartVisibility = (healthwatchDashboard?.public_chart_visibility && typeof healthwatchDashboard.public_chart_visibility === "object"
+    ? healthwatchDashboard.public_chart_visibility
+    : null) as RecordItem | null;
+  const latestLocalTerminalCapture = getLatestLocalTerminalCapture(localTerminalCaptureStore);
+  const publicFailureDetails = (publicChartVisibility?.failure_details && typeof publicChartVisibility.failure_details === "object"
+    ? publicChartVisibility.failure_details
+    : null) as RecordItem | null;
 
   const balanceRows = (safeBalances.balances as RecordItem[]) || [];
   const pendingRows = Object.entries(safePending);
@@ -71,7 +94,7 @@ export default async function Page() {
             example="Si Pending approvals monte et qu'un incident est ouvert, va d'abord sur Terminal puis Incidents."
             terms={["allocation", "metaRisk", "liquidity"]}
           />
-          <div className="row"><span>User</span><span className="pill">{String(me.username)} ({String(me.role)})</span></div>
+          <div className="row"><span>User</span><span className="pill">{String(me.username)} ({meRoleLabel})</span></div>
           <p style={{ marginTop: 8 }}>
             <Link href="/terminal">TXT Terminal</Link>
             {" | "}
@@ -99,6 +122,36 @@ export default async function Page() {
           <p className="subtle">Les approbations passent par bearer token, rôle et signature HMAC.</p>
           <div className="row"><span>Policy version</span><span>{String(safeOverview.policy_version)}</span></div>
           <div className="row"><span>Paper only</span><span className="warn">{String(safeOverview.paper_only)}</span></div>
+        </div>
+      </section>
+
+      <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
+        <div className="panel">
+          <div className="eyebrow">Public Probe <HelpHint text="Reference probe du chart public. Ce bloc ne parle pas forcement de l'onglet terminal local en face de toi." examples={["Si ce probe est green mais le terminal local est rouge, le probleme est dans l'instance locale ou son feed choisi.", "Si failure reason=freshness, le chart public peut encore rendre des bougies mais avec retard."]} /></div>
+          <div className={`metric ${String(publicChartVisibility?.state || publicChartVisibility?.public_chart_state || "unknown") === "healthy" ? "good" : "warn"}`}>{String(publicChartVisibility?.state || publicChartVisibility?.public_chart_state || "unavailable")}</div>
+          <div className="row"><span>Failure reason</span><span>{String(publicChartVisibility?.failure_reason || "none")}</span></div>
+          <div className="row"><span>Feed</span><span>{String(((publicChartVisibility?.ohlcv_contract as RecordItem | undefined)?.instrument) || "-")} @ {String(((publicChartVisibility?.ohlcv_contract as RecordItem | undefined)?.venue) || "-")}</span></div>
+          <div className="row"><span>Bars freshness</span><span>{String(publicFailureDetails?.freshness_stale_ms || "-")}</span></div>
+          <div className="row"><span>Generated</span><span>{String(healthwatchDashboard?.generated_at || "-").slice(11, 19) || "-"}</span></div>
+        </div>
+        <div className="panel">
+          <div className="eyebrow">Local Terminal Capture <HelpHint text="Snapshot persiste de l'onglet terminal actif. C'est la source de verite pour verifier les pills exactes d'une instance locale." examples={["Si tu vois BUS OFFLINE dans l'onglet, ce bloc doit montrer la meme chose ici si cette instance publie encore ses captures.", "Le client id permet de distinguer plusieurs onglets ou postes de travail si necessaire."]} /></div>
+          {latestLocalTerminalCapture ? (
+            <>
+              <div className={`metric ${latestLocalTerminalCapture.runtime.noCandlesExpected ? "warn" : "good"}`}>{latestLocalTerminalCapture.runtime.noCandlesExpected ? "No candles expected" : "Flowing"}</div>
+              <div className="row"><span>Client id</span><span>{latestLocalTerminalCapture.clientId.slice(0, 8)}</span></div>
+              <div className="row"><span>Feed</span><span>{latestLocalTerminalCapture.chart.feedLabel}</span></div>
+              <div className="row"><span>Signal</span><span>{latestLocalTerminalCapture.localFeed.signal}</span></div>
+              <div className="row"><span>Persisted</span><span>{latestLocalTerminalCapture.capturedAt.slice(11, 19)}</span></div>
+              {latestLocalTerminalCapture.runtime.exactStateVector.map((item) => (
+                <div className="row" key={item}>
+                  <span>State</span><span>{item}</span>
+                </div>
+              ))}
+            </>
+          ) : (
+            <p className="subtle">Aucune capture locale persistee pour le moment.</p>
+          )}
         </div>
       </section>
 

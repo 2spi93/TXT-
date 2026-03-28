@@ -1,12 +1,11 @@
 import { NextResponse } from "next/server";
 
 import { fallbackQuotes, hasUsableRows } from "../../../../lib/binanceMarketFallback";
-import { cpFetch } from "../../../../lib/controlPlane";
+import { cpFetchJsonSafe } from "../../../../lib/controlPlane";
 
 export async function GET(): Promise<NextResponse> {
   try {
-    const response = await cpFetch("/v1/market/quotes");
-    const payload = await response.json();
+    const { response, payload } = await cpFetchJsonSafe("/v1/market/quotes");
     if (response.ok && hasUsableRows(payload)) {
       return NextResponse.json(payload, { status: response.status });
     }

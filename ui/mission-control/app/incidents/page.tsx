@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import HelpHint from "../../components/HelpHint";
 import TxtMiniGuide from "../../components/ui/TxtMiniGuide";
@@ -16,7 +16,7 @@ export default function IncidentsPage() {
   const [error, setError] = useState<string | null>(null);
   const [resolutionNote, setResolutionNote] = useState("Resolved after review");
 
-  async function loadIncidents(status: string = statusFilter): Promise<void> {
+  const loadIncidents = useCallback(async (status: string = statusFilter): Promise<void> => {
     const suffix = status ? `?status=${encodeURIComponent(status)}` : "";
     const response = await fetch(`/api/incidents${suffix}`, { cache: "no-store" });
     if (!response.ok) {
@@ -25,15 +25,15 @@ export default function IncidentsPage() {
     const payload = await response.json();
     setSlaMinutes(Number(payload.sla_minutes || 0));
     setItems((payload.items as JsonMap[] | undefined) || []);
-  }
+  }, [statusFilter]);
 
   useEffect(() => {
-    loadIncidents().catch((err) => setError(err instanceof Error ? err.message : "Erreur inconnue"));
+    loadIncidents(statusFilter).catch((err) => setError(err instanceof Error ? err.message : "Erreur inconnue"));
     const timer = window.setInterval(() => {
-      void loadIncidents();
+      void loadIncidents(statusFilter);
     }, 30_000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [loadIncidents, statusFilter]);
 
   const slaBreachedCount = items.filter((x) => Boolean(x.sla_breached)).length;
 
@@ -50,7 +50,7 @@ export default function IncidentsPage() {
         const payload = await response.json();
         throw new Error(String(payload?.detail || "Assignation impossible"));
       }
-      await loadIncidents();
+      await loadIncidents(statusFilter);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Erreur inconnue");
     } finally {
@@ -71,7 +71,7 @@ export default function IncidentsPage() {
         const payload = await response.json();
         throw new Error(String(payload?.detail || "Cloture impossible"));
       }
-      await loadIncidents();
+      await loadIncidents(statusFilter);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Erreur inconnue");
     } finally {

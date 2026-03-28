@@ -1,8 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import { fallbackOhlcv, hasUsableRows } from "../../../../lib/binanceMarketFallback";
-import { cpFetch, extractMcContextHeaders } from "../../../../lib/controlPlane";
+import { cpFetchJsonSafe, extractMcContextHeaders } from "../../../../lib/controlPlane";
 import { getCachedOhlcv, setCachedOhlcv } from "../../../../lib/ohlcvCache";
+import { normalizeOhlcvRows, type NormalizedOhlcvBar } from "../../../../lib/ohlcvIntegrity";
+
+type CanonicalOhlcvBar = NormalizedOhlcvBar;
 
 export async function GET(request: NextRequest): Promise<NextResponse> {
   const instrument = request.nextUrl.searchParams.get("instrument") || "BTCUSDT";
@@ -15,30 +18,45 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   if (cached && cached.length >= Math.min(limit, cached.length)) {
     return NextResponse.json(cached.slice(-limit), {
       status: 200,
-      headers: { "X-Data-Source": "cache" },
+      headers: { "X-Data-Source": "cache", "X-Data-Contract": "ohlcv-v1" },
     });
   }
 
   try {
-    const response = await cpFetch(`/v1/market/ohlcv?instrument=${encodeURIComponent(instrument)}&venue=${encodeURIComponent(venue)}&timeframe=${encodeURIComponent(timeframe)}&limit=${encodeURIComponent(String(limit))}`, {
+    const { response, payload } = await cpFetchJsonSafe(`/v1/market/ohlcv?instrument=${encodeURIComponent(instrument)}&venue=${encodeURIComponent(venue)}&timeframe=${encodeURIComponent(timeframe)}&limit=${encodeURIComponent(String(limit))}`, {
       headers: extractMcContextHeaders(request),
     });
-    const payload = await response.json();
     if (response.ok && hasUsableRows(payload)) {
-      const rows = Array.isArray(payload) ? payload : (payload?.rows ?? []);
-      setCachedOhlcv(instrument, timeframe, rows);
-      return NextResponse.json(rows, { status: response.status });
+      const rows = Array.isArray(payload) ? payload : (((payload as { rows?: unknown[] } | null)?.rows) ?? []);
+      const normalized = normalizeOhlcvRows(rows, { instrument, venue, timeframe }) as CanonicalOhlcvBar[];
+      setCachedOhlcv(instrument, timeframe, normalized);
+      return NextResponse.json(normalized, {
+        status: response.status,
+        headers: { "X-Data-Contract": "ohlcv-v1" },
+      });
     }
   } catch {
     // Fall through to market fallback.
   }
 
   const fallback = await fallbackOhlcv(instrument, timeframe, limit);
-  setCachedOhlcv(instrument, timeframe, fallback);
-  return NextResponse.json(fallback, {
-    status: 200,
+  const normalizedFallback = normalizeOhlcvRows(fallback, { instrument, venue, timeframe }) as CanonicalOhlcvBar[];
+  if (normalizedFallback.length > 0) {
+    setCachedOhlcv(instrument, timeframe, normalizedFallback);
+    return NextResponse.json(normalizedFallback, {
+      status: 200,
+      headers: {
+        "X-Data-Source": "fallback-binance",
+        "X-Data-Contract": "ohlcv-v1",
+      },
+    });
+  }
+
+  return NextResponse.json([], {
+    status: 503,
     headers: {
-      "X-Data-Source": "fallback-binance",
+      "X-Data-Source": "canonical-unavailable",
+      "X-Data-Contract": "ohlcv-v1",
     },
   });
 }

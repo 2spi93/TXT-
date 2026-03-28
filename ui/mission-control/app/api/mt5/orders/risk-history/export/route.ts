@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 
-import { cpFetch } from "../../../../../../lib/controlPlane";
+import { cpFetch, readJsonFromResponseSafe } from "../../../../../../lib/controlPlane";
 
 function csvToJsonRows(payload: string): Array<Record<string, string>> {
   const lines = payload
@@ -62,7 +62,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     }
 
     if (contentType.includes("application/json")) {
-      const payload = await response.json();
+      const payload = await readJsonFromResponseSafe(response);
       return NextResponse.json(payload, { status: response.status });
     }
 

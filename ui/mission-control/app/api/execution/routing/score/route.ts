@@ -105,7 +105,9 @@ function buildRequestContext(request: NextRequest): RoutingRequestContext {
 }
 
 function sessionKeyFromRequest(request: NextRequest): string {
-  const cookieToken = request.cookies.get("mc_token")?.value || "";
+  const cookieToken = request.cookies.get("mc_token")?.value
+    || request.cookies.get("mc_token_compat")?.value
+    || "";
   if (cookieToken) {
     return `cookie:${cookieToken.slice(0, 24)}`;
   }
@@ -234,6 +236,20 @@ function parseJsonSafe<T>(text: string, fallback: T): T {
   }
 }
 
+function degradedRoutingScore(symbol: string, detail: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    symbol,
+    score: 0,
+    confidence: 0,
+    best: null,
+    backup: null,
+    routes: [],
+    degraded: true,
+    detail,
+    ...extra,
+  };
+}
+
 export async function GET(request: NextRequest): Promise<NextResponse> {
   const nowMs = Date.now();
   const symbol = normalizeSymbol(request.nextUrl.searchParams.get("symbol"));
@@ -272,17 +288,14 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       });
     }
     return NextResponse.json(
-      {
-        detail: "routing_score_circuit_open",
-        symbol,
+      degradedRoutingScore(symbol, "routing_score_circuit_open", {
         retry_after_ms: breaker.openUntilMs - nowMs,
-      },
+      }),
       {
-        status: 503,
+        status: 200,
         headers: {
-          "x-mc-routing-guard": "circuit-open",
+          "x-mc-routing-guard": "circuit-open-degraded",
           "x-mc-routing-profile": context.highVolatility ? "volatile" : "normal",
-          "retry-after": String(Math.max(1, Math.ceil((breaker.openUntilMs - nowMs) / 1000))),
           "cache-control": "no-store",
         },
       },
@@ -303,17 +316,14 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       });
     }
     return NextResponse.json(
-      {
-        detail: "routing_score_rate_limited",
-        symbol,
+      degradedRoutingScore(symbol, "routing_score_rate_limited", {
         window_ms: ROUTING_RATE_WINDOW_MS,
         max_requests: context.rateLimitMax,
-      },
+      }),
       {
-        status: 429,
+        status: 200,
         headers: {
-          "x-mc-routing-guard": "rate-limited",
-          "retry-after": "1",
+          "x-mc-routing-guard": "rate-limited-degraded",
           "cache-control": "no-store",
         },
       },
@@ -357,13 +367,19 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
         },
       });
     }
-    return NextResponse.json(payload, {
-      status: response.status,
-      headers: {
-        "x-mc-routing-guard": "live-error",
-        "cache-control": "no-store",
+    return NextResponse.json(
+      degradedRoutingScore(symbol, "routing_score_upstream_error", {
+        upstream_status: response.status,
+        upstream_payload: payload,
+      }),
+      {
+        status: 200,
+        headers: {
+          "x-mc-routing-guard": "live-error-degraded",
+          "cache-control": "no-store",
+        },
       },
-    });
+    );
   } catch {
     markUpstreamFailure(guard, symbol, nowMs);
     const fallback = readLastGood(guard, symbol);
@@ -379,14 +395,11 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       });
     }
     return NextResponse.json(
+      degradedRoutingScore(symbol, "routing_score_upstream_unreachable"),
       {
-        detail: "routing_score_upstream_unreachable",
-        symbol,
-      },
-      {
-        status: 503,
+        status: 200,
         headers: {
-          "x-mc-routing-guard": "upstream-unreachable",
+          "x-mc-routing-guard": "upstream-unreachable-degraded",
           "cache-control": "no-store",
         },
       },

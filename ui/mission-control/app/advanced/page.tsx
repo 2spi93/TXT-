@@ -1,5 +1,7 @@
+import { redirect } from "next/navigation";
 import TxtMiniGuide from "../../components/ui/TxtMiniGuide";
 import Link from "next/link";
+import { getServerRoleGroup } from "../../lib/serverAuth";
 
 const MODULES = [
   "Strategies",
@@ -10,7 +12,10 @@ const MODULES = [
   "Journaling",
 ];
 
-export default function AdvancedPage() {
+export default async function AdvancedPage() {
+  const roleGroup = await getServerRoleGroup();
+  if (roleGroup === "client") redirect("/terminal");
+
   return (
     <main className="shell txt-page-shell">
       <section className="panel txt-page-hero">

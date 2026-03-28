@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { cpFetch } from "../../../../../lib/controlPlane";
+import { cpFetchJsonSafe } from "../../../../../lib/controlPlane";
 import { listSelfLearningV4Scopes } from "../../../../../lib/selfLearningV4Store";
 
 function noStoreJson(payload: unknown, status = 200): NextResponse {
@@ -33,24 +33,45 @@ export async function GET(request: Request) {
     }
     params.set("limit", String(limit));
 
-    const cpResponse = await cpFetch(`/v1/strategies/self-learning-v4/scopes?${params.toString()}`, { method: "GET" });
+    const { response: cpResponse, payload } = await cpFetchJsonSafe(`/v1/strategies/self-learning-v4/scopes?${params.toString()}`, { method: "GET" });
     if (cpResponse.ok) {
-      const payload = await cpResponse.json().catch(() => ({}));
+      const items = Array.isArray((payload as { items?: unknown })?.items)
+        ? (((payload as { items?: unknown[] }).items) || [])
+        : [];
       return noStoreJson({
         status: "ok",
-        items: Array.isArray(payload?.items) ? payload.items : [],
-        total: Number(payload?.total || 0),
+        items,
+        total: Number((payload as { total?: unknown })?.total || 0),
         storage: "control-plane",
       }, 200);
     }
-    if (cpResponse.status === 400 || cpResponse.status === 401 || cpResponse.status === 403) {
-      const payload = await cpResponse.json().catch(() => ({ detail: "upstream_error" }));
-      return noStoreJson({ status: "error", message: payload?.detail || "upstream_error" }, cpResponse.status);
+    if (cpResponse.status === 400) {
+      const detail = (payload as { detail?: unknown })?.detail;
+      return noStoreJson({ status: "error", message: typeof detail === "string" ? detail : "upstream_error" }, 400);
+    }
+    if (cpResponse.status === 401 || cpResponse.status === 403) {
+      const items = await listSelfLearningV4Scopes({ accountId, symbol, timeframe, limit }).catch(() => []);
+      return noStoreJson({
+        status: "ok",
+        items,
+        total: items.length,
+        storage: "local-fallback",
+        degraded: true,
+        detail: "self_learning_v4_scopes_anonymous_degraded",
+        upstream_status: cpResponse.status,
+      }, 200);
     }
 
     const items = await listSelfLearningV4Scopes({ accountId, symbol, timeframe, limit });
     return noStoreJson({ status: "ok", items, total: items.length, storage: "local-fallback" }, 200);
   } catch {
-    return noStoreJson({ status: "error", message: "unable to list self-learning v4 scopes" }, 500);
+    return noStoreJson({
+      status: "ok",
+      items: [],
+      total: 0,
+      storage: "local-fallback",
+      degraded: true,
+      detail: "self_learning_v4_scopes_unreachable",
+    }, 200);
   }
 }

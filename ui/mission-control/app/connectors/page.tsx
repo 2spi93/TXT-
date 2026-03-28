@@ -8,6 +8,28 @@ import TxtMiniGuide from "../../components/ui/TxtMiniGuide";
 
 type JsonMap = Record<string, unknown>;
 
+function buildConnectorsWsUrl(token: string, controlPlaneUrl?: string): string {
+  if (typeof window === "undefined") {
+    return "";
+  }
+  const currentProtocol = window.location.protocol === "https:" ? "wss" : "ws";
+  const currentBase = `${currentProtocol}://${window.location.host}`;
+  const configured = String(controlPlaneUrl || "").trim();
+  if (!configured) {
+    return `${currentBase}/v1/connectors/ws?token=${encodeURIComponent(token)}`;
+  }
+  try {
+    const parsed = new URL(configured);
+    if (["localhost", "127.0.0.1", "0.0.0.0", "control-plane"].includes(parsed.hostname)) {
+      return `${currentBase}/v1/connectors/ws?token=${encodeURIComponent(token)}`;
+    }
+    const protocol = parsed.protocol === "https:" ? "wss" : "ws";
+    return `${protocol}://${parsed.host}/v1/connectors/ws?token=${encodeURIComponent(token)}`;
+  } catch {
+    return `${currentBase}/v1/connectors/ws?token=${encodeURIComponent(token)}`;
+  }
+}
+
 export default function ConnectorsPage() {
   const [status, setStatus] = useState<JsonMap | null>(null);
   const [mt5Health, setMt5Health] = useState<JsonMap | null>(null);
@@ -73,13 +95,12 @@ export default function ConnectorsPage() {
           return;
         }
         const tokenPayload = await tokenRes.json();
-        const cpUrl = String(tokenPayload.controlPlaneUrl || "http://127.0.0.1:8000");
         const token = String(tokenPayload.token || "");
         if (!token) {
           return;
         }
 
-        const wsUrl = cpUrl.replace("http://", "ws://").replace("https://", "wss://") + `/v1/connectors/ws?token=${encodeURIComponent(token)}`;
+        const wsUrl = buildConnectorsWsUrl(token, String(tokenPayload.controlPlaneUrl || ""));
         ws = new WebSocket(wsUrl);
         ws.onmessage = (event) => {
           if (cancelled) {

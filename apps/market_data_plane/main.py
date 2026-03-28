@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -19,16 +20,46 @@ DEFAULT_VENUE = os.getenv("MARKET_PRIMARY_VENUE", "binance-public")
 SYNC_SECONDS = max(4, int(os.getenv("MARKET_SYNC_SECONDS", "12")))
 MAX_DEPTH_LEVELS = max(5, min(100, int(os.getenv("MARKET_DEPTH_LEVELS", "20"))))
 DEPTH_STREAM_ENABLED = os.getenv("MARKET_DEPTH_STREAM_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+MARKET_SHARD_INDEX = max(0, int(os.getenv("MARKET_SHARD_INDEX", "0")))
+MARKET_SHARD_TOTAL = max(1, int(os.getenv("MARKET_SHARD_TOTAL", "1")))
+
+SUPPORTED_VENUES = [
+    "binance-public",
+    "coinbase-public",
+    "kraken-public",
+    "okx-public",
+    "bitget-public",
+    "bingx-public",
+    "solana-jupiter",
+    "paper-bitget",
+    "paper-coinbase",
+    "paper-kraken",
+    "paper-okx",
+    "paper-bingx",
+]
 
 SNAPSHOTS = {
     "paper-bitget:BTCUSDT-PERP": {"venue": "paper-bitget", "instrument": "BTCUSDT-PERP", "bid": 68245.5, "ask": 68250.1, "last": 68247.8, "spread_bps": 0.67},
     "paper-coinbase:ETHUSDT-PERP": {"venue": "paper-coinbase", "instrument": "ETHUSDT-PERP", "bid": 3520.2, "ask": 3521.0, "last": 3520.5, "spread_bps": 2.27},
+    "paper-kraken:BTCUSD-PERP": {"venue": "paper-kraken", "instrument": "BTCUSD-PERP", "bid": 68240.2, "ask": 68245.1, "last": 68242.9, "spread_bps": 0.71},
+    "paper-okx:ETHUSDT-SWAP": {"venue": "paper-okx", "instrument": "ETHUSDT-SWAP", "bid": 3519.8, "ask": 3520.7, "last": 3520.1, "spread_bps": 2.56},
+    "paper-bingx:SOLUSDT-PERP": {"venue": "paper-bingx", "instrument": "SOLUSDT-PERP", "bid": 184.12, "ask": 184.23, "last": 184.18, "spread_bps": 5.97},
+    "solana-jupiter:SOLUSDC": {"venue": "solana-jupiter", "instrument": "SOLUSDC", "bid": 184.05, "ask": 184.16, "last": 184.1, "spread_bps": 5.97},
     "paper-polymarket:BTC-UP-THIS-WEEK": {"venue": "paper-polymarket", "instrument": "BTC-UP-THIS-WEEK", "bid": 0.57, "ask": 0.58, "last": 0.575, "spread_bps": 173.91},
 }
 
 DEPTH_BOOKS: dict[str, dict[str, Any]] = {}
 DEPTH_SUBSCRIBERS: dict[str, set[WebSocket]] = {}
 DERIVATIVES_CACHE: dict[str, dict[str, Any]] = {}
+OHLCV_SUBSCRIBERS: dict[str, set[WebSocket]] = {}
+OHLCV_STREAM_STATE: dict[str, dict[str, Any]] = {}
+
+
+def _active_symbols() -> list[str]:
+    normalized = [_normalize_instrument(symbol) for symbol in DEFAULT_SYMBOLS]
+    if MARKET_SHARD_TOTAL <= 1:
+        return normalized
+    return [symbol for idx, symbol in enumerate(normalized) if idx % MARKET_SHARD_TOTAL == MARKET_SHARD_INDEX]
 
 
 def _now_utc() -> datetime:
@@ -41,6 +72,10 @@ def _normalize_instrument(instrument: str) -> str:
 
 def _stream_key(venue: str, instrument: str) -> str:
     return f"{venue}:{_normalize_instrument(instrument)}"
+
+
+def _ohlcv_stream_key(venue: str, instrument: str, timeframe: str) -> str:
+    return f"{venue}:{_normalize_instrument(instrument)}:{timeframe}"
 
 
 def _session_label(ts: datetime) -> str:
@@ -362,6 +397,131 @@ def _upsert_ohlcv_from_trades(venue: str, instrument: str, trades: list[dict[str
         )
 
 
+def _fetch_ohlcv_rows(venue: str, instrument: str, timeframe: str, limit: int) -> list[dict[str, Any]]:
+    rows = fetch_all(
+        """
+        SELECT venue, instrument, timeframe, bucket_start, open, high, low, close, volume, quote_volume, trades_count, source
+        FROM market_ohlcv
+        WHERE venue = %s AND instrument = %s AND timeframe = %s
+        ORDER BY bucket_start DESC
+        LIMIT %s
+        """,
+        (venue, _normalize_instrument(instrument), timeframe, limit),
+    )
+    return list(reversed(rows))
+
+
+def _sequence_ohlcv_rows(venue: str, instrument: str, timeframe: str, rows: list[dict[str, Any]]) -> list[int]:
+    stream_key = _ohlcv_stream_key(venue, instrument, timeframe)
+    state = OHLCV_STREAM_STATE.setdefault(stream_key, {"next_seq": 1, "bucket_seq": {}, "last_signature": ""})
+    bucket_seq = state.setdefault("bucket_seq", {})
+    next_seq = int(state.get("next_seq", 1) or 1)
+    sequences: list[int] = []
+
+    for row in rows:
+        bucket_start = row.get("bucket_start")
+        if isinstance(bucket_start, datetime):
+            bucket_key = bucket_start.isoformat()
+        else:
+            bucket_key = str(bucket_start or "")
+        seq = bucket_seq.get(bucket_key)
+        if not isinstance(seq, int) or seq <= 0:
+            seq = next_seq
+            next_seq += 1
+            bucket_seq[bucket_key] = seq
+        sequences.append(seq)
+
+    active_keys = {
+        bucket_start.isoformat() if isinstance(bucket_start := row.get("bucket_start"), datetime) else str(bucket_start or "")
+        for row in rows
+    }
+    state["bucket_seq"] = {
+        key: value
+        for key, value in bucket_seq.items()
+        if key in active_keys
+    }
+    state["next_seq"] = next_seq
+    return sequences
+
+
+def _serialize_ohlcv_rows(rows: list[dict[str, Any]], venue: str, instrument: str, timeframe: str) -> list[dict[str, Any]]:
+    sequences = _sequence_ohlcv_rows(venue, instrument, timeframe, rows)
+    normalized: list[dict[str, Any]] = []
+    for row, seq in zip(rows, sequences):
+        bucket_start = row.get("bucket_start")
+        if isinstance(bucket_start, datetime):
+            bucket_start_iso = bucket_start.isoformat()
+        else:
+            bucket_start_iso = str(bucket_start or "")
+
+        timeframe = str(row.get("timeframe") or "")
+        open_price = _float(row.get("open"), 0.0)
+        high_price = _float(row.get("high"), open_price)
+        low_price = _float(row.get("low"), open_price)
+        close_price = _float(row.get("close"), open_price)
+        volume = _float(row.get("volume"), 0.0)
+        quote_volume = _float(row.get("quote_volume"), 0.0)
+        trades_count = int(_float(row.get("trades_count"), 0.0))
+
+        normalized.append(
+            {
+                "venue": str(row.get("venue") or DEFAULT_VENUE),
+                "instrument": _normalize_instrument(str(row.get("instrument") or "")),
+                "timeframe": timeframe,
+                "bucket_start": bucket_start_iso,
+                "open": open_price,
+                "high": high_price,
+                "low": low_price,
+                "close": close_price,
+                "volume": volume,
+                "quote_volume": quote_volume,
+                "trades_count": trades_count,
+                "source": str(row.get("source") or "trade-resampled"),
+                "t": bucket_start_iso,
+                "o": open_price,
+                "h": high_price,
+                "l": low_price,
+                "c": close_price,
+                "v": volume,
+                "tf": timeframe,
+                "seq": seq,
+            }
+        )
+    return normalized
+
+
+async def _broadcast_ohlcv_snapshot(venue: str, instrument: str, timeframe: str, limit: int = 500) -> None:
+    stream_key = _ohlcv_stream_key(venue, instrument, timeframe)
+    subscribers = OHLCV_SUBSCRIBERS.get(stream_key, set())
+    if not subscribers:
+        return
+
+    rows = _serialize_ohlcv_rows(_fetch_ohlcv_rows(venue, instrument, timeframe, limit), venue, instrument, timeframe)
+    state = OHLCV_STREAM_STATE.setdefault(stream_key, {"next_seq": 1, "bucket_seq": {}, "last_signature": ""})
+    signature = hashlib.sha256(json_dumps(rows).encode("utf-8")).hexdigest()
+    if signature == str(state.get("last_signature") or ""):
+        return
+
+    payload = {
+        "type": "snapshot",
+        "venue": venue,
+        "instrument": _normalize_instrument(instrument),
+        "timeframe": timeframe,
+        "items": rows,
+        "as_of": _now_utc().isoformat(),
+    }
+    stale: list[WebSocket] = []
+    for socket in list(subscribers):
+        try:
+            await socket.send_json(payload)
+        except Exception:
+            stale.append(socket)
+    for socket in stale:
+        subscribers.discard(socket)
+
+    state["last_signature"] = signature
+
+
 def _cleanup_old_rows() -> None:
     execute("DELETE FROM market_trades WHERE traded_at < NOW() - INTERVAL '24 hours'")
     execute("DELETE FROM market_orderbook_snapshots WHERE snapshot_at < NOW() - INTERVAL '12 hours'")
@@ -378,8 +538,12 @@ async def _sync_symbol(client: httpx.AsyncClient, instrument: str) -> None:
     trades = await _fetch_binance_trades(client, symbol, limit=200)
     if trades:
         _store_trades(DEFAULT_VENUE, symbol, trades)
+        updated_timeframes: list[str] = []
         for timeframe in ("1m", "5m", "15m", "1h"):
             _upsert_ohlcv_from_trades(DEFAULT_VENUE, symbol, trades, timeframe)
+            updated_timeframes.append(timeframe)
+        for timeframe in updated_timeframes:
+            await _broadcast_ohlcv_snapshot(DEFAULT_VENUE, symbol, timeframe)
 
     depth_snapshot = await _fetch_binance_depth_snapshot(client, symbol)
     if depth_snapshot:
@@ -401,7 +565,7 @@ async def _sync_loop() -> None:
     while True:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                for instrument in DEFAULT_SYMBOLS:
+                for instrument in _active_symbols():
                     await _sync_symbol(client, instrument)
             _cleanup_old_rows()
         except Exception:
@@ -472,8 +636,8 @@ async def startup() -> None:
         _upsert_snapshot(snapshot)
     asyncio.create_task(_sync_loop())
     if DEPTH_STREAM_ENABLED:
-        for symbol in DEFAULT_SYMBOLS:
-            asyncio.create_task(_stream_depth_symbol(_normalize_instrument(symbol)))
+        for symbol in _active_symbols():
+            asyncio.create_task(_stream_depth_symbol(symbol))
 
 
 @app.get("/health")
@@ -484,8 +648,20 @@ async def health() -> dict:
         "service": "market-data-plane",
         "snapshots": symbols["count"],
         "symbols": DEFAULT_SYMBOLS,
+        "active_symbols": _active_symbols(),
+        "supported_venues": SUPPORTED_VENUES,
+        "shard": {"index": MARKET_SHARD_INDEX, "total": MARKET_SHARD_TOTAL},
         "depth_stream_enabled": DEPTH_STREAM_ENABLED,
         "depth_books": len(DEPTH_BOOKS),
+    }
+
+
+@app.get("/v1/market/venues")
+async def market_venues() -> dict:
+    return {
+        "status": "ok",
+        "primary": DEFAULT_VENUE,
+        "supported_venues": SUPPORTED_VENUES,
     }
 
 
@@ -501,17 +677,8 @@ async def market_ohlcv(
     timeframe: str = Query("1m"),
     limit: int = Query(200, ge=1, le=1000),
 ) -> list[dict]:
-    rows = fetch_all(
-        """
-        SELECT venue, instrument, timeframe, bucket_start, open, high, low, close, volume, quote_volume, trades_count, source
-        FROM market_ohlcv
-        WHERE venue = %s AND instrument = %s AND timeframe = %s
-        ORDER BY bucket_start DESC
-        LIMIT %s
-        """,
-        (venue, _normalize_instrument(instrument), timeframe, limit),
-    )
-    return list(reversed(rows))
+    rows = _fetch_ohlcv_rows(venue, instrument, timeframe, limit)
+    return _serialize_ohlcv_rows(rows, venue, instrument, timeframe)
 
 
 @app.get("/v1/market/trades")
@@ -608,6 +775,41 @@ async def ws_market_depth(websocket: WebSocket, instrument: str, venue: str = DE
             await websocket.receive_text()
     except WebSocketDisconnect:
         DEPTH_SUBSCRIBERS.get(key, set()).discard(websocket)
+
+
+@app.websocket("/ws/v1/market/ohlcv/{instrument}")
+async def ws_market_ohlcv(
+    websocket: WebSocket,
+    instrument: str,
+    venue: str = DEFAULT_VENUE,
+    timeframe: str = "1m",
+    limit: int = 500,
+) -> None:
+    symbol = _normalize_instrument(instrument)
+    safe_limit = max(50, min(limit, 1000))
+    stream_key = _ohlcv_stream_key(venue, symbol, timeframe)
+    await websocket.accept()
+    OHLCV_SUBSCRIBERS.setdefault(stream_key, set()).add(websocket)
+
+    rows = _serialize_ohlcv_rows(_fetch_ohlcv_rows(venue, symbol, timeframe, safe_limit), venue, symbol, timeframe)
+    state = OHLCV_STREAM_STATE.setdefault(stream_key, {"next_seq": 1, "bucket_seq": {}, "last_signature": ""})
+    state["last_signature"] = hashlib.sha256(json_dumps(rows).encode("utf-8")).hexdigest()
+    await websocket.send_json(
+        {
+            "type": "snapshot",
+            "venue": venue,
+            "instrument": symbol,
+            "timeframe": timeframe,
+            "items": rows,
+            "as_of": _now_utc().isoformat(),
+        }
+    )
+
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        OHLCV_SUBSCRIBERS.get(stream_key, set()).discard(websocket)
 
 
 @app.get("/v1/market/microstructure")

@@ -75,9 +75,57 @@ export function toBinanceSymbol(instrument: string): string {
   return `${normalized}USDT`;
 }
 
+// Intervalles supportés nativement par Binance REST klines
+const BINANCE_VALID_INTERVALS = new Set([
+  "1s", "1m", "3m", "5m", "15m", "30m",
+  "1h", "2h", "4h", "6h", "8h", "12h",
+  "1d", "3d", "1w", "1M",
+]);
+
+// Alias courants → intervalle Binance canonique
+const BINANCE_INTERVAL_ALIASES: Record<string, string> = {
+  "60m": "1h",
+  "120m": "2h",
+  "240m": "4h",
+  "360m": "6h",
+  "480m": "8h",
+  "720m": "12h",
+  "1440m": "1d",
+  "D": "1d",
+  "W": "1w",
+  "M": "1M",
+};
+
 function toBinanceInterval(timeframe: string): string {
-  if (timeframe === "5m" || timeframe === "15m") {
-    return timeframe;
+  const tf = String(timeframe || "1m").trim();
+  if (BINANCE_VALID_INTERVALS.has(tf)) return tf;
+  if (BINANCE_INTERVAL_ALIASES[tf]) return BINANCE_INTERVAL_ALIASES[tf];
+  // Tentative de parse générique : "45m" → "1h" (arrondi supérieur Binance le plus proche)
+  const match = tf.match(/^(\d+)([mhd])$/);
+  if (match) {
+    const n = Number(match[1]);
+    const unit = match[2];
+    if (unit === "m") {
+      if (n <= 1)   return "1m";
+      if (n <= 3)   return "3m";
+      if (n <= 5)   return "5m";
+      if (n <= 15)  return "15m";
+      if (n <= 30)  return "30m";
+      if (n <= 60)  return "1h";
+      if (n <= 120) return "2h";
+      if (n <= 240) return "4h";
+      return "1d";
+    }
+    if (unit === "h") {
+      if (n <= 1)  return "1h";
+      if (n <= 2)  return "2h";
+      if (n <= 4)  return "4h";
+      if (n <= 6)  return "6h";
+      if (n <= 8)  return "8h";
+      if (n <= 12) return "12h";
+      return "1d";
+    }
+    if (unit === "d") return n >= 3 ? "3d" : "1d";
   }
   return "1m";
 }

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { cpFetch } from "../../../../../lib/controlPlane";
+import { cpFetchJsonSafe } from "../../../../../lib/controlPlane";
 
 export async function POST(
   request: Request,
@@ -8,11 +8,10 @@ export async function POST(
 ): Promise<NextResponse> {
   const resolved = await params;
   const body = await request.json();
-  const response = await cpFetch(`/v1/incidents/${resolved.ticketKey}/close`, {
+  const { response, payload } = await cpFetchJsonSafe(`/v1/incidents/${resolved.ticketKey}/close`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  const payload = await response.json();
   return NextResponse.json(payload, { status: response.status });
 }

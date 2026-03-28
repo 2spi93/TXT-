@@ -4,8 +4,10 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 
 import { useUiMode } from "../../lib/userUiPrefs";
+import type { RoleGroup } from "../../lib/roleGroups";
 
-const NAV_ITEMS = [
+/** Navigation visible to internal TXT staff only (admin · operator · viewer). */
+const INTERNAL_NAV_ITEMS = [
   { href: "/", label: "Dashboard" },
   { href: "/terminal", label: "Terminal" },
   { href: "/live-readiness", label: "Readiness" },
@@ -17,13 +19,25 @@ const NAV_ITEMS = [
   { href: "/settings", label: "Settings" },
 ];
 
-export default function TxtGlobalNav() {
+/** Navigation visible to external clients (client · trader · investor · premium · pro). */
+const CLIENT_NAV_ITEMS = [
+  { href: "/terminal", label: "Terminal" },
+  { href: "/learn", label: "Learn" },
+  { href: "/settings", label: "Settings" },
+];
+
+export default function TxtGlobalNav({ roleGroup = "unknown" }: { roleGroup?: RoleGroup }) {
   const pathname = usePathname();
   const [uiMode, setUiMode] = useUiMode();
 
   if (pathname === "/login" || pathname === "/change-password") {
     return null;
   }
+
+  // Clients never see internal nav items; unknown role falls back to internal
+  // nav so the UX is intact for unauthenticated / SSR edge cases where the
+  // middleware will redirect anyway.
+  const navItems = roleGroup === "client" ? CLIENT_NAV_ITEMS : INTERNAL_NAV_ITEMS;
 
   return (
     <header className="txt-global-nav" role="banner">
@@ -32,7 +46,7 @@ export default function TxtGlobalNav() {
         <div className="txt-global-subbrand">Trader eXelle Terminal</div>
       </div>
       <nav className="txt-global-links" aria-label="TXT main navigation">
-        {NAV_ITEMS.map((item) => {
+        {navItems.map((item) => {
           const active = pathname === item.href;
           return (
             <Link key={item.href} href={item.href} className={`txt-global-link${active ? " active" : ""}`}>

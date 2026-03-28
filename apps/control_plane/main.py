@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import csv
 import hashlib
+import hmac
 import io
+import json
 import math
 import os
 import random
+import secrets
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode
 from uuid import uuid4
 
 import httpx
@@ -32,6 +37,54 @@ CURRENT_SYSTEM_MODE = SystemMode(os.getenv("SYSTEM_MODE", SystemMode.SUGGEST.val
 AUDIT_LOG: list[AuditEvent] = []
 PENDING_INTENTS: dict[str, dict] = {}
 
+CONNECTOR_CATALOG: list[dict[str, str]] = [
+    {"name": "binance", "type": "crypto", "transport": "rest/ws", "health_group": "market"},
+    {"name": "coinbase", "type": "crypto", "transport": "rest/ws", "health_group": "market"},
+    {"name": "kraken", "type": "crypto", "transport": "rest/ws", "health_group": "market"},
+    {"name": "okx", "type": "crypto", "transport": "rest/ws", "health_group": "market"},
+    {"name": "bitget", "type": "crypto", "transport": "rest/ws", "health_group": "market"},
+    {"name": "bingx", "type": "crypto", "transport": "rest/ws", "health_group": "market"},
+    {"name": "solana-jupiter", "type": "dex", "transport": "rest/ws", "health_group": "market"},
+    {"name": "topstep", "type": "propfirm", "transport": "broker-adapter", "health_group": "broker"},
+    {"name": "ftmo", "type": "propfirm", "transport": "broker-adapter", "health_group": "broker"},
+    {"name": "sabiotrade", "type": "propfirm", "transport": "broker-adapter", "health_group": "broker"},
+    {"name": "ig", "type": "broker", "transport": "broker-adapter", "health_group": "broker"},
+    {"name": "tradingview", "type": "charting", "transport": "webhook/ws", "health_group": "broker"},
+    {"name": "quantower", "type": "terminal", "transport": "bridge/ws", "health_group": "broker"},
+    {"name": "polymarket", "type": "prediction", "transport": "rest", "health_group": "market"},
+    {"name": "mt5", "type": "forex-indices", "transport": "bridge", "health_group": "mt5"},
+    {"name": "broker-adapter", "type": "execution", "transport": "rest", "health_group": "broker"},
+    {"name": "ai-orchestrator", "type": "intelligence", "transport": "rest", "health_group": "ai"},
+    {"name": "embeddings-service", "type": "memory", "transport": "rest", "health_group": "embeddings"},
+]
+
+OAUTH_PROVIDER_CONFIG: dict[str, dict[str, str]] = {
+    "coinbase": {
+        "auth_url": "https://www.coinbase.com/oauth/authorize",
+        "token_url": "https://api.coinbase.com/oauth/token",
+    },
+    "kraken": {
+        "auth_url": "https://www.kraken.com/oauth/authorize",
+        "token_url": "https://api.kraken.com/oauth/token",
+    },
+    "okx": {
+        "auth_url": "https://www.okx.com/oauth/authorize",
+        "token_url": "https://www.okx.com/oauth/token",
+    },
+    "bitget": {
+        "auth_url": "https://api.bitget.com/oauth/authorize",
+        "token_url": "https://api.bitget.com/oauth/token",
+    },
+    "bingx": {
+        "auth_url": "https://open-api.bingx.com/oauth/authorize",
+        "token_url": "https://open-api.bingx.com/oauth/token",
+    },
+    "ig": {
+        "auth_url": "https://api.ig.com/oauth/authorize",
+        "token_url": "https://api.ig.com/oauth/token",
+    },
+}
+
 
 def _secret_env(name: str, default: str) -> str:
     file_path = os.getenv(f"{name}_FILE", "").strip()
@@ -49,6 +102,12 @@ def _secret_env(name: str, default: str) -> str:
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _json_safe_value(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
 
 
 def _kill_switch_thresholds() -> dict[str, float]:
@@ -104,6 +163,184 @@ def _save_kill_switch_state(state: dict) -> None:
         """,
         (json_dumps(state),),
     )
+
+
+def _load_connector_accounts() -> list[dict]:
+    row = fetch_one("SELECT config_value FROM system_config WHERE config_key = 'connector_linked_accounts'")
+    if not row:
+        return []
+    raw = row.get("config_value")
+    return raw if isinstance(raw, list) else []
+
+
+def _save_connector_accounts(accounts: list[dict]) -> None:
+    execute(
+        """
+        INSERT INTO system_config (config_key, config_value)
+        VALUES ('connector_linked_accounts', %s::jsonb)
+        ON CONFLICT (config_key) DO UPDATE SET config_value = EXCLUDED.config_value, updated_at = NOW()
+        """,
+        (json_dumps(accounts),),
+    )
+
+
+def _load_connector_credentials_store() -> dict:
+    row = fetch_one("SELECT config_value FROM system_config WHERE config_key = 'connector_credentials_store_v1'")
+    if not row:
+        return {}
+    raw = row.get("config_value")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _save_connector_credentials_store(store: dict) -> None:
+    execute(
+        """
+        INSERT INTO system_config (config_key, config_value)
+        VALUES ('connector_credentials_store_v1', %s::jsonb)
+        ON CONFLICT (config_key) DO UPDATE SET config_value = EXCLUDED.config_value, updated_at = NOW()
+        """,
+        (json_dumps(store),),
+    )
+
+
+def _load_connector_signal_routes() -> list[dict]:
+    row = fetch_one("SELECT config_value FROM system_config WHERE config_key = 'connector_signal_routes_v1'")
+    if not row:
+        return []
+    raw = row.get("config_value")
+    return raw if isinstance(raw, list) else []
+
+
+def _save_connector_signal_routes(routes: list[dict]) -> None:
+    execute(
+        """
+        INSERT INTO system_config (config_key, config_value)
+        VALUES ('connector_signal_routes_v1', %s::jsonb)
+        ON CONFLICT (config_key) DO UPDATE SET config_value = EXCLUDED.config_value, updated_at = NOW()
+        """,
+        (json_dumps(routes),),
+    )
+
+
+def _load_oauth_state_store() -> dict:
+    row = fetch_one("SELECT config_value FROM system_config WHERE config_key = 'connector_oauth_state_v1'")
+    if not row:
+        return {}
+    raw = row.get("config_value")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _save_oauth_state_store(store: dict) -> None:
+    execute(
+        """
+        INSERT INTO system_config (config_key, config_value)
+        VALUES ('connector_oauth_state_v1', %s::jsonb)
+        ON CONFLICT (config_key) DO UPDATE SET config_value = EXCLUDED.config_value, updated_at = NOW()
+        """,
+        (json_dumps(store),),
+    )
+
+
+def _credentials_master_key() -> bytes:
+    file_path = os.getenv("CONNECTOR_CREDENTIALS_KEY_FILE", "").strip()
+    raw = ""
+    if file_path:
+        try:
+            with open(file_path, "r", encoding="utf-8") as handle:
+                raw = handle.read().strip()
+        except OSError:
+            raw = ""
+    if not raw:
+        raw = os.getenv("CONNECTOR_CREDENTIALS_KEY", "").strip()
+    if not raw:
+        # Fallback stable key derived from app secret to avoid plaintext storage.
+        raw = _secret_env("APPROVAL_HMAC_SECRET", "mission-control-secret")
+    return hashlib.sha256(raw.encode("utf-8")).digest()
+
+
+def _xor_bytes(payload: bytes, stream: bytes) -> bytes:
+    return bytes(a ^ b for a, b in zip(payload, stream))
+
+
+def _derive_keystream(key: bytes, nonce: bytes, length: int) -> bytes:
+    blocks: list[bytes] = []
+    counter = 0
+    while len(b"".join(blocks)) < length:
+        blocks.append(hmac.new(key, nonce + counter.to_bytes(8, "big"), hashlib.sha256).digest())
+        counter += 1
+    return b"".join(blocks)[:length]
+
+
+def _encrypt_secret_payload(secret_payload: dict) -> dict:
+    key = _credentials_master_key()
+    nonce = os.urandom(16)
+    plaintext = json_dumps(secret_payload).encode("utf-8")
+    keystream = _derive_keystream(key, nonce, len(plaintext))
+    ciphertext = _xor_bytes(plaintext, keystream)
+    mac = hmac.new(key, nonce + ciphertext, hashlib.sha256).hexdigest()
+    return {
+        "v": 1,
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
+        "mac": mac,
+    }
+
+
+def _decrypt_secret_payload(envelope: dict) -> dict:
+    if int(envelope.get("v", 0)) != 1:
+        raise ValueError("unsupported credential envelope version")
+    key = _credentials_master_key()
+    nonce = base64.b64decode(str(envelope.get("nonce", "")).encode("ascii"))
+    ciphertext = base64.b64decode(str(envelope.get("ciphertext", "")).encode("ascii"))
+    mac = str(envelope.get("mac", ""))
+    expected = hmac.new(key, nonce + ciphertext, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(mac, expected):
+        raise ValueError("credential envelope integrity check failed")
+    keystream = _derive_keystream(key, nonce, len(ciphertext))
+    plaintext = _xor_bytes(ciphertext, keystream)
+    data = json.loads(plaintext.decode("utf-8"))
+    return data if isinstance(data, dict) else {}
+
+
+def _store_encrypted_connector_credential(provider: str, account_id: str, auth_method: str, secret_payload: dict, created_by: str) -> str:
+    store = _load_connector_credentials_store()
+    credential_id = f"cred-{uuid4()}"
+    store[credential_id] = {
+        "provider": provider,
+        "account_id": account_id,
+        "auth_method": auth_method,
+        "created_by": created_by,
+        "created_at": _now_utc().isoformat(),
+        "envelope": _encrypt_secret_payload(secret_payload),
+    }
+    _save_connector_credentials_store(store)
+    return credential_id
+
+
+def _provider_client_config(provider: str) -> dict:
+    key = provider.strip().upper().replace("-", "_")
+    client_id = os.getenv(f"{key}_OAUTH_CLIENT_ID", "").strip()
+    client_secret = os.getenv(f"{key}_OAUTH_CLIENT_SECRET", "").strip()
+    base = OAUTH_PROVIDER_CONFIG.get(provider, {})
+    return {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "auth_url": base.get("auth_url", ""),
+        "token_url": base.get("token_url", ""),
+    }
+
+
+def _provider_to_preferred_venue(provider: str) -> str:
+    mapping = {
+        "binance": "binance-public",
+        "coinbase": "paper-coinbase",
+        "kraken": "paper-kraken",
+        "okx": "paper-okx",
+        "bitget": "paper-bitget",
+        "bingx": "paper-bingx",
+        "ig": "paper-ig",
+    }
+    return mapping.get(provider, "binance-public")
 
 
 def _normalize_ui_preferences(payload: dict | None) -> dict:
@@ -962,19 +1199,39 @@ def _resolve_auth(
 
 
 def viewer_auth(authorization: str | None = Header(default=None)) -> AuthContext:
+    """Internal-only read access: viewer · operator · admin."""
     return _resolve_auth(authorization, {"viewer", "operator", "admin"})
 
 
 def operator_auth(authorization: str | None = Header(default=None)) -> AuthContext:
+    """Internal write access: operator · admin."""
     return _resolve_auth(authorization, {"operator", "admin"})
 
 
 def admin_auth(authorization: str | None = Header(default=None)) -> AuthContext:
+    """Admin-only access."""
     return _resolve_auth(authorization, {"admin"})
 
 
+# ── Client / external roles ────────────────────────────────────────────────
+_CLIENT_ROLES: set[str] = {"client", "trader", "investor", "premium", "pro"}
+_INTERNAL_ROLES: set[str] = {"viewer", "operator", "admin"}
+_ALL_ROLES: set[str] = _INTERNAL_ROLES | _CLIENT_ROLES
+
+
+def client_auth(authorization: str | None = Header(default=None)) -> AuthContext:
+    """External client access: client · trader · investor · premium · pro."""
+    return _resolve_auth(authorization, _CLIENT_ROLES)
+
+
+def any_read_auth(authorization: str | None = Header(default=None)) -> AuthContext:
+    """Any authenticated user (internal or client) — for market-data endpoints."""
+    return _resolve_auth(authorization, _ALL_ROLES)
+
+
 def relaxed_auth(authorization: str | None = Header(default=None)) -> AuthContext:
-    return _resolve_auth(authorization, {"viewer", "operator", "admin"}, require_password_fresh=False)
+    """Any authenticated user, no password-freshness check. Used for auth/me, logout, etc."""
+    return _resolve_auth(authorization, _ALL_ROLES, require_password_fresh=False)
 
 
 def _resolve_websocket_user(token: str) -> dict | None:
@@ -1006,7 +1263,7 @@ def _resolve_websocket_user(token: str) -> dict | None:
 
 def _execution_telemetry_rows(limit: int = 50) -> list[dict]:
     safe_limit = max(1, min(limit, 500))
-    return fetch_all(
+    rows = fetch_all(
         """
         SELECT telemetry_id, decision_id, account_id, symbol, side, lots,
                route_chosen, route_backup, route_reason, route_score, backup_score,
@@ -1020,6 +1277,10 @@ def _execution_telemetry_rows(limit: int = 50) -> list[dict]:
         """,
         (safe_limit,),
     )
+    normalized: list[dict] = []
+    for row in rows:
+        normalized.append({key: _json_safe_value(value) for key, value in row.items()})
+    return normalized
 
 
 def append_audit(category: str, payload: dict) -> None:
@@ -1105,9 +1366,15 @@ async def startup() -> None:
 
 async def seed_default_users() -> None:
     default_users = [
-        ("admin", _secret_env("DEFAULT_ADMIN_PASSWORD", "admin123"), "admin"),
+        # ── Internal roles (TXT team only) ────────────────────────────────
+        ("admin",    _secret_env("DEFAULT_ADMIN_PASSWORD",    "admin123"),    "admin"),
         ("operator", _secret_env("DEFAULT_OPERATOR_PASSWORD", "operator123"), "operator"),
-        ("viewer", _secret_env("DEFAULT_VIEWER_PASSWORD", "viewer123"), "viewer"),
+        ("viewer",   _secret_env("DEFAULT_VIEWER_PASSWORD",   "viewer123"),   "viewer"),
+        # ── External / client roles ────────────────────────────────────────
+        # The 'client' account is the default entry point for end-customers.
+        # Its password should be overridden via DEFAULT_CLIENT_PASSWORD env var
+        # or the /api/auth/client-onboard flow before going to production.
+        ("client",   _secret_env("DEFAULT_CLIENT_PASSWORD",   "client123"),   "client"),
     ]
     for username, password, role in default_users:
         execute(
@@ -1528,7 +1795,7 @@ async def dashboard_overview(auth: AuthContext = Depends(viewer_auth)) -> dict:
 
 
 @app.get("/v1/market/quotes")
-async def proxy_market_quotes(auth: AuthContext = Depends(viewer_auth)) -> list[dict]:
+async def proxy_market_quotes(auth: AuthContext = Depends(any_read_auth)) -> list[dict]:
     del auth
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.get(f"{MARKET_DATA_URL}/v1/quotes")
@@ -1547,13 +1814,14 @@ async def proxy_market_ohlcv(
     venue: str = "binance-public",
     timeframe: str = "1m",
     limit: int = 200,
-    auth: AuthContext = Depends(viewer_auth),
+    auth: AuthContext = Depends(any_read_auth),
 ) -> list[dict]:
     del auth
+    market_symbol = _market_data_symbol(venue, instrument)
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.get(
             f"{MARKET_DATA_URL}/v1/market/ohlcv",
-            params={"instrument": instrument, "venue": venue, "timeframe": timeframe, "limit": max(1, min(limit, 1000))},
+            params={"instrument": market_symbol, "venue": venue, "timeframe": timeframe, "limit": max(1, min(limit, 1000))},
         )
         return response.json()
 
@@ -1563,13 +1831,14 @@ async def proxy_market_trades(
     instrument: str,
     venue: str = "binance-public",
     limit: int = 200,
-    auth: AuthContext = Depends(viewer_auth),
+    auth: AuthContext = Depends(any_read_auth),
 ) -> list[dict]:
     del auth
+    market_symbol = _market_data_symbol(venue, instrument)
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.get(
             f"{MARKET_DATA_URL}/v1/market/trades",
-            params={"instrument": instrument, "venue": venue, "limit": max(1, min(limit, 500))},
+            params={"instrument": market_symbol, "venue": venue, "limit": max(1, min(limit, 500))},
         )
         return response.json()
 
@@ -1578,13 +1847,14 @@ async def proxy_market_trades(
 async def proxy_market_depth(
     instrument: str,
     venue: str = "binance-public",
-    auth: AuthContext = Depends(viewer_auth),
+    auth: AuthContext = Depends(any_read_auth),
 ) -> dict:
     del auth
+    market_symbol = _market_data_symbol(venue, instrument)
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.get(
             f"{MARKET_DATA_URL}/v1/market/orderbook/depth",
-            params={"instrument": instrument, "venue": venue},
+            params={"instrument": market_symbol, "venue": venue},
         )
         return response.json()
 
@@ -1597,10 +1867,11 @@ async def proxy_market_microstructure(
     auth: AuthContext = Depends(viewer_auth),
 ) -> dict:
     del auth
+    market_symbol = _market_data_symbol(venue, instrument)
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.get(
             f"{MARKET_DATA_URL}/v1/market/microstructure",
-            params={"instrument": instrument, "venue": venue, "lookback_minutes": max(5, min(lookback_minutes, 720))},
+            params={"instrument": market_symbol, "venue": venue, "lookback_minutes": max(5, min(lookback_minutes, 720))},
         )
         return response.json()
 
@@ -1613,8 +1884,236 @@ async def proxy_market_session_state(instrument: str = "BTCUSDT", auth: AuthCont
         return response.json()
 
 
+@app.get("/v1/market/bus/snapshot")
+async def market_bus_snapshot(
+    instrument: str,
+    venue: str = "binance-public",
+    timeframe: str = "1m",
+    lookback_minutes: int = 60,
+    trade_limit: int = 200,
+    auth: AuthContext = Depends(any_read_auth),
+) -> dict:
+    del auth
+    symbol = _normalize_symbol(instrument)
+    market_symbol = _market_data_symbol(venue, instrument)
+    safe_lookback = max(5, min(lookback_minutes, 720))
+    safe_trade_limit = max(20, min(trade_limit, 500))
+
+    def _parse_dt(value):
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if not isinstance(value, str) or not value.strip():
+            return None
+        normalized = value.strip()
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+    def _freshness_ms(value):
+        parsed = _parse_dt(value)
+        if not parsed:
+            return None
+        return max(0, int((_now_utc() - parsed).total_seconds() * 1000))
+
+    def _timeframe_ms(value: str) -> int | None:
+        normalized = str(value or "").strip().lower()
+        if not normalized:
+            return None
+        unit = normalized[-1]
+        try:
+            amount = int(normalized[:-1])
+        except ValueError:
+            return None
+        if amount <= 0:
+            return None
+        if unit == "m":
+            return amount * 60_000
+        if unit == "h":
+            return amount * 3_600_000
+        if unit == "d":
+            return amount * 86_400_000
+        if unit == "w":
+            return amount * 604_800_000
+        return None
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        responses = await asyncio.gather(
+            client.get(
+                f"{MARKET_DATA_URL}/v1/market/trades",
+                params={"instrument": market_symbol, "venue": venue, "limit": safe_trade_limit},
+            ),
+            client.get(
+                f"{MARKET_DATA_URL}/v1/market/microstructure",
+                params={"instrument": market_symbol, "venue": venue, "lookback_minutes": safe_lookback},
+            ),
+            client.get(
+                f"{MARKET_DATA_URL}/v1/market/session-state",
+                params={"instrument": market_symbol},
+            ),
+            client.get(
+                f"{BROKER_ADAPTER_URL}/v1/orderbook/{venue}/{symbol}",
+            ),
+            client.get(
+                f"{EXECUTION_ROUTER_URL}/v1/routes/score",
+                params={"symbol": symbol},
+            ),
+            client.get(
+                f"{MARKET_DATA_URL}/v1/market/ohlcv",
+                params={"instrument": market_symbol, "venue": venue, "timeframe": timeframe, "limit": 500},
+            ),
+            client.get(
+                f"{MARKET_DATA_URL}/v1/market/orderbook/depth",
+                params={"instrument": market_symbol, "venue": venue},
+            ),
+            return_exceptions=True,
+        )
+
+    def parse_result(index: int, fallback):
+        result = responses[index]
+        if isinstance(result, Exception):
+            return fallback
+        if result.status_code >= 400:
+            return fallback
+        try:
+            payload = result.json()
+        except Exception:
+            return fallback
+        return payload if payload is not None else fallback
+
+    trades = parse_result(0, [])
+    microstructure = parse_result(1, None)
+    session_state = parse_result(2, None)
+    orderbook = parse_result(3, None)
+    routing_score = parse_result(4, None)
+    ohlcv_rows = parse_result(5, [])
+    depth_snapshot = parse_result(6, None)
+
+    latest_trade_at = None
+    if isinstance(trades, list) and trades:
+        latest_trade = trades[0] if isinstance(trades[0], dict) else None
+        if latest_trade:
+            latest_trade_at = latest_trade.get("traded_at")
+
+    latest_bar = None
+    if isinstance(ohlcv_rows, list) and ohlcv_rows:
+        last_item = ohlcv_rows[-1]
+        latest_bar = last_item if isinstance(last_item, dict) else None
+
+    ohlcv_sequences = [
+        int(item.get("seq"))
+        for item in ohlcv_rows
+        if isinstance(item, dict) and isinstance(item.get("seq"), int)
+    ]
+    ohlcv_bucket_times = [
+        _parse_dt(item.get("t") or item.get("bucket_start"))
+        for item in ohlcv_rows
+        if isinstance(item, dict)
+    ]
+    ohlcv_latest_seq = max(ohlcv_sequences) if ohlcv_sequences else None
+    ohlcv_first_seq = min(ohlcv_sequences) if ohlcv_sequences else None
+    timeframe_ms = _timeframe_ms(timeframe)
+    ohlcv_contiguous = bool(ohlcv_bucket_times)
+    if ohlcv_contiguous:
+        if any(bucket is None for bucket in ohlcv_bucket_times):
+            ohlcv_contiguous = False
+        else:
+            ordered_bucket_times = [bucket for bucket in ohlcv_bucket_times if bucket is not None]
+            if len({bucket.isoformat() for bucket in ordered_bucket_times}) != len(ordered_bucket_times):
+                ohlcv_contiguous = False
+            else:
+                tolerance_ms = 1_500
+                for index in range(1, len(ordered_bucket_times)):
+                    delta_ms = int((ordered_bucket_times[index] - ordered_bucket_times[index - 1]).total_seconds() * 1000)
+                    if delta_ms <= 0:
+                        ohlcv_contiguous = False
+                        break
+                    if timeframe_ms is not None and abs(delta_ms - timeframe_ms) > tolerance_ms:
+                        ohlcv_contiguous = False
+                        break
+
+    depth_payload = depth_snapshot.get("depth_payload") if isinstance(depth_snapshot, dict) else None
+    depth_last_update_id = depth_payload.get("lastUpdateId") if isinstance(depth_payload, dict) else None
+
+    component_health = {
+        "trades": {
+            "status": "ok" if isinstance(trades, list) and len(trades) > 0 else "degraded",
+            "freshness_ms": _freshness_ms(latest_trade_at),
+            "count": len(trades) if isinstance(trades, list) else 0,
+        },
+        "microstructure": {
+            "status": "ok" if isinstance(microstructure, dict) else "degraded",
+            "freshness_ms": _freshness_ms(microstructure.get("captured_at")) if isinstance(microstructure, dict) else None,
+            "source": microstructure.get("source") if isinstance(microstructure, dict) else None,
+        },
+        "session_state": {
+            "status": "ok" if isinstance(session_state, dict) else "degraded",
+            "phase": session_state.get("phase") if isinstance(session_state, dict) else None,
+        },
+        "orderbook": {
+            "status": "ok" if isinstance(orderbook, dict) else "degraded",
+            "best_bid": orderbook.get("best_bid") if isinstance(orderbook, dict) else None,
+            "best_ask": orderbook.get("best_ask") if isinstance(orderbook, dict) else None,
+        },
+        "routing_score": {
+            "status": "ok" if isinstance(routing_score, dict) else "degraded",
+            "source": routing_score.get("source") if isinstance(routing_score, dict) else None,
+        },
+        "ohlcv": {
+            "status": "ok" if isinstance(ohlcv_rows, list) and len(ohlcv_rows) > 0 else "degraded",
+            "freshness_ms": _freshness_ms(latest_bar.get("t") if isinstance(latest_bar, dict) else None),
+            "bar_count": len(ohlcv_rows) if isinstance(ohlcv_rows, list) else 0,
+            "timeframe": timeframe,
+        },
+        "depth": {
+            "status": "ok" if isinstance(depth_snapshot, dict) else "degraded",
+            "freshness_ms": _freshness_ms(depth_snapshot.get("snapshot_at")) if isinstance(depth_snapshot, dict) else None,
+            "source": depth_snapshot.get("source") if isinstance(depth_snapshot, dict) else None,
+        },
+    }
+    overall_status = "ok" if all(component.get("status") == "ok" for component in component_health.values()) else "degraded"
+
+    return {
+        "instrument": symbol,
+        "venue": venue,
+        "timeframe": timeframe,
+        "trades": trades,
+        "microstructure": microstructure,
+        "session_state": session_state,
+        "orderbook": orderbook,
+        "routing_score": routing_score,
+        "meta": {
+            "health": {
+                "status": overall_status,
+                "components": component_health,
+            },
+            "sequencing": {
+                "ohlcv": {
+                    "first_seq": ohlcv_first_seq,
+                    "latest_seq": ohlcv_latest_seq,
+                    "bar_count": len(ohlcv_rows) if isinstance(ohlcv_rows, list) else 0,
+                    "latest_bucket": latest_bar.get("t") if isinstance(latest_bar, dict) else None,
+                    "contiguous": ohlcv_contiguous,
+                },
+                "depth": {
+                    "last_update_id": depth_last_update_id,
+                    "snapshot_at": depth_snapshot.get("snapshot_at") if isinstance(depth_snapshot, dict) else None,
+                },
+                "trades": {
+                    "latest_trade_at": latest_trade_at,
+                    "count": len(trades) if isinstance(trades, list) else 0,
+                },
+            },
+        },
+        "as_of": _now_utc().isoformat(),
+    }
+
+
 @app.get("/v1/broker/balance")
-async def proxy_broker_balance(auth: AuthContext = Depends(viewer_auth)) -> dict:
+async def proxy_broker_balance(auth: AuthContext = Depends(any_read_auth)) -> dict:
     del auth
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.get(f"{BROKER_ADAPTER_URL}/v1/balance")
@@ -1622,7 +2121,7 @@ async def proxy_broker_balance(auth: AuthContext = Depends(viewer_auth)) -> dict
 
 
 @app.get("/v1/broker/positions")
-async def proxy_broker_positions(auth: AuthContext = Depends(viewer_auth)) -> list[dict]:
+async def proxy_broker_positions(auth: AuthContext = Depends(any_read_auth)) -> list[dict]:
     del auth
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.get(f"{BROKER_ADAPTER_URL}/v1/positions")
@@ -1630,7 +2129,7 @@ async def proxy_broker_positions(auth: AuthContext = Depends(viewer_auth)) -> li
 
 
 @app.get("/v1/broker/orderbook/{venue}/{instrument}")
-async def proxy_broker_orderbook(venue: str, instrument: str, auth: AuthContext = Depends(viewer_auth)) -> dict:
+async def proxy_broker_orderbook(venue: str, instrument: str, auth: AuthContext = Depends(any_read_auth)) -> dict:
     del auth
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.get(f"{BROKER_ADAPTER_URL}/v1/orderbook/{venue}/{instrument}")
@@ -2013,13 +2512,13 @@ async def proxy_mt5_filtered_order(payload: dict, auth: AuthContext = Depends(op
 
 
 @app.get("/v1/execution/routing/score")
-async def execution_routing_score(symbol: str, auth: AuthContext = Depends(viewer_auth)) -> dict:
+async def execution_routing_score(symbol: str, auth: AuthContext = Depends(any_read_auth)) -> dict:
     del auth
     return await _compute_route_plan(symbol)
 
 
 @app.get("/v1/execution/telemetry/recent")
-async def execution_telemetry_recent(limit: int = 50, auth: AuthContext = Depends(viewer_auth)) -> list[dict]:
+async def execution_telemetry_recent(limit: int = 50, auth: AuthContext = Depends(any_read_auth)) -> list[dict]:
     del auth
     return _execution_telemetry_rows(limit)
 
@@ -2386,53 +2885,69 @@ def _normalize_symbol(symbol: str) -> str:
     return symbol.replace("-PERP", "").replace("/", "").replace("-", "").upper()
 
 
+def _market_data_symbol(venue: str, symbol: str) -> str:
+    normalized = _normalize_symbol(symbol)
+    if venue == "binance-public" and normalized.endswith("USD") and not normalized.endswith("USDT"):
+        return f"{normalized[:-3]}USDT"
+    return normalized
+
+
 async def _compute_route_plan(symbol: str) -> dict:
     normalized_symbol = _normalize_symbol(symbol)
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        router_response = await client.get(
-            f"{EXECUTION_ROUTER_URL}/v1/routes/score",
-            params={"symbol": normalized_symbol},
-        )
-        if router_response.status_code < 400:
-            payload = router_response.json()
-            if isinstance(payload, dict) and payload.get("best"):
-                return payload
-
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        quotes_response = await client.get(f"{MARKET_DATA_URL}/v1/quotes")
-        quotes = quotes_response.json() if quotes_response.status_code < 400 else []
-
-        candidates: list[dict] = []
-        for quote in quotes:
-            instrument = _normalize_symbol(str(quote.get("instrument", "")))
-            if instrument != normalized_symbol:
-                continue
-            venue = str(quote.get("venue", "unknown"))
-            spread_bps = float(quote.get("spread_bps", 9999.0) or 9999.0)
-            depth_response = await client.get(
-                f"{MARKET_DATA_URL}/v1/market/orderbook/depth",
-                params={"venue": venue, "instrument": normalized_symbol},
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            router_response = await client.get(
+                f"{EXECUTION_ROUTER_URL}/v1/routes/score",
+                params={"symbol": normalized_symbol},
             )
-            depth_payload = depth_response.json() if depth_response.status_code < 400 else {}
-            raw_bids = ((depth_payload or {}).get("depth_payload") or {}).get("bids", [])
-            available_depth_usd = 0.0
-            for level in raw_bids[:5]:
-                try:
-                    available_depth_usd += float(level[0]) * float(level[1])
-                except Exception:
+            if router_response.status_code < 400:
+                payload = router_response.json()
+                if isinstance(payload, dict) and payload.get("best"):
+                    return payload
+    except Exception:
+        pass
+
+    candidates: list[dict] = []
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            quotes_response = await client.get(f"{MARKET_DATA_URL}/v1/quotes")
+            quotes = quotes_response.json() if quotes_response.status_code < 400 else []
+
+            for quote in quotes:
+                instrument = _normalize_symbol(str(quote.get("instrument", "")))
+                if instrument != normalized_symbol:
                     continue
+                venue = str(quote.get("venue", "unknown"))
+                spread_bps = float(quote.get("spread_bps", 9999.0) or 9999.0)
+                try:
+                    depth_response = await client.get(
+                        f"{MARKET_DATA_URL}/v1/market/orderbook/depth",
+                        params={"venue": venue, "instrument": normalized_symbol},
+                    )
+                    depth_payload = depth_response.json() if depth_response.status_code < 400 else {}
+                except Exception:
+                    depth_payload = {}
+                raw_bids = ((depth_payload or {}).get("depth_payload") or {}).get("bids", [])
+                available_depth_usd = 0.0
+                for level in raw_bids[:5]:
+                    try:
+                        available_depth_usd += float(level[0]) * float(level[1])
+                    except Exception:
+                        continue
 
-            score = max(0.0, 100.0 - spread_bps * 2.0 + min(45.0, available_depth_usd / 25000.0))
-            candidates.append(
-                {
-                    "venue": venue,
-                    "instrument": normalized_symbol,
-                    "spread_bps": spread_bps,
-                    "available_depth_usd": available_depth_usd,
-                    "score": score,
-                }
-            )
+                score = max(0.0, 100.0 - spread_bps * 2.0 + min(45.0, available_depth_usd / 25000.0))
+                candidates.append(
+                    {
+                        "venue": venue,
+                        "instrument": normalized_symbol,
+                        "spread_bps": spread_bps,
+                        "available_depth_usd": available_depth_usd,
+                        "score": score,
+                    }
+                )
+    except Exception:
+        candidates = []
 
     candidates = sorted(candidates, key=lambda item: item["score"], reverse=True)
     best = candidates[0] if candidates else None
@@ -2662,6 +3177,15 @@ async def _compute_connectors_snapshot() -> dict:
             }
         )
 
+    health_by_group = {
+        "market": market_ok,
+        "broker": broker_ok,
+        "mt5": mt5_ok,
+        "ai": ai_ok,
+        "embeddings": embeddings_ok,
+    }
+    linked_accounts = _load_connector_accounts()
+
     return {
         "status": "ok",
         "pending_live_approvals": int(pending["count"]),
@@ -2669,15 +3193,15 @@ async def _compute_connectors_snapshot() -> dict:
         "kill_switch": kill_state,
         "recent_live_approvals": recent_approvals,
         "alerts": alerts,
+        "linked_accounts_count": len(linked_accounts),
         "connectors": [
-            {"name": "binance", "type": "crypto", "transport": "rest/ws", "healthy": market_ok},
-            {"name": "okx", "type": "crypto", "transport": "rest/ws", "healthy": market_ok},
-            {"name": "bitget", "type": "crypto", "transport": "rest/ws", "healthy": market_ok},
-            {"name": "polymarket", "type": "prediction", "transport": "rest", "healthy": market_ok},
-            {"name": "mt5", "type": "forex-indices", "transport": "bridge", "healthy": mt5_ok},
-            {"name": "broker-adapter", "type": "execution", "transport": "rest", "healthy": broker_ok},
-            {"name": "ai-orchestrator", "type": "intelligence", "transport": "rest", "healthy": ai_ok},
-            {"name": "embeddings-service", "type": "memory", "transport": "rest", "healthy": embeddings_ok},
+            {
+                "name": connector["name"],
+                "type": connector["type"],
+                "transport": connector["transport"],
+                "healthy": bool(health_by_group.get(connector.get("health_group", "market"), False)),
+            }
+            for connector in CONNECTOR_CATALOG
         ],
     }
 
@@ -2933,6 +3457,24 @@ async def list_incidents(status: str = "", auth: AuthContext = Depends(viewer_au
     return {"status": "ok", "sla_minutes": threshold, "items": rows}
 
 
+@app.get("/v1/incidents/{ticket_key}")
+async def get_incident(ticket_key: str, auth: AuthContext = Depends(viewer_auth)) -> dict:
+    del auth
+    row = fetch_one(
+        """
+        SELECT ticket_key, severity, title, status, assignee, source, payload, created_by,
+               resolution_note, closed_by, closed_at, created_at, updated_at,
+               ROUND(EXTRACT(EPOCH FROM (NOW() - created_at)) / 60.0, 1) AS age_minutes
+        FROM incident_tickets
+        WHERE ticket_key = %s
+        """,
+        (ticket_key,),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    return row
+
+
 @app.post("/v1/incidents/{ticket_key}/assign")
 async def assign_incident(ticket_key: str, payload: dict, auth: AuthContext = Depends(operator_auth)) -> dict:
     assignee = str(payload.get("assignee") or "").strip() or auth.username
@@ -2967,6 +3509,26 @@ async def close_incident(ticket_key: str, payload: dict, auth: AuthContext = Dep
     )
     append_audit("incident_closed", {"ticket_key": ticket_key, "by": auth.username})
     return {"status": "ok", "ticket_key": ticket_key, "closed_by": auth.username}
+
+
+@app.post("/v1/audit/events")
+async def append_audit_event(payload: dict, auth: AuthContext = Depends(viewer_auth)) -> dict:
+    category = str(payload.get("category") or "").strip()
+    event_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else None
+    allowed = {
+        "local_terminal_ohlcv_unusable",
+        "local_terminal_bars_hard_fail",
+        "local_terminal_ohlcv_renderable_recovered",
+    }
+    if category not in allowed:
+        raise HTTPException(status_code=400, detail="audit_category_not_allowed")
+    if event_payload is None:
+        raise HTTPException(status_code=400, detail="audit_payload_required")
+    append_audit(category, {
+        **event_payload,
+        "recorded_by": auth.username,
+    })
+    return {"status": "ok", "category": category}
 
 
 @app.get("/v1/live-readiness/overview")
@@ -3122,6 +3684,510 @@ async def copilot_chat(payload: dict, auth: AuthContext = Depends(viewer_auth)) 
 async def connectors_status(auth: AuthContext = Depends(viewer_auth)) -> dict:
     del auth
     return await _compute_connectors_snapshot()
+
+
+@app.get("/v1/connectors/catalog")
+async def connectors_catalog(auth: AuthContext = Depends(viewer_auth)) -> dict:
+    del auth
+    return {"status": "ok", "connectors": CONNECTOR_CATALOG}
+
+
+@app.get("/v1/connectors/accounts")
+async def connectors_accounts(auth: AuthContext = Depends(viewer_auth)) -> dict:
+    del auth
+    accounts = _load_connector_accounts()
+    redacted: list[dict] = []
+    for item in accounts:
+        clean = dict(item)
+        clean.pop("oauth_tokens", None)
+        clean.pop("api_key", None)
+        clean.pop("api_secret", None)
+        clean.pop("passphrase", None)
+        clean["has_credentials"] = bool(clean.get("credential_id"))
+        redacted.append(clean)
+    return {"status": "ok", "accounts": redacted}
+
+
+@app.post("/v1/connectors/accounts/link")
+async def connectors_link_account(payload: dict, auth: AuthContext = Depends(operator_auth)) -> dict:
+    provider = str(payload.get("provider") or "").strip().lower()
+    account_id = str(payload.get("account_id") or "").strip()
+    label = str(payload.get("label") or "").strip()
+    mode = str(payload.get("mode") or "read").strip().lower()
+    if not provider or not account_id:
+        raise HTTPException(status_code=400, detail="provider and account_id are required")
+
+    allowed_providers = {entry["name"] for entry in CONNECTOR_CATALOG}
+    if provider not in allowed_providers:
+        raise HTTPException(status_code=400, detail=f"unsupported provider: {provider}")
+
+    accounts = _load_connector_accounts()
+    remaining = [
+        item
+        for item in accounts
+        if not (
+            str(item.get("provider", "")).strip().lower() == provider
+            and str(item.get("account_id", "")).strip() == account_id
+        )
+    ]
+    remaining.append(
+        {
+            "provider": provider,
+            "account_id": account_id,
+            "label": label,
+            "mode": mode if mode in {"read", "trade"} else "read",
+            "auth_method": str(payload.get("auth_method") or "manual"),
+            "credential_id": str(payload.get("credential_id") or "").strip() or None,
+            "linked_by": auth.username,
+            "linked_at": _now_utc().isoformat(),
+        }
+    )
+    _save_connector_accounts(remaining)
+    append_audit(
+        "connector_account_linked",
+        {"provider": provider, "account_id": account_id, "label": label, "mode": mode, "by": auth.username},
+    )
+    return {"status": "ok", "accounts": remaining}
+
+
+@app.post("/v1/connectors/accounts/link-api-key")
+async def connectors_link_api_key(payload: dict, auth: AuthContext = Depends(operator_auth)) -> dict:
+    provider = str(payload.get("provider") or "").strip().lower()
+    account_id = str(payload.get("account_id") or "").strip()
+    label = str(payload.get("label") or "").strip()
+    mode = str(payload.get("mode") or "trade").strip().lower()
+    api_key = str(payload.get("api_key") or "").strip()
+    api_secret = str(payload.get("api_secret") or "").strip()
+    passphrase = str(payload.get("passphrase") or "").strip()
+    if not provider or not account_id or not api_key or not api_secret:
+        raise HTTPException(status_code=400, detail="provider, account_id, api_key and api_secret are required")
+
+    allowed_providers = {entry["name"] for entry in CONNECTOR_CATALOG}
+    if provider not in allowed_providers:
+        raise HTTPException(status_code=400, detail=f"unsupported provider: {provider}")
+
+    credential_id = _store_encrypted_connector_credential(
+        provider=provider,
+        account_id=account_id,
+        auth_method="api_key",
+        secret_payload={
+            "api_key": api_key,
+            "api_secret": api_secret,
+            "passphrase": passphrase,
+        },
+        created_by=auth.username,
+    )
+
+    accounts = _load_connector_accounts()
+    accounts = [
+        item
+        for item in accounts
+        if not (
+            str(item.get("provider", "")).strip().lower() == provider
+            and str(item.get("account_id", "")).strip() == account_id
+        )
+    ]
+    accounts.append(
+        {
+            "provider": provider,
+            "account_id": account_id,
+            "label": label,
+            "mode": mode if mode in {"read", "trade"} else "trade",
+            "auth_method": "api_key",
+            "credential_id": credential_id,
+            "linked_by": auth.username,
+            "linked_at": _now_utc().isoformat(),
+        }
+    )
+    _save_connector_accounts(accounts)
+    append_audit(
+        "connector_account_linked_api_key",
+        {"provider": provider, "account_id": account_id, "credential_id": credential_id, "by": auth.username},
+    )
+    return {"status": "ok", "credential_id": credential_id, "accounts": accounts}
+
+
+@app.post("/v1/connectors/oauth/start")
+async def connectors_oauth_start(payload: dict, auth: AuthContext = Depends(operator_auth)) -> dict:
+    provider = str(payload.get("provider") or "").strip().lower()
+    account_id = str(payload.get("account_id") or "").strip()
+    label = str(payload.get("label") or "").strip()
+    redirect_uri = str(payload.get("redirect_uri") or "").strip()
+    mode = str(payload.get("mode") or "trade").strip().lower()
+    if not provider or not account_id or not redirect_uri:
+        raise HTTPException(status_code=400, detail="provider, account_id and redirect_uri are required")
+
+    conf = _provider_client_config(provider)
+    if not conf.get("client_id") or not conf.get("auth_url"):
+        raise HTTPException(status_code=400, detail=f"oauth not configured for provider: {provider}")
+
+    raw_scopes = payload.get("scopes")
+    scopes: list[str]
+    if isinstance(raw_scopes, list):
+        scopes = [str(item).strip() for item in raw_scopes if str(item).strip()]
+    elif isinstance(raw_scopes, str):
+        scopes = [part.strip() for part in raw_scopes.split(" ") if part.strip()]
+    else:
+        scopes = ["read", "trade"]
+
+    state = secrets.token_urlsafe(32)
+    state_store = _load_oauth_state_store()
+    expires_at = (_now_utc() + timedelta(minutes=10)).isoformat()
+    state_store[state] = {
+        "provider": provider,
+        "account_id": account_id,
+        "label": label,
+        "mode": mode if mode in {"read", "trade"} else "trade",
+        "redirect_uri": redirect_uri,
+        "scopes": scopes,
+        "created_by": auth.username,
+        "expires_at": expires_at,
+    }
+    # Keep store bounded.
+    for key, value in list(state_store.items()):
+        parsed = _parse_iso_utc(str(value.get("expires_at") or ""))
+        if parsed and parsed < _now_utc():
+            state_store.pop(key, None)
+    _save_oauth_state_store(state_store)
+
+    auth_params = {
+        "response_type": "code",
+        "client_id": conf["client_id"],
+        "redirect_uri": redirect_uri,
+        "scope": " ".join(scopes),
+        "state": state,
+    }
+    auth_url = f"{conf['auth_url']}?{urlencode(auth_params)}"
+    append_audit("connector_oauth_started", {"provider": provider, "account_id": account_id, "by": auth.username})
+    return {"status": "ok", "provider": provider, "state": state, "expires_at": expires_at, "auth_url": auth_url}
+
+
+@app.get("/v1/connectors/oauth/callback")
+async def connectors_oauth_callback(provider: str, state: str, code: str | None = None, error: str | None = None) -> dict:
+    provider_norm = str(provider or "").strip().lower()
+    state_key = str(state or "").strip()
+    if not provider_norm or not state_key:
+        raise HTTPException(status_code=400, detail="provider and state are required")
+    if error:
+        raise HTTPException(status_code=400, detail=f"oauth error: {error}")
+    if not code:
+        raise HTTPException(status_code=400, detail="oauth code is required")
+
+    state_store = _load_oauth_state_store()
+    state_payload = state_store.get(state_key)
+    if not state_payload:
+        raise HTTPException(status_code=400, detail="invalid oauth state")
+    expires_at = _parse_iso_utc(str(state_payload.get("expires_at") or ""))
+    if expires_at and expires_at < _now_utc():
+        state_store.pop(state_key, None)
+        _save_oauth_state_store(state_store)
+        raise HTTPException(status_code=400, detail="oauth state expired")
+
+    if str(state_payload.get("provider") or "").strip().lower() != provider_norm:
+        raise HTTPException(status_code=400, detail="oauth provider mismatch")
+
+    conf = _provider_client_config(provider_norm)
+    if not conf.get("token_url") or not conf.get("client_id") or not conf.get("client_secret"):
+        raise HTTPException(status_code=400, detail=f"oauth token exchange not configured for provider: {provider_norm}")
+
+    token_payload = {
+        "grant_type": "authorization_code",
+        "client_id": conf["client_id"],
+        "client_secret": conf["client_secret"],
+        "code": code,
+        "redirect_uri": str(state_payload.get("redirect_uri") or "").strip(),
+    }
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.post(conf["token_url"], data=token_payload, headers={"Content-Type": "application/x-www-form-urlencoded"})
+        if response.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"oauth token exchange failed for {provider_norm}")
+        tokens = response.json() if isinstance(response.json(), dict) else {}
+
+    account_id = str(state_payload.get("account_id") or "").strip()
+    label = str(state_payload.get("label") or "").strip()
+    mode = str(state_payload.get("mode") or "trade").strip().lower()
+    created_by = str(state_payload.get("created_by") or "oauth-callback")
+    credential_id = _store_encrypted_connector_credential(
+        provider=provider_norm,
+        account_id=account_id,
+        auth_method="oauth",
+        secret_payload={"tokens": tokens, "scopes": state_payload.get("scopes", [])},
+        created_by=created_by,
+    )
+
+    accounts = _load_connector_accounts()
+    accounts = [
+        item
+        for item in accounts
+        if not (
+            str(item.get("provider", "")).strip().lower() == provider_norm
+            and str(item.get("account_id", "")).strip() == account_id
+        )
+    ]
+    accounts.append(
+        {
+            "provider": provider_norm,
+            "account_id": account_id,
+            "label": label,
+            "mode": mode if mode in {"read", "trade"} else "trade",
+            "auth_method": "oauth",
+            "credential_id": credential_id,
+            "linked_by": created_by,
+            "linked_at": _now_utc().isoformat(),
+        }
+    )
+    _save_connector_accounts(accounts)
+    state_store.pop(state_key, None)
+    _save_oauth_state_store(state_store)
+    append_audit("connector_oauth_linked", {"provider": provider_norm, "account_id": account_id, "credential_id": credential_id})
+    return {"status": "ok", "provider": provider_norm, "account_id": account_id, "credential_id": credential_id}
+
+
+@app.delete("/v1/connectors/accounts/{provider}/{account_id}")
+async def connectors_unlink_account(provider: str, account_id: str, auth: AuthContext = Depends(operator_auth)) -> dict:
+    provider_norm = str(provider or "").strip().lower()
+    account_id_norm = str(account_id or "").strip()
+    accounts = _load_connector_accounts()
+    remaining = [
+        item
+        for item in accounts
+        if not (
+            str(item.get("provider", "")).strip().lower() == provider_norm
+            and str(item.get("account_id", "")).strip() == account_id_norm
+        )
+    ]
+    credential_ids_to_remove = {
+        str(item.get("credential_id") or "").strip()
+        for item in accounts
+        if str(item.get("provider", "")).strip().lower() == provider_norm
+        and str(item.get("account_id", "")).strip() == account_id_norm
+        and str(item.get("credential_id") or "").strip()
+    }
+    if credential_ids_to_remove:
+        store = _load_connector_credentials_store()
+        for credential_id in credential_ids_to_remove:
+            store.pop(credential_id, None)
+        _save_connector_credentials_store(store)
+    _save_connector_accounts(remaining)
+    append_audit(
+        "connector_account_unlinked",
+        {"provider": provider_norm, "account_id": account_id_norm, "by": auth.username},
+    )
+    return {"status": "ok", "accounts": remaining}
+
+
+@app.get("/v1/integrations/routes")
+async def integrations_routes(auth: AuthContext = Depends(viewer_auth)) -> dict:
+    del auth
+    return {"status": "ok", "routes": _load_connector_signal_routes()}
+
+
+@app.get("/v1/integrations/platforms")
+async def integrations_platforms(auth: AuthContext = Depends(viewer_auth)) -> dict:
+    del auth
+    routes = _load_connector_signal_routes()
+    platforms = sorted({str(item.get("source", "")).strip().lower() for item in routes if str(item.get("source", "")).strip()})
+    return {"status": "ok", "platforms": platforms}
+
+
+@app.post("/v1/integrations/routes")
+async def integrations_routes_upsert(payload: dict, auth: AuthContext = Depends(operator_auth)) -> dict:
+    source = str(payload.get("source") or "").strip().lower()
+    provider = str(payload.get("provider") or "").strip().lower()
+    account_id = str(payload.get("account_id") or "").strip()
+    route_key = str(payload.get("route_key") or "default").strip().lower()
+    if not source:
+        raise HTTPException(status_code=400, detail="source is required")
+    if len(source) > 64 or not all(ch.isalnum() or ch in {"-", "_"} for ch in source):
+        raise HTTPException(status_code=400, detail="invalid source format")
+    if not provider or not account_id:
+        raise HTTPException(status_code=400, detail="provider and account_id are required")
+
+    accounts = _load_connector_accounts()
+    linked = any(
+        str(item.get("provider", "")).strip().lower() == provider
+        and str(item.get("account_id", "")).strip() == account_id
+        for item in accounts
+    )
+    if not linked:
+        raise HTTPException(status_code=400, detail="account is not linked for this provider")
+
+    routes = _load_connector_signal_routes()
+    routes = [
+        item
+        for item in routes
+        if not (
+            str(item.get("source", "")).strip().lower() == source
+            and str(item.get("route_key", "default")).strip().lower() == route_key
+        )
+    ]
+    routes.append(
+        {
+            "source": source,
+            "route_key": route_key,
+            "provider": provider,
+            "account_id": account_id,
+            "preferred_venue": str(payload.get("preferred_venue") or _provider_to_preferred_venue(provider)).strip(),
+            "symbol_map": payload.get("symbol_map") if isinstance(payload.get("symbol_map"), dict) else {},
+            "notional_usd": float(payload.get("notional_usd") or 1000.0),
+            "updated_by": auth.username,
+            "updated_at": _now_utc().isoformat(),
+        }
+    )
+    _save_connector_signal_routes(routes)
+    append_audit("integration_route_upserted", {"source": source, "route_key": route_key, "provider": provider, "account_id": account_id, "by": auth.username})
+    return {"status": "ok", "routes": routes}
+
+
+@app.delete("/v1/integrations/routes/{source}/{route_key}")
+async def integrations_routes_delete(source: str, route_key: str, auth: AuthContext = Depends(operator_auth)) -> dict:
+    source_norm = str(source or "").strip().lower()
+    route_key_norm = str(route_key or "default").strip().lower()
+    routes = _load_connector_signal_routes()
+    routes = [
+        item
+        for item in routes
+        if not (
+            str(item.get("source", "")).strip().lower() == source_norm
+            and str(item.get("route_key", "default")).strip().lower() == route_key_norm
+        )
+    ]
+    _save_connector_signal_routes(routes)
+    append_audit("integration_route_deleted", {"source": source_norm, "route_key": route_key_norm, "by": auth.username})
+    return {"status": "ok", "routes": routes}
+
+
+def _resolve_integration_route(source: str, route_key: str | None) -> dict | None:
+    source_norm = str(source or "").strip().lower()
+    route_key_norm = str(route_key or "").strip().lower()
+    routes = _load_connector_signal_routes()
+    if route_key_norm:
+        for item in routes:
+            if (
+                str(item.get("source", "")).strip().lower() == source_norm
+                and str(item.get("route_key", "default")).strip().lower() == route_key_norm
+            ):
+                return item
+    for item in routes:
+        if (
+            str(item.get("source", "")).strip().lower() == source_norm
+            and str(item.get("route_key", "default")).strip().lower() == "default"
+        ):
+            return item
+    return None
+
+
+def _webhook_secret_env_name(source: str) -> str:
+    normalized = "".join(ch if ch.isalnum() else "_" for ch in source.upper())
+    return f"{normalized}_WEBHOOK_SECRET"
+
+
+async def _handle_signal_webhook(source: str, payload: dict, provided_secret: str | None) -> dict:
+    expected_secret = os.getenv(_webhook_secret_env_name(source), "").strip()
+    if expected_secret and str(provided_secret or "").strip() != expected_secret:
+        raise HTTPException(status_code=401, detail="invalid webhook secret")
+
+    route_key = str(payload.get("route_key") or payload.get("strategy") or payload.get("alert_id") or "").strip().lower()
+    route = _resolve_integration_route(source, route_key)
+    if not route:
+        raise HTTPException(status_code=400, detail="no integration route configured")
+
+    provider = str(route.get("provider") or "").strip().lower()
+    account_id = str(route.get("account_id") or "").strip()
+    accounts = _load_connector_accounts()
+    linked = next(
+        (
+            item
+            for item in accounts
+            if str(item.get("provider", "")).strip().lower() == provider
+            and str(item.get("account_id", "")).strip() == account_id
+        ),
+        None,
+    )
+    if not linked:
+        raise HTTPException(status_code=400, detail="mapped account is not linked")
+    if str(linked.get("mode") or "read").strip().lower() != "trade":
+        raise HTTPException(status_code=403, detail="mapped account is read-only")
+
+    symbol_raw = str(payload.get("symbol") or payload.get("instrument") or "").strip().upper()
+    symbol_map = route.get("symbol_map") if isinstance(route.get("symbol_map"), dict) else {}
+    symbol = str(symbol_map.get(symbol_raw) or symbol_raw).replace("/", "").replace("-", "")
+    if not symbol:
+        raise HTTPException(status_code=400, detail="symbol is required")
+
+    side = str(payload.get("side") or payload.get("action") or "buy").strip().lower()
+    if side not in {"buy", "sell"}:
+        raise HTTPException(status_code=400, detail="side must be buy or sell")
+
+    requested_notional = payload.get("estimated_notional_usd") or payload.get("notional_usd") or route.get("notional_usd") or 1000.0
+    try:
+        notional = float(requested_notional)
+    except Exception:
+        raise HTTPException(status_code=400, detail="estimated_notional_usd must be numeric")
+    if notional <= 0:
+        raise HTTPException(status_code=400, detail="estimated_notional_usd must be > 0")
+
+    execution_payload = {
+        "decision_id": str(payload.get("decision_id") or f"{source}-{uuid4()}"),
+        "symbol": symbol,
+        "side": side,
+        "estimated_notional_usd": notional,
+        "preferred_venue": str(route.get("preferred_venue") or _provider_to_preferred_venue(provider)),
+        "execution_mode": f"{source}-webhook",
+        "metadata": {
+            "source": source,
+            "provider": provider,
+            "account_id": account_id,
+            "route_key": route_key or "default",
+            "raw_payload": payload,
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.post(f"{EXECUTION_ROUTER_URL}/v1/orders/routed", json=execution_payload)
+        if response.status_code >= 400:
+            raise HTTPException(status_code=502, detail="execution-router unavailable")
+        routed = response.json()
+
+    append_audit(
+        "integration_webhook_executed",
+        {
+            "source": source,
+            "provider": provider,
+            "account_id": account_id,
+            "symbol": symbol,
+            "side": side,
+            "notional": notional,
+            "decision_id": execution_payload["decision_id"],
+        },
+    )
+    return {"status": "ok", "route": route, "execution": routed}
+
+
+@app.post("/v1/integrations/platforms/{platform_id}/webhook")
+async def generic_platform_webhook(platform_id: str, payload: dict, x_platform_secret: str | None = Header(default=None)) -> dict:
+    source = str(platform_id or "").strip().lower()
+    if not source:
+        raise HTTPException(status_code=400, detail="platform_id is required")
+    body_secret = str(payload.get("secret") or "").strip() if isinstance(payload, dict) else ""
+    provided_secret = x_platform_secret or body_secret
+    return await _handle_signal_webhook(source, payload if isinstance(payload, dict) else {}, provided_secret)
+
+
+# Backward-compatible aliases (deprecated)
+@app.post("/v1/integrations/tradingview/webhook")
+async def tradingview_webhook(payload: dict, x_tradingview_secret: str | None = Header(default=None)) -> dict:
+    body_secret = str(payload.get("secret") or "").strip() if isinstance(payload, dict) else ""
+    provided_secret = x_tradingview_secret or body_secret
+    return await _handle_signal_webhook("tradingview", payload if isinstance(payload, dict) else {}, provided_secret)
+
+
+@app.post("/v1/integrations/quantower/webhook")
+async def quantower_webhook(payload: dict, x_quantower_secret: str | None = Header(default=None)) -> dict:
+    body_secret = str(payload.get("secret") or "").strip() if isinstance(payload, dict) else ""
+    provided_secret = x_quantower_secret or body_secret
+    return await _handle_signal_webhook("quantower", payload if isinstance(payload, dict) else {}, provided_secret)
 
 
 @app.websocket("/v1/connectors/ws")

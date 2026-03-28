@@ -10,6 +10,9 @@ BASE_URL="${BASE_URL:-http://127.0.0.1:3000}"
 HOST_HEADER="${HOST_HEADER:-app.txt.gtixt.com}"
 CHECK_TIMEOUT_SEC="${CHECK_TIMEOUT_SEC:-180}"
 CHECK_INTERVAL_SEC="${CHECK_INTERVAL_SEC:-2}"
+WS_PATH="${WS_PATH:-/ws/v1/market/quotes}"
+WS_USERNAME="${WS_USERNAME:-operator}"
+WS_PASSWORD="${WS_PASSWORD:-}"
 
 DEFAULT_CHECKS=(
   "/terminal"
@@ -29,7 +32,7 @@ Safe restart flow:
 1) Snapshot running services
 2) docker compose up -d
 3) Wait for services to be healthy/running
-4) Run API checks (HTTP 200 expected)
+4) Run API + Next static asset checks
 5) Check WebSocket connectivity
 6) On failure: auto rollback + log dump
 7) Export JSON summary for monitoring
@@ -45,7 +48,7 @@ Options:
   --help                 Show this help
 
 Environment:
-  BASE_URL, HOST_HEADER, CHECK_TIMEOUT_SEC, CHECK_INTERVAL_SEC
+  BASE_URL, HOST_HEADER, CHECK_TIMEOUT_SEC, CHECK_INTERVAL_SEC, WS_PATH, WS_USERNAME, WS_PASSWORD
 
 Output:
   Diagnostics saved to logs/safe-restart/<TIMESTAMP>/
@@ -123,9 +126,13 @@ READINESS_START_TIME=0
 READINESS_END_TIME=0
 CHECKS_START_TIME=0
 CHECKS_END_TIME=0
+STATIC_ASSETS_SUCCESS=0
 WS_START_TIME=0
 WS_END_TIME=0
 WS_SUCCESS=0
+RUN_SUCCESS=0
+ROLLBACK_TRIGGERED=0
+FAILURE_STAGE=""
 
 dump_logs() {
   log "Dumping diagnostics to $RUN_DIR"
@@ -158,6 +165,7 @@ printf '%s\n' "${PREV_RUNNING[@]-}" >"$RUN_DIR/prev-running-services.txt"
 
 rollback() {
   log "Rollback started"
+  ROLLBACK_TRIGGERED=1
 
   CURRENT_RUNNING=()
   while IFS= read -r svc; do
@@ -266,33 +274,39 @@ check_apis() {
   return 0
 }
 
-check_websocket() {
-  local ws_url ws_protocol timeout=10
-  
-  WS_START_TIME=$SECONDS
-  
-  # Convert http/https to ws/wss
-  if [[ "$BASE_URL" == https://* ]]; then
-    ws_url="${BASE_URL//https:/wss:}/"
-  else
-    ws_url="${BASE_URL//http:/ws:}/"
+check_static_assets() {
+  if "$ROOT_DIR/scripts/check_ui_static_assets.sh" --base-url "$BASE_URL" --host "$HOST_HEADER" >"$RUN_DIR/static-assets.txt" 2>&1; then
+    STATIC_ASSETS_SUCCESS=1
+    log "Next static asset checks passed"
+    return 0
   fi
-  
-  # Use curl to connect via HTTP Upgrade (WebSocket handshake)
-  if curl --max-time "$timeout" -i -N -H "Connection: Upgrade" \
-       -H "Upgrade: websocket" \
-       -H "Sec-WebSocket-Version: 13" \
-       -H "Sec-WebSocket-Key: SGVsbG8sIHdvcmxkIQ==" \
-       -H "Host: $HOST_HEADER" \
-       "${ws_url}ws" >/dev/null 2>&1; then
+
+  STATIC_ASSETS_SUCCESS=0
+  log "Next static asset checks failed"
+  return 1
+}
+
+check_websocket() {
+  local status=0
+
+  WS_START_TIME=$SECONDS
+
+  if WS_PATH="$WS_PATH" WS_E2E=1 SKIP_API_SMOKE=1 USERNAME="$WS_USERNAME" PASSWORD="$WS_PASSWORD" \
+    "$ROOT_DIR/scripts/mc-auth-smoke.sh" \
+      --base-url "$BASE_URL" \
+      --host "$HOST_HEADER" \
+      --username "$WS_USERNAME" \
+      --ws-path "$WS_PATH" \
+      >"$RUN_DIR/websocket-check.txt" 2>&1; then
     WS_END_TIME=$SECONDS
     WS_SUCCESS=1
     log "WebSocket check passed (latency: $((WS_END_TIME - WS_START_TIME))s)"
     return 0
   else
+    status=$?
     WS_END_TIME=$SECONDS
     WS_SUCCESS=0
-    log "WebSocket check failed (latency: $((WS_END_TIME - WS_START_TIME))s)"
+    log "WebSocket check failed (latency: $((WS_END_TIME - WS_START_TIME))s, exit=$status)"
     return 1
   fi
 }
@@ -314,7 +328,9 @@ export_json_summary() {
 {
   "timestamp": "$TIMESTAMP",
   "dry_run": $DRY_RUN,
-  "success": $([[ $? -eq 0 ]] && echo "true" || echo "false"),
+  "success": $([[ $RUN_SUCCESS -eq 1 ]] && echo "true" || echo "false"),
+  "failure_stage": "$FAILURE_STAGE",
+  "rollback_triggered": $([[ $ROLLBACK_TRIGGERED -eq 1 ]] && echo "true" || echo "false"),
   "base_url": "$BASE_URL",
   "host_header": "$HOST_HEADER",
   "timings": {
@@ -327,6 +343,9 @@ export_json_summary() {
   "websocket": {
     "success": $WS_SUCCESS,
     "latency_sec": $ws_duration
+  },
+  "static_assets": {
+    "success": $STATIC_ASSETS_SUCCESS
   },
   "logs_directory": "$RUN_DIR"
 }
@@ -344,6 +363,7 @@ fi
 
 log "Step 2/5: wait services health/running"
 if ! wait_for_services; then
+  FAILURE_STAGE="readiness"
   dump_logs
   if [[ $DRY_RUN -eq 0 ]]; then
     rollback
@@ -355,11 +375,23 @@ fi
 
 log "Step 3/5: API checks"
 if ! check_apis; then
+  FAILURE_STAGE="checks"
   dump_logs
   if [[ $DRY_RUN -eq 0 ]]; then
     rollback
   fi
   log "FAILED (checks). Diagnostics in $RUN_DIR"
+  export_json_summary
+  exit 1
+fi
+
+if ! check_static_assets; then
+  FAILURE_STAGE="static-assets"
+  dump_logs
+  if [[ $DRY_RUN -eq 0 ]]; then
+    rollback
+  fi
+  log "FAILED (static-assets). Diagnostics in $RUN_DIR"
   export_json_summary
   exit 1
 fi
@@ -371,6 +403,7 @@ fi
 
 log "Step 5/5: success"
 log "OK - safe restart completed"
+RUN_SUCCESS=1
 export_json_summary
 
 popd >/dev/null

@@ -35,6 +35,21 @@ CREATE TABLE IF NOT EXISTS users (
 ALTER TABLE users ADD COLUMN IF NOT EXISTS password_must_change BOOLEAN NOT NULL DEFAULT TRUE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_password_change_at TIMESTAMPTZ;
 
+-- Idempotent: extend role CHECK constraint to include external client roles.
+-- The original constraint was auto-named `users_role_check` by PostgreSQL.
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.check_constraints
+    WHERE constraint_schema = 'public'
+      AND constraint_name = 'users_role_check'
+      AND check_clause LIKE '%client%'
+  ) THEN
+    ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
+    ALTER TABLE users ADD CONSTRAINT users_role_check
+      CHECK (role IN ('viewer', 'operator', 'admin', 'client', 'trader', 'investor', 'premium', 'pro'));
+  END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
     user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,

@@ -1,6 +1,7 @@
 import { cookies } from "next/headers";
 
 const baseUrl = process.env.CONTROL_PLANE_URL || "http://127.0.0.1:8000";
+const fallbackBaseUrl = process.env.CONTROL_PLANE_FALLBACK_URL || "http://control-plane:8000";
 const fallbackToken = process.env.CONTROL_PLANE_TOKEN || "";
 const controlPlaneGlobal = globalThis as typeof globalThis & {
   __mcE2eDegradedWarnedKeys?: Set<string>;
@@ -43,18 +44,32 @@ function toRouteFamily(path: string): string {
 
 export async function getControlPlaneToken(): Promise<string> {
   let cookieToken = "";
+  let compatCookieToken = "";
   try {
     const maybeCookies = cookies as unknown as (() => Promise<{ get?: (name: string) => { value?: string } | undefined }>) | undefined;
     const store = typeof maybeCookies === "function" ? await maybeCookies() : undefined;
     cookieToken = store?.get?.("mc_token")?.value || "";
+    compatCookieToken = store?.get?.("mc_token_compat")?.value || "";
   } catch {
     cookieToken = "";
+    compatCookieToken = "";
   }
-  return cookieToken || fallbackToken;
+  return cookieToken || compatCookieToken || fallbackToken;
 }
 
 export function getControlPlaneUrl(): string {
   return baseUrl;
+}
+
+function getControlPlaneUrlCandidates(): string[] {
+  const candidates = [baseUrl.trim(), fallbackBaseUrl.trim()].filter(Boolean);
+  const deduped: string[] = [];
+  for (const candidate of candidates) {
+    if (!deduped.includes(candidate)) {
+      deduped.push(candidate);
+    }
+  }
+  return deduped;
 }
 
 export function extractMcContextHeaders(request: Request): Headers {
@@ -82,15 +97,26 @@ export async function cpFetch(path: string, init: RequestInit = {}): Promise<Res
   if (token) {
     headers.set("Authorization", `Bearer ${token}`);
   }
+  let lastError: unknown;
+  let attemptedBaseUrls: string[] = [];
   try {
-    return await fetch(`${baseUrl}${path}`, {
-      ...init,
-      headers,
-      cache: "no-store",
-    });
-  } catch (error) {
+    const candidates = getControlPlaneUrlCandidates();
+    attemptedBaseUrls = candidates;
+    for (const candidate of candidates) {
+      try {
+        return await fetch(`${candidate}${path}`, {
+          ...init,
+          headers,
+          cache: "no-store",
+        });
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error("control_plane_unreachable");
+  } catch {
     if (!isE2eDevDegradedModeEnabled()) {
-      throw error;
+      throw (lastError instanceof Error ? lastError : new Error("control_plane_unreachable"));
     }
 
     const method = String(init.method || "GET").toUpperCase();
@@ -107,6 +133,7 @@ export async function cpFetch(path: string, init: RequestInit = {}): Promise<Res
         method,
         path,
         baseUrl,
+        attempted_base_urls: attemptedBaseUrls,
       }),
       {
         status: 503,
@@ -117,4 +144,28 @@ export async function cpFetch(path: string, init: RequestInit = {}): Promise<Res
       },
     );
   }
+}
+
+export async function readJsonFromResponseSafe(response: Response): Promise<unknown> {
+  const raw = await response.text().catch(() => "");
+  if (!raw) {
+    return {};
+  }
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    return {
+      detail: "invalid_upstream_json",
+      raw: raw.slice(0, 500),
+    };
+  }
+}
+
+export async function cpFetchJsonSafe(path: string, init: RequestInit = {}): Promise<{
+  response: Response;
+  payload: unknown;
+}> {
+  const response = await cpFetch(path, init);
+  const payload = await readJsonFromResponseSafe(response);
+  return { response, payload };
 }

@@ -44,17 +44,19 @@ export function decimate(bars: Bar[], maxBars: number): Bar[] {
     const slice = bars.slice(i, Math.min(i + step, bars.length));
     if (slice.length === 0) continue;
 
-    const opens = slice.map((b) => b.open);
-    const highs = slice.map((b) => b.high);
-    const lows = slice.map((b) => b.low);
-    const closes = slice.map((b) => b.close);
-    const volumes = slice.map((b) => b.volume);
+    const opens = slice.map((b) => b.open).filter(Number.isFinite);
+    const highs = slice.map((b) => b.high).filter(Number.isFinite);
+    const lows = slice.map((b) => b.low).filter(Number.isFinite);
+    const closes = slice.map((b) => b.close).filter(Number.isFinite);
+    const volumes = slice.map((b) => b.volume).filter(Number.isFinite);
+
+    if (opens.length === 0 || closes.length === 0) continue;
 
     result.push({
       time: slice[0].time, // anchor to first bar in slice
       open: opens[0], // open of first
-      high: Math.max(...highs), // highest in slice
-      low: Math.min(...lows), // lowest in slice
+      high: highs.length > 0 ? Math.max(...highs) : opens[0], // highest in slice
+      low: lows.length > 0 ? Math.min(...lows) : opens[0], // lowest in slice
       close: closes[closes.length - 1], // close of last
       volume: volumes.reduce((sum, v) => sum + v, 0), // sum
     });

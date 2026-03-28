@@ -3,7 +3,7 @@ import { createHash, createHmac } from "node:crypto";
 
 import { appendAutoTuningAudit, readAutoTuningAudit } from "../../../../lib/autoTuningAudit";
 import { getCachedIdempotentResult, saveIdempotentResult } from "../../../../lib/autoTuningIdempotency";
-import { cpFetch, getControlPlaneToken } from "../../../../lib/controlPlane";
+import { cpFetch, getControlPlaneToken, readJsonFromResponseSafe } from "../../../../lib/controlPlane";
 
 type RecommendationPayload = {
   strategyId: string;
@@ -299,7 +299,7 @@ export async function POST(request: Request): Promise<NextResponse> {
     body: upstreamBodyText,
   });
 
-  const upstreamPayload = await response.json().catch(() => ({}));
+  const upstreamPayload = await readJsonFromResponseSafe(response);
   const status: "accepted" | "failed" = response.ok ? "accepted" : "failed";
   await appendAutoTuningAudit({
     id: `at-${Date.now()}`,

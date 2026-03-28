@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 
-import { cpFetch } from "../../../../../../lib/controlPlane";
+import { cpFetchJsonSafe } from "../../../../../../lib/controlPlane";
 import { executeWithShadowMode, shadowResponse } from "../../../../../../lib/shadowMode";
 
 const SHADOW_CONFIG = {
@@ -58,9 +58,9 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     { ...SHADOW_CONFIG, userId },
     {
       fetchBackend: async () => {
-        const response = await cpFetch(`/v1/mt5/orders/risk-history/summary?${params.toString()}`);
+        const { response, payload } = await cpFetchJsonSafe(`/v1/mt5/orders/risk-history/summary?${params.toString()}`);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return response.json();
+        return payload;
       },
       getFallback: () => fallbackSummary(windowValue, missThreshold),
     }
