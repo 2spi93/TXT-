@@ -5493,6 +5493,7 @@ def _resolve_live_execution_request(
     requested_notional_usd: float,
     explicit_flag: bool,
     purpose: str = "execute",
+    paper_only: bool = False,
 ) -> dict[str, Any]:
     provider_norm = _normalize_connector_provider(provider)
     policy = _load_live_execution_policy()
@@ -5507,6 +5508,8 @@ def _resolve_live_execution_request(
         reasons.append("live_route_flag_disabled")
     if not _provider_live_env_enabled(provider_norm):
         reasons.append("live_env_flag_disabled")
+    if purpose == "execute" and paper_only:
+        reasons.append("risk_policy_paper_only")
 
     linked_account = _linked_connector_account(provider_norm, account_id)
     if not linked_account:
@@ -5539,6 +5542,7 @@ def _resolve_live_execution_request(
         "account_id": str(account_id or "").strip(),
         "execution_venue": _preferred_execution_venue(provider_norm, live_enabled=enabled),
         "reasons": reasons,
+        "paper_only": paper_only,
         "policy": _sanitize_live_execution_policy(provider_policy),
         "linked_account": _connector_account_public_view(linked_account),
         "secret_payload": secret_payload if enabled else None,
@@ -13125,12 +13129,14 @@ async def _handle_signal_webhook(source: str, payload: dict, provided_secret: st
         raise HTTPException(status_code=400, detail="estimated_notional_usd must be > 0")
 
     live_requested = _bool_from_any(route.get("live_enabled"), False)
+    policy = await fetch_policy()
     live_execution = _resolve_live_execution_request(
         provider,
         account_id,
         requested_notional_usd=notional,
         explicit_flag=live_requested,
         purpose="execute",
+        paper_only=_bool_from_any(policy.get("paper_only"), False),
     )
     if live_requested and not live_execution.get("enabled"):
         raise HTTPException(
@@ -13141,6 +13147,7 @@ async def _handle_signal_webhook(source: str, payload: dict, provided_secret: st
                 "account_id": account_id,
                 "reasons": live_execution.get("reasons"),
                 "policy": live_execution.get("policy"),
+                "paper_only": live_execution.get("paper_only"),
             },
         )
     resolved_preferred_venue = str(route.get("preferred_venue") or "").strip()
@@ -13862,6 +13869,7 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
             requested_notional_usd=_to_float(effective_intent_payload.get("target_notional_usd"), 0.0),
             explicit_flag=True,
             purpose="execute",
+            paper_only=_bool_from_any(risk_decision.risk_snapshot.get("paper_only"), False),
         )
         if not live_execution.get("enabled"):
             raise HTTPException(
@@ -13870,6 +13878,7 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
                     "status": "live_execution_blocked",
                     "reasons": live_execution.get("reasons"),
                     "policy": live_execution.get("policy"),
+                    "paper_only": live_execution.get("paper_only"),
                     "provider": live_execution.get("provider"),
                     "account_id": live_execution.get("account_id"),
                 },
