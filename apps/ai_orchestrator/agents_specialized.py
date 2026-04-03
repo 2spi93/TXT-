@@ -11,10 +11,16 @@ Each agent sees the market differently:
 All inherit from TradingAgent base class.
 """
 
-from agents_framework import (
-    TradingAgent, AgentSignal, TradeDirection, Regime, AgentType,
-    _now_iso
-)
+try:
+    from .agents_framework import (
+        TradingAgent, AgentSignal, TradeDirection, Regime, AgentType,
+        _now_iso,
+    )
+except ImportError:
+    from agents_framework import (
+        TradingAgent, AgentSignal, TradeDirection, Regime, AgentType,
+        _now_iso,
+    )
 from typing import Any, Dict, Optional
 import math
 

@@ -1,6 +1,11 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+
+type OpsCopilotPromptDetail = {
+  message?: string;
+  autoSend?: boolean;
+};
 
 type ChatMessage = {
   role: "user" | "assistant";
@@ -19,6 +24,21 @@ type ChatResponse = {
   };
 };
 
+const PAGE_SHORTCUTS = [
+  { href: "/terminal", label: "Terminal" },
+  { href: "/ai", label: "AI Desk" },
+  { href: "/live-capital", label: "Live Capital" },
+  { href: "/connectors", label: "Connectors" },
+  { href: "/connections", label: "Connections" },
+] as const;
+
+const PROMPT_SHORTCUTS = [
+  "Explique-moi la différence entre fonds paper, live, exchange et wallet.",
+  "Vérifie ce qu'il est possible de contrôler sur la plateforme et les fonds disponibles.",
+  "Propose si la stratégie doit être promue vers un usage live et pourquoi.",
+  "Résume-moi les pages utiles pour piloter le capital et les connecteurs.",
+] as const;
+
 export default function OpsChatbot() {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -26,7 +46,7 @@ export default function OpsChatbot() {
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       role: "assistant",
-      text: "Ops Copilot actif. Demande: live readiness, drift, A/B memory, kill-switch.",
+      text: "Ops Copilot actif. Je peux expliquer paper/live/exchange/wallet, vérifier les workflows capital/plateforme, guider la promotion live d'une stratégie et t'orienter vers les bons desks.",
     },
   ]);
   const [pendingAction, setPendingAction] = useState("run_runbook");
@@ -38,8 +58,27 @@ export default function OpsChatbot() {
 
   const canSend = useMemo(() => input.trim().length > 0 && !loading, [input, loading]);
 
-  async function sendMessage(): Promise<void> {
-    const message = input.trim();
+  useEffect(() => {
+    function onPrompt(event: Event): void {
+      const detail = (event as CustomEvent<OpsCopilotPromptDetail>).detail;
+      const message = String(detail?.message || "").trim();
+      if (!message) {
+        return;
+      }
+      setOpen(true);
+      if (detail?.autoSend) {
+        void sendMessage(message);
+        return;
+      }
+      setInput(message);
+    }
+
+    window.addEventListener("ops-copilot:prompt", onPrompt as EventListener);
+    return () => window.removeEventListener("ops-copilot:prompt", onPrompt as EventListener);
+  }, [loading]);
+
+  async function sendMessage(forcedMessage?: string): Promise<void> {
+    const message = String(forcedMessage ?? input).trim();
     if (!message) {
       return;
     }
@@ -62,6 +101,18 @@ export default function OpsChatbot() {
       setMessages((prev) => [...prev, { role: "assistant", text: `${text}${actions ? `\n${actions}` : ""}` }]);
       if ((payload.actions || []).includes("open_incident_board")) {
         setMessages((prev) => [...prev, { role: "assistant", text: "Ouvre /incidents pour traiter les tickets." }]);
+      }
+      if ((payload.actions || []).includes("open_live_capital")) {
+        setMessages((prev) => [...prev, { role: "assistant", text: "Ouvre /live-capital pour distinguer paper/live/exchange/wallet, vérifier les comptes source et poser les caps d'allocation." }]);
+      }
+      if ((payload.actions || []).includes("open_connectors_hub")) {
+        setMessages((prev) => [...prev, { role: "assistant", text: "Ouvre /connectors ou /connections pour contrôler la plateforme, les credentials, les statuts d'intégration et les venues branchés." }]);
+      }
+      if ((payload.actions || []).includes("open_ai_desk")) {
+        setMessages((prev) => [...prev, { role: "assistant", text: "Ouvre /ai pour relire la gouvernance de route, les sources de capital et les vérifications plateforme en langage naturel." }]);
+      }
+      if ((payload.actions || []).includes("review_strategy_promotion")) {
+        setMessages((prev) => [...prev, { role: "assistant", text: "Va sur /live-capital pour confronter la proposition de promotion de stratégie au compte source, au cap USD et au niveau courant." }]);
       }
       if (suggestions) {
         setMessages((prev) => [...prev, { role: "assistant", text: `Actions guidees: ${suggestions}` }]);
@@ -156,6 +207,22 @@ export default function OpsChatbot() {
       {open ? (
         <div className="ops-chatbot-panel">
           <div className="ops-chatbot-head">Agent Ops</div>
+            <div className="ops-chatbot-guided" style={{ paddingTop: 0 }}>
+              <div className="subtle mini">Raccourcis pages</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                {PAGE_SHORTCUTS.map((shortcut) => (
+                  <a key={shortcut.href} href={shortcut.href} className="subtle mini">{shortcut.label}</a>
+                ))}
+              </div>
+              <div className="subtle mini" style={{ marginTop: 6 }}>Prompts rapides</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {PROMPT_SHORTCUTS.map((shortcut) => (
+                  <button key={shortcut} type="button" disabled={loading} onClick={() => void sendMessage(shortcut)}>
+                    {shortcut}
+                  </button>
+                ))}
+              </div>
+            </div>
           <div className="ops-chatbot-messages">
             {messages.map((m, idx) => (
               <div key={`${m.role}-${idx}`} className={m.role === "assistant" ? "chat-bubble assistant" : "chat-bubble user"}>

@@ -12,10 +12,56 @@ import {
   summarizeRecentLocalTerminalCaptureEvents,
   summarizeLocalTerminalCaptures,
 } from "../../../../lib/localTerminalCapture";
-import { closeIncidentTicket, getIncidentTicket, openIncidentTicket } from "../../../../lib/incidentTickets";
+import { closeIncidentTicket, getIncidentTicket, listIncidentTickets, openIncidentTicket, type IncidentTicketRecord } from "../../../../lib/incidentTickets";
 import { readLocalTerminalCaptureStore, writeLocalTerminalAutoIncident, writeLocalTerminalCapture } from "../../../../lib/localTerminalCaptureStore";
 
 const AUTO_CLOSE_MIN_HEALTHY_FRAMES = 3;
+
+function buildChartIncidentTitle(capture: {
+  chart: { instrument: string; timeframe: string };
+}): string {
+  return `Terminal local hard fail ${capture.chart.instrument} ${capture.chart.timeframe}`;
+}
+
+function isIncidentClosedStatus(status: string | null | undefined): boolean {
+  return String(status || "").toLowerCase() === "closed";
+}
+
+function matchesLocalTerminalChartIncident(
+  incident: IncidentTicketRecord,
+  capture: {
+    chart: { instrument: string; timeframe: string; venue: string };
+  },
+): boolean {
+  if (incident.title !== buildChartIncidentTitle(capture)) {
+    return false;
+  }
+  const payload = incident.payload && typeof incident.payload === "object" ? incident.payload : {};
+  const origin = typeof payload.origin === "string" ? payload.origin : "";
+  const chartPayload = payload.chart && typeof payload.chart === "object"
+    ? payload.chart as Record<string, unknown>
+    : {};
+  const instrument = typeof chartPayload.instrument === "string" ? chartPayload.instrument : "";
+  const timeframe = typeof chartPayload.timeframe === "string" ? chartPayload.timeframe : "";
+  const venue = typeof chartPayload.venue === "string" ? chartPayload.venue : "";
+  return origin === "local-terminal-health"
+    && instrument === capture.chart.instrument
+    && timeframe === capture.chart.timeframe
+    && venue === capture.chart.venue;
+}
+
+async function findActiveMatchingLocalTerminalIncidents(capture: {
+  chart: { instrument: string; timeframe: string; venue: string };
+}): Promise<IncidentTicketRecord[]> {
+  const incidentList = await listIncidentTickets().catch(() => null);
+  if (!incidentList?.ok) {
+    return [];
+  }
+  return incidentList.items.filter((incident) => (
+    !isIncidentClosedStatus(incident.status)
+      && matchesLocalTerminalChartIncident(incident, capture)
+  ));
+}
 
 function isDurablyHealthyCapture(capture: {
   localFeed: { signal: string };
@@ -123,7 +169,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
   if (autoIncident?.ticketKey) {
     const currentTicket = await getIncidentTicket(autoIncident.ticketKey).catch(() => null);
-    if (currentTicket?.ok && currentTicket.ticketStatus === "closed" && autoIncident.status !== "closed") {
+    if (currentTicket?.ok && isIncidentClosedStatus(currentTicket.ticketStatus) && autoIncident.status !== "closed") {
       autoIncident = {
         ...autoIncident,
         closedAt: autoIncident.closedAt || body.capturedAt,
@@ -139,23 +185,32 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     && hasHealthyCaptureSince(currentHistory, autoIncident.closedAt || autoIncident.openedAt);
 
   if (body.runtime.blockedByFiveStateFailure && (!autoIncident || autoIncident.signature !== incidentSignature || canReopenSameSignature)) {
-    const incidentTitle = `Terminal local hard fail ${body.chart.instrument} ${body.chart.timeframe}`;
-    const incidentResult = await openIncidentTicket({
-      title: incidentTitle,
-      severity: "critical",
-      payload: {
-        origin: "local-terminal-health",
-        client_id: body.clientId,
-        chart: body.chart,
-        runtime: body.runtime,
-        local_feed: body.localFeed,
-      },
-    }).catch((error) => ({
-      ok: false,
-      status: 500,
-      ticketKey: null,
-      detail: error instanceof Error ? error.message : "incident_open_failed",
-    }));
+    const incidentTitle = buildChartIncidentTitle(body);
+    const matchingActiveIncidents = await findActiveMatchingLocalTerminalIncidents(body);
+    const reusedIncident = matchingActiveIncidents[0] || null;
+    const incidentResult = reusedIncident
+      ? {
+        ok: true,
+        status: 200,
+        ticketKey: reusedIncident.ticketKey,
+        detail: "incident_reused_existing_open_ticket",
+      }
+      : await openIncidentTicket({
+        title: incidentTitle,
+        severity: "critical",
+        payload: {
+          origin: "local-terminal-health",
+          client_id: body.clientId,
+          chart: body.chart,
+          runtime: body.runtime,
+          local_feed: body.localFeed,
+        },
+      }).catch((error) => ({
+        ok: false,
+        status: 500,
+        ticketKey: null,
+        detail: error instanceof Error ? error.message : "incident_open_failed",
+      }));
 
     autoIncident = {
       clientId: body.clientId,
@@ -173,24 +228,37 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     && currentHistory.slice(0, AUTO_CLOSE_MIN_HEALTHY_FRAMES).every((capture) => isDurablyHealthyCapture(capture));
 
   if (!body.runtime.blockedByFiveStateFailure
-    && autoIncident
-    && autoIncident.status !== "closed"
-    && autoIncident.status !== "suppressed"
-    && autoIncident.ticketKey
     && healthyRecoveryReady) {
+    const matchingActiveIncidents = await findActiveMatchingLocalTerminalIncidents(body);
     const resolutionNote = `Auto-closed after ${AUTO_CLOSE_MIN_HEALTHY_FRAMES} healthy local captures for ${body.chart.feedLabel || `${body.chart.instrument} ${body.chart.timeframe}`}`;
-    const closeResult = await closeIncidentTicket(autoIncident.ticketKey, resolutionNote).catch((error) => ({
-      ok: false,
-      status: 500,
-      detail: error instanceof Error ? error.message : "incident_close_failed",
-    }));
-    autoIncident = {
-      ...autoIncident,
-      closedAt: body.capturedAt,
-      detail: closeResult.detail,
-      status: closeResult.ok ? "closed" : "close-failed",
-    };
-    store = await writeLocalTerminalAutoIncident(autoIncident);
+    const closableIncident = autoIncident
+      && autoIncident.status !== "closed"
+      && autoIncident.status !== "suppressed"
+      && autoIncident.ticketKey
+      ? autoIncident
+      : null;
+    const ticketsToClose = new Set<string>([
+      ...matchingActiveIncidents.map((incident) => incident.ticketKey),
+      ...(closableIncident?.ticketKey ? [closableIncident.ticketKey] : []),
+    ]);
+    let closeFailed = false;
+    for (const ticketKey of ticketsToClose) {
+      const closeResult = await closeIncidentTicket(ticketKey, resolutionNote).catch((error) => ({
+        ok: false,
+        status: 500,
+        detail: error instanceof Error ? error.message : "incident_close_failed",
+      }));
+      closeFailed = closeFailed || !closeResult.ok;
+    }
+    if (closableIncident) {
+      autoIncident = {
+        ...closableIncident,
+        closedAt: body.capturedAt,
+        detail: closeFailed ? "incident_close_failed" : "incident_closed_recovered_chart",
+        status: closeFailed ? "close-failed" : "closed",
+      };
+      store = await writeLocalTerminalAutoIncident(autoIncident);
+    }
   }
 
   const transitionEvents: Array<Promise<unknown>> = [];

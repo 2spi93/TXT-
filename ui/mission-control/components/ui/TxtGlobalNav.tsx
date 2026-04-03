@@ -9,8 +9,12 @@ import type { RoleGroup } from "../../lib/roleGroups";
 /** Navigation visible to internal TXT staff only (admin · operator · viewer). */
 const INTERNAL_NAV_ITEMS = [
   { href: "/", label: "Dashboard" },
+  { href: "/fund-manager", label: "Fund Manager" },
+  { href: "/live-capital", label: "Live Capital" },
   { href: "/terminal", label: "Terminal" },
   { href: "/live-readiness", label: "Readiness" },
+  { href: "/advanced/reality-gap", label: "Reality Gap" },
+  { href: "/advanced/kairos-shadow", label: "Kairos" },
   { href: "/incidents", label: "Incidents" },
   { href: "/connectors", label: "Connectors" },
   { href: "/ai", label: "AI" },
@@ -22,8 +26,8 @@ const INTERNAL_NAV_ITEMS = [
 /** Navigation visible to external clients (client · trader · investor · premium · pro). */
 const CLIENT_NAV_ITEMS = [
   { href: "/terminal", label: "Terminal" },
+  { href: "/connections", label: "Connections" },
   { href: "/learn", label: "Learn" },
-  { href: "/settings", label: "Settings" },
 ];
 
 export default function TxtGlobalNav({ roleGroup = "unknown" }: { roleGroup?: RoleGroup }) {

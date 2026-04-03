@@ -532,8 +532,12 @@ class HedgeFundSystem:
         2. Vote
         3. Return consensus
         """
+        next_symbol = str(market_data.get('symbol') or market_data.get('instrument') or '').strip()
         signals = []
         for agent in self.agents.values():
+            agent.instrument_data = market_data
+            if next_symbol:
+                agent.symbol = next_symbol
             signal = agent.get_signal()
             if signal:
                 signals.append(signal)

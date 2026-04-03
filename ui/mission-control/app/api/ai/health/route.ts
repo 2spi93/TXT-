@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { cpFetchJsonSafe } from "../../../../lib/controlPlane";
+import { cpFetchJsonSafe, getControlPlaneNetworkMetricsSnapshot } from "../../../../lib/controlPlane";
 
 export async function GET(): Promise<NextResponse> {
   try {
@@ -22,6 +22,14 @@ export async function GET(): Promise<NextResponse> {
           capacity: capacityResult.response.status,
           providers: providersResult.response.status,
         },
+        network: {
+          health: healthResult.network,
+          capacity: capacityResult.network,
+          providers: providersResult.network,
+        },
+        network_state: degraded ? "degraded" : "healthy",
+        degraded_flag: degraded,
+        network_metrics: getControlPlaneNetworkMetricsSnapshot(),
       },
       {
         status: 200,
@@ -38,6 +46,9 @@ export async function GET(): Promise<NextResponse> {
         providers: [],
         degraded: true,
         detail: "ai_health_unreachable",
+        network_state: "degraded",
+        degraded_flag: true,
+        network_metrics: getControlPlaneNetworkMetricsSnapshot(),
       },
       {
         status: 200,

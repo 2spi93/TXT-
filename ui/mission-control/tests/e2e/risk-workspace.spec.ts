@@ -1,7 +1,9 @@
 import { expect, test } from "@playwright/test";
 
+import { loginIfRequired } from "./helpers/terminal";
+
 test("workspace change -> reset risk alert -> persist -> reload", async ({ page }) => {
-  await page.goto("/terminal", { waitUntil: "domcontentloaded" });
+  await loginIfRequired(page, "/terminal", "risk workspace test");
 
   const riskControls = page.locator(".risk-timeline-controls").first();
   const thresholdInput = riskControls.locator('label:has-text("Threshold") input[type="number"]').first();

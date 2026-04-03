@@ -1,8 +1,8 @@
 import { NextResponse } from "next/server";
 
-import { cpFetchJsonSafe } from "../../../../lib/controlPlane";
+import { cpFetchJsonSafe, withControlPlaneNetwork } from "../../../../lib/controlPlane";
 
 export async function GET(): Promise<NextResponse> {
-  const { response, payload } = await cpFetchJsonSafe("/v1/system/kill-switch");
-  return NextResponse.json(payload, { status: response.status });
+  const { response, payload, network } = await cpFetchJsonSafe("/v1/system/kill-switch");
+  return NextResponse.json(withControlPlaneNetwork(payload, network), { status: response.status });
 }

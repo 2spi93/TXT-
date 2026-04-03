@@ -12,34 +12,98 @@ import type { NormalizedOhlcvBar } from "./ohlcvIntegrity";
 
 // ── Timeframe → ms ────────────────────────────────────────────────────────────
 
-const TF_MS: Record<string, number> = {
-  "1s":   1_000,
-  "1m":  60_000,
-  "3m":  60_000 * 3,
-  "5m":  60_000 * 5,
-  "15m": 60_000 * 15,
-  "30m": 60_000 * 30,
-  "1h":  60_000 * 60,
-  "2h":  60_000 * 120,
-  "4h":  60_000 * 240,
-  "6h":  60_000 * 360,
-  "8h":  60_000 * 480,
-  "12h": 60_000 * 720,
-  "1d":  60_000 * 1440,
-  "3d":  60_000 * 4320,
-  "1w":  60_000 * 10080,
+const MONTH_TIMEFRAME = "month" as const;
+
+const TF_MS: Record<string, number | typeof MONTH_TIMEFRAME> = {
+  "1s": 1_000,
+  "5s": 5_000,
+  "10s": 10_000,
+  "15s": 15_000,
+  "30s": 30_000,
+  "1m": 60_000,
+  "2m": 120_000,
+  "3m": 180_000,
+  "5m": 300_000,
+  "15m": 900_000,
+  "30m": 1_800_000,
+  "45m": 2_700_000,
+  "1h": 3_600_000,
+  "2h": 7_200_000,
+  "3h": 10_800_000,
+  "4h": 14_400_000,
+  "6h": 21_600_000,
+  "8h": 28_800_000,
+  "12h": 43_200_000,
+  "1d": 86_400_000,
+  "3d": 259_200_000,
+  "1w": 604_800_000,
+  "1M": MONTH_TIMEFRAME,
   // aliases fréquents
-  "60m": 60_000 * 60,
-  "240m": 60_000 * 240,
-  "D":   60_000 * 1440,
-  "W":   60_000 * 10080,
+  "60m": 3_600_000,
+  "90s": 90_000,
+  "240m": 14_400_000,
+  "d": 86_400_000,
+  "w": 604_800_000,
 };
 
-export function timeframeToMs(timeframe: string): number {
-  const raw = String(timeframe || "").trim().toLowerCase();
-  if (TF_MS[raw]) return TF_MS[raw];
-  // pattern numérique : "45m", "2h", etc.
-  const match = raw.match(/^(\d+)([smhdw])$/);
+export const SUPPORTED_TIMEFRAMES = [
+  "1s",
+  "5s",
+  "10s",
+  "15s",
+  "30s",
+  "1m",
+  "2m",
+  "3m",
+  "5m",
+  "15m",
+  "30m",
+  "45m",
+  "1h",
+  "2h",
+  "3h",
+  "4h",
+  "6h",
+  "8h",
+  "12h",
+  "1d",
+  "3d",
+  "1w",
+  "1M",
+] as const;
+
+export type SupportedTimeframe = typeof SUPPORTED_TIMEFRAMES[number];
+
+export function normalizeTimeframe(timeframe: string): string {
+  const trimmed = String(timeframe || "").trim();
+  if (!trimmed) {
+    return "1m";
+  }
+  if (trimmed === "1M" || /^1mo(nth)?$/i.test(trimmed)) {
+    return "1M";
+  }
+  const raw = trimmed.toLowerCase();
+  if (raw === "d") return "1d";
+  if (raw === "w") return "1w";
+  if (raw === "60m") return "1h";
+  if (raw === "240m") return "4h";
+  if (/^(\d+)([smhdw])$/.test(raw)) {
+    const match = raw.match(/^(\d+)([smhdw])$/);
+    if (!match) {
+      return "1m";
+    }
+    return `${Math.max(1, Number(match[1]))}${match[2]}`;
+  }
+  return TF_MS[trimmed] ? trimmed : TF_MS[raw] ? raw : "1m";
+}
+
+function timeframeUnitValue(timeframe: string): number | typeof MONTH_TIMEFRAME {
+  const normalized = normalizeTimeframe(timeframe);
+  const direct = TF_MS[normalized];
+  if (direct) {
+    return direct;
+  }
+  const match = normalized.match(/^(\d+)([smhdw])$/);
   if (!match) return 60_000;
   const amount = Math.max(1, Number(match[1]));
   const unit = match[2];
@@ -50,6 +114,38 @@ export function timeframeToMs(timeframe: string): number {
     unit === "d" ? 86_400_000 :
     604_800_000;
   return amount * unitMs;
+}
+
+export function isTimeframeSupported(timeframe: string): boolean {
+  const normalized = normalizeTimeframe(timeframe);
+  return normalized === "1M" || SUPPORTED_TIMEFRAMES.includes(normalized as SupportedTimeframe) || /^(\d+)([smhdw])$/.test(normalized);
+}
+
+export function timeframeToMs(timeframe: string): number {
+  const value = timeframeUnitValue(timeframe);
+  return value === MONTH_TIMEFRAME ? 31 * 86_400_000 : value;
+}
+
+export function canDeriveTimeframe(sourceTimeframe: string, targetTimeframe: string): boolean {
+  return timeframeToMs(targetTimeframe) >= timeframeToMs(sourceTimeframe);
+}
+
+export function bucketStartForTimeframe(tsMs: number, timeframe: string): number {
+  const value = timeframeUnitValue(timeframe);
+  if (value === MONTH_TIMEFRAME) {
+    const date = new Date(tsMs);
+    return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1, 0, 0, 0, 0);
+  }
+  return alignToTimeSlot(tsMs, value);
+}
+
+export function nextBucketStartForTimeframe(tsMs: number, timeframe: string): number {
+  const value = timeframeUnitValue(timeframe);
+  if (value === MONTH_TIMEFRAME) {
+    const date = new Date(bucketStartForTimeframe(tsMs, timeframe));
+    return Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1, 0, 0, 0, 0);
+  }
+  return bucketStartForTimeframe(tsMs, timeframe) + value;
 }
 
 // ── Slot alignment ────────────────────────────────────────────────────────────
@@ -68,9 +164,7 @@ export function alignToTimeSlot(tsMs: number, slotMs: number): number {
 export function alignIsoToSlot(iso: string, tf: string): string {
   const tsMs = Date.parse(iso);
   if (!Number.isFinite(tsMs)) return iso;
-  const slotMs = timeframeToMs(tf);
-  if (slotMs <= 0) return iso;
-  return new Date(alignToTimeSlot(tsMs, slotMs)).toISOString();
+  return new Date(bucketStartForTimeframe(tsMs, tf)).toISOString();
 }
 
 // ── Time Series Engine ────────────────────────────────────────────────────────
@@ -98,7 +192,7 @@ export function buildTimeSeries(
   for (const bar of bars) {
     const tsMs = Date.parse(bar.t);
     if (!Number.isFinite(tsMs)) continue;
-    const slot = alignToTimeSlot(tsMs, slotMs);
+    const slot = bucketStartForTimeframe(tsMs, tf);
     const existing = slotMap.get(slot);
     // Si plusieurs barres tombent dans le même slot : garde la dernière reçue
     if (!existing || Date.parse(bar.t) >= Date.parse(existing.t)) {
@@ -174,8 +268,8 @@ export function applyTickToLastBar(
   if (!Number.isFinite(lastSlotMs)) return bars;
 
   // Tick dans un slot plus récent → nouvelle bougie synthétique
-  if (Number.isFinite(tickMs) && tickMs >= lastSlotMs + slotMs) {
-    const newSlot = alignToTimeSlot(tickMs, slotMs);
+  if (Number.isFinite(tickMs) && tickMs >= nextBucketStartForTimeframe(lastSlotMs, tf)) {
+    const newSlot = bucketStartForTimeframe(tickMs, tf);
     const safeClose = lastBar.c > 0 ? lastBar.c : price;
     const syntheticBar: NormalizedOhlcvBar = {
       t: new Date(newSlot).toISOString(),
@@ -216,10 +310,9 @@ export function normalizeBarToSlot(
   bar: NormalizedOhlcvBar,
   tf: string,
 ): NormalizedOhlcvBar {
-  const slotMs = timeframeToMs(tf);
   const tsMs = Date.parse(bar.t);
-  const alignedTs = Number.isFinite(tsMs) && slotMs > 0
-    ? new Date(alignToTimeSlot(tsMs, slotMs)).toISOString()
+  const alignedTs = Number.isFinite(tsMs)
+    ? new Date(bucketStartForTimeframe(tsMs, tf)).toISOString()
     : bar.t;
 
   const o = bar.o > 0 ? bar.o : bar.c;
@@ -229,4 +322,46 @@ export function normalizeBarToSlot(
   const safeL = Number.isFinite(l) ? l : Math.min(o, c);
 
   return { ...bar, t: alignedTs, o, h, l: safeL, c, v: Math.max(0, bar.v) };
+}
+
+export function aggregateBarsToTimeframe(
+  bars: NormalizedOhlcvBar[],
+  tf: string,
+): NormalizedOhlcvBar[] {
+  if (bars.length === 0) {
+    return [];
+  }
+
+  const targetTf = normalizeTimeframe(tf);
+  const sorted = [...bars]
+    .filter((bar) => Number.isFinite(Date.parse(bar.t)))
+    .sort((left, right) => Date.parse(left.t) - Date.parse(right.t));
+  const bucketed = new Map<number, NormalizedOhlcvBar>();
+
+  for (const bar of sorted) {
+    const bucketStart = bucketStartForTimeframe(Date.parse(bar.t), targetTf);
+    const bucketIso = new Date(bucketStart).toISOString();
+    const existing = bucketed.get(bucketStart);
+    if (!existing) {
+      bucketed.set(bucketStart, {
+        ...bar,
+        t: bucketIso,
+        tf: targetTf,
+        seq: bucketStart,
+      });
+      continue;
+    }
+    bucketed.set(bucketStart, {
+      ...existing,
+      h: Math.max(existing.h, bar.h, bar.o, bar.c),
+      l: Math.min(existing.l, bar.l, bar.o, bar.c),
+      c: bar.c,
+      v: Math.max(0, existing.v) + Math.max(0, bar.v),
+      source: existing.source || bar.source,
+    });
+  }
+
+  return [...bucketed.values()]
+    .sort((left, right) => Date.parse(left.t) - Date.parse(right.t))
+    .map((bar, index) => ({ ...bar, tf: targetTf, seq: index + 1 }));
 }

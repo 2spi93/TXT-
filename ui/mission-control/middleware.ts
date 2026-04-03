@@ -15,6 +15,7 @@ import { type NextRequest, NextResponse } from "next/server";
 const INTERNAL_ONLY_PATHS = [
   "/",
   "/live-readiness",
+  "/live-capital",
   "/incidents",
   "/connectors",
   "/ai",
@@ -31,7 +32,8 @@ const CLIENT_ROLES = new Set(["client", "trader", "investor", "premium", "pro"])
 
 function parseTokenRole(token: string): string | null {
   try {
-    const [payloadPart] = token.split(".");
+    const parts = token.split(".");
+    const payloadPart = parts.length === 2 ? parts[0] : parts[1];
     if (!payloadPart) return null;
     const padded = payloadPart + "=".repeat((4 - (payloadPart.length % 4)) % 4);
     // atob is available in the Edge Runtime

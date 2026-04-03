@@ -2,6 +2,7 @@
 
 import type { ReactNode } from "react";
 
+import HelpHint from "../../components/HelpHint";
 import PanelShell from "../../components/ui/PanelShell";
 
 type RiskTimelineFilter = "all" | "compliant" | "miss";
@@ -45,13 +46,111 @@ type RiskTimelineRow = {
   source?: string;
   outcome: string;
 };
+type OmsLifecycleSummary = {
+  pendingApprovals: number;
+  routedCount: number;
+  acceptedCount: number;
+  partialCount: number;
+  filledCount: number;
+  blockedCount: number;
+  avgLatencyMs: number;
+  avgSlippageBps: number;
+  lastEventIso: string | null;
+  agentReadyCount: number;
+  agentTotalCount: number;
+};
+type PortfolioOverlaySummary = {
+  accountFreeUsd: number;
+  openTradesCount: number;
+  grossExposureUsd: number;
+  exposureRatioPct: number;
+  dailyPnLUsd: number;
+  dailyDrawdownPct: number;
+  dominantBookLabel: string;
+};
+type AiBridgeSummary = {
+  routeLabel: string;
+  routeScore: number;
+  v7Label: string;
+  v7Tone: "good" | "warn" | "neutral";
+  edgeBps: number;
+  v8Execute: boolean;
+  v8ProbabilityPct: number;
+  brainAction: string;
+  brainConfidencePct: number;
+  brainRegime: string;
+  reasonLabel: string;
+};
 
 function safeNumber(value: unknown, fallback = 0): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
+function formatCompactUsd(value: unknown): string {
+  const amount = safeNumber(value, 0);
+  return `${amount.toFixed(Math.abs(amount) >= 100 ? 0 : 2)} USD`;
+}
+
 function ScrollWrap({ children, className }: { children: ReactNode; className?: string }) {
   return <div className={className} style={{ height: "100%", overflow: "auto" }}>{children}</div>;
+}
+
+const PANEL_HINTS: Record<string, { text: string; examples: string[] }> = {
+  DOM: {
+    text: "Le DOM montre la profondeur instantanee: bid/ask, tailles et concentration de liquidite autour du prix.",
+    examples: ["Beaucoup d'ask au-dessus peut freiner une montee.", "Une profondeur tres fine signale souvent un environnement plus fragile pour l'execution."],
+  },
+  Footprint: {
+    text: "Le footprint oppose les volumes buy/sell par niveau de prix pour lire l'agression reelle dans la bougie.",
+    examples: ["Delta positif fort: aggression acheteuse dominante.", "Delta negatif autour d'un support peut signaler une cassure faible ou un absorbtion."],
+  },
+  Tape: {
+    text: "Le tape liste les derniers prints executes pour lire le rythme et le sens immediat des transactions.",
+    examples: ["Une succession de prints buy peut confirmer une acceleration.", "Des prints alternes et petits traduisent souvent un marche hesitant."],
+  },
+  Heatmap: {
+    text: "La heatmap visualise la densite de liquidite par niveau de prix, utile pour reperer murs et zones d'absorption.",
+    examples: ["Un mur ask persistant peut bloquer la hausse.", "Une zone bid qui disparait brutalement annonce souvent un trou de liquidite."],
+  },
+  "Blotter d'exécution": {
+    text: "Le blotter recense les executions recentes, leur PnL, leur slippage et leur statut de fin.",
+    examples: ["Slip eleve avec PnL faible: execution a retravailler.", "Compare les statuts pour voir si les runs passent ou restent bloques."],
+  },
+  "Desk Bridge · OMS · Overlay": {
+    text: "Resume compact du lifecycle OMS, de l'overlay portefeuille et du pont IA d'execution deja calcules dans le terminal.",
+    examples: ["Si les approvals montent mais que les fills stagnent, le lifecycle OMS se tasse avant execution finale.", "Croise edge IA, exposition portefeuille et disponibilite agents avant de laisser le desk pousser en live."],
+  },
+  "Alertes actives": {
+    text: "Bloc des alertes prioritaires: incidents critiques, guardrails, approvals et signaux de degradation.",
+    examples: ["Une alerte critique doit etre traitee avant toute nouvelle action live.", "Les alertes repetitives indiquent souvent un flux ou un service degrade."],
+  },
+  Incidents: {
+    text: "Les incidents structurent le suivi operatoire avec statut, severite et SLA.",
+    examples: ["SLA breach signale une dette operatoire a traiter vite.", "Un incident ouvert sur connecteurs invalide souvent une lecture trop confiante du desk."],
+  },
+  Governance: {
+    text: "La gouvernance rassemble les signaux de derive, limites et guardrails actifs sur le systeme.",
+    examples: ["Trie par severity pour voir ce qui bloque vraiment l'usage live.", "Le filtre texte aide a isoler une strategie, un routeur ou un composant precis."],
+  },
+  Readiness: {
+    text: "La readiness combine drift, suspensions, memoire et incidents pour juger si le systeme est exploitable.",
+    examples: ["Beaucoup de drift et des SLA breach = environnement pas pret pour une promotion live.", "Une strategie suspendue ne doit pas etre traitee comme allocable."],
+  },
+  "Risk Compliance Timeline": {
+    text: "Historique de conformite risque: ok/miss, ratio de miss, poll et seuils d'alerte locale.",
+    examples: ["Si le ratio miss grimpe, le desk doit ralentir ou couper certaines executions.", "Le hard alert permet de declencher une vigilance locale plus stricte."],
+  },
+};
+
+function titleWithHelp(title: string, badge?: ReactNode): ReactNode {
+  const hint = PANEL_HINTS[title];
+  return (
+    <>
+      {title}
+      {hint ? <HelpHint text={hint.text} examples={hint.examples} label="Guide rapide" /> : null}
+      {badge ? <> {badge}</> : null}
+    </>
+  );
 }
 
 function MonitoringPanelCard({
@@ -70,7 +169,7 @@ function MonitoringPanelCard({
   return (
     <div className="monitoring-col">
       <div className="eyebrow monitoring-panel-head" style={{ marginBottom: 6 }}>
-        <span className="monitoring-panel-title">{title} {badge}</span>
+        <span className="monitoring-panel-title">{titleWithHelp(title, badge)}</span>
         {layoutEditMode ? <button type="button" className="panel-detach-btn" title="Floating" onClick={onDetach}>⤡</button> : null}
       </div>
       {children}
@@ -88,7 +187,7 @@ export function DomDockPanel({
   return (
     <ScrollWrap>
       <PanelShell className="panel micro-panel">
-        <div className="eyebrow micro-panel-title">DOM <span className={`micro-stream-badge micro-stream-${depthStreamState}`}>{depthStreamState}</span></div>
+        <div className="eyebrow micro-panel-title">{titleWithHelp("DOM", <span className={`micro-stream-badge micro-stream-${depthStreamState}`}>{depthStreamState}</span>)}</div>
         <div className="dom-table-compact">
           <div className="dom-header-row"><span>Side</span><span>Prix</span><span>Taille</span><span>Profondeur</span></div>
           {activeDomLevels.map((level, index) => (
@@ -109,7 +208,7 @@ export function FootprintDockPanel({ activeFootprintRows }: { activeFootprintRow
   return (
     <ScrollWrap>
       <PanelShell className="panel micro-panel">
-        <div className="eyebrow micro-panel-title">Footprint</div>
+        <div className="eyebrow micro-panel-title">{titleWithHelp("Footprint")}</div>
         <div className="footprint-compact">
           <div className="fp-header-row"><span>Niveau</span><span className="good">Buy</span><span className="warn">Sell</span><span>Δ</span></div>
           {activeFootprintRows.map((row, index) => (
@@ -130,7 +229,7 @@ export function TapeDockPanel({ activeTape }: { activeTape: TapePanelPrint[] }) 
   return (
     <ScrollWrap>
       <PanelShell className="panel micro-panel">
-        <div className="eyebrow micro-panel-title">Tape</div>
+        <div className="eyebrow micro-panel-title">{titleWithHelp("Tape")}</div>
         <div className="tape-compact">
           {activeTape.map((print, index) => (
             <div key={`ftp-${index}`} className={`tape-row-compact ${print.side}`}>
@@ -156,7 +255,7 @@ export function HeatmapDockPanel({
   return (
     <ScrollWrap>
       <PanelShell className="panel micro-panel">
-        <div className="eyebrow micro-panel-title">Heatmap <span className="subtle mini" style={{ marginLeft: 6 }}>{sessionLabel}</span></div>
+        <div className="eyebrow micro-panel-title">{titleWithHelp("Heatmap", <span className="subtle mini" style={{ marginLeft: 6 }}>{sessionLabel}</span>)}</div>
         <div className="heatmap-compact">
           {activeHeatmapLevels.map((level, index) => (
             <div key={`fhm-${index}`} className={`hm-row ${level.side}`} style={{ opacity: Math.max(0.2, level.intensity) }}>
@@ -181,7 +280,7 @@ export function BlotterDockPanel({
   return (
     <ScrollWrap>
       <PanelShell className="panel term-blotter-panel">
-        <div className="eyebrow">Blotter d'exécution</div>
+        <div className="eyebrow">{titleWithHelp("Blotter d'exécution")}</div>
         {filteredOutcomes.length === 0 ? <p className="subtle mini" style={{ marginTop: 8 }}>Aucune exécution.</p> : null}
         {filteredOutcomes.length > 0 ? (
           <div className="blotter-scroll">
@@ -211,29 +310,43 @@ export function BrokersDockPanel({
   balances,
   positions,
   instrumentLabel,
+  omsLifecycle,
+  portfolioOverlay,
+  aiBridge,
 }: {
   providerRows: BrokerProviderRow[];
   balances: BrokerBalanceRow[];
   positions: BrokerPositionRow[];
   instrumentLabel: (item: BrokerPositionRow) => string;
+  omsLifecycle: OmsLifecycleSummary;
+  portfolioOverlay: PortfolioOverlaySummary;
+  aiBridge: AiBridgeSummary;
 }) {
   return (
     <ScrollWrap>
       <PanelShell className="panel term-brokers-panel">
-        <div className="eyebrow">Brokers · Agents · Capital</div>
+        <div className="eyebrow">{titleWithHelp("Desk Bridge · OMS · Overlay")}</div>
         <div className="brokers-grid">
           <div className="brokers-section">
-            <div className="chart-stat-label" style={{ marginBottom: 6 }}>Agents IA</div>
-            {providerRows.slice(0, 5).map((item, index) => (
-              <div key={`fbr-ag-${index}`} className="agent-row">
-                <span className="agent-name gtix-ellipsis">{String(item.route || "–").slice(0, 14)}</span>
-                <span className={Boolean(item.available) ? "good mini" : "warn mini"}>{Boolean(item.available) ? "●" : "○"}</span>
-              </div>
-            ))}
+            <div className="chart-stat-label" style={{ marginBottom: 6 }}>OMS Lifecycle</div>
+            <div className="row"><span>Approvals</span><span className={omsLifecycle.pendingApprovals > 0 ? "warn" : "good"}>{omsLifecycle.pendingApprovals}</span></div>
+            <div className="row"><span>Routed / ack</span><span>{omsLifecycle.routedCount} / {omsLifecycle.acceptedCount}</span></div>
+            <div className="row"><span>Partial / final</span><span>{omsLifecycle.partialCount} / {omsLifecycle.filledCount}</span></div>
+            <div className="row"><span>Blocked</span><span className={omsLifecycle.blockedCount > 0 ? "warn" : "good"}>{omsLifecycle.blockedCount}</span></div>
+            <div className="row"><span>Latency / slip</span><span>{safeNumber(omsLifecycle.avgLatencyMs, 0).toFixed(0)} ms | {safeNumber(omsLifecycle.avgSlippageBps, 0).toFixed(1)} bps</span></div>
+            <div className="row"><span>Agents live</span><span className={omsLifecycle.agentReadyCount >= Math.max(1, omsLifecycle.agentTotalCount) ? "good" : "subtle"}>{omsLifecycle.agentReadyCount}/{omsLifecycle.agentTotalCount}</span></div>
+            <div className="subtle mini" style={{ marginTop: 6 }}>last event {omsLifecycle.lastEventIso ? omsLifecycle.lastEventIso.slice(11, 19) : "n/a"}</div>
           </div>
           <div className="brokers-section">
-            <div className="chart-stat-label" style={{ marginBottom: 6 }}>Capital</div>
-            {balances.slice(0, 5).map((item) => (
+            <div className="chart-stat-label" style={{ marginBottom: 6 }}>Portfolio Overlay</div>
+            <div className="row"><span>Free equity</span><span>{formatCompactUsd(portfolioOverlay.accountFreeUsd)}</span></div>
+            <div className="row"><span>Open books</span><span>{portfolioOverlay.openTradesCount}</span></div>
+            <div className="row"><span>Gross exposure</span><span>{formatCompactUsd(portfolioOverlay.grossExposureUsd)}</span></div>
+            <div className="row"><span>Exposure / cash</span><span className={portfolioOverlay.exposureRatioPct >= 100 ? "warn" : portfolioOverlay.exposureRatioPct >= 70 ? "subtle" : "good"}>{portfolioOverlay.exposureRatioPct.toFixed(0)}%</span></div>
+            <div className="row"><span>PnL 24h</span><span className={portfolioOverlay.dailyPnLUsd >= 0 ? "good" : "warn"}>{formatCompactUsd(portfolioOverlay.dailyPnLUsd)}</span></div>
+            <div className="row"><span>Intraday DD</span><span className={portfolioOverlay.dailyDrawdownPct >= 2 ? "warn" : portfolioOverlay.dailyDrawdownPct >= 1 ? "subtle" : "good"}>{portfolioOverlay.dailyDrawdownPct.toFixed(2)}%</span></div>
+            <div className="subtle mini gtix-ellipsis" style={{ marginTop: 6 }}>dominant book {portfolioOverlay.dominantBookLabel}</div>
+            {balances.slice(0, 2).map((item) => (
               <div key={String(item.currency || "")} className="balance-row">
                 <span className="balance-ccy">{String(item.currency || "–")}</span>
                 <span className="balance-val gtix-ellipsis">{String(item.free || "–")}</span>
@@ -241,8 +354,21 @@ export function BrokersDockPanel({
             ))}
           </div>
           <div className="brokers-section">
-            <div className="chart-stat-label" style={{ marginBottom: 6 }}>Positions</div>
-            {positions.slice(0, 5).map((item) => (
+            <div className="chart-stat-label" style={{ marginBottom: 6 }}>AI Execution Bridge</div>
+            <div className="row"><span>V7 gate</span><span className={aiBridge.v7Tone === "good" ? "good" : aiBridge.v7Tone === "warn" ? "warn" : "subtle"}>{aiBridge.v7Label}</span></div>
+            <div className="row"><span>Route</span><span>{aiBridge.routeLabel} | {aiBridge.routeScore.toFixed(2)}</span></div>
+            <div className="row"><span>Final edge</span><span className={aiBridge.edgeBps >= 0 ? "good" : "warn"}>{aiBridge.edgeBps.toFixed(1)} bps</span></div>
+            <div className="row"><span>V8 execute</span><span className={aiBridge.v8Execute ? "good" : "subtle"}>{aiBridge.v8Execute ? "yes" : "hold"} | {aiBridge.v8ProbabilityPct.toFixed(0)}%</span></div>
+            <div className="row"><span>Brain</span><span>{aiBridge.brainAction} | {aiBridge.brainConfidencePct.toFixed(0)}%</span></div>
+            <div className="row"><span>Regime</span><span>{aiBridge.brainRegime}</span></div>
+            <div className="subtle mini gtix-ellipsis" style={{ marginTop: 6 }}>{aiBridge.reasonLabel || "No predictor rationale"}</div>
+            {providerRows.slice(0, 3).map((item, index) => (
+              <div key={`fbr-ag-${index}`} className="agent-row">
+                <span className="agent-name gtix-ellipsis">{String(item.route || "–").slice(0, 14)}</span>
+                <span className={Boolean(item.available) ? "good mini" : "warn mini"}>{Boolean(item.available) ? "●" : "○"}</span>
+              </div>
+            ))}
+            {positions.slice(0, 2).map((item) => (
               <div key={instrumentLabel(item)} className="pos-row">
                 <span className="pos-sym gtix-ellipsis">{instrumentLabel(item).slice(0, 10)}</span>
                 <span className="balance-val">{safeNumber(item.net_notional_usd, 0).toFixed(0)}</span>
@@ -258,7 +384,7 @@ export function BrokersDockPanel({
 export function AlertsDockPanel({ filteredAlerts }: { filteredAlerts: AlertRow[] }) {
   return (
     <div className="monitoring-col" style={{ height: "100%", overflow: "auto" }}>
-      <div className="eyebrow" style={{ marginBottom: 8 }}>Alertes actives</div>
+      <div className="eyebrow" style={{ marginBottom: 8 }}>{titleWithHelp("Alertes actives")}</div>
       {filteredAlerts.length === 0 ? <p className="subtle mini">Aucune alerte.</p> : null}
       {filteredAlerts.slice(0, 10).map((item, index) => (
         <div key={`fal-${index}`} className="mon-row">
@@ -273,9 +399,9 @@ export function AlertsDockPanel({ filteredAlerts }: { filteredAlerts: AlertRow[]
 export function IncidentsDockPanel({ incidentRows }: { incidentRows: IncidentItemRow[] }) {
   return (
     <div className="monitoring-col" style={{ height: "100%", overflow: "auto" }}>
-      <div className="eyebrow" style={{ marginBottom: 8 }}>Incidents</div>
+      <div className="eyebrow" style={{ marginBottom: 8 }}>{titleWithHelp("Incidents")}</div>
       {incidentRows.length === 0 ? <p className="subtle mini">Aucun incident.</p> : null}
-      {incidentRows.slice(0, 8).map(({ item, status, severityLabel, slaLabel }) => (
+      {incidentRows.map(({ item, status, severityLabel, slaLabel }) => (
         <div key={String(item.ticket_key || "")} className="mon-row incident-row">
           <span>{String(item.ticket_key || "–")}</span>
           <span className="subtle mini">{String(item.title || "–").slice(0, 28)}</span>
@@ -293,7 +419,7 @@ export function IncidentsDockPanel({ incidentRows }: { incidentRows: IncidentIte
 export function GovernanceDockPanel({ governanceFiltered }: { governanceFiltered: GovernanceRow[] }) {
   return (
     <div className="monitoring-col" style={{ height: "100%", overflow: "auto" }}>
-      <div className="eyebrow" style={{ marginBottom: 8 }}>Governance</div>
+      <div className="eyebrow" style={{ marginBottom: 8 }}>{titleWithHelp("Governance")}</div>
       {governanceFiltered.slice(0, 12).map((row) => (
         <div key={row.label} className="mon-row">
           <span>{row.label}</span>
@@ -317,7 +443,7 @@ export function ReadinessDockPanel({
 }) {
   return (
     <div className="monitoring-col" style={{ height: "100%", overflow: "auto" }}>
-      <div className="eyebrow" style={{ marginBottom: 8 }}>Readiness</div>
+      <div className="eyebrow" style={{ marginBottom: 8 }}>{titleWithHelp("Readiness")}</div>
       <div className="mon-row"><span>Drift détecté</span><span>{driftItems.filter((item) => Boolean(item.drift_detected)).length}</span></div>
       <div className="mon-row"><span>Suspendues</span><span className={suspendedCount > 0 ? "warn" : "good"}>{suspendedCount}</span></div>
       <div className="mon-row"><span>Similarity</span><span>{String(memorySummary.avg_final_similarity || "–")}</span></div>

@@ -1,5 +1,16 @@
 import { cpFetchJsonSafe } from "./controlPlane";
 
+export type IncidentTicketRecord = {
+  ticketKey: string;
+  severity: string;
+  title: string;
+  status: string;
+  assignee: string | null;
+  payload: Record<string, unknown>;
+  createdAt: string | null;
+  updatedAt: string | null;
+};
+
 export type OpenIncidentTicketInput = {
   title: string;
   severity?: "low" | "medium" | "high" | "critical";
@@ -104,5 +115,56 @@ export async function getIncidentTicket(ticketKey: string): Promise<{
         : `incident_ticket_lookup_failed_${response.status}`,
     ticketStatus: typeof safePayload.status === "string" ? safePayload.status : null,
     assignee: typeof safePayload.assignee === "string" ? safePayload.assignee : null,
+  };
+}
+
+export async function listIncidentTickets(status?: string): Promise<{
+  ok: boolean;
+  status: number;
+  detail: string;
+  items: IncidentTicketRecord[];
+}> {
+  const suffix = status ? `?status=${encodeURIComponent(status)}` : "";
+  const { response, payload } = await cpFetchJsonSafe(`/v1/incidents${suffix}`);
+  const safePayload = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
+  const rawItems = Array.isArray(safePayload.items)
+    ? safePayload.items
+    : Array.isArray(payload)
+      ? payload
+      : [];
+
+  const items = rawItems.reduce<IncidentTicketRecord[]>((accumulator, entry) => {
+    if (!entry || typeof entry !== "object") {
+      return accumulator;
+    }
+    const candidate = entry as Record<string, unknown>;
+    const ticketKey = typeof candidate.ticket_key === "string" ? candidate.ticket_key : "";
+    const title = typeof candidate.title === "string" ? candidate.title : "";
+    const ticketStatus = typeof candidate.status === "string" ? candidate.status : "";
+    if (!ticketKey || !title || !ticketStatus) {
+      return accumulator;
+    }
+    accumulator.push({
+      ticketKey,
+      severity: typeof candidate.severity === "string" ? candidate.severity : "unknown",
+      title,
+      status: ticketStatus,
+      assignee: typeof candidate.assignee === "string" ? candidate.assignee : null,
+      payload: candidate.payload && typeof candidate.payload === "object" ? candidate.payload as Record<string, unknown> : {},
+      createdAt: typeof candidate.created_at === "string" ? candidate.created_at : null,
+      updatedAt: typeof candidate.updated_at === "string" ? candidate.updated_at : null,
+    });
+    return accumulator;
+  }, []);
+
+  return {
+    ok: response.ok,
+    status: response.status,
+    detail: typeof safePayload.detail === "string"
+      ? safePayload.detail
+      : response.ok
+        ? "incident_ticket_list_loaded"
+        : `incident_ticket_list_failed_${response.status}`,
+    items,
   };
 }

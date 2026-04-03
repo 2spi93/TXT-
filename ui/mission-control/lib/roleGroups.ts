@@ -59,6 +59,7 @@ export function getRoleDisplayLabel(role: string, group: RoleGroup): string {
 export const INTERNAL_ONLY_PATHS = [
   "/",
   "/live-readiness",
+  "/live-capital",
   "/incidents",
   "/connectors",
   "/ai",

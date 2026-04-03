@@ -26,6 +26,20 @@ function fallbackSummary(windowValue: string, missThreshold: string): Record<str
   };
 }
 
+function normalizeRiskSummaryShadowShape(payload: unknown): Record<string, unknown> {
+  const record = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
+  return {
+    has_count_ok: typeof record.count_ok === "number",
+    has_count_miss: typeof record.count_miss === "number",
+    has_last_block_reason: typeof record.last_block_reason === "string",
+    has_window_size: typeof record.window_size === "number",
+    has_miss_in_window: typeof record.miss_in_window === "number",
+    has_ratio_miss_window: typeof record.ratio_miss_window === "number",
+    has_miss_threshold: typeof record.miss_threshold === "number",
+    has_alert_flag: typeof record.alert === "boolean",
+  };
+}
+
 export async function GET(request: NextRequest): Promise<NextResponse> {
   const windowValue = request.nextUrl.searchParams.get("window") || "10";
   const missThreshold = request.nextUrl.searchParams.get("miss_threshold") || "3";
@@ -63,6 +77,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
         return payload;
       },
       getFallback: () => fallbackSummary(windowValue, missThreshold),
+      normalizeForComparison: (payload) => normalizeRiskSummaryShadowShape(payload),
     }
   );
 

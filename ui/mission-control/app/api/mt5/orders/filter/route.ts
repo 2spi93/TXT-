@@ -1,6 +1,12 @@
 import { NextResponse } from "next/server";
 
-import { cpFetchJsonSafe, extractMcContextHeaders } from "../../../../../lib/controlPlane";
+import {
+  classifyControlPlaneNetworkRegime,
+  computeControlPlaneInfraHealth,
+  cpFetchJsonSafe,
+  extractMcContextHeaders,
+  getControlPlaneNetworkMetricsSnapshot,
+} from "../../../../../lib/controlPlane";
 
 type JsonMap = Record<string, unknown>;
 
@@ -49,11 +55,15 @@ function asString(value: unknown, fallback = ""): string {
 export async function POST(request: Request): Promise<NextResponse> {
   const forwardedHeaders = extractMcContextHeaders(request);
   const raw = asObject(await request.json());
+  const networkMetrics = getControlPlaneNetworkMetricsSnapshot();
+  const infraHealth = computeControlPlaneInfraHealth(networkMetrics);
+  const networkRegime = classifyControlPlaneNetworkRegime(networkMetrics, infraHealth);
   const side = asString(raw.side, "buy") === "sell" ? "sell" : "buy";
   const orderIntentRaw = asObject(raw.order_intent) as OrderIntentPayload;
   const bracket = asObject(orderIntentRaw.bracket);
   const oco = asObject(orderIntentRaw.oco);
   const riskPreview = asObject(orderIntentRaw.risk_preview);
+  const predictorContext = asObject(raw.predictor_context);
 
   const normalizedOrderIntent: OrderIntentPayload | undefined = Object.keys(orderIntentRaw).length > 0
     ? {
@@ -90,10 +100,19 @@ export async function POST(request: Request): Promise<NextResponse> {
     account_id: asString(raw.account_id),
     symbol: asString(raw.symbol),
     side,
+    preferred_venue: asString(raw.preferred_venue),
     lots: asNumber(raw.lots, 0.1),
     estimated_notional_usd: asNumber(raw.estimated_notional_usd),
     max_spread_bps: asNumber(raw.max_spread_bps),
     rationale: asString(raw.rationale),
+    predictor_context: {
+      ...predictorContext,
+      infra_health: asNumber(predictorContext.infra_health, infraHealth),
+      network_regime: asString(predictorContext.network_regime, networkRegime),
+      network_metrics: Object.keys(asObject(predictorContext.network_metrics)).length > 0
+        ? asObject(predictorContext.network_metrics)
+        : networkMetrics,
+    },
     order_intent: normalizedOrderIntent,
     // Compatibility fields for downstream services that consume top-level bracket/oco.
     bracket: normalizedOrderIntent?.bracket,

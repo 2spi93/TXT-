@@ -4,7 +4,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import GpuChartV4Surface from "./GpuChartV4Surface";
 import InstitutionalChart from "./InstitutionalChart";
+import { DEFAULT_MIN_RENDERABLE_BARS } from "../../lib/ohlcvIntegrity";
 import { computePredictionV5, type PredictionV5 } from "../../lib/predictionEngineV5";
+
+const TERMINAL_V2_TIMEFRAME_SELECTOR_PRIMARY = ["1s", "5s", "10s", "30s", "1m", "5m", "15m"] as const;
+const TERMINAL_V2_TIMEFRAME_SELECTOR_SECONDARY = ["30m", "1h", "4h", "8h", "1d", "1w", "1M"] as const;
 
 type CandlePoint = { label: string; open: number; high: number; low: number; close: number; volume: number };
 type DomLevel = { side: "bid" | "ask"; price: number; size: number; intensity: number };
@@ -30,7 +34,7 @@ type RiskJournalEntry = {
   detail: string;
 };
 
-const MIN_RENDER_CANDLES = 12;
+const MIN_RENDER_CANDLES = DEFAULT_MIN_RENDERABLE_BARS;
 
 // ── Auto Trader V5 types ────────────────────────────────────────────────────
 type AutoTraderV5Mode = "standby" | "watching" | "in-trade" | "paused";
@@ -72,10 +76,11 @@ type Props = {
   onToggleEnabled: () => void;
   symbol: string;
   timeframe: string;
-  onTimeframeChange: (timeframe: "1m" | "5m" | "15m") => void;
+  onTimeframeChange: (timeframe: string) => void;
   chartWindow: number;
   onZoomIn: () => void;
   onZoomOut: () => void;
+  liveFeedKey?: string;
   candles: CandlePoint[];
   fallbackPrice: number;
   loading: boolean;
@@ -179,6 +184,7 @@ export default function TerminalChartV2(props: Props) {
     chartWindow,
     onZoomIn,
     onZoomOut,
+    liveFeedKey,
     candles,
     fallbackPrice,
     loading,
@@ -238,6 +244,14 @@ export default function TerminalChartV2(props: Props) {
   const [assistantInput, setAssistantInput] = useState("");
   const [assistantMessages, setAssistantMessages] = useState<Array<{ role: "user" | "assistant"; text: string }>>([]);
   const lastStableCandlesRef = useRef<CandlePoint[]>([]);
+
+  const handleCrosshairMove = useCallback((payload: { price: number; timeLabel: string; timeKey: string } | null) => {
+    if (!payload) {
+      setCrosshairText("--");
+      return;
+    }
+    setCrosshairText(`${payload.price.toFixed(2)} @ ${payload.timeLabel}`);
+  }, []);
 
   // ── Prediction V5 + Auto Trader V5 ─────────────────────────────────────────
   const prevAiConfRef = useRef(aiConfidencePct);
@@ -590,8 +604,11 @@ export default function TerminalChartV2(props: Props) {
 
         <span className="terminal-v2-sep" />
 
-        {(["1m", "5m", "15m"] as const).map((tf) => (
-          <button key={tf} type="button" className={`chart-chip ${timeframe === tf ? "active" : ""}`} onClick={() => onTimeframeChange(tf)}>{tf}</button>
+        {TERMINAL_V2_TIMEFRAME_SELECTOR_PRIMARY.map((tf) => (
+          <button key={tf} type="button" className={`chart-chip ${timeframe === tf ? "active" : ""}`} aria-pressed={timeframe === tf} onClick={() => onTimeframeChange(tf)}>{tf}</button>
+        ))}
+        {TERMINAL_V2_TIMEFRAME_SELECTOR_SECONDARY.map((tf) => (
+          <button key={tf} type="button" className={`chart-chip ${timeframe === tf ? "active" : ""}`} aria-pressed={timeframe === tf} onClick={() => onTimeframeChange(tf)}>{tf}</button>
         ))}
 
         <button type="button" className="chart-chip" onClick={onZoomIn}>Zoom +</button>
@@ -622,6 +639,7 @@ export default function TerminalChartV2(props: Props) {
               mode="candles"
               chartMotionPreset="balanced"
               visualMode="clean"
+              liveFeedKey={liveFeedKey}
               candles={safeCandles}
               overlayZones={[]}
               liquidityZones={[]}
@@ -635,13 +653,7 @@ export default function TerminalChartV2(props: Props) {
               viewportGrid={gpuViewportGrid}
               smoothingMs={chartSmoothingMs}
               multiSymbolFeeds={gpuViewportFeeds}
-              onCrosshairMove={(payload) => {
-                if (!payload) {
-                  setCrosshairText("--");
-                  return;
-                }
-                setCrosshairText(`${payload.price.toFixed(2)} @ ${payload.timeLabel}`);
-              }}
+              onCrosshairMove={handleCrosshairMove}
             />
           ) : (
             <InstitutionalChart
@@ -651,6 +663,7 @@ export default function TerminalChartV2(props: Props) {
               mode="candles"
               chartMotionPreset="balanced"
               visualMode="clean"
+              liveFeedKey={liveFeedKey}
               candles={safeCandles}
               overlayZones={[]}
               liquidityZones={[]}
@@ -660,13 +673,7 @@ export default function TerminalChartV2(props: Props) {
               indicatorSeries={indicatorSeriesProp as any}
               showSessions={false}
               candleTransform="none"
-              onCrosshairMove={(payload) => {
-                if (!payload) {
-                  setCrosshairText("--");
-                  return;
-                }
-                setCrosshairText(`${payload.price.toFixed(2)} @ ${payload.timeLabel}`);
-              }}
+              onCrosshairMove={handleCrosshairMove}
             />
           )}
         </div>

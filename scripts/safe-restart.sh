@@ -13,6 +13,8 @@ CHECK_INTERVAL_SEC="${CHECK_INTERVAL_SEC:-2}"
 WS_PATH="${WS_PATH:-/ws/v1/market/quotes}"
 WS_USERNAME="${WS_USERNAME:-operator}"
 WS_PASSWORD="${WS_PASSWORD:-}"
+TRADES_WS_INSTRUMENT="${TRADES_WS_INSTRUMENT:-BTCUSDT}"
+TRADES_WS_VENUE="${TRADES_WS_VENUE:-binance-public}"
 
 DEFAULT_CHECKS=(
   "/terminal"
@@ -130,9 +132,25 @@ STATIC_ASSETS_SUCCESS=0
 WS_START_TIME=0
 WS_END_TIME=0
 WS_SUCCESS=0
+TRADES_WS_SUCCESS=0
 RUN_SUCCESS=0
 ROLLBACK_TRIGGERED=0
 FAILURE_STAGE=""
+
+preflight_validate() {
+  log "Running preflight validation"
+
+  python3 -m py_compile "$ROOT_DIR/apps/market_data_plane/main.py" >"$RUN_DIR/preflight-backend.txt" 2>&1
+
+  if docker ps --format '{{.Names}}' | grep -qx 'mission-control-ui'; then
+    docker exec mission-control-ui sh -lc 'cd /workspace/ui/mission-control && npm run lint' \
+      >"$RUN_DIR/preflight-ui-lint.txt" 2>&1
+  else
+    printf 'mission-control-ui container not running; skipped containerized lint\n' >"$RUN_DIR/preflight-ui-lint.txt"
+  fi
+
+  log "Preflight validation passed"
+}
 
 dump_logs() {
   log "Dumping diagnostics to $RUN_DIR"
@@ -311,6 +329,20 @@ check_websocket() {
   fi
 }
 
+check_trades_websocket() {
+  if TRADES_WS_INSTRUMENT="$TRADES_WS_INSTRUMENT" TRADES_WS_VENUE="$TRADES_WS_VENUE" \
+    "$ROOT_DIR/scripts/smoke_market_trades_ws.sh" "$TRADES_WS_INSTRUMENT" "$TRADES_WS_VENUE" 5 \
+    >"$RUN_DIR/trades-websocket-check.txt" 2>&1; then
+    TRADES_WS_SUCCESS=1
+    log "Trades WebSocket smoke passed"
+    return 0
+  fi
+
+  TRADES_WS_SUCCESS=0
+  log "Trades WebSocket smoke failed"
+  return 1
+}
+
 export_json_summary() {
   local total_duration checks_duration ws_duration
   total_duration=$((SECONDS))
@@ -344,6 +376,11 @@ export_json_summary() {
     "success": $WS_SUCCESS,
     "latency_sec": $ws_duration
   },
+  "trades_websocket": {
+    "success": $TRADES_WS_SUCCESS,
+    "instrument": "$TRADES_WS_INSTRUMENT",
+    "venue": "$TRADES_WS_VENUE"
+  },
   "static_assets": {
     "success": $STATIC_ASSETS_SUCCESS
   },
@@ -354,14 +391,23 @@ EOF
   log "JSON summary exported to $RUN_DIR/summary.json"
 }
 
-log "Step 1/5: docker compose up -d"
+log "Step 0/6: preflight validation"
+if ! preflight_validate; then
+  FAILURE_STAGE="preflight"
+  dump_logs
+  log "FAILED (preflight). Diagnostics in $RUN_DIR"
+  export_json_summary
+  exit 1
+fi
+
+log "Step 1/6: docker compose up -d"
 if [[ $DRY_RUN -eq 1 ]]; then
   log "[DRY-RUN] Skipping docker compose up -d"
 else
   "${COMPOSE_BIN[@]}" up -d
 fi
 
-log "Step 2/5: wait services health/running"
+log "Step 2/6: wait services health/running"
 if ! wait_for_services; then
   FAILURE_STAGE="readiness"
   dump_logs
@@ -373,7 +419,7 @@ if ! wait_for_services; then
   exit 1
 fi
 
-log "Step 3/5: API checks"
+log "Step 3/6: API checks"
 if ! check_apis; then
   FAILURE_STAGE="checks"
   dump_logs
@@ -396,12 +442,17 @@ if ! check_static_assets; then
   exit 1
 fi
 
-log "Step 4/5: WebSocket check"
+log "Step 4/6: WebSocket check"
 if ! check_websocket; then
   log "WARNING: WebSocket check failed (continuing anyway)"
 fi
 
-log "Step 5/5: success"
+log "Step 5/6: trades WebSocket smoke"
+if ! check_trades_websocket; then
+  log "WARNING: trades WebSocket smoke failed (continuing anyway)"
+fi
+
+log "Step 6/6: success"
 log "OK - safe restart completed"
 RUN_SUCCESS=1
 export_json_summary

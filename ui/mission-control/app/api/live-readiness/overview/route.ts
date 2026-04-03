@@ -1,13 +1,13 @@
 import { NextResponse } from "next/server";
 
-import { cpFetchJsonSafe } from "../../../../lib/controlPlane";
+import { cpFetchJsonSafe, getControlPlaneNetworkMetricsSnapshot, withControlPlaneNetwork } from "../../../../lib/controlPlane";
 
 export async function GET(): Promise<NextResponse> {
   try {
-    const { response, payload } = await cpFetchJsonSafe("/v1/live-readiness/overview");
+    const { response, payload, network } = await cpFetchJsonSafe("/v1/live-readiness/overview");
     return NextResponse.json(
       {
-        ...((typeof payload === "object" && payload !== null) ? payload : { payload }),
+        ...withControlPlaneNetwork(payload, network),
         degraded: !response.ok,
         upstream_status: response.status,
       },
@@ -24,6 +24,7 @@ export async function GET(): Promise<NextResponse> {
         degraded: true,
         upstream_status: 0,
         detail: "live_readiness_unreachable",
+        network_metrics: getControlPlaneNetworkMetricsSnapshot(),
       },
       {
         status: 200,

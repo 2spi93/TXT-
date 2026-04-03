@@ -86,6 +86,9 @@ export default function ChartHudSignalDecisionPanel({
   selfLearningModelUpdatedAt,
   selfLearningDriftAutoDemotedAt,
   selfLearningAdaptiveWeights,
+  brainAttributionHeadline,
+  brainAttributionPills,
+  brainLearningRatePills,
   executionAdaptMode,
   onSetExecutionAdaptMode,
   pendingExecutionAdaptation,
@@ -222,6 +225,20 @@ export default function ChartHudSignalDecisionPanel({
               <span className="chart-action-pill">{intelligentExitV3.detail}</span>
               <span className={`chart-action-pill chart-action-pill-status ${trailingV3.tone}`}>TRAILING {trailingV3.status}</span>
               <span className="chart-action-pill">{trailingV3.detail}</span>
+            </div>
+          </div>
+          <div className="chart-execution-brain-v3">
+            <div className="chart-signal-kicker">Explainable RL</div>
+            <div className="chart-learning-strip">
+              <span>{brainAttributionHeadline}</span>
+            </div>
+            <div className="chart-execution-brain-v3-grid">
+              {brainAttributionPills.length > 0 ? brainAttributionPills.map((pill) => (
+                <span key={`brain-attr-${pill}`} className="chart-action-pill">{pill}</span>
+              )) : <span className="chart-action-pill">Attribution warming up</span>}
+              {brainLearningRatePills.length > 0 ? brainLearningRatePills.map((pill) => (
+                <span key={`brain-lr-${pill}`} className="chart-action-pill">{pill}</span>
+              )) : <span className="chart-action-pill">LR adaptation pending</span>}
             </div>
           </div>
           <div className="chart-auto-exec-panel">

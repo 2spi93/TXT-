@@ -2,10 +2,10 @@
  * MarketDataEngine V5 — Pipeline Unifié (Hedge Fund Grade)
  *
  * Architecture :
- *   EXCHANGE (WS trades + depth + OHLCV)
+ *   EXCHANGE (trades + depth + quotes)
  *         ↓
  *   CandleEngineV5  (reconstruction tick-level depuis trades)
- *   MarketDataEngineV3 (série OHLCV canonique)
+ *   MarketDataEngineV3 (backfill OHLCV uniquement)
  *         ↓
  *   MERGE  (V3 prioritaire + V5 comble les gaps)
  *         ↓
@@ -32,6 +32,7 @@ import {
 } from "./marketDataEngineV4";
 import { CandleEngineV5, type TradeForCandle, type GapRange } from "./candleEngineV5";
 import type { NormalizedOhlcvBar } from "./ohlcvIntegrity";
+import { aggregateBarsToTimeframe, canDeriveTimeframe, normalizeTimeframe, SUPPORTED_TIMEFRAMES } from "./ohlcvDataEngine";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -61,16 +62,22 @@ export type V5FlowScore = {
   };
 };
 
+type TimeframeRuntime = {
+  v3: MarketDataEngineV3;
+  candleEngine: CandleEngineV5;
+  lastGaps: GapRange[];
+};
+
 // ── Engine ─────────────────────────────────────────────────────────────────────
 
 export class MarketDataEngineV5 {
-  private v3: MarketDataEngineV3;
   private v4: MarketDataEngineV4;
-  private candleEngine: CandleEngineV5;
+  private runtimes: Map<string, TimeframeRuntime>;
 
   private timeframe: string;
   private instrument: string;
   private venue: string;
+  private supportedTimeframes: string[];
 
   private latencyOffsetMs = 0;
   private stable = false;
@@ -78,12 +85,94 @@ export class MarketDataEngineV5 {
   private backfillCallback: ((startMs: number, endMs: number) => void) | null = null;
 
   constructor(timeframe: string, instrument: string, venue: string) {
-    this.timeframe = timeframe;
+    this.timeframe = normalizeTimeframe(timeframe);
     this.instrument = instrument;
     this.venue = venue;
-    this.v3 = new MarketDataEngineV3(timeframe, instrument, venue);
     this.v4 = new MarketDataEngineV4();
-    this.candleEngine = new CandleEngineV5(timeframe);
+    this.supportedTimeframes = [...new Set([...SUPPORTED_TIMEFRAMES, this.timeframe])];
+    this.runtimes = this.createRuntimes();
+  }
+
+  private createRuntime(timeframe: string): TimeframeRuntime {
+    const normalized = normalizeTimeframe(timeframe);
+    return {
+      v3: new MarketDataEngineV3(normalized, this.instrument, this.venue),
+      candleEngine: new CandleEngineV5(normalized),
+      lastGaps: [],
+    };
+  }
+
+  private createRuntimes(): Map<string, TimeframeRuntime> {
+    const runtimes = new Map<string, TimeframeRuntime>();
+    for (const timeframe of this.supportedTimeframes) {
+      runtimes.set(timeframe, this.createRuntime(timeframe));
+    }
+    return runtimes;
+  }
+
+  private ensureRuntime(timeframe: string): TimeframeRuntime {
+    const normalized = normalizeTimeframe(timeframe);
+    const existing = this.runtimes.get(normalized);
+    if (existing) {
+      return existing;
+    }
+    const runtime = this.createRuntime(normalized);
+    if (this.latencyOffsetMs !== 0) {
+      runtime.candleEngine.setLatencyOffset(this.latencyOffsetMs);
+    }
+    this.runtimes.set(normalized, runtime);
+    if (!this.supportedTimeframes.includes(normalized)) {
+      this.supportedTimeframes.push(normalized);
+    }
+    return runtime;
+  }
+
+  private updateActiveGaps(timeframe = this.timeframe): void {
+    const runtime = this.ensureRuntime(timeframe);
+    const tradeSeries = runtime.candleEngine.getSeries();
+    const referenceSeries = tradeSeries.length > 0 ? tradeSeries : runtime.v3.getSeries();
+    runtime.lastGaps = runtime.candleEngine.detectGaps(referenceSeries);
+    if (timeframe === this.timeframe) {
+      this.lastGaps = runtime.lastGaps;
+    }
+  }
+
+  private mergedSeriesFor(timeframe: string): NormalizedOhlcvBar[] {
+    const normalized = normalizeTimeframe(timeframe);
+    const runtime = this.ensureRuntime(normalized);
+    const tradeSeries = runtime.candleEngine.getSeries();
+    const v3Series = runtime.v3.getSeries();
+
+    if (tradeSeries.length === 0) {
+      this.updateActiveGaps(normalized);
+      return v3Series;
+    }
+
+    this.updateActiveGaps(normalized);
+    if (normalized === this.timeframe && runtime.lastGaps.length > 0 && this.backfillCallback) {
+      for (const gap of runtime.lastGaps) {
+        this.backfillCallback(gap.startMs, gap.endMs);
+      }
+    }
+
+    const merged = runtime.candleEngine.mergeWithOhlcv(v3Series);
+    return this.latencyOffsetMs > 50
+      ? runtime.candleEngine.applyLatencyCompensation(merged, this.latencyOffsetMs)
+      : merged;
+  }
+
+  setActiveTimeframe(timeframe: string): void {
+    this.timeframe = normalizeTimeframe(timeframe);
+    this.ensureRuntime(this.timeframe);
+    this.updateActiveGaps(this.timeframe);
+  }
+
+  getActiveTimeframe(): string {
+    return this.timeframe;
+  }
+
+  getSupportedTimeframes(): string[] {
+    return [...this.supportedTimeframes];
   }
 
   // ── Bootstrap (PREBUILD AVANT RENDER) ────────────────────────────────────────
@@ -96,11 +185,22 @@ export class MarketDataEngineV5 {
    *    stable = true seulement après cette méthode.
    */
   bootstrap(input: BootstrapInput): void {
+    this.reset();
     this.stable = false;
 
-    // 1. V3 : série OHLCV canonique (REST bootstrap)
+    const activeTf = this.timeframe;
+
+    // 1. V3 : backfill OHLCV uniquement (historique / secours)
     if (input.ohlcvBars.length > 0) {
-      this.v3.ingestSnapshot(input.ohlcvBars);
+      const activeRuntime = this.ensureRuntime(activeTf);
+      activeRuntime.v3.ingestSnapshot(input.ohlcvBars);
+      for (const timeframe of this.supportedTimeframes) {
+        if (timeframe === activeTf || !canDeriveTimeframe(activeTf, timeframe)) {
+          continue;
+        }
+        const runtime = this.ensureRuntime(timeframe);
+        runtime.v3.ingestSnapshot(aggregateBarsToTimeframe(input.ohlcvBars, timeframe));
+      }
     }
 
     // 2. CandleV5 : reconstruction depuis batch trades
@@ -110,8 +210,11 @@ export class MarketDataEngineV5 {
         size: t.size,
         side: String(t.side ?? ""),
         tsMs: (t as TradeInput & { tsMs?: number }).tsMs ?? Date.now(),
+        exchangeTs: (t as TradeInput & { exchangeTs?: number }).exchangeTs,
       }));
-      this.candleEngine.ingestTrades(tradesToIngest);
+      for (const runtime of this.runtimes.values()) {
+        runtime.candleEngine.ingestTrades(tradesToIngest);
+      }
 
       // Nourrir V4 microstructure
       for (const t of input.trades) {
@@ -122,10 +225,13 @@ export class MarketDataEngineV5 {
     // 3. Latency offset initial
     if (input.latencyMs !== undefined) {
       this.latencyOffsetMs = input.latencyMs;
+      for (const runtime of this.runtimes.values()) {
+        runtime.candleEngine.setLatencyOffset(this.latencyOffsetMs);
+      }
     }
 
     // 4. Détection immédiate des gaps
-    this.lastGaps = this.candleEngine.detectGaps(this.v3.getSeries());
+    this.updateActiveGaps();
 
     // 5. Déclencher backfill si gaps détectés
     if (this.lastGaps.length > 0 && this.backfillCallback) {
@@ -140,23 +246,43 @@ export class MarketDataEngineV5 {
   // ── Ingestion temps réel ──────────────────────────────────────────────────────
 
   ingestWsBar(bar: NormalizedOhlcvBar): void {
-    this.v3.ingestWsBar(bar);
+    const activeRuntime = this.ensureRuntime(this.timeframe);
+    activeRuntime.v3.ingestWsBar(bar);
+    for (const timeframe of this.supportedTimeframes) {
+      if (timeframe === this.timeframe || !canDeriveTimeframe(this.timeframe, timeframe)) {
+        continue;
+      }
+      const runtime = this.ensureRuntime(timeframe);
+      const aggregated = aggregateBarsToTimeframe(activeRuntime.v3.getSeries(), timeframe);
+      runtime.v3.reset();
+      runtime.v3.ingestSnapshot(aggregated);
+    }
   }
 
   ingestTrade(trade: TradeInput & { tsMs?: number; exchangeTs?: number }): void {
     const ts = trade.exchangeTs ?? trade.tsMs ?? Date.now();
 
     // Candle reconstruction depuis trade
-    this.candleEngine.ingestTrade({
-      price: trade.price,
-      size: trade.size,
-      side: String(trade.side ?? ""),
-      tsMs: ts,
-      exchangeTs: trade.exchangeTs,
-    });
+    for (const runtime of this.runtimes.values()) {
+      runtime.candleEngine.ingestTrade({
+        price: trade.price,
+        size: trade.size,
+        side: String(trade.side ?? ""),
+        tsMs: ts,
+        exchangeTs: trade.exchangeTs,
+      });
+    }
 
     // Microstructure V4
     this.v4.ingestTrade(trade);
+  }
+
+  ingestTradeFast(price: number, size: number, sideFlag: number, tsMs: number, venue?: string): void {
+    for (const runtime of this.runtimes.values()) {
+      runtime.candleEngine.ingestTradeFast(price, size, sideFlag, tsMs);
+    }
+    this.v4.ingestTradeFast(price, size, sideFlag, tsMs);
+    this.v4.ingestTickFast(venue ?? this.venue, price, tsMs, size);
   }
 
   ingestTrades(trades: Array<TradeInput & { tsMs?: number; exchangeTs?: number }>): void {
@@ -170,7 +296,15 @@ export class MarketDataEngineV5 {
   ingestTick(price: number, tsMs: number, venue?: string): boolean {
     const v4tick: VenueTick = { venue: venue ?? this.venue ?? "primary", price, tsMs };
     this.v4.ingestTick(v4tick);
-    return this.v3.ingestTick(price, tsMs);
+    let activeChanged = false;
+    for (const [timeframe, runtime] of this.runtimes.entries()) {
+      const v3Changed = runtime.v3.ingestTick(price, tsMs);
+      const tradeChanged = runtime.candleEngine.ingestPriceTick(price, tsMs);
+      if (timeframe === this.timeframe) {
+        activeChanged = v3Changed || tradeChanged;
+      }
+    }
+    return activeChanged;
   }
 
   ingestDepth(delta: { bids?: DepthRow[]; asks?: DepthRow[] }): void {
@@ -183,44 +317,17 @@ export class MarketDataEngineV5 {
 
   // ── Série finale (merge - priorité OHLCV - gaps comblés par trades) ──────────
 
-  getSeries(): NormalizedOhlcvBar[] {
-    const v3Series = this.v3.getSeries();
-
-    // Détection et enregistrement des gaps
-    this.lastGaps = this.candleEngine.detectGaps(v3Series);
-
-    // Déclencher backfill pour les nouveaux gaps
-    if (this.lastGaps.length > 0 && this.backfillCallback) {
-      for (const gap of this.lastGaps) {
-        this.backfillCallback(gap.startMs, gap.endMs);
-      }
-    }
-
-    const tradeSeries = this.candleEngine.getSeries();
-
-    // Pas de trades → série V3 pure
-    if (tradeSeries.length === 0) return v3Series;
-
-    // Merge : trades comblent les trous de V3
-    const merged = this.candleEngine.mergeWithOhlcv(v3Series);
-
-    // Latency compensation
-    if (this.latencyOffsetMs > 50) {
-      return this.candleEngine.applyLatencyCompensation(merged, this.latencyOffsetMs);
-    }
-
-    return merged;
+  getSeries(timeframe = this.timeframe): NormalizedOhlcvBar[] {
+    return this.mergedSeriesFor(timeframe);
   }
 
-  getSeriesSnapshot(): V5SeriesSnapshot {
-    const v3Series = this.v3.getSeries();
-    const tradeSeries = this.candleEngine.getSeries();
-    const gaps = this.candleEngine.detectGaps(v3Series);
+  getSeriesSnapshot(timeframe = this.timeframe): V5SeriesSnapshot {
+    const runtime = this.ensureRuntime(timeframe);
+    const v3Series = runtime.v3.getSeries();
+    const tradeSeries = runtime.candleEngine.getSeries();
+    const gaps = runtime.candleEngine.detectGaps(v3Series);
 
-    const merged = this.candleEngine.mergeWithOhlcv(v3Series);
-    const bars = this.latencyOffsetMs > 50
-      ? this.candleEngine.applyLatencyCompensation(merged, this.latencyOffsetMs)
-      : merged;
+    const bars = this.getSeries(timeframe);
 
     const source: V5SeriesSnapshot["source"] =
       tradeSeries.length > 0 && gaps.length > 0 ? "merged"
@@ -230,8 +337,9 @@ export class MarketDataEngineV5 {
     return { bars, isStable: this.stable, gapsDetected: gaps, tradeCandleCount: tradeSeries.length, source };
   }
 
-  getCurrentBar(): NormalizedOhlcvBar | null {
-    return this.v3.getCurrentBar() ?? this.candleEngine.getLatestCandle();
+  getCurrentBar(timeframe = this.timeframe): NormalizedOhlcvBar | null {
+    const runtime = this.ensureRuntime(timeframe);
+    return runtime.candleEngine.getLatestCandle() ?? runtime.v3.getCurrentBar();
   }
 
   // ── Double Buffer (pour render zéro jitter) ───────────────────────────────────
@@ -240,16 +348,18 @@ export class MarketDataEngineV5 {
    * Prépare le back-buffer avec la série courante.
    * Appeler avant requestAnimationFrame.
    */
-  prepareFrame(): void {
-    this.candleEngine.prepareBackBuffer();
+  prepareFrame(series?: NormalizedOhlcvBar[], timeframe = this.timeframe): void {
+    const runtime = this.ensureRuntime(timeframe);
+    runtime.candleEngine.prepareBackBuffer(series ?? this.getSeries(timeframe));
   }
 
   /**
    * Swaps front ↔ back buffer.
    * Appeler DANS requestAnimationFrame pour un render atomique.
    */
-  swapFrame(): NormalizedOhlcvBar[] {
-    return this.candleEngine.swapBuffers();
+  swapFrame(timeframe = this.timeframe): NormalizedOhlcvBar[] {
+    const runtime = this.ensureRuntime(timeframe);
+    return runtime.candleEngine.swapBuffers();
   }
 
   // ── Microstructure V4 ─────────────────────────────────────────────────────────
@@ -291,6 +401,9 @@ export class MarketDataEngineV5 {
 
   updateLatencyOffset(latencyMs: number): void {
     this.latencyOffsetMs = latencyMs;
+    for (const runtime of this.runtimes.values()) {
+      runtime.candleEngine.setLatencyOffset(latencyMs);
+    }
   }
 
   getLatencyOffset(): number {
@@ -303,7 +416,7 @@ export class MarketDataEngineV5 {
   syncLatencyFromV4(): void {
     const micro = this.v4.getSnapshot();
     if (micro.avgLatencyMs > 0) {
-      this.latencyOffsetMs = Math.round(micro.avgLatencyMs);
+      this.updateLatencyOffset(Math.round(micro.avgLatencyMs));
     }
   }
 
@@ -334,25 +447,32 @@ export class MarketDataEngineV5 {
     latencyOffsetMs: number;
     stable: boolean;
     flowScore: V5FlowScore;
+    timeframeCount: number;
+    activeTimeframe: string;
   } {
+    const activeRuntime = this.ensureRuntime(this.timeframe);
     return {
-      v3: this.v3.getStats(),
-      tradeCandleCount: this.candleEngine.getCandleCount(),
+      v3: activeRuntime.v3.getStats(),
+      tradeCandleCount: activeRuntime.candleEngine.getCandleCount(),
       gapCount: this.lastGaps.length,
       latencyOffsetMs: this.latencyOffsetMs,
       stable: this.stable,
       flowScore: this.getFlowScore(),
+      timeframeCount: this.runtimes.size,
+      activeTimeframe: this.timeframe,
     };
   }
 
   // ── Reset ──────────────────────────────────────────────────────────────────────
 
   reset(): void {
-    this.v3 = new MarketDataEngineV3(this.timeframe, this.instrument, this.venue);
+    this.runtimes = this.createRuntimes();
     this.v4.reset();
-    this.candleEngine.reset();
     this.stable = false;
     this.lastGaps = [];
     this.latencyOffsetMs = 0;
+    for (const runtime of this.runtimes.values()) {
+      runtime.candleEngine.setLatencyOffset(0);
+    }
   }
 }

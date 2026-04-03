@@ -265,6 +265,9 @@ export type ChartHudSignalDecisionPanelProps = {
   selfLearningModelUpdatedAt: string | null;
   selfLearningDriftAutoDemotedAt: string | null;
   selfLearningAdaptiveWeights: SelfLearningAdaptiveWeightsShape;
+  brainAttributionHeadline: string;
+  brainAttributionPills: string[];
+  brainLearningRatePills: string[];
   executionAdaptMode: ExecutionAdaptMode;
   onSetExecutionAdaptMode: (mode: ExecutionAdaptMode) => void;
   pendingExecutionAdaptation: PendingExecutionAdaptationShape | null;

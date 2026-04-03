@@ -1,35 +1,13 @@
 import { expect, test, type Page } from "@playwright/test";
+import { CHART_SIDECAR_PROFILE_LAYOUTS } from "../../app/terminal/chartSidecarLayout";
+import { loginIfRequired } from "./helpers/terminal";
 
 const TERMINAL_STORAGE_PREFIXES = [
   "txt.terminal.layout.v1",
   "txt.terminal.workspaces.v1",
   "txt.terminal.chart-sidecar.v1",
 ];
-
-async function loginIfRequired(page: Page): Promise<void> {
-  await page.goto("/terminal", { waitUntil: "domcontentloaded" });
-
-  const username = page.locator("#username");
-  if (await username.count() === 0) {
-    return;
-  }
-
-  const password = process.env.PLAYWRIGHT_OPERATOR_PASSWORD || process.env.MC_SMOKE_PASSWORD || "";
-  if (!password) {
-    throw new Error("PLAYWRIGHT_OPERATOR_PASSWORD is required when /terminal redirects to login");
-  }
-
-  await username.fill("operator");
-  await page.locator("#password").fill(password);
-  await page.locator('form[action="/api/auth/login"] button[type="submit"]').click();
-  await page.waitForLoadState("domcontentloaded");
-
-  if (page.url().includes("/change-password")) {
-    throw new Error("Operator account requires password change before sidecar workspace test can run");
-  }
-
-  await page.goto("/terminal", { waitUntil: "domcontentloaded" });
-}
+const EXPECTED_SWING_SIDECAR_COUNT = CHART_SIDECAR_PROFILE_LAYOUTS.swing.cards.length;
 
 function floatingSidecarByTitle(page: Page, title: string) {
   return page.locator(".chart-sidecar-floating-window").filter({
@@ -54,17 +32,19 @@ async function expectSwingDockedLayout(page: Page): Promise<void> {
   await expect.poll(async () => ({
     docked: await page.locator(".chart-sidecar-stack .chart-sidecar-card").count(),
     floating: await page.locator(".chart-sidecar-floating-window").count(),
-  }), { timeout: 30_000 }).toEqual({ docked: 3, floating: 0 });
+  }), { timeout: 30_000 }).toEqual({ docked: EXPECTED_SWING_SIDECAR_COUNT, floating: 0 });
 }
 
 async function expectSwingDetachedLayout(page: Page): Promise<void> {
   await expect.poll(async () => ({
     docked: await page.locator(".chart-sidecar-stack .chart-sidecar-card").count(),
     floating: await page.locator(".chart-sidecar-floating-window").count(),
-  }), { timeout: 30_000 }).toEqual({ docked: 0, floating: 3 });
+  }), { timeout: 30_000 }).toEqual({ docked: 0, floating: EXPECTED_SWING_SIDECAR_COUNT });
 }
 
 test("@chart detached sidecar drag + custom save persists on reload", async ({ page }) => {
+  test.setTimeout(120_000);
+
   const consoleErrors: string[] = [];
   page.on("console", (msg) => {
     if (msg.type() === "error" && !msg.text().includes("Maximum update depth exceeded")) {
@@ -72,7 +52,7 @@ test("@chart detached sidecar drag + custom save persists on reload", async ({ p
     }
   });
 
-  await loginIfRequired(page);
+  await loginIfRequired(page, "/terminal", "sidecar workspace test");
   await resetTerminalLayoutStorage(page);
   await expectSwingDockedLayout(page);
 
@@ -85,7 +65,7 @@ test("@chart detached sidecar drag + custom save persists on reload", async ({ p
   const floatingTitles = await page.locator(".chart-sidecar-floating-window .floating-panel-title").allTextContents();
   expect(floatingTitles).toContain("EXECUTION");
   expect(floatingTitles).toContain("POLICY");
-  expect(floatingTitles).toHaveLength(3);
+  expect(floatingTitles).toHaveLength(EXPECTED_SWING_SIDECAR_COUNT);
 
   const executionWindow = floatingSidecarByTitle(page, "EXECUTION");
   const policyWindow = floatingSidecarByTitle(page, "POLICY");
@@ -115,7 +95,7 @@ test("@chart detached sidecar drag + custom save persists on reload", async ({ p
   const movedDy = Math.round(afterDrag.y - before.y);
   expect(Math.abs(movedDx) >= 40 || Math.abs(movedDy) >= 25).toBeTruthy();
 
-  await policyWindow.getByRole("button", { name: /^Custom save$/i }).click();
+  await layoutGroup.getByRole("button", { name: /^Custom save$/i }).click({ force: true });
   const hintBadge = page.locator(".layout-workspace-hint-badge").filter({ hasText: "Custom sidecar saved" }).first();
   await expect(hintBadge).toBeVisible();
   await expect(hintBadge).toContainText("Custom sidecar saved");

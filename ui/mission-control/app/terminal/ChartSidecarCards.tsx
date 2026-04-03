@@ -471,6 +471,14 @@ export function LocalFeedSidecarCard({
 type ForensicReplaySidecarCardProps = {
   headActions?: ReactNode;
   captureClientId: string | null;
+  attributionHeadline: string;
+  attributionContextLabel: string;
+  attributionPills: string[];
+  agentLearningHeadline: string;
+  agentLearningPills: string[];
+  latentHeadline: string;
+  provenanceHeadline: string;
+  latentPills: string[];
   frames: Array<{
     capturedAt: string;
     feedLabel: string;
@@ -478,6 +486,8 @@ type ForensicReplaySidecarCardProps = {
     blockedByFiveStateFailure: boolean;
     noCandlesExpected: boolean;
     exactStateVector: string[];
+    replayLatentLabel: string;
+    replayOriginLabel: string;
   }>;
   autoIncidentTicketKey: string | null;
   autoIncidentStatus: string | null;
@@ -486,6 +496,14 @@ type ForensicReplaySidecarCardProps = {
 export function ForensicReplaySidecarCard({
   headActions,
   captureClientId,
+  attributionHeadline,
+  attributionContextLabel,
+  attributionPills,
+  agentLearningHeadline,
+  agentLearningPills,
+  latentHeadline,
+  provenanceHeadline,
+  latentPills,
   frames,
   autoIncidentTicketKey,
   autoIncidentStatus,
@@ -497,6 +515,42 @@ export function ForensicReplaySidecarCard({
         <ChartActionPill>{captureClientId || "no-client"}</ChartActionPill>
         <ChartActionPill status={autoIncidentStatus === "opened" ? "bad" : autoIncidentStatus === "closed" ? "good" : "warn"}>incident {autoIncidentTicketKey || autoIncidentStatus || "none"}</ChartActionPill>
       </div>
+      <div className="chart-sidecar-execution-stack">
+        <div className="chart-sidecar-kicker">Attribution Replay</div>
+        <div className="chart-sidecar-preview-grid">
+          <span>Leader</span><strong>{attributionHeadline}</strong>
+          <span>Context</span><strong>{attributionContextLabel}</strong>
+        </div>
+        <div className="chart-sidecar-grid">
+          {attributionPills.length > 0 ? attributionPills.map((pill) => (
+            <ChartActionPill key={`forensic-attribution-${pill}`}>{pill}</ChartActionPill>
+          )) : <ChartActionPill>Attribution warming up</ChartActionPill>}
+        </div>
+      </div>
+      <div className="chart-sidecar-execution-stack">
+        <div className="chart-sidecar-kicker">Latent / Dream</div>
+        <div className="chart-sidecar-preview-grid">
+          <span>Transition</span><strong>{latentHeadline}</strong>
+          <span>Provenance</span><strong>{provenanceHeadline}</strong>
+        </div>
+        <div className="chart-sidecar-grid">
+          {latentPills.length > 0 ? latentPills.map((pill) => (
+            <ChartActionPill key={`forensic-latent-${pill}`}>{pill}</ChartActionPill>
+          )) : <ChartActionPill>Latent state warming up</ChartActionPill>}
+        </div>
+      </div>
+      <div className="chart-sidecar-execution-stack">
+        <div className="chart-sidecar-kicker">Agent LR</div>
+        <div className="chart-sidecar-preview-grid">
+          <span>Spread</span><strong>{agentLearningHeadline}</strong>
+          <span>Why</span><strong>{agentLearningPills[0] || "No agent LR trace yet"}</strong>
+        </div>
+        <div className="chart-sidecar-grid">
+          {agentLearningPills.length > 0 ? agentLearningPills.map((pill) => (
+            <ChartActionPill key={`forensic-agent-lr-${pill}`}>{pill}</ChartActionPill>
+          )) : <ChartActionPill>Agent LR warming up</ChartActionPill>}
+        </div>
+      </div>
       <div className="chart-sidecar-scroll">
         {frames.length === 0 ? <div className="chart-sidecar-row flat"><span>No forensic frames yet</span></div> : null}
         {frames.map((frame) => (
@@ -504,7 +558,7 @@ export function ForensicReplaySidecarCard({
             <span>{frame.capturedAt.slice(11, 19)}</span>
             <span>{frame.signal.replace("OHLCV_", "")}</span>
             <span>{frame.blockedByFiveStateFailure ? "5X FAIL" : frame.noCandlesExpected ? "NO CANDLES" : "FLOWING"}</span>
-            <span>{frame.exactStateVector.join(" · ")}</span>
+            <span>{[...frame.exactStateVector, frame.replayLatentLabel, frame.replayOriginLabel].filter(Boolean).join(" · ")}</span>
           </div>
         ))}
       </div>

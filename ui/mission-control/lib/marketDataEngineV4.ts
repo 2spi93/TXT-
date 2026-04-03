@@ -217,6 +217,15 @@ export class MarketDataEngineV4 {
     this._checkMomentumFlip();
   }
 
+  ingestTradeFast(price: number, size: number, sideFlag: number, tsMs: number): void {
+    this.ingestTrade({
+      price,
+      size,
+      side: sideFlag > 0 ? "sell" : "buy",
+      tsMs,
+    });
+  }
+
   // ── Ingestion Tick (multi-feed) ─────────────────────────────────────────────
 
   ingestTick(tick: VenueTick): void {
@@ -240,6 +249,10 @@ export class MarketDataEngineV4 {
     }
 
     this._checkMomentumFlip();
+  }
+
+  ingestTickFast(venue: string, price: number, tsMs: number, size?: number): void {
+    this.ingestTick({ venue, price, tsMs, size });
   }
 
   // ── Reset (changement config) ────────────────────────────────────────────────

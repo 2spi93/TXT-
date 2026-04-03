@@ -65,7 +65,7 @@ export async function POST(request: Request): Promise<NextResponse> {
   cookieStore.set("mc_token_compat", payload.access_token, {
     httpOnly: true,
     sameSite: "lax",
-    secure: false,
+    secure: secureCookie,
     path: "/",
     maxAge: 2 * 3600,
   });

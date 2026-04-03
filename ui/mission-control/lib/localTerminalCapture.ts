@@ -3,6 +3,32 @@ export type LocalHealthTone = "good" | "warn" | "bad";
 export type LocalStreamState = "offline" | "connecting" | "live";
 export type LocalOhlcvSignal = "OHLCV_RENDERABLE" | "OHLCV_PARTIAL" | "OHLCV_UNUSABLE";
 
+export type LocalTerminalPerceptualRuntime = {
+  engine: "v3" | "v4";
+  densityLevel: string;
+  visibleBars: number;
+  candleStepPx: number;
+  profile: string | null;
+  renderer: string | null;
+  gridLabel: string | null;
+  pixelSnapping: boolean;
+  denseMode: string | null;
+  preferredBodyWidthPx: number | null;
+  wickWidthPx: number | null;
+  minGapPx: number | null;
+  fps: number;
+  frameTimeMs: number | null;
+  cpuLoad: number | null;
+  workerLatencyMs: number | null;
+  drawCalls: number | null;
+  batchSize: number | null;
+  reframeCount: number | null;
+  transitionMode: string | null;
+  lastPriceDriftPx: number | null;
+  peakPriceDriftPx: number | null;
+  updatedAt: string;
+};
+
 export type LocalTerminalRuntimeCapture = {
   version: 1;
   clientId: string;
@@ -72,6 +98,13 @@ export type LocalTerminalRuntimeCapture = {
       tone: LocalHealthTone;
       display: string;
     };
+    candles: {
+      receivedTicks: number;
+      candleUpdates: number;
+      syntheticHeartbeatOpens: number;
+      lastUpdateAge: string;
+    };
+    perceptual: LocalTerminalPerceptualRuntime | null;
     compactAlertLabel: string;
     alertText: string;
     exactStateVector: string[];
@@ -134,8 +167,13 @@ export type BuildLocalTerminalRuntimeCaptureInput = {
   barsAge: string;
   depthAge: string;
   tradesAge: string;
+  candleTicks: number;
+  candleUpdates: number;
+  syntheticHeartbeatOpens: number;
+  candleLastUpdateAge: string;
   chartCompactAlertLabel: string;
   chartFlowAlertText: string;
+  perceptual?: LocalTerminalPerceptualRuntime | null;
 };
 
 const MAX_CAPTURE_COUNT = 12;
@@ -259,6 +297,13 @@ export function buildLocalTerminalRuntimeCapture(input: BuildLocalTerminalRuntim
         tone: asToneForStatus(input.tradesFreshnessState),
         display: `TRADES ${input.tradesFreshnessState.toUpperCase()} ${input.tradesAge}`,
       },
+      candles: {
+        receivedTicks: input.candleTicks,
+        candleUpdates: input.candleUpdates,
+        syntheticHeartbeatOpens: input.syntheticHeartbeatOpens,
+        lastUpdateAge: input.candleLastUpdateAge,
+      },
+      perceptual: input.perceptual || null,
       compactAlertLabel: input.chartCompactAlertLabel,
       alertText: input.chartFlowAlertText,
       exactStateVector,
@@ -421,6 +466,7 @@ export function summarizeLocalTerminalCaptures(store: PersistedLocalTerminalCapt
   local_feed_signal: LocalOhlcvSignal;
   exact_state_vector: string[];
   no_candles_expected: boolean;
+  synthetic_heartbeat_opens: number;
   history_count: number;
 }> {
   return Object.values(store.captures)
@@ -432,6 +478,7 @@ export function summarizeLocalTerminalCaptures(store: PersistedLocalTerminalCapt
       local_feed_signal: capture.localFeed.signal,
       exact_state_vector: capture.runtime.exactStateVector,
       no_candles_expected: capture.runtime.noCandlesExpected,
+      synthetic_heartbeat_opens: capture.runtime.candles?.syntheticHeartbeatOpens ?? 0,
       history_count: store.captureHistory[capture.clientId]?.length || 0,
     }));
 }

@@ -1,6 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 
-import { cpFetch } from "../../../../../lib/controlPlane";
+import {
+  classifyControlPlaneNetworkRegime,
+  computeControlPlaneInfraHealth,
+  cpFetchJsonSafe,
+  getControlPlaneNetworkMetricsSnapshot,
+  withControlPlaneNetwork,
+} from "../../../../../lib/controlPlane";
 
 const ROUTING_RATE_WINDOW_MS = 2000;
 const ROUTING_RATE_MAX = 5;
@@ -42,6 +48,7 @@ type RoutingRequestContext = {
   bypassCircuitOpen: boolean;
   cacheTtlMs: number;
   rateLimitMax: number;
+  schedulingProfile: "stable" | "degraded" | "critical";
 };
 
 const routingGuardGlobal = globalThis as typeof globalThis & {
@@ -101,6 +108,33 @@ function buildRequestContext(request: NextRequest): RoutingRequestContext {
     bypassCircuitOpen: priorityExecution,
     cacheTtlMs: highVolatility ? ROUTING_CACHE_TTL_MS_VOLATILE : ROUTING_CACHE_TTL_MS,
     rateLimitMax: highVolatility ? ROUTING_RATE_MAX_VOLATILE : ROUTING_RATE_MAX,
+    schedulingProfile: "stable",
+  };
+}
+
+function applyInfraScheduling(
+  context: RoutingRequestContext,
+  networkRegime: "stable" | "degraded" | "critical",
+): RoutingRequestContext {
+  if (networkRegime === "stable") {
+    return context;
+  }
+  if (networkRegime === "critical") {
+    return {
+      ...context,
+      bypassCache: context.priorityExecution,
+      bypassRateLimit: context.priorityExecution,
+      cacheTtlMs: Math.max(context.cacheTtlMs * 4, ROUTING_CACHE_TTL_MS * 4),
+      rateLimitMax: Math.max(1, Math.floor(context.rateLimitMax * 0.4)),
+      schedulingProfile: "critical",
+    };
+  }
+  return {
+    ...context,
+    bypassCache: context.priorityExecution,
+    cacheTtlMs: Math.max(context.cacheTtlMs * 2, ROUTING_CACHE_TTL_MS * 2),
+    rateLimitMax: Math.max(2, Math.floor(context.rateLimitMax * 0.6)),
+    schedulingProfile: "degraded",
   };
 }
 
@@ -246,14 +280,27 @@ function degradedRoutingScore(symbol: string, detail: string, extra: Record<stri
     routes: [],
     degraded: true,
     detail,
+    failure_source: "infra",
+    failure_reasons: [detail],
+    failure_blocking: true,
     ...extra,
   };
+}
+
+function asObject(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
 }
 
 export async function GET(request: NextRequest): Promise<NextResponse> {
   const nowMs = Date.now();
   const symbol = normalizeSymbol(request.nextUrl.searchParams.get("symbol"));
-  const context = buildRequestContext(request);
+  const baseContext = buildRequestContext(request);
+  const networkMetrics = getControlPlaneNetworkMetricsSnapshot();
+  const infraHealth = computeControlPlaneInfraHealth(networkMetrics);
+  const networkRegime = classifyControlPlaneNetworkRegime(networkMetrics, infraHealth);
+  const context = applyInfraScheduling(baseContext, networkRegime);
   const guard = getOrCreateSessionGuard(sessionKeyFromRequest(request), nowMs);
   guard.requestCount += 1;
 
@@ -264,6 +311,8 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       headers: {
         "x-mc-routing-guard": "cache-hit",
         "x-mc-routing-profile": context.highVolatility ? "volatile" : "normal",
+          "x-mc-routing-scheduler": context.schedulingProfile,
+          "x-mc-routing-network-regime": networkRegime,
         "cache-control": "no-store",
       },
     });
@@ -283,6 +332,8 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
           "x-mc-routing-guard": "fallback-used",
           "x-mc-routing-fallback-source": "circuit-open",
           "x-mc-routing-fallback-age-ms": String(Math.max(0, nowMs - fallback.atMs)),
+          "x-mc-routing-scheduler": context.schedulingProfile,
+          "x-mc-routing-network-regime": networkRegime,
           "cache-control": "no-store",
         },
       });
@@ -296,6 +347,8 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
         headers: {
           "x-mc-routing-guard": "circuit-open-degraded",
           "x-mc-routing-profile": context.highVolatility ? "volatile" : "normal",
+          "x-mc-routing-scheduler": context.schedulingProfile,
+          "x-mc-routing-network-regime": networkRegime,
           "cache-control": "no-store",
         },
       },
@@ -311,6 +364,8 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
           "x-mc-routing-guard": "fallback-used",
           "x-mc-routing-fallback-source": "rate-limited",
           "x-mc-routing-fallback-age-ms": String(Math.max(0, nowMs - fallback.atMs)),
+          "x-mc-routing-scheduler": context.schedulingProfile,
+          "x-mc-routing-network-regime": networkRegime,
           "cache-control": "no-store",
         },
       });
@@ -324,6 +379,8 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
         status: 200,
         headers: {
           "x-mc-routing-guard": "rate-limited-degraded",
+          "x-mc-routing-scheduler": context.schedulingProfile,
+          "x-mc-routing-network-regime": networkRegime,
           "cache-control": "no-store",
         },
       },
@@ -331,22 +388,26 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   }
 
   try {
-    const response = await cpFetch(`/v1/execution/routing/score?symbol=${encodeURIComponent(symbol)}`);
-    const rawText = await response.text();
-    const payload = parseJsonSafe<unknown>(rawText, {
-      detail: "routing_score_invalid_json",
-      symbol,
-      raw: rawText.slice(0, 500),
-    });
+    const { response, payload, network } = await cpFetchJsonSafe(
+      `/v1/execution/routing/score?symbol=${encodeURIComponent(symbol)}&infra_health=${encodeURIComponent(String(infraHealth))}&network_regime=${encodeURIComponent(networkRegime)}`,
+    );
+    const payloadMap = asObject(payload);
+    const envelope = {
+      ...withControlPlaneNetwork(payloadMap, network),
+      infra_health: Number.isFinite(Number(payloadMap.infra_health)) ? Number(payloadMap.infra_health) : infraHealth,
+      network_regime: String(payloadMap.network_regime || networkRegime),
+    };
 
     if (response.ok) {
-      setCache(guard, symbol, response.status, payload, nowMs);
+      setCache(guard, symbol, response.status, envelope, nowMs);
       resetUpstreamFailure(guard, symbol);
-      return NextResponse.json(payload, {
+      return NextResponse.json(envelope, {
         status: response.status,
         headers: {
           "x-mc-routing-guard": context.priorityExecution ? "priority-bypass" : "live",
           "x-mc-routing-profile": context.highVolatility ? "volatile" : "normal",
+          "x-mc-routing-scheduler": context.schedulingProfile,
+          "x-mc-routing-network-regime": networkRegime,
           "cache-control": "no-store",
         },
       });
@@ -363,6 +424,8 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
           "x-mc-routing-guard": "fallback-used",
           "x-mc-routing-fallback-source": "upstream-error",
           "x-mc-routing-fallback-age-ms": String(Math.max(0, nowMs - fallback.atMs)),
+          "x-mc-routing-scheduler": context.schedulingProfile,
+          "x-mc-routing-network-regime": networkRegime,
           "cache-control": "no-store",
         },
       });
@@ -371,11 +434,16 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       degradedRoutingScore(symbol, "routing_score_upstream_error", {
         upstream_status: response.status,
         upstream_payload: payload,
+        network_metrics: networkMetrics,
+        infra_health: infraHealth,
+        network_regime: networkRegime,
       }),
       {
         status: 200,
         headers: {
           "x-mc-routing-guard": "live-error-degraded",
+          "x-mc-routing-scheduler": context.schedulingProfile,
+          "x-mc-routing-network-regime": networkRegime,
           "cache-control": "no-store",
         },
       },
@@ -390,16 +458,24 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
           "x-mc-routing-guard": "fallback-used",
           "x-mc-routing-fallback-source": "upstream-unreachable",
           "x-mc-routing-fallback-age-ms": String(Math.max(0, nowMs - fallback.atMs)),
+          "x-mc-routing-scheduler": context.schedulingProfile,
+          "x-mc-routing-network-regime": networkRegime,
           "cache-control": "no-store",
         },
       });
     }
     return NextResponse.json(
-      degradedRoutingScore(symbol, "routing_score_upstream_unreachable"),
+      degradedRoutingScore(symbol, "routing_score_upstream_unreachable", {
+        network_metrics: networkMetrics,
+        infra_health: infraHealth,
+        network_regime: networkRegime,
+      }),
       {
         status: 200,
         headers: {
           "x-mc-routing-guard": "upstream-unreachable-degraded",
+          "x-mc-routing-scheduler": context.schedulingProfile,
+          "x-mc-routing-network-regime": networkRegime,
           "cache-control": "no-store",
         },
       },

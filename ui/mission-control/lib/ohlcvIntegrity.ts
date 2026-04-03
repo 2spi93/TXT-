@@ -1,4 +1,4 @@
-import { alignIsoToSlot, buildTimeSeries } from "./ohlcvDataEngine";
+import { alignIsoToSlot, buildTimeSeries, timeframeToMs } from "./ohlcvDataEngine";
 
 export type NormalizedOhlcvBar = {
   t: string;
@@ -33,6 +33,8 @@ type NormalizeOhlcvOptions = {
   venue?: string;
   timeframe?: string;
 };
+
+export const DEFAULT_MIN_RENDERABLE_BARS = 20;
 
 const MAX_GAP_FILL_BARS = 120;
 
@@ -157,26 +159,6 @@ export function normalizeOhlcvRows(
   return buildTimeSeries(aligned, tf);
 }
 
-function timeframeToMs(timeframe: string): number {
-  const raw = String(timeframe || "").trim().toLowerCase();
-  const match = raw.match(/^(\d+)([smhdw])$/);
-  if (!match) {
-    return 60_000;
-  }
-  const amount = Math.max(1, Number(match[1]));
-  const unit = match[2];
-  const unitMs = unit === "s"
-    ? 1_000
-    : unit === "m"
-      ? 60_000
-      : unit === "h"
-        ? 3_600_000
-        : unit === "d"
-          ? 86_400_000
-          : 604_800_000;
-  return amount * unitMs;
-}
-
 function fillMissingTimeSlots(rows: NormalizedOhlcvBar[], timeframe: string): NormalizedOhlcvBar[] {
   if (rows.length <= 1) {
     return rows;
@@ -229,7 +211,7 @@ function fillMissingTimeSlots(rows: NormalizedOhlcvBar[], timeframe: string): No
 export function analyzeOhlcvRows(
   payload: unknown,
   options: NormalizeOhlcvOptions = {},
-  minimumRenderableBars = 20,
+  minimumRenderableBars = DEFAULT_MIN_RENDERABLE_BARS,
 ): OhlcvRenderabilityAnalysis {
   const rows = Array.isArray(payload) ? payload : [];
   const droppedReasonKinds = new Set<string>();

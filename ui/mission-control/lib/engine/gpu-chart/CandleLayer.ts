@@ -12,8 +12,11 @@ layout(location = 4) in float aLowY;
 layout(location = 5) in float aCloseY;
 layout(location = 6) in float aHalfWidth;
 layout(location = 7) in vec3 aColor;
+layout(location = 8) in float aWickHalfWidth;
 
 out vec3 vColor;
+out vec2 vLocal;
+out float vWickMask;
 
 void main() {
   float bodyTop = max(aOpenY, aCloseY);
@@ -22,9 +25,12 @@ void main() {
   float yTop = mix(bodyTop, aHighY, wickMask);
   float yBottom = mix(bodyBottom, aLowY, wickMask);
 
-  float x = aCenterX + aLocal.x * aHalfWidth;
+  float xHalfWidth = mix(aHalfWidth, aWickHalfWidth, wickMask);
+  float x = aCenterX + aLocal.x * xHalfWidth;
   float y = mix(yBottom, yTop, (aLocal.y + 1.0) * 0.5);
   vColor = aColor;
+  vLocal = aLocal;
+  vWickMask = wickMask;
   gl_Position = vec4(x, y, 0.0, 1.0);
 }
 `;
@@ -33,10 +39,34 @@ const FRAGMENT_SHADER = `#version 300 es
 precision highp float;
 
 in vec3 vColor;
+in vec2 vLocal;
+in float vWickMask;
 out vec4 outColor;
 
 void main() {
-  outColor = vec4(vColor, 0.98);
+  float verticalLight = mix(0.84, 1.16, (vLocal.y + 1.0) * 0.5);
+  float faceHighlight = smoothstep(1.0, 0.18, abs(vLocal.x)) * 0.11;
+  float edgeHighlight = smoothstep(0.95, 0.35, vLocal.y) * 0.07;
+  float innerShadow = smoothstep(0.18, 1.0, abs(vLocal.x)) * 0.08;
+  float emboss = smoothstep(0.0, 0.82, 1.0 - abs(vLocal.y)) * 0.035;
+
+  float wickTaper = mix(1.0, 0.64, smoothstep(0.0, 1.0, abs(vLocal.y)));
+  float wickAlpha = 1.0 - smoothstep(wickTaper, 1.0, abs(vLocal.x));
+  float wickGlow = smoothstep(0.94, 0.15, 1.0 - abs(vLocal.x)) * smoothstep(0.72, 1.0, abs(vLocal.y)) * 0.16;
+
+  vec3 bodyColor = vColor * verticalLight;
+  bodyColor += vec3(0.07) * faceHighlight;
+  bodyColor += vec3(0.05) * edgeHighlight;
+  bodyColor += vec3(0.03) * emboss;
+  bodyColor -= vec3(innerShadow);
+
+  vec3 wickColor = mix(vColor, vec3(1.0), 0.15);
+  wickColor *= 0.88 + (1.0 - abs(vLocal.y)) * 0.08;
+  wickColor += vec3(0.09) * wickGlow;
+
+  vec3 color = mix(bodyColor, wickColor, vWickMask);
+  float alpha = mix(0.985, 0.84 + wickAlpha * 0.16, vWickMask);
+  outColor = vec4(clamp(color, 0.0, 1.0), clamp(alpha, 0.0, 1.0));
 }
 `;
 
@@ -106,7 +136,7 @@ export class CandleLayer {
     }
   }
 
-  draw(viewportId: string, bars: OhlcBar[], options?: { allowUpload?: boolean; frameTimeMs?: number; smoothingMs?: number }): void {
+  draw(viewportId: string, bars: OhlcBar[], options?: { allowUpload?: boolean; frameTimeMs?: number; smoothingMs?: number; canvasWidth?: number; canvasHeight?: number }): void {
     if (bars.length === 0) {
       return;
     }
@@ -119,6 +149,8 @@ export class CandleLayer {
     const smoothingMs = Number.isFinite(options?.smoothingMs)
       ? Math.max(0, Number(options?.smoothingMs))
       : LAST_BAR_SMOOTH_TIME_MS_DEFAULT;
+    const canvasWidth = Number.isFinite(options?.canvasWidth) ? Math.max(1, Number(options?.canvasWidth)) : this.gl.canvas.width;
+    const canvasHeight = Number.isFinite(options?.canvasHeight) ? Math.max(1, Number(options?.canvasHeight)) : this.gl.canvas.height;
 
     const lastBar = bars[count - 1];
     const displayLastBar = resolveDisplayLastBar(state, lastBar, frameTimeMs, smoothingMs);
@@ -137,13 +169,14 @@ export class CandleLayer {
     const rangeSig = `${count}|${range.minPrice}|${range.maxPrice}`;
     const lastSig = buildLastBarSignature(lastBar);
     const isFullUpload = state.previousCount !== count || state.previousRangeSig !== rangeSig;
+    const averageRange = resolveAverageRange(bars, count);
 
     gl.useProgram(this.program);
     gl.bindVertexArray(state.vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, state.instanceBuffer);
 
     if (isFullUpload) {
-      const packed = packAllBars(bars, count, range.minPrice, range.maxPrice, state.instanceData);
+      const packed = packAllBars(bars, count, range.minPrice, range.maxPrice, state.instanceData, canvasWidth, canvasHeight);
       const lastBase = (count - 1) * INSTANCE_STRIDE_FLOATS;
       writePackedBar(
         state.instanceData,
@@ -154,6 +187,9 @@ export class CandleLayer {
         range.minPrice,
         Math.max(1e-6, range.maxPrice - range.minPrice),
         Math.min(0.028, 0.76 / Math.max(1, count)),
+        canvasWidth,
+        canvasHeight,
+        averageRange,
       );
       gl.bufferSubData(gl.ARRAY_BUFFER, 0, packed.subarray(0, count * INSTANCE_STRIDE_FLOATS));
       state.minPrice = range.minPrice;
@@ -169,7 +205,7 @@ export class CandleLayer {
       const shouldUploadLast = state.previousLastSig !== lastSig
         || state.lastBarAnim?.displaySig !== displaySig;
       if (shouldUploadLast) {
-        writePackedBar(state.instanceData, base, index, count, displayLastBar, state.minPrice, state.span, state.halfWidth);
+        writePackedBar(state.instanceData, base, index, count, displayLastBar, state.minPrice, state.span, state.halfWidth, canvasWidth, canvasHeight, averageRange);
         gl.bufferSubData(
           gl.ARRAY_BUFFER,
           base * 4,
@@ -215,6 +251,7 @@ export class CandleLayer {
     this.bindInstanceAttrib(5, 1, 4);
     this.bindInstanceAttrib(6, 1, 5);
     this.bindInstanceAttrib(7, 3, 6);
+    this.bindInstanceAttrib(8, 1, 9);
 
     gl.bindVertexArray(null);
 
@@ -357,13 +394,18 @@ function packAllBars(
   minPrice: number,
   maxPrice: number,
   target: Float32Array,
+  canvasWidth: number,
+  canvasHeight: number,
 ): Float32Array {
   const span = Math.max(1e-6, maxPrice - minPrice);
   const halfWidth = Math.min(0.028, 0.76 / Math.max(1, count));
+  const averageRange = bars.length > 0
+    ? bars.reduce((sum, bar) => sum + Math.max(0, bar.high - bar.low), 0) / bars.length
+    : 0;
 
   for (let index = 0; index < count; index += 1) {
     const base = index * INSTANCE_STRIDE_FLOATS;
-    writePackedBar(target, base, index, count, bars[index], minPrice, span, halfWidth);
+    writePackedBar(target, base, index, count, bars[index], minPrice, span, halfWidth, canvasWidth, canvasHeight, averageRange);
   }
 
   return target;
@@ -378,12 +420,20 @@ function writePackedBar(
   minPrice: number,
   span: number,
   halfWidth: number,
+  canvasWidth: number,
+  canvasHeight: number,
+  averageRange: number,
 ): void {
-  const x = -1 + ((index + 0.5) / Math.max(1, count)) * 2;
-  const openY = normalizePrice(bar.open, minPrice, span);
-  const highY = normalizePrice(bar.high, minPrice, span);
-  const lowY = normalizePrice(bar.low, minPrice, span);
-  const closeY = normalizePrice(bar.close, minPrice, span);
+  const rangeImportance = averageRange > 1e-6 ? Math.max(0.8, Math.min(1.8, (Math.max(0, bar.high - bar.low) / averageRange))) : 1;
+  const renderStyle = resolvePackedRenderStyle(count, canvasWidth, canvasHeight, rangeImportance);
+  const x = snapNdcX(-1 + ((index + 0.5) / Math.max(1, count)) * 2, canvasWidth, renderStyle.pixelSnapping);
+  let openY = snapNdcY(normalizePrice(bar.open, minPrice, span), canvasHeight, renderStyle.pixelSnapping);
+  let highY = snapNdcY(normalizePrice(bar.high, minPrice, span), canvasHeight, renderStyle.pixelSnapping);
+  let lowY = snapNdcY(normalizePrice(bar.low, minPrice, span), canvasHeight, renderStyle.pixelSnapping);
+  let closeY = snapNdcY(normalizePrice(bar.close, minPrice, span), canvasHeight, renderStyle.pixelSnapping);
+  ({ openY, closeY } = enforceMinimumBodyHeight(openY, closeY, canvasHeight, renderStyle.minBodyHeightPx));
+  highY = Math.max(highY, openY, closeY);
+  lowY = Math.min(lowY, openY, closeY);
   const isUp = closeY >= openY;
 
   target[base + 0] = x;
@@ -391,11 +441,11 @@ function writePackedBar(
   target[base + 2] = highY;
   target[base + 3] = lowY;
   target[base + 4] = closeY;
-  target[base + 5] = halfWidth;
+  target[base + 5] = renderStyle.bodyHalfWidthNdc || halfWidth;
   target[base + 6] = isUp ? 0.0 : 1.0;
   target[base + 7] = isUp ? 1.0 : 0.23;
   target[base + 8] = isUp ? 0.64 : 0.23;
-  target[base + 9] = isUp ? 0.23 : 0.23;
+  target[base + 9] = renderStyle.wickHalfWidthNdc;
 }
 
 function buildLastBarSignature(bar: OhlcBar): string {
@@ -405,4 +455,77 @@ function buildLastBarSignature(bar: OhlcBar): string {
 function normalizePrice(price: number, minPrice: number, span: number): number {
   const t = (Number(price) - minPrice) / span;
   return t * 2 - 1;
+}
+
+function resolveAverageRange(bars: OhlcBar[], count: number): number {
+  if (count <= 0) {
+    return 0;
+  }
+  let sum = 0;
+  for (let index = 0; index < count; index += 1) {
+    const bar = bars[index];
+    sum += Math.max(0, bar.high - bar.low);
+  }
+  return sum / count;
+}
+
+function resolvePackedRenderStyle(count: number, canvasWidth: number, canvasHeight: number, importance = 1): {
+  pixelSnapping: boolean;
+  bodyHalfWidthNdc: number;
+  wickHalfWidthNdc: number;
+  minBodyHeightPx: number;
+} {
+  const stepPx = canvasWidth / Math.max(1, count);
+  const pixelSnapping = stepPx <= 14;
+  const denseMode = stepPx <= 3.4 ? (stepPx <= 1.7 ? "micro" : "dense") : "off";
+  const bodyWidthPx = stepPx < 2
+    ? 1
+    : Math.max(1, Math.floor(stepPx * (denseMode === "micro" ? 0.9 : denseMode === "dense" ? 0.75 : 0.6)));
+  const wickWidthPx = Math.min(2.4, Math.max(1, 0.9 + stepPx * 0.08 + (importance - 1) * 0.45));
+  const minBodyHeightPx = denseMode === "micro" ? 1.45 : denseMode === "dense" ? 1.2 : 1.0;
+  return {
+    pixelSnapping,
+    bodyHalfWidthNdc: pixelWidthToNdcX(bodyWidthPx * 0.5, canvasWidth),
+    wickHalfWidthNdc: pixelWidthToNdcX(wickWidthPx * 0.5, canvasWidth),
+    minBodyHeightPx: Math.min(minBodyHeightPx, Math.max(0.9, canvasHeight * 0.02)),
+  };
+}
+
+function pixelWidthToNdcX(widthPx: number, canvasWidth: number): number {
+  return (Math.max(0.5, widthPx) / Math.max(1, canvasWidth)) * 2;
+}
+
+function snapNdcX(value: number, canvasWidth: number, enabled: boolean): number {
+  if (!enabled) {
+    return value;
+  }
+  const pixel = ((value + 1) * 0.5) * canvasWidth;
+  const snapped = Math.round(pixel - 0.5) + 0.5;
+  return (snapped / Math.max(1, canvasWidth)) * 2 - 1;
+}
+
+function snapNdcY(value: number, canvasHeight: number, enabled: boolean): number {
+  if (!enabled) {
+    return value;
+  }
+  const pixel = ((value + 1) * 0.5) * canvasHeight;
+  const snapped = Math.round(pixel - 0.5) + 0.5;
+  return (snapped / Math.max(1, canvasHeight)) * 2 - 1;
+}
+
+function enforceMinimumBodyHeight(openY: number, closeY: number, canvasHeight: number, minBodyHeightPx: number): { openY: number; closeY: number } {
+  const openPx = ((openY + 1) * 0.5) * canvasHeight;
+  const closePx = ((closeY + 1) * 0.5) * canvasHeight;
+  const deltaPx = closePx - openPx;
+  if (Math.abs(deltaPx) >= minBodyHeightPx) {
+    return { openY, closeY };
+  }
+  const midPx = (openPx + closePx) * 0.5;
+  const halfPx = minBodyHeightPx * 0.5;
+  const nextOpenPx = deltaPx >= 0 ? midPx - halfPx : midPx + halfPx;
+  const nextClosePx = deltaPx >= 0 ? midPx + halfPx : midPx - halfPx;
+  return {
+    openY: (nextOpenPx / Math.max(1, canvasHeight)) * 2 - 1,
+    closeY: (nextClosePx / Math.max(1, canvasHeight)) * 2 - 1,
+  };
 }

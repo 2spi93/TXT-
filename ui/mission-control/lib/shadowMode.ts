@@ -183,9 +183,11 @@ function compareObjects(a: any, b: any, path = ''): { equal: boolean; reasons: s
 export async function executeWithShadowMode<T>(config: ShadowConfig, {
   fetchBackend,
   getFallback,
+  normalizeForComparison,
 }: {
   fetchBackend: () => Promise<T>;
   getFallback: () => T;
+  normalizeForComparison?: (data: T, source: 'backend' | 'fallback') => unknown;
 }): Promise<ShadowResult<T>> {
   const startTime = Date.now();
   const fallback = getFallback();
@@ -262,7 +264,10 @@ export async function executeWithShadowMode<T>(config: ShadowConfig, {
   let divergenceReason = '';
   
   if (backendResult.status === 'ok' && backendResult.data) {
-    const comparison = compareObjects(backendResult.data, fallback);
+    const comparison = compareObjects(
+      normalizeForComparison ? normalizeForComparison(backendResult.data, 'backend') : backendResult.data,
+      normalizeForComparison ? normalizeForComparison(fallback, 'fallback') : fallback,
+    );
     if (!comparison.equal) {
       divergenceDetected = true;
       divergenceReason = comparison.reasons.slice(0, 3).join(' | '); // First 3 reasons

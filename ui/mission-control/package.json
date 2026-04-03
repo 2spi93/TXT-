@@ -17,6 +17,7 @@
     "qa:real-control-plane:staging": "sh scripts/qa-real-control-plane.sh staging",
     "qa:real-control-plane:prod": "sh scripts/qa-real-control-plane.sh prod",
     "deps:check-next": "sh scripts/check-next-version.sh",
+    "test:ohlcv-kernel-regression": "sh scripts/test-ohlcv-kernel-regression.sh",
     "test:risk-workspace": "node scripts/risk-workspace.integration.js",
     "test:e2e": "playwright test",
     "test:e2e:install": "playwright install --with-deps"

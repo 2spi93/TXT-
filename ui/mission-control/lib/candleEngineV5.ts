@@ -34,7 +34,9 @@ export type GapRange = {
 // ── Engine ────────────────────────────────────────────────────────────────────
 
 export class CandleEngineV5 {
+  private timeframe: string;
   private tfMs: number;
+  private latencyOffsetMs = 0;
 
   // Candles courantes construites depuis trades
   private candles = new Map<number, NormalizedOhlcvBar>(); // slotMs → bar
@@ -48,6 +50,7 @@ export class CandleEngineV5 {
   private readonly TRADE_BUFFER_MS = 600_000;
 
   constructor(timeframe: string) {
+    this.timeframe = timeframe;
     this.tfMs = timeframeToMs(timeframe);
   }
 
@@ -58,7 +61,7 @@ export class CandleEngineV5 {
    * Retourne la candle modifiée.
    */
   ingestTrade(trade: TradeForCandle): NormalizedOhlcvBar {
-    const ts = trade.exchangeTs ?? trade.tsMs;
+    const ts = (trade.exchangeTs ?? trade.tsMs) + this.latencyOffsetMs;
     const slotMs = alignToTimeSlot(ts, this.tfMs);
     const slotTs = new Date(slotMs).toISOString();
 
@@ -73,7 +76,7 @@ export class CandleEngineV5 {
         l: trade.price,
         c: trade.price,
         v: trade.size,
-        tf: "",
+        tf: this.timeframe,
         seq: slotMs,
       };
     } else {
@@ -101,6 +104,60 @@ export class CandleEngineV5 {
     return candle;
   }
 
+  ingestTradeFast(price: number, size: number, sideFlag: number, tsMs: number, exchangeTs?: number): NormalizedOhlcvBar {
+    return this.ingestTrade({
+      price,
+      size,
+      side: sideFlag > 0 ? "sell" : "buy",
+      tsMs,
+      exchangeTs,
+    });
+  }
+
+  ingestPriceTick(price: number, tsMs: number, exchangeTs?: number): boolean {
+    if (!Number.isFinite(price) || price <= 0) {
+      return false;
+    }
+
+    const ts = (exchangeTs ?? tsMs) + this.latencyOffsetMs;
+    const slotMs = alignToTimeSlot(ts, this.tfMs);
+    const slotTs = new Date(slotMs).toISOString();
+    const existing = this.candles.get(slotMs);
+
+    if (!existing) {
+      const latest = this.getLatestCandle();
+      const openPrice = latest && latest.c > 0 ? latest.c : price;
+      const candle: NormalizedOhlcvBar = {
+        t: slotTs,
+        o: openPrice,
+        h: Math.max(openPrice, price),
+        l: Math.min(openPrice, price),
+        c: price,
+        v: 0,
+        tf: this.timeframe,
+        seq: slotMs,
+        source: "quote-tick-new-bar",
+      };
+      this.candles.set(slotMs, candle);
+      return true;
+    }
+
+    const nextHigh = Math.max(existing.h, price);
+    const nextLow = Math.min(existing.l, price);
+    if (nextHigh === existing.h && nextLow === existing.l && existing.c === price) {
+      return false;
+    }
+
+    this.candles.set(slotMs, {
+      ...existing,
+      h: nextHigh,
+      l: nextLow,
+      c: price,
+      source: existing.v > 0 ? "quote-tick-update" : "quote-only-update",
+    });
+    return true;
+  }
+
   /**
    * Ingestion en batch (REST trades snapshot).
    */
@@ -125,8 +182,8 @@ export class CandleEngineV5 {
    * Copie la série courante dans le back-buffer.
    * Appeler avant un cycle de rendu, puis swapBuffers().
    */
-  prepareBackBuffer(): void {
-    this.backBuffer = this.getSeries();
+  prepareBackBuffer(series?: NormalizedOhlcvBar[]): void {
+    this.backBuffer = series ? [...series] : this.getSeries();
   }
 
   /**
@@ -186,14 +243,32 @@ export class CandleEngineV5 {
   mergeWithOhlcv(ohlcvSeries: NormalizedOhlcvBar[]): NormalizedOhlcvBar[] {
     const merged = new Map<string, NormalizedOhlcvBar>();
 
-    // 1. Seed avec les candles construites depuis trades (priorité basse)
-    for (const bar of this.getSeries()) {
+    // 1. Seed avec le backfill OHLCV (priorité basse)
+    for (const bar of ohlcvSeries) {
       merged.set(bar.t, bar);
     }
 
-    // 2. La série OHLCV API écrase (priorité haute)
-    for (const bar of ohlcvSeries) {
-      merged.set(bar.t, bar);
+    // 2. Les candles reconstruites depuis trades écrasent le backfill.
+    for (const bar of this.getSeries()) {
+      const existing = merged.get(bar.t);
+      if (!existing) {
+        merged.set(bar.t, bar);
+        continue;
+      }
+      const existingLow = existing.l > 0 ? existing.l : Math.min(existing.o, existing.c);
+      const barLow = bar.l > 0 ? bar.l : Math.min(bar.o, bar.c);
+      merged.set(bar.t, {
+        ...existing,
+        o: existing.o > 0 ? existing.o : bar.o,
+        h: Math.max(existing.h, bar.h, existing.o, existing.c, bar.o, bar.c),
+        l: Math.min(existingLow, barLow, existing.o, existing.c, bar.o, bar.c),
+        c: bar.c > 0 ? bar.c : existing.c,
+        v: Math.max(existing.v, bar.v),
+        tf: existing.tf || bar.tf,
+        venue: existing.venue || bar.venue,
+        instrument: existing.instrument || bar.instrument,
+        source: bar.v > 0 ? bar.source || "trades" : existing.source || bar.source || "merged",
+      });
     }
 
     return [...merged.values()].sort((a, b) => a.t.localeCompare(b.t));
@@ -212,6 +287,10 @@ export class CandleEngineV5 {
       ...bar,
       t: new Date(new Date(bar.t).getTime() - latencyMs).toISOString(),
     }));
+  }
+
+  setLatencyOffset(latencyMs: number): void {
+    this.latencyOffsetMs = Math.round(latencyMs);
   }
 
   // ── Utilitaires ────────────────────────────────────────────────────────────

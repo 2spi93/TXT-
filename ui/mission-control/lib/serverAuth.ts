@@ -9,7 +9,8 @@ import { getRoleGroup, type RoleGroup } from "./roleGroups";
 
 function parseTokenPayload(token: string): { role?: string; exp?: number } | null {
   try {
-    const [payloadPart] = token.split(".");
+    const parts = token.split(".");
+    const payloadPart = parts.length === 2 ? parts[0] : parts[1];
     if (!payloadPart) return null;
     const padded = payloadPart + "=".repeat((4 - (payloadPart.length % 4)) % 4);
     const decoded = Buffer.from(

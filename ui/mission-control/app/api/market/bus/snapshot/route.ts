@@ -85,7 +85,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
 
   const headers = extractMcContextHeaders(request);
   const baseUrl = new URL(request.url).origin;
-  const [ohlcvRows, depthSnapshot, microstructure] = await Promise.all([
+  const [ohlcvRows, depthSnapshot, microstructure, tradesPayload] = await Promise.all([
     fetch(`${baseUrl}/api/market/ohlcv?instrument=${encodeURIComponent(instrument)}&venue=${encodeURIComponent(venue)}&timeframe=${encodeURIComponent(timeframe)}&limit=500`, {
       cache: "no-store",
       headers,
@@ -95,6 +95,10 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       headers,
     }).then((res) => (res.ok ? res.json() : null)).catch(() => null),
     fallbackMicrostructure(instrument),
+    cpFetchJsonSafe(
+      `/v1/market/trades?instrument=${encodeURIComponent(instrument)}&venue=${encodeURIComponent(venue)}&limit=${encodeURIComponent(tradeLimit)}`,
+      { headers },
+    ).then(({ response, payload }) => (response.ok ? payload : [])).catch(() => []),
   ]);
 
   const nowMs = Date.now();
@@ -124,11 +128,27 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   const hasAnyMarketPayload = (Array.isArray(ohlcvRows) && ohlcvRows.length > 0) || Boolean(depthSnapshot);
   const fallbackStatus = hasAnyMarketPayload ? "degraded" : "offline";
 
+  const trades = Array.isArray(tradesPayload)
+    ? tradesPayload
+    : (tradesPayload && typeof tradesPayload === "object" && Array.isArray((tradesPayload as JsonMap).items))
+      ? (tradesPayload as JsonMap).items as unknown[]
+      : [];
+  const latestTradeMs = trades.reduce((latest, trade) => {
+    const entry = (trade && typeof trade === "object") ? trade as JsonMap : {};
+    const raw = toNumber(entry.T ?? entry.ts ?? entry.timestamp ?? entry.time, NaN);
+    if (!Number.isFinite(raw) || raw <= 0) {
+      return latest;
+    }
+    const next = raw > 1e12 ? raw : raw * 1000;
+    return Math.max(latest, next);
+  }, Number.NEGATIVE_INFINITY);
+  const tradesFreshnessMs = Number.isFinite(latestTradeMs) ? Math.max(0, nowMs - latestTradeMs) : -1;
+
   return NextResponse.json({
     instrument,
     venue,
     timeframe,
-    trades: [],
+    trades,
     microstructure,
     session_state: fallbackSessionState(instrument),
     orderbook: depthSnapshot,
@@ -147,7 +167,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
             freshness_ms: depthFreshnessMs,
           },
           trades: {
-            freshness_ms: -1,
+            freshness_ms: tradesFreshnessMs,
           },
         },
       },

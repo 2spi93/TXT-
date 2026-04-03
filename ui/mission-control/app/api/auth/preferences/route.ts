@@ -115,6 +115,26 @@ function generateFallback() {
   };
 }
 
+function normalizePreferencesGetShadowShape(payload: unknown): Record<string, unknown> {
+  const record = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
+  const preferences = record.preferences && typeof record.preferences === "object"
+    ? record.preferences as Record<string, unknown>
+    : null;
+  return {
+    has_preferences_object: preferences !== null,
+    updated_at_nullable: record.updated_at === null || typeof record.updated_at === "string",
+  };
+}
+
+function normalizePreferencesPutShadowShape(payload: unknown): Record<string, unknown> {
+  const record = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
+  const status = String(record.status || "").toLowerCase();
+  return {
+    acknowledged: status === "ok" || status === "updated",
+    has_timestamp: typeof record.updated_at === "string" || typeof record.timestamp === "string" || record.updated_at === null,
+  };
+}
+
 export async function GET(request: Request): Promise<Response> {
   const nowMs = Date.now();
   const sessionKey = toSessionKey(request);
@@ -142,6 +162,7 @@ export async function GET(request: Request): Promise<Response> {
         return payload;
       },
       getFallback: generateFallback,
+      normalizeForComparison: (payload) => normalizePreferencesGetShadowShape(payload),
     }
   );
 
@@ -178,6 +199,7 @@ export async function PUT(request: Request): Promise<Response> {
         persisted: false,
         timestamp: new Date().toISOString(),
       }),
+      normalizeForComparison: (payload) => normalizePreferencesPutShadowShape(payload),
     }
   );
 

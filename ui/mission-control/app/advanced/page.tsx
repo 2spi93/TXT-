@@ -2,6 +2,7 @@ import { redirect } from "next/navigation";
 import TxtMiniGuide from "../../components/ui/TxtMiniGuide";
 import Link from "next/link";
 import { getServerRoleGroup } from "../../lib/serverAuth";
+import RustExecutionAdminDesk from "../../components/internal/RustExecutionAdminDesk";
 
 const MODULES = [
   "Strategies",
@@ -38,6 +39,18 @@ export default async function AdvancedPage() {
           <p className="subtle">Vue live des snapshots de calibration auto avec heat, sparkline et diagnostics de switch.</p>
           <Link href="/advanced/chart-auto-stability">Open debug view</Link>
         </article>
+        <article className="panel txt-topic-card">
+          <div className="eyebrow">Predictor</div>
+          <h2 style={{ margin: "8px 0", fontSize: 20 }}>Failure LR Calibration</h2>
+          <p className="subtle">Compare les fenetres offline 24h/7j/30j/all replay et l'historique des recalculs predictor.</p>
+          <Link href="/advanced/predictor-calibration">Open calibration admin</Link>
+        </article>
+        <article className="panel txt-topic-card">
+          <div className="eyebrow">Execution Learning</div>
+          <h2 style={{ margin: "8px 0", fontSize: 20 }}>Reality Gap Monitor</h2>
+          <p className="subtle">Observe les derniers samples predits vs realises et les profils de calibration actifs par venue, symbole et regime.</p>
+          <Link href="/advanced/reality-gap">Open reality-gap view</Link>
+        </article>
         {MODULES.map((moduleName) => (
           <article className="panel txt-topic-card" key={moduleName}>
             <div className="eyebrow">Module</div>
@@ -46,6 +59,10 @@ export default async function AdvancedPage() {
             <button type="button" disabled>Bientot</button>
           </article>
         ))}
+      </section>
+
+      <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr" }}>
+        <RustExecutionAdminDesk />
       </section>
     </main>
   );

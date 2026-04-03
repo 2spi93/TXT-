@@ -1,12 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 
-import { cpFetchJsonSafe, extractMcContextHeaders } from "../../../../../lib/controlPlane";
+import { attachInfraAwareResponseHeaders, cpFetchJsonSafe, extractMcContextHeaders, withControlPlaneNetwork } from "../../../../../lib/controlPlane";
 
 export async function GET(request: NextRequest): Promise<NextResponse> {
   const limit = request.nextUrl.searchParams.get("limit") || "50";
 
-  const { response, payload } = await cpFetchJsonSafe(`/v1/execution/telemetry/recent?limit=${encodeURIComponent(limit)}`, {
+  const { response, payload, network } = await cpFetchJsonSafe(`/v1/execution/telemetry/recent?limit=${encodeURIComponent(limit)}`, {
     headers: extractMcContextHeaders(request),
   });
-  return NextResponse.json(payload, { status: response.status });
+  const nextResponse = NextResponse.json(withControlPlaneNetwork(payload, network), { status: response.status });
+  attachInfraAwareResponseHeaders(nextResponse.headers, network, response.headers.get("x-mc-control-plane-retry-policy") || undefined);
+  return nextResponse;
 }

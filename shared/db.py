@@ -10,7 +10,21 @@ import psycopg
 from psycopg.rows import dict_row
 
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://txt:txt@127.0.0.1:5432/mission_control")
+def _secret_env(name: str, default: str) -> str:
+    file_path = os.getenv(f"{name}_FILE", "").strip()
+    if file_path:
+        try:
+            with open(file_path, "r", encoding="utf-8") as handle:
+                value = handle.read().strip()
+            if value:
+                return value
+        except OSError:
+            pass
+    value = os.getenv(name, "").strip()
+    return value or default
+
+
+DATABASE_URL = _secret_env("DATABASE_URL", "postgresql://txt:txt@127.0.0.1:5432/mission_control")
 
 
 SCHEMA_SQL = """
@@ -265,6 +279,38 @@ CREATE TABLE IF NOT EXISTS execution_fill_events (
     UNIQUE (decision_id, fill_id)
 );
 
+CREATE TABLE IF NOT EXISTS reality_gap_samples (
+    sample_id TEXT PRIMARY KEY,
+    decision_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    venue TEXT NOT NULL,
+    regime TEXT NOT NULL DEFAULT 'UNKNOWN',
+    side TEXT NOT NULL DEFAULT 'hold',
+    failure_source TEXT,
+    failure_reasons JSONB NOT NULL DEFAULT '[]'::jsonb,
+    calibration_action TEXT,
+    gap_slippage_bps DOUBLE PRECISION,
+    gap_fill_probability DOUBLE PRECISION,
+    gap_latency_ms DOUBLE PRECISION,
+    gap_impact_bps DOUBLE PRECISION,
+    gap_queue_ahead_qty DOUBLE PRECISION,
+    predicted_execution JSONB NOT NULL DEFAULT '{}'::jsonb,
+    realized_execution JSONB NOT NULL DEFAULT '{}'::jsonb,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS reality_gap_calibration_profiles (
+    profile_key TEXT PRIMARY KEY,
+    venue TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    regime TEXT NOT NULL DEFAULT 'UNKNOWN',
+    sample_count INTEGER NOT NULL DEFAULT 0,
+    calibration JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS strategies (
     strategy_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -304,6 +350,43 @@ CREATE TABLE IF NOT EXISTS ai_orchestration_events (
     latency_ms INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL,
     error_summary TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS kairos_shadow_cycles (
+    cycle_id TEXT PRIMARY KEY,
+    cycle_at TIMESTAMPTZ NOT NULL,
+    symbol TEXT NOT NULL,
+    venue TEXT NOT NULL,
+    shadow_action TEXT NOT NULL,
+    shadow_reasons JSONB NOT NULL DEFAULT '[]'::jsonb,
+    decision_id TEXT NOT NULL,
+    decision_direction TEXT NOT NULL DEFAULT 'wait',
+    predictor_should_execute BOOLEAN NOT NULL DEFAULT FALSE,
+    memory_source TEXT NOT NULL DEFAULT 'none',
+    memory_confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+    memory_recommendation JSONB NOT NULL DEFAULT '{}'::jsonb,
+    proposed_trade JSONB,
+    cycle_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS kairos_shadow_decisions (
+    decision_id TEXT PRIMARY KEY,
+    cycle_id TEXT NOT NULL REFERENCES kairos_shadow_cycles(cycle_id) ON DELETE CASCADE,
+    decision_at TIMESTAMPTZ NOT NULL,
+    symbol TEXT NOT NULL,
+    venue TEXT NOT NULL,
+    direction TEXT NOT NULL DEFAULT 'wait',
+    meta_confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+    agent_consensus_pct DOUBLE PRECISION NOT NULL DEFAULT 0,
+    risk_approved BOOLEAN NOT NULL DEFAULT FALSE,
+    risk_reason TEXT NOT NULL DEFAULT '',
+    predictor_should_execute BOOLEAN NOT NULL DEFAULT FALSE,
+    memory_source TEXT NOT NULL DEFAULT 'none',
+    memory_confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+    recommended_execution JSONB,
+    decision_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -503,8 +586,397 @@ CREATE TABLE IF NOT EXISTS chatbot_action_confirmations (
     executed_at TIMESTAMPTZ
 );
 
+CREATE TABLE IF NOT EXISTS clients (
+    client_id TEXT PRIMARY KEY,
+    legal_name TEXT NOT NULL,
+    client_type TEXT NOT NULL CHECK (client_type IN ('internal', 'individual', 'prop', 'fund', 'family_office')),
+    base_currency TEXT NOT NULL DEFAULT 'USD',
+    status TEXT NOT NULL CHECK (status IN ('active', 'pending', 'suspended', 'closed')),
+    kyc_status TEXT NOT NULL DEFAULT 'not_required',
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS user_client_memberships (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    client_id TEXT NOT NULL REFERENCES clients(client_id) ON DELETE CASCADE,
+    membership_role TEXT NOT NULL CHECK (membership_role IN ('admin', 'trader', 'investor', 'viewer', 'operator')),
+    is_primary BOOLEAN NOT NULL DEFAULT FALSE,
+    permissions JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (user_id, client_id, membership_role)
+);
+
+CREATE TABLE IF NOT EXISTS accounts_registry (
+    account_id TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL REFERENCES clients(client_id) ON DELETE CASCADE,
+    account_type TEXT NOT NULL CHECK (account_type IN ('broker', 'exchange', 'wallet', 'strategy_subaccount', 'omnibus')),
+    venue TEXT NOT NULL,
+    connector_type TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK (mode IN ('paper', 'live')),
+    base_currency TEXT NOT NULL DEFAULT 'USD',
+    status TEXT NOT NULL CHECK (status IN ('active', 'pending', 'disabled', 'error', 'closed')),
+    external_ref TEXT,
+    display_name TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS account_balances (
+    id BIGSERIAL PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts_registry(account_id) ON DELETE CASCADE,
+    asset_symbol TEXT NOT NULL,
+    available_qty DOUBLE PRECISION NOT NULL DEFAULT 0,
+    locked_qty DOUBLE PRECISION NOT NULL DEFAULT 0,
+    equity_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    mark_price_usd DOUBLE PRECISION,
+    as_of TIMESTAMPTZ NOT NULL,
+    source TEXT NOT NULL,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    UNIQUE (account_id, asset_symbol, as_of)
+);
+
+CREATE TABLE IF NOT EXISTS consolidated_positions (
+    position_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts_registry(account_id) ON DELETE CASCADE,
+    portfolio_id TEXT,
+    strategy_id TEXT,
+    symbol TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    side TEXT NOT NULL CHECK (side IN ('long', 'short', 'flat')),
+    quantity DOUBLE PRECISION NOT NULL,
+    notional_usd DOUBLE PRECISION NOT NULL,
+    avg_entry_price DOUBLE PRECISION NOT NULL,
+    mark_price DOUBLE PRECISION NOT NULL,
+    pnl_unrealized_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    pnl_realized_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    as_of TIMESTAMPTZ NOT NULL,
+    source TEXT NOT NULL,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE TABLE IF NOT EXISTS portfolios (
+    portfolio_id TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL REFERENCES clients(client_id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    base_currency TEXT NOT NULL DEFAULT 'USD',
+    mandate_type TEXT NOT NULL CHECK (mandate_type IN ('discretionary', 'advisory', 'simulation', 'treasury')),
+    risk_profile TEXT NOT NULL DEFAULT 'balanced',
+    benchmark_symbol TEXT,
+    status TEXT NOT NULL CHECK (status IN ('active', 'paused', 'closed')),
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS portfolio_accounts (
+    id BIGSERIAL PRIMARY KEY,
+    portfolio_id TEXT NOT NULL REFERENCES portfolios(portfolio_id) ON DELETE CASCADE,
+    account_id TEXT NOT NULL REFERENCES accounts_registry(account_id) ON DELETE CASCADE,
+    allocation_weight DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    allocation_cap_usd DOUBLE PRECISION,
+    status TEXT NOT NULL DEFAULT 'active',
+    UNIQUE (portfolio_id, account_id)
+);
+
+CREATE TABLE IF NOT EXISTS strategies_registry (
+    strategy_id TEXT PRIMARY KEY,
+    portfolio_id TEXT NOT NULL REFERENCES portfolios(portfolio_id) ON DELETE CASCADE,
+    owner_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    strategy_type TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('draft', 'paper', 'active', 'paused', 'retired')),
+    capital_allocation_mode TEXT NOT NULL DEFAULT 'shared',
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    portfolio_id TEXT NOT NULL REFERENCES portfolios(portfolio_id) ON DELETE CASCADE,
+    gross_exposure_usd DOUBLE PRECISION NOT NULL,
+    net_exposure_usd DOUBLE PRECISION NOT NULL,
+    long_exposure_usd DOUBLE PRECISION NOT NULL,
+    short_exposure_usd DOUBLE PRECISION NOT NULL,
+    equity_usd DOUBLE PRECISION NOT NULL,
+    pnl_day_usd DOUBLE PRECISION NOT NULL,
+    drawdown_pct DOUBLE PRECISION NOT NULL,
+    var_95_usd DOUBLE PRECISION,
+    var_99_usd DOUBLE PRECISION,
+    leverage_gross DOUBLE PRECISION,
+    leverage_net DOUBLE PRECISION,
+    as_of TIMESTAMPTZ NOT NULL,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE TABLE IF NOT EXISTS portfolio_symbol_exposure (
+    id BIGSERIAL PRIMARY KEY,
+    snapshot_id TEXT NOT NULL REFERENCES portfolio_snapshots(snapshot_id) ON DELETE CASCADE,
+    symbol TEXT NOT NULL,
+    net_notional_usd DOUBLE PRECISION NOT NULL,
+    gross_notional_usd DOUBLE PRECISION NOT NULL,
+    beta_weighted_notional_usd DOUBLE PRECISION,
+    concentration_pct DOUBLE PRECISION NOT NULL,
+    UNIQUE (snapshot_id, symbol)
+);
+
+CREATE TABLE IF NOT EXISTS portfolio_correlation_snapshots (
+    id BIGSERIAL PRIMARY KEY,
+    snapshot_id TEXT NOT NULL REFERENCES portfolio_snapshots(snapshot_id) ON DELETE CASCADE,
+    symbol_x TEXT NOT NULL,
+    symbol_y TEXT NOT NULL,
+    correlation_30d DOUBLE PRECISION NOT NULL,
+    UNIQUE (snapshot_id, symbol_x, symbol_y)
+);
+
+CREATE TABLE IF NOT EXISTS risk_limit_breaches (
+    breach_id TEXT PRIMARY KEY,
+    portfolio_id TEXT REFERENCES portfolios(portfolio_id) ON DELETE SET NULL,
+    account_id TEXT REFERENCES accounts_registry(account_id) ON DELETE SET NULL,
+    scope_type TEXT NOT NULL CHECK (scope_type IN ('portfolio', 'account', 'strategy', 'client')),
+    breach_type TEXT NOT NULL,
+    severity TEXT NOT NULL CHECK (severity IN ('info', 'warn', 'critical')),
+    current_value DOUBLE PRECISION,
+    limit_value DOUBLE PRECISION,
+    action_taken TEXT,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS performance_timeseries (
+    id BIGSERIAL PRIMARY KEY,
+    scope_type TEXT NOT NULL CHECK (scope_type IN ('client', 'portfolio', 'account', 'strategy', 'symbol', 'provider')),
+    scope_id TEXT NOT NULL,
+    bucket_start TIMESTAMPTZ NOT NULL,
+    bucket_granularity TEXT NOT NULL CHECK (bucket_granularity IN ('1h', '1d', '1mo')),
+    equity_open_usd DOUBLE PRECISION,
+    equity_close_usd DOUBLE PRECISION,
+    pnl_realized_usd DOUBLE PRECISION,
+    pnl_unrealized_usd DOUBLE PRECISION,
+    flow_net_usd DOUBLE PRECISION,
+    drawdown_pct DOUBLE PRECISION,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (scope_type, scope_id, bucket_granularity, bucket_start)
+);
+
+CREATE TABLE IF NOT EXISTS performance_attribution (
+    id BIGSERIAL PRIMARY KEY,
+    scope_type TEXT NOT NULL CHECK (scope_type IN ('client', 'portfolio', 'account', 'strategy')),
+    scope_id TEXT NOT NULL,
+    strategy_id TEXT,
+    symbol TEXT,
+    venue TEXT,
+    period_start TIMESTAMPTZ NOT NULL,
+    period_end TIMESTAMPTZ NOT NULL,
+    realized_pnl_usd DOUBLE PRECISION NOT NULL,
+    unrealized_pnl_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    trade_count INTEGER NOT NULL DEFAULT 0,
+    win_rate_pct DOUBLE PRECISION,
+    expectancy_usd DOUBLE PRECISION,
+    sharpe_ratio DOUBLE PRECISION,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS capital_flow_events (
+    event_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts_registry(account_id) ON DELETE CASCADE,
+    portfolio_id TEXT REFERENCES portfolios(portfolio_id) ON DELETE SET NULL,
+    venue TEXT NOT NULL,
+    connector_type TEXT,
+    pocket TEXT,
+    event_type TEXT NOT NULL,
+    flow_direction TEXT NOT NULL DEFAULT 'neutral',
+    asset_symbol TEXT,
+    amount_native DOUBLE PRECISION,
+    amount_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    raw_cash_usd DOUBLE PRECISION,
+    equivalent_usd DOUBLE PRECISION,
+    counterparty TEXT,
+    description TEXT,
+    external_event_id TEXT,
+    source TEXT NOT NULL,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (account_id, source, external_event_id)
+);
+
+CREATE TABLE IF NOT EXISTS investor_reports (
+    report_id TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL REFERENCES clients(client_id) ON DELETE CASCADE,
+    portfolio_id TEXT REFERENCES portfolios(portfolio_id) ON DELETE SET NULL,
+    report_month DATE NOT NULL,
+    report_type TEXT NOT NULL CHECK (report_type IN ('monthly', 'quarterly', 'custom')),
+    status TEXT NOT NULL CHECK (status IN ('draft', 'published', 'archived')),
+    storage_path TEXT,
+    summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    published_at TIMESTAMPTZ
+);
+
+CREATE OR REPLACE VIEW v_accounts_canonical AS
+SELECT
+    ar.account_id,
+    ar.client_id,
+    ar.account_type,
+    ar.venue,
+    ar.connector_type,
+    ar.mode,
+    ar.base_currency,
+    ar.status,
+    ar.external_ref,
+    ar.display_name,
+    ar.metadata,
+    ar.created_at,
+    ar.updated_at,
+    mt5.broker AS connector_broker,
+    mt5.server AS connector_server,
+    mt5.login AS connector_login,
+    mt5.status AS connector_status,
+    mt5.metadata AS connector_metadata
+FROM accounts_registry ar
+LEFT JOIN mt5_accounts mt5 ON mt5.account_id = ar.account_id;
+
+CREATE OR REPLACE VIEW v_positions_canonical AS
+SELECT
+    cp.position_id,
+    cp.account_id,
+    ar.client_id,
+    cp.portfolio_id,
+    cp.strategy_id,
+    cp.symbol,
+    cp.instrument,
+    cp.side,
+    cp.quantity,
+    cp.notional_usd,
+    cp.avg_entry_price,
+    cp.mark_price,
+    cp.pnl_unrealized_usd,
+    cp.pnl_realized_usd,
+    cp.as_of,
+    cp.source,
+    cp.payload
+FROM consolidated_positions cp
+JOIN accounts_registry ar ON ar.account_id = cp.account_id;
+
+CREATE OR REPLACE VIEW v_execution_ledger AS
+SELECT
+    i.intent_id,
+    i.strategy_id,
+    i.portfolio_id,
+    i.venue,
+    i.instrument,
+    i.side,
+    i.reason_code,
+    i.confidence,
+    i.target_notional_usd,
+    i.max_slippage_bps,
+    i.system_mode,
+    i.status AS intent_status,
+    i.risk_decision,
+    i.created_at AS intent_created_at,
+    o.order_id,
+    o.status AS order_status,
+    o.execution_mode,
+    o.requested_notional_usd,
+    o.filled_notional_usd,
+    o.avg_fill_price,
+    o.created_at AS order_created_at,
+    et.telemetry_id,
+    et.account_id,
+    et.route_chosen,
+    et.route_reason,
+    et.realized_slippage_bps,
+    et.latency_e2e_ms,
+    fill_summary.total_fills,
+    fill_summary.total_fill_notional_usd,
+    fill_summary.last_fill_at
+FROM intents i
+LEFT JOIN orders o ON o.intent_id = i.intent_id
+LEFT JOIN execution_telemetry et ON et.decision_id = i.intent_id
+LEFT JOIN (
+    SELECT
+        decision_id,
+        COUNT(*) AS total_fills,
+        COALESCE(SUM(notional_usd), 0) AS total_fill_notional_usd,
+        MAX(filled_at) AS last_fill_at
+    FROM execution_fill_events
+    GROUP BY decision_id
+) AS fill_summary ON fill_summary.decision_id = i.intent_id;
+
 CREATE INDEX IF NOT EXISTS idx_ai_orchestration_events_created_at
 ON ai_orchestration_events (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_kairos_shadow_cycles_created_at
+ON kairos_shadow_cycles (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_kairos_shadow_cycles_symbol_venue
+ON kairos_shadow_cycles (symbol, venue, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_kairos_shadow_decisions_created_at
+ON kairos_shadow_decisions (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_kairos_shadow_decisions_symbol_venue
+ON kairos_shadow_decisions (symbol, venue, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_clients_status
+ON clients (status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_user_client_memberships_user
+ON user_client_memberships (user_id, is_primary DESC, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_accounts_registry_client
+ON accounts_registry (client_id, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_accounts_registry_connector
+ON accounts_registry (connector_type, venue, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_account_balances_account_asset
+ON account_balances (account_id, asset_symbol, as_of DESC);
+
+CREATE INDEX IF NOT EXISTS idx_consolidated_positions_account_symbol
+ON consolidated_positions (account_id, symbol, as_of DESC);
+
+CREATE INDEX IF NOT EXISTS idx_consolidated_positions_portfolio
+ON consolidated_positions (portfolio_id, as_of DESC);
+
+CREATE INDEX IF NOT EXISTS idx_portfolios_client
+ON portfolios (client_id, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_accounts_portfolio
+ON portfolio_accounts (portfolio_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_accounts_account
+ON portfolio_accounts (account_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_strategies_registry_portfolio
+ON strategies_registry (portfolio_id, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_portfolio_as_of
+ON portfolio_snapshots (portfolio_id, as_of DESC);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_symbol_exposure_snapshot
+ON portfolio_symbol_exposure (snapshot_id, gross_notional_usd DESC);
+
+CREATE INDEX IF NOT EXISTS idx_portfolio_correlation_snapshots_snapshot
+ON portfolio_correlation_snapshots (snapshot_id, correlation_30d DESC);
+
+CREATE INDEX IF NOT EXISTS idx_capital_flow_events_account_time
+ON capital_flow_events (account_id, occurred_at DESC, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_capital_flow_events_portfolio_time
+ON capital_flow_events (portfolio_id, occurred_at DESC, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_risk_limit_breaches_scope_time
+ON risk_limit_breaches (scope_type, severity, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_risk_limit_breaches_portfolio_time
+ON risk_limit_breaches (portfolio_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_mt5_order_events_created_at
 ON mt5_order_events (created_at DESC);
@@ -559,6 +1031,18 @@ ON execution_fill_events (decision_id, filled_at ASC);
 
 CREATE INDEX IF NOT EXISTS idx_execution_fill_events_symbol_time
 ON execution_fill_events (instrument, filled_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_reality_gap_samples_decision
+ON reality_gap_samples (decision_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_reality_gap_samples_symbol_time
+ON reality_gap_samples (symbol, venue, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_reality_gap_samples_regime
+ON reality_gap_samples (regime, failure_source, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_reality_gap_calibration_profiles_scope
+ON reality_gap_calibration_profiles (venue, symbol, regime, updated_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_strategy_embeddings_strategy_id
 ON strategy_embeddings (strategy_id);

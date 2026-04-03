@@ -1,4 +1,6 @@
 import { NextResponse } from 'next/server';
+
+import { getControlPlaneNetworkMetricsSnapshot } from '../../../../lib/controlPlane';
 import { getMetricsSnapshot } from '../../../../lib/shadowMode';
 
 /**
@@ -15,12 +17,20 @@ import { getMetricsSnapshot } from '../../../../lib/shadowMode';
  */
 export async function GET() {
   const snapshot = getMetricsSnapshot();
+  const controlPlaneNetwork = getControlPlaneNetworkMetricsSnapshot();
 
   return NextResponse.json(
     {
       status: 'ok',
       fallback_rate_pct: (snapshot.fallback_rate * 100).toFixed(2),
       metrics_snapshot: snapshot.metrics,
+      control_plane_network: controlPlaneNetwork,
+      control_plane_network_pct: {
+        dns_transient_rate: (controlPlaneNetwork.dns_transient_rate * 100).toFixed(2),
+        timeout_rate: (controlPlaneNetwork.timeout_rate * 100).toFixed(2),
+        degraded_usage_ratio: (controlPlaneNetwork.degraded_usage_ratio * 100).toFixed(2),
+        retry_recovered_ratio: (controlPlaneNetwork.retry_recovered_ratio * 100).toFixed(2),
+      },
       timestamp: snapshot.timestamp,
       endpoints: {
         'auth/preferences': {
@@ -39,7 +49,9 @@ export async function GET() {
         success_criteria: {
           shadow_diff_pct: '< 2%',
           fallback_rate_pct: '0% (UI stable on fallback)',
-          backend_p99_latency_ms: '< 500ms'
+          backend_p99_latency_ms: '< 500ms',
+          dns_transient_rate_pct: '< 5%',
+          degraded_usage_ratio_pct: '< 1%'
         }
       }
     },

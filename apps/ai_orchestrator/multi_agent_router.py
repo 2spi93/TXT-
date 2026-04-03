@@ -16,15 +16,25 @@ from pydantic import BaseModel
 from typing import Dict, List, Optional, Any
 import asyncio
 import json
+import os
 from datetime import datetime, timezone
 
-from agents_framework import (
-    HedgeFundSystem, TradeDirection, Regime, AgentType,
-    AgentSignal, MetaAgentDecision, PortfolioState
-)
-from agents_specialized import (
-    OrderflowAgent, MomentumAgent, ReversalAgent, RegimeAgent, RiskAgent
-)
+try:
+    from .agents_framework import (
+        HedgeFundSystem, TradeDirection, Regime, AgentType,
+        AgentSignal, MetaAgentDecision, PortfolioState,
+    )
+    from .agents_specialized import (
+        OrderflowAgent, MomentumAgent, ReversalAgent, RegimeAgent, RiskAgent,
+    )
+except ImportError:
+    from agents_framework import (
+        HedgeFundSystem, TradeDirection, Regime, AgentType,
+        AgentSignal, MetaAgentDecision, PortfolioState,
+    )
+    from agents_specialized import (
+        OrderflowAgent, MomentumAgent, ReversalAgent, RegimeAgent, RiskAgent,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -98,22 +108,30 @@ class LearningUpdateRequest(BaseModel):
 
 HEDGE_FUND_SYSTEM: Optional[HedgeFundSystem] = None
 
-def get_hf_system() -> HedgeFundSystem:
+def _normalized_symbol(symbol: Optional[str]) -> str:
+    candidate = str(symbol or os.getenv("KAIROS_SYMBOL", "BTCUSDT")).strip().upper()
+    return candidate or "BTCUSDT"
+
+
+def get_hf_system(symbol: Optional[str] = None) -> HedgeFundSystem:
     """Get or initialize the hedge fund system"""
     global HEDGE_FUND_SYSTEM
+    target_symbol = _normalized_symbol(symbol)
     if HEDGE_FUND_SYSTEM is None:
         HEDGE_FUND_SYSTEM = HedgeFundSystem()
-        
-        # Initialize 5 agents (one instance per asset class for now)
-        # In prod: would be dynamic per symbol
-        _init_agents("BTCUSD")
-    
+        _init_agents(target_symbol)
+    else:
+        current_symbol = next((agent.symbol for agent in HEDGE_FUND_SYSTEM.agents.values()), target_symbol)
+        if _normalized_symbol(current_symbol) != target_symbol:
+            HEDGE_FUND_SYSTEM = HedgeFundSystem()
+            _init_agents(target_symbol)
     return HEDGE_FUND_SYSTEM
 
 
 def _init_agents(symbol: str) -> None:
     """Initialize 5 specialized agents"""
     system = HEDGE_FUND_SYSTEM
+    symbol = _normalized_symbol(symbol)
     
     # Dummy market data (would come from market data service)
     dummy_market_data = {
@@ -174,6 +192,7 @@ async def multi_agent_health() -> dict:
     return {
         "status": "ok",
         "system_id": system.system_id,
+        "symbol": next((agent.symbol for agent in system.agents.values()), None),
         "agent_count": len(system.agents),
         "decision_log_size": len(system.decision_log)
     }
@@ -256,28 +275,22 @@ async def conduct_meta_agent_vote(request: MetaAgentVoteRequest) -> MetaAgentVot
     All 5 agents vote, meta-agent produces consensus.
     """
     
-    system = get_hf_system()
-    
-    # Update market data for agents
+    system = get_hf_system(request.symbol)
+
     for agent in system.agents.values():
-        agent.instrument_data = request.market_data
-    
-    # Get signals from all agents
-    signals = []
-    for agent in system.agents.values():
-        signal = agent.get_signal()
-        if signal:
-            signals.append(signal)
-    
-    # Meta-agent voting
+        if hasattr(agent, "portfolio_state") and isinstance(request.portfolio_state, dict):
+            agent.portfolio_state = request.portfolio_state
+
     risk_constraint = {
         'min_consensus_pct': 50,
         'min_confidence': 0.4
     }
     if request.portfolio_state:
         risk_constraint['max_drawdown_pct'] = request.portfolio_state.get('max_drawdown_pct', 3.0)
-    
-    decision = system.meta_agent.vote(signals, risk_constraint)
+
+    enriched_market_data = dict(request.market_data)
+    enriched_market_data.setdefault("symbol", _normalized_symbol(request.symbol))
+    decision = system.make_decision(enriched_market_data, risk_constraint)
     
     # Build response
     long_signals = [_agent_signal_to_response(s) for s in decision.agents_for_long]

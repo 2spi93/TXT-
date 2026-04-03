@@ -7,10 +7,8 @@ cd "$ROOT_DIR"
 echo "[1/6] Build and update stack"
 docker compose -f docker-compose.yml up -d --build
 
-echo "[2/6] Apply distributed market-data shards"
-docker compose -f docker-compose.yml -f docker-compose.distributed.yml up -d \
-  market-data market-data-shard-1 market-data-shard-2 market-data-shard-3 \
-  market-data-shard-4 market-data-shard-5 market-data-shard-6 market-data-shard-7
+echo "[2/6] Apply distributed market-data single-writer overlay"
+docker compose -f docker-compose.yml -f docker-compose.distributed.yml up -d market-data
 
 echo "[3/6] Reload gateway/tls after proxy fix"
 docker compose -f docker-compose.yml up -d mission-control-gateway mission-control-tls

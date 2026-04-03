@@ -1,8 +1,10 @@
-export default function LoginPage({
+export default async function LoginPage({
   searchParams,
 }: {
-  searchParams?: { error?: string };
+  searchParams?: Promise<{ error?: string }>;
 }) {
+  const resolvedSearchParams = await searchParams;
+
   return (
     <main className="shell">
       <section className="hero" style={{ gridTemplateColumns: "1fr" }}>
@@ -14,7 +16,7 @@ export default function LoginPage({
             <strong>Guide rapide</strong>
             <p className="subtle">1) Connecte-toi avec ton compte operateur. 2) Verifie le mode (paper/live) dans Terminal avant toute action. 3) Si erreur, reviens ici puis verifie la rotation mot de passe.</p>
           </div>
-          {searchParams?.error ? <p className="warn">Identifiants invalides ou redirection echouee.</p> : null}
+          {resolvedSearchParams?.error ? <p className="warn">Identifiants invalides ou redirection echouee.</p> : null}
           <div className="txt-auth-guide" aria-label="Diagnostic navigateur">
             <strong>Si Chrome refuse la connexion</strong>
             <p className="subtle">Vide les cookies du domaine TXT, desactive temporairement le blocage strict des cookies tiers pour le site, puis recharge /login. Edge peut reutiliser une ancienne session valide.</p>

@@ -98,6 +98,8 @@ export class MultiChartManager {
         allowUpload: uploadSet.has(viewport.id),
         frameTimeMs,
         smoothingMs: this.lastBarSmoothingMs,
+        canvasWidth: gl.canvas.width,
+        canvasHeight: gl.canvas.height,
       });
       this._drawCallCount += 1;
       if (viewport.candles.length > this._lastBatchSize) {
@@ -135,8 +137,17 @@ export class MultiChartManager {
     gl.disable(gl.SCISSOR_TEST);
   }
 
-  getMetrics(): { drawCalls: number; batchSize: number } {
-    return { drawCalls: this._drawCallCount, batchSize: this._lastBatchSize };
+  getMetrics(): { drawCalls: number; batchSize: number; overlayIntervalMs: number } {
+    const viewports = this.viewports.length;
+    const adaptiveOverlayInterval = viewports >= 16
+      ? 420
+      : viewports >= 4
+        ? 320
+        : 250;
+    if (this.overlayIntervalMs !== adaptiveOverlayInterval) {
+      this.overlayIntervalMs = adaptiveOverlayInterval;
+    }
+    return { drawCalls: this._drawCallCount, batchSize: this._lastBatchSize, overlayIntervalMs: this.overlayIntervalMs };
   }
 
   setFrameBudgetMs(value: number): void {

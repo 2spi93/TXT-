@@ -7,6 +7,18 @@ export async function POST(
   { params }: { params: Promise<{ strategyId: string }> }
 ): Promise<NextResponse> {
   const resolved = await params;
+  const contentType = request.headers.get("content-type") || "";
+  if (contentType.includes("application/json")) {
+    const payload = await request.json().catch(() => ({}));
+    const response = await cpFetch(`/v1/strategies/${resolved.strategyId}/promote`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload || {}),
+    });
+    const body = await response.json().catch(() => ({ detail: "strategy_promote_failed" }));
+    return NextResponse.json(body, { status: response.status });
+  }
+
   const form = await request.formData();
   const toLevel = Number(form.get("to_level") || 0);
   const rationale = String(form.get("rationale") || "");

@@ -9,6 +9,8 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.tsbuildinfo
+.venv/
 .next/
 .next-runtime/
 node_modules/
@@ -23,6 +25,8 @@ coverage/
 dist/
 data/certbot/
 data/mission-control/
+data/predictor_v8/
+rust-execution-engine/target/
 
 # Screenshots / diagnostic captures (Playwright, manual)
 *.png

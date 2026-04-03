@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import JSZip from "jszip";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ComponentProps, ReactNode } from "react";
 import { Panel, PanelGroup, PanelResizeHandle, type ImperativePanelGroupHandle } from "react-resizable-panels";
 
@@ -46,6 +46,7 @@ import {
   resolveSignalCalibration,
 } from "../../lib/chartViewTransforms";
 import { analyzeOhlcvRows, normalizeOhlcvRows } from "../../lib/ohlcvIntegrity";
+import { isTimeframeSupported, SUPPORTED_TIMEFRAMES, timeframeToMs } from "../../lib/ohlcvDataEngine";
 import {
   DomTapeSidecarCard,
   ExecutionSidecarCard,
@@ -123,9 +124,17 @@ import ChartExecutionHud from "./ChartExecutionHud";
 import { buildChartOrderTicketPriceLabels, buildChartSnapEnabledLabel } from "./chartHudHelpers";
 import ChartHudOrderRiskPanel from "./ChartHudOrderRiskPanel";
 import ChartHudSignalDecisionPanel from "./ChartHudSignalDecisionPanel";
+import ChartPerceptualDebugPanel from "./ChartPerceptualDebugPanel";
 import GpuChartV4Surface from "./GpuChartV4Surface";
 import InstitutionalChart from "./InstitutionalChart";
 import TerminalChartV2 from "./TerminalChartV2";
+import type { ChartPerceptualTelemetry, GpuPerceptualTelemetry } from "./chartPerceptual";
+import {
+  clearTerminalComputePerf,
+  measureTerminalCompute,
+  snapshotTerminalComputePerf,
+  type TerminalComputePerfEntry,
+} from "./terminalComputePerf";
 import { isWebGL2Available } from "../../lib/engine/gpu-chart/context";
 import {
   AlertsDockPanel,
@@ -148,15 +157,77 @@ import {
 import { barArrayHash, type Bar } from "../../lib/dataEngine";
 import { indicatorWorkerAdapter } from "../../lib/indicators/workerAdapter";
 import type { ActiveIndicator, IndicatorSeriesData } from "../../lib/indicators/engine";
-import { createMarketDataBus, type OhlcvBar } from "../../lib/marketDataBus";
+import { ExecutionEngineV7, type V7Decision } from "../../lib/executionEngineV7";
+import { PredictorEngineV8, type PredictorEngineV8TrainingStats } from "../../lib/predictorEngineV8";
+import { createMarketDataBus, type MarketDataBusKernelTelemetry, type OhlcvBar } from "../../lib/marketDataBus";
 import type { SelfLearningV4Regime, SelfLearningV4Scenario } from "../../lib/selfLearningV4Store";
 import { useChartExecutionHud } from "../../lib/useChartExecutionHud";
 
 type JsonMap = Record<string, unknown>;
+const V8_PREDICTOR_STORAGE_KEY = "gtixt.terminal.v8.predictor.v1";
+const V8_BACKEND_PREDICT_DEBOUNCE_MS = 250;
+const V8_BACKEND_STATS_POLL_MS = 15000;
+const V8_BACKEND_TRAINING_FLUSH_SIZE = 100;
+const V8_BACKEND_TRAINING_FLUSH_INTERVAL_MS = 5000;
+const V8_DATA_RELIABILITY_MAX_BACKLOG = 384;
+const V8_LATENCY_GUARD_MS = 300;
+const DEFAULT_MARKET_BUS_KERNEL_TELEMETRY: MarketDataBusKernelTelemetry = {
+  tickLatencyMs: 0,
+  bufferBacklog: 0,
+  drainedTicksPerFrame: 0,
+  skippedFrames: 0,
+  schedulerBudgetMs: 5,
+  schedulerPullLimit: 320,
+  cpuLoadHint: 1,
+  fpsHint: 60,
+  frameTimeHintMs: 16.7,
+  backlogPressure: 0,
+  framesProcessed: 0,
+  benchmarkMode: false,
+  benchmarkTicksPerSec: 0,
+  benchmarkInjectedTicks: 0,
+  receivedTicks: 0,
+  candleUpdates: 0,
+  syntheticHeartbeatOpens: 0,
+  lastCandleUpdateAt: null,
+  lastDrainAt: null,
+};
+
 type LearningRegimeV4 = SelfLearningV4Regime;
 type MarketDecisionScenario = SelfLearningV4Scenario;
 type QuotePoint = { label: string; value: number };
 type QuoteHistoryMap = Record<string, QuotePoint[]>;
+type MultiAnchorVwapSnapshot = {
+  session: number;
+  day: number;
+  week: number;
+  month: number;
+  swing: number;
+  impulse: number;
+  sessionDistanceBps: number;
+  dayDistanceBps: number;
+  weekDistanceBps: number;
+  monthDistanceBps: number;
+  swingDistanceBps: number;
+  impulseDistanceBps: number;
+  primaryLabel: string;
+  primaryDistanceBps: number;
+  anchorCompressionBps: number;
+  confluenceScore: number;
+};
+type LiquidityEngineSnapshot = {
+  restingBidUsd: number;
+  restingAskUsd: number;
+  restingImbalance: number;
+  touchDensity: number;
+  sweepRisk: number;
+  liquidityVacuum: number;
+  supportScore: number;
+  resistanceScore: number;
+  liquidityPressure: number;
+  liquidityEngineScore: number;
+  stateLabel: string;
+};
 type OverlayZone = {
   kind: "fvg" | "ob";
   label: string;
@@ -433,14 +504,120 @@ type RiskPollingStatus = {
   latencyMs: number | null;
   source: "summary" | "history" | null;
 };
+type PerformanceSummaryPayload = {
+  scope_type: string;
+  scope_id: string;
+  period_start: string;
+  period_end: string;
+  trade_count: number;
+  realized_pnl_usd: number;
+  unrealized_pnl_usd: number;
+  fees_usd: number;
+  win_rate_pct: number;
+  expectancy_usd: number;
+  avg_slippage_bps: number;
+  avg_latency_ms: number;
+  sharpe_ratio: number | null;
+};
+type PerformanceAttributionItem = {
+  strategy_id: string | null;
+  symbol: string | null;
+  venue: string | null;
+  realized_pnl_usd: number;
+  unrealized_pnl_usd: number;
+  fees_usd: number;
+  trade_count: number;
+  win_rate_pct: number;
+  expectancy_usd: number;
+  avg_slippage_bps: number;
+  avg_latency_ms: number;
+  avg_score_pre_trade: number;
+  gross_profit_usd: number;
+  gross_loss_usd: number;
+  profit_factor: number | null;
+  pnl_contribution_pct: number;
+  avg_mae: number;
+  avg_mfe: number;
+  group_by: string[];
+};
+type PerformanceCapitalSource = {
+  key: string;
+  sourceType: "broker" | "exchange" | "wallet";
+  environment: string;
+  platform: string;
+  displayName: string;
+  status: string;
+  latestEquityUsd: number | null;
+  canonical: boolean;
+};
+type InvestorReportItem = {
+  report_id: string;
+  client_id: string;
+  portfolio_id: string | null;
+  report_month: string;
+  report_type: string;
+  status: string;
+  storage_path: string | null;
+  summary: JsonMap;
+  created_at: string | null;
+  published_at: string | null;
+};
 type ReplayEventMarker = {
   id: string;
   label: string;
-  kind: "intent" | "approval" | "fill" | "incident" | "routing" | "outcome" | "other";
+  kind: "intent" | "approval" | "fill" | "incident" | "routing" | "outcome" | "latent" | "other";
   timeKey: string;
   frameIndex: number;
   critical: boolean;
   detail: string;
+};
+type BrainReplayAttributionFamily = {
+  family: string;
+  contribution: number;
+  shapLike: number;
+  marginalImpact: number;
+  correlation: number;
+  learningRateHint: number;
+  wrongWay: boolean;
+};
+type BrainReplayAgentLearningRate = {
+  agent: string;
+  base: number;
+  featureMultiplier: number;
+  failureMultiplier: number;
+  combinedMultiplier: number;
+  effectiveLearningRate: number;
+  families: string[];
+  failureSource: string | null;
+  calibrationMode: string;
+  calibrationConfidence: number;
+  calibrationSamples: number;
+  calibrationEffectiveWeight: number;
+  explanation: string;
+};
+type BrainReplayAttributionSnapshot = {
+  id: string;
+  action: string;
+  reward: number;
+  rawReward: number;
+  rewardScale: number;
+  contextLabel: string;
+  topFamily: string;
+  topContribution: number;
+  families: BrainReplayAttributionFamily[];
+  latentLabel: string;
+  latentNextLabel: string;
+  latentTransition: number;
+  latentShiftLabel: string;
+  synthetic: boolean;
+  dreamSource: string;
+  sampleWeight: number;
+  dreamCount: number;
+  dreamWeight: number;
+  failureSource: string | null;
+  failureReasons: string[];
+  failureBlocking: boolean;
+  agentLearningRates: BrainReplayAgentLearningRate[];
 };
 type MetaRiskAuditEvent = {
   id: string;
@@ -454,6 +631,66 @@ type MetaRiskAuditEvent = {
   blockedRegimes: string[];
   venue: string;
 };
+
+function normalizePerformanceCapitalSources(accountsPayload: unknown, connectorsPayload: unknown): PerformanceCapitalSource[] {
+  const sources = new Map<string, PerformanceCapitalSource>();
+  const accounts = Array.isArray(accountsPayload) ? accountsPayload : [];
+  for (const item of accounts) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const row = item as JsonMap;
+    const accountId = String(row.account_id || "");
+    if (!accountId) {
+      continue;
+    }
+    const accountType = String(row.account_type || "broker").toLowerCase();
+    const sourceType = accountType === "exchange" || accountType === "wallet" ? accountType : "broker";
+    sources.set(accountId, {
+      key: `canonical:${accountId}`,
+      sourceType,
+      environment: sourceType === "broker" ? String(row.mode || "unknown") : `${sourceType} live`,
+      platform: String(row.venue || row.connector_type || accountId),
+      displayName: String(row.display_name || accountId),
+      status: String(row.status || "unknown"),
+      latestEquityUsd: Number.isFinite(Number(row.latest_equity_usd)) ? Number(row.latest_equity_usd) : null,
+      canonical: true,
+    });
+  }
+
+  const connectorAccounts = connectorsPayload && typeof connectorsPayload === "object" && Array.isArray((connectorsPayload as JsonMap).accounts)
+    ? ((connectorsPayload as JsonMap).accounts as unknown[])
+    : [];
+  for (const item of connectorAccounts) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const row = item as JsonMap;
+    const accountId = String(row.account_id || "");
+    const provider = String(row.provider || "");
+    if (!accountId || provider.toLowerCase() === "mt5" || sources.has(accountId)) {
+      continue;
+    }
+    const providerType = String(row.provider_type || "exchange").toLowerCase();
+    const sourceType = providerType === "wallet" ? "wallet" : "exchange";
+    sources.set(accountId, {
+      key: `linked:${provider}:${accountId}`,
+      sourceType,
+      environment: sourceType === "wallet" ? "wallet live" : "exchange live",
+      platform: provider || sourceType,
+      displayName: String(row.label || accountId),
+      status: Boolean(row.has_credentials) ? "linked" : "credential-missing",
+      latestEquityUsd: null,
+      canonical: false,
+    });
+  }
+
+  return [...sources.values()];
+}
+
+function formatCurrency(value: number): string {
+  return value.toLocaleString("fr-FR", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+}
 
 type AutoTuningAuditEvent = {
   id: string;
@@ -480,6 +717,18 @@ type AutoExecutionAuditEvent = {
   sizeUsd: number;
   qualityScore: number;
   reasons: string[];
+};
+
+type TradeTicketOverrides = {
+  symbol?: string;
+  side?: "buy" | "sell";
+  lots?: number;
+  notional?: number;
+  maxSpread?: number;
+  rationale?: string;
+  preferredVenue?: string;
+  orderIntent?: JsonMap;
+  metadata?: JsonMap;
 };
 
 type SelfLearningJournalEventV4 = {
@@ -529,8 +778,28 @@ const ROLLBACK_GUARD_BRIER_RISE = Number(process.env.NEXT_PUBLIC_ROLLBACK_GUARD_
 const TERMINAL_V2_DEFAULT = process.env.NEXT_PUBLIC_TERMINAL_V2 === "1";
 const TERMINAL_CHART_ENGINE_DEFAULT: "v3" | "v4" = process.env.NEXT_PUBLIC_TERMINAL_ENGINE_V4 === "1" ? "v4" : "v3";
 const TERMINAL_SMOOTHING_DEFAULT_MS: 0 | 80 | 140 | 220 = 140;
+type TerminalFocusDeckId = "micro" | "markets" | "monitoring" | "capital" | "metaRisk" | "correlation" | "calibration";
+const TERMINAL_FOCUS_DECKS: Array<{ id: TerminalFocusDeckId; label: string }> = [
+  { id: "micro", label: "Micro" },
+  { id: "markets", label: "Markets" },
+  { id: "monitoring", label: "Ops" },
+  { id: "capital", label: "Capital" },
+  { id: "metaRisk", label: "Risk" },
+  { id: "correlation", label: "Correlation" },
+  { id: "calibration", label: "Calibration" },
+];
+const TERMINAL_FOCUS_DECK_THROTTLE_MS: Record<TerminalFocusDeckId, number> = {
+  micro: 250,
+  markets: 1200,
+  monitoring: 1500,
+  capital: 1500,
+  metaRisk: 1500,
+  correlation: 2000,
+  calibration: 2000,
+};
 
 const DEBUG_TIME_SYNC = process.env.NEXT_PUBLIC_DEBUG_TIME_SYNC === "1";
+const TERMINAL_COMPUTE_PERF_STORAGE_KEY = "txt.terminal.compute-perf";
 const MARKET_SNAPSHOT_CACHE_TTL_MS = 20_000;
 const CHART_ORDER_PRESETS: Record<Exclude<ChartOrderPreset, "custom">, { slPct: number; tpPct: number; notional: number; maxSpread: number }> = {
   scalp: { slPct: 0.003, tpPct: 0.006, notional: 10000, maxSpread: 10 },
@@ -543,7 +812,9 @@ const DEFAULT_CONFLUENCE_WEIGHTS: MarketConfluenceWeights = {
   liquidity: 1.1,
   "price-action": 0.95,
 };
-const CHART_TIMEFRAMES: Array<"1m" | "5m" | "15m"> = ["1m", "5m", "15m"];
+const CHART_TIMEFRAMES: string[] = [...SUPPORTED_TIMEFRAMES];
+const CHART_TIMEFRAME_SELECTOR_PRIMARY = ["1s", "5s", "10s", "30s", "1m", "5m", "15m"] as const;
+const CHART_TIMEFRAME_SELECTOR_SECONDARY = ["30m", "1h", "4h", "8h", "1d", "1w", "1M"] as const;
 const HUMAN_MODE_INDICATORS: ActiveIndicator[] = [
   { id: "ema9", params: {} },
   { id: "ema21", params: {} },
@@ -705,6 +976,431 @@ const TEAM_PRESET_NAMES = Object.keys(TEAM_PRESETS);
 function toNumber(value: unknown, fallback = 0): number {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : fallback;
+}
+
+function formatFeatureFamilyLabel(value: string): string {
+  const normalized = String(value || "n/a").trim().toLowerCase();
+  const labels: Record<string, string> = {
+    orderflow: "Orderflow",
+    liquidity: "Liquidity",
+    vwap: "VWAP",
+    regime: "Regime",
+  };
+  return labels[normalized] || normalized || "n/a";
+}
+
+function compactFeatureFamilyLabel(value: string): string {
+  const normalized = String(value || "n/a").trim().toLowerCase();
+  const labels: Record<string, string> = {
+    orderflow: "OF",
+    liquidity: "LQ",
+    vwap: "VW",
+    regime: "RG",
+  };
+  return labels[normalized] || normalized.slice(0, 2).toUpperCase() || "NA";
+}
+
+function formatReplayAgentLabel(value: unknown): string {
+  const normalized = String(value || "").trim().toLowerCase();
+  const labels: Record<string, string> = {
+    scalper: "Scalper",
+    trend: "Trend",
+    liquidity: "Liquidity",
+    execution: "Execution",
+    risk: "Risk",
+  };
+  return labels[normalized] || (normalized ? `${normalized.slice(0, 1).toUpperCase()}${normalized.slice(1)}` : "Agent");
+}
+
+function compactReplayAgentLabel(value: unknown): string {
+  const normalized = String(value || "").trim().toLowerCase();
+  const labels: Record<string, string> = {
+    scalper: "SC",
+    trend: "TR",
+    liquidity: "LQ",
+    execution: "EX",
+    risk: "RK",
+  };
+  return labels[normalized] || normalized.slice(0, 2).toUpperCase() || "AG";
+}
+
+function formatFailureSourceLabel(value: unknown): string {
+  const normalized = String(value || "").trim().toLowerCase();
+  const labels: Record<string, string> = {
+    infra: "Infra",
+    market: "Market",
+    execution: "Execution",
+  };
+  return labels[normalized] || (normalized ? `${normalized.slice(0, 1).toUpperCase()}${normalized.slice(1)}` : "Source");
+}
+
+function formatControlPlaneStateLabel(value: unknown): string {
+  const normalized = String(value || "healthy").trim().toLowerCase();
+  if (normalized === "retry_recovered") {
+    return "retry recovered";
+  }
+  if (normalized === "degraded") {
+    return "degraded";
+  }
+  return "healthy";
+}
+
+function compactControlPlaneFailureLabel(value: unknown): string {
+  const normalized = String(value || "none").trim().toLowerCase();
+  const labels: Record<string, string> = {
+    none: "none",
+    dns_transient: "dns",
+    dns_unresolved: "dns hard",
+    timeout: "timeout",
+    connection_refused: "refused",
+    connection_reset: "reset",
+    aborted: "abort",
+    network_unknown: "network",
+    unknown_error: "unknown",
+  };
+  return labels[normalized] || normalized.replace(/_/g, " ");
+}
+
+function buildFeatureContextLabel(context: JsonMap | null | undefined): string {
+  const regime = String(context?.regime || "n/a").toLowerCase();
+  const session = String(context?.session || "n/a").toLowerCase();
+  const volatility = String(context?.volatility || "n/a").toLowerCase();
+  const spread = String(context?.spread || "n/a").toLowerCase();
+  return `${regime} · ${session} · ${volatility} · ${spread}`;
+}
+
+function normalizeReplayLatentLabel(value: unknown): string {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized || "uninitialized";
+}
+
+function formatReplayLatentLabel(value: unknown): string {
+  return normalizeReplayLatentLabel(value)
+    .split("-")
+    .map((part) => part ? `${part.slice(0, 1).toUpperCase()}${part.slice(1)}` : "")
+    .filter(Boolean)
+    .join(" ");
+}
+
+function compactReplayLatentLabel(value: unknown): string {
+  const tokens = normalizeReplayLatentLabel(value)
+    .split("-")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (tokens.length === 0) {
+    return "UN";
+  }
+  return tokens.map((part) => part.slice(0, 1).toUpperCase()).join("").slice(0, 3) || "UN";
+}
+
+function buildReplayLatentShiftLabel(latentLabel: string, latentNextLabel: string): string {
+  return latentLabel === latentNextLabel
+    ? `${formatReplayLatentLabel(latentLabel)} hold`
+    : `${formatReplayLatentLabel(latentLabel)} -> ${formatReplayLatentLabel(latentNextLabel)}`;
+}
+
+function formatReplayDreamSource(value: unknown): string {
+  const normalized = String(value || "").trim();
+  if (!normalized || normalized === "real") {
+    return "real tape";
+  }
+  if (normalized === "synthetic") {
+    return "synthetic";
+  }
+  return normalized.length <= 22 ? normalized : `${normalized.slice(0, 10)}...${normalized.slice(-6)}`;
+}
+
+function buildReplayDreamSummary(snapshot: BrainReplayAttributionSnapshot | null | undefined): string {
+  if (!snapshot) {
+    return "real tape";
+  }
+  if (snapshot.synthetic) {
+    return `dream from ${formatReplayDreamSource(snapshot.dreamSource)} · w x${snapshot.sampleWeight.toFixed(2)}`;
+  }
+  if (snapshot.dreamCount > 0) {
+    return `spawned ${snapshot.dreamCount} dream${snapshot.dreamCount === 1 ? "" : "s"} · w x${snapshot.dreamWeight.toFixed(2)}`;
+  }
+  return `real tape · w x${snapshot.sampleWeight.toFixed(2)}`;
+}
+
+function formatReplayFailureSource(value: unknown): string {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "infra") {
+    return "infra";
+  }
+  if (normalized === "execution") {
+    return "execution";
+  }
+  if (normalized === "market") {
+    return "market";
+  }
+  return "";
+}
+
+function mergeReplayDreamEcho(
+  target: BrainReplayAttributionSnapshot | undefined,
+  dreamSnapshot: BrainReplayAttributionSnapshot,
+): BrainReplayAttributionSnapshot {
+  const base = target || {
+    ...dreamSnapshot,
+    id: dreamSnapshot.dreamSource,
+    synthetic: false,
+    dreamSource: dreamSnapshot.dreamSource,
+    sampleWeight: 1,
+    dreamCount: 0,
+    dreamWeight: 0,
+    agentLearningRates: dreamSnapshot.agentLearningRates,
+  };
+  return {
+    ...base,
+    dreamCount: base.dreamCount + 1,
+    dreamWeight: Number((base.dreamWeight + dreamSnapshot.sampleWeight).toFixed(4)),
+  };
+}
+
+function normalizeReplayAgentLearningRates(raw: unknown): BrainReplayAgentLearningRate[] {
+  const normalizedRows: BrainReplayAgentLearningRate[] = [];
+  const pushRow = (value: JsonMap, fallbackAgent: string) => {
+    const agent = String(value.agent || fallbackAgent).trim().toLowerCase();
+    if (!agent) {
+      return;
+    }
+    normalizedRows.push({
+      agent,
+      base: toNumber(value.base, 0),
+      featureMultiplier: toNumber(value.featureMultiplier ?? value.feature_multiplier, 1),
+      failureMultiplier: toNumber(value.failureMultiplier ?? value.failure_multiplier, 1),
+      combinedMultiplier: toNumber(value.combinedMultiplier ?? value.combined_multiplier, 1),
+      effectiveLearningRate: toNumber(value.effectiveLearningRate ?? value.effective_learning_rate, 0),
+      families: Array.isArray(value.families) ? value.families.map((item) => String(item || "").trim()).filter(Boolean) : [],
+      failureSource: formatReplayFailureSource(value.failureSource || value.failure_source) || null,
+      calibrationMode: String(value.calibrationMode || value.calibration_mode || "prior").trim().toLowerCase() || "prior",
+      calibrationConfidence: toNumber(value.calibrationConfidence ?? value.calibration_confidence, 0),
+      calibrationSamples: Math.max(0, Math.round(toNumber(value.calibrationSamples ?? value.calibration_samples, 0))),
+      calibrationEffectiveWeight: toNumber(value.calibrationEffectiveWeight ?? value.calibration_effective_weight, 0),
+      explanation: String(value.explanation || "").trim(),
+    });
+  };
+
+  if (Array.isArray(raw)) {
+    raw.filter((item): item is JsonMap => Boolean(item) && typeof item === "object").forEach((item, index) => {
+      pushRow(item, `agent-${index + 1}`);
+    });
+  } else if (raw && typeof raw === "object") {
+    Object.entries(raw as JsonMap).forEach(([agent, value]) => {
+      if (value && typeof value === "object") {
+        pushRow(value as JsonMap, agent);
+      }
+    });
+  }
+
+  return normalizedRows.sort((left, right) => Math.abs(right.combinedMultiplier - 1) - Math.abs(left.combinedMultiplier - 1));
+}
+
+function buildReplayAttributionSnapshotFromExperience(row: JsonMap): BrainReplayAttributionSnapshot | null {
+  const id = String(row.experience_id || row.decision_id || row.id || row.event_id || "").trim();
+  if (!id) {
+    return null;
+  }
+  const diagnostics = row.feature_diagnostics && typeof row.feature_diagnostics === "object"
+    ? row.feature_diagnostics as Record<string, JsonMap>
+    : {};
+  const contributions = row.feature_contributions && typeof row.feature_contributions === "object"
+    ? row.feature_contributions as Record<string, unknown>
+    : {};
+  const context = row.context && typeof row.context === "object"
+    ? row.context as JsonMap
+    : null;
+  const statePayload = row.state && typeof row.state === "object"
+    ? row.state as JsonMap
+    : null;
+  const nextStatePayload = row.next_state && typeof row.next_state === "object"
+    ? row.next_state as JsonMap
+    : row.nextState && typeof row.nextState === "object"
+      ? row.nextState as JsonMap
+      : null;
+  const latentLabel = normalizeReplayLatentLabel(statePayload?.latent_label || context?.latent || row.latent_label);
+  const latentNextLabel = normalizeReplayLatentLabel(nextStatePayload?.latent_label || context?.latent_next || row.latent_next || latentLabel);
+  const latentTransition = toNumber(statePayload?.latent_transition ?? row.latent_transition, 0);
+  const synthetic = Boolean(row.synthetic || context?.origin === "synthetic");
+  const dreamSource = String(row.dream_source || row.source_experience_id || row.source_id || (synthetic ? "synthetic" : "real")).trim() || (synthetic ? "synthetic" : "real");
+  const sampleWeight = toNumber(row.sample_weight, synthetic ? 0.2 : 1);
+  const families = Object.entries(diagnostics)
+    .map(([family, raw]) => ({
+      family,
+      contribution: toNumber(raw?.contribution ?? contributions[family], 0),
+      shapLike: toNumber(raw?.shap_like, 0),
+      marginalImpact: toNumber(raw?.marginal_impact, 0),
+      correlation: toNumber(raw?.rolling_correlation, 0),
+      learningRateHint: toNumber(raw?.learning_rate_hint, 1),
+      wrongWay: Boolean(raw?.wrong_way),
+    }))
+    .sort((left, right) => Math.abs(right.contribution) - Math.abs(left.contribution));
+  const fallbackFamilies = families.length > 0
+    ? families
+    : Object.entries(contributions)
+      .map(([family, value]) => ({
+        family,
+        contribution: toNumber(value, 0),
+        shapLike: 0,
+        marginalImpact: 0,
+        correlation: 0,
+        learningRateHint: 1,
+        wrongWay: false,
+      }))
+      .sort((left, right) => Math.abs(right.contribution) - Math.abs(left.contribution));
+  const leader = fallbackFamilies[0] || null;
+  const failureReasons = Array.isArray(row.failure_reasons)
+    ? row.failure_reasons.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
+  const agentLearningRates = normalizeReplayAgentLearningRates(row.agent_learning_rate_hints);
+  return {
+    id,
+    action: String(row.action || "HOLD"),
+    reward: toNumber(row.reward, 0),
+    rawReward: toNumber(row.raw_reward ?? row.reward, 0),
+    rewardScale: toNumber(row.reward_scale, 1),
+    contextLabel: buildFeatureContextLabel(context),
+    topFamily: leader?.family || "n/a",
+    topContribution: leader?.contribution || 0,
+    families: fallbackFamilies.slice(0, 4),
+    latentLabel,
+    latentNextLabel,
+    latentTransition,
+    latentShiftLabel: buildReplayLatentShiftLabel(latentLabel, latentNextLabel),
+    synthetic,
+    dreamSource,
+    sampleWeight,
+    dreamCount: 0,
+    dreamWeight: 0,
+    failureSource: formatReplayFailureSource(row.failure_source) || null,
+    failureReasons,
+    failureBlocking: Boolean(row.failure_blocking),
+    agentLearningRates,
+  };
+}
+
+function normalizeReplayAttributionSnapshot(raw: JsonMap | null | undefined): BrainReplayAttributionSnapshot | null {
+  if (!raw) {
+    return null;
+  }
+  const id = String(raw.id || raw.experience_id || raw.decision_id || "").trim();
+  if (!id) {
+    return null;
+  }
+  const families = Array.isArray(raw.families)
+    ? raw.families
+      .filter((item): item is JsonMap => Boolean(item) && typeof item === "object")
+      .map((item) => ({
+        family: String(item.family || "n/a").trim().toLowerCase() || "n/a",
+        contribution: toNumber(item.contribution, 0),
+        shapLike: toNumber(item.shapLike ?? item.shap_like, 0),
+        marginalImpact: toNumber(item.marginalImpact ?? item.marginal_impact, 0),
+        correlation: toNumber(item.correlation, 0),
+        learningRateHint: toNumber(item.learningRateHint ?? item.learning_rate_hint, 1),
+        wrongWay: Boolean(item.wrongWay ?? item.wrong_way),
+      }))
+      .sort((left, right) => Math.abs(right.contribution) - Math.abs(left.contribution))
+    : [];
+  const latentLabel = normalizeReplayLatentLabel(raw.latentLabel || raw.latent_label);
+  const latentNextLabel = normalizeReplayLatentLabel(raw.latentNextLabel || raw.latent_next_label || latentLabel);
+  const synthetic = Boolean(raw.synthetic);
+  const failureReasonsValue = raw.failureReasons ?? raw.failure_reasons;
+  const agentLearningRates = normalizeReplayAgentLearningRates(raw.agentLearningRates ?? raw.agent_learning_rates ?? raw.agent_learning_rate_hints);
+  return {
+    id,
+    action: String(raw.action || "HOLD").trim().toUpperCase() || "HOLD",
+    reward: toNumber(raw.reward, 0),
+    rawReward: toNumber(raw.rawReward ?? raw.raw_reward ?? raw.reward, 0),
+    rewardScale: toNumber(raw.rewardScale ?? raw.reward_scale, 1),
+    contextLabel: String(raw.contextLabel || raw.context_label || "").trim() || buildFeatureContextLabel(null),
+    topFamily: String(raw.topFamily || raw.top_family || families[0]?.family || "n/a").trim().toLowerCase() || "n/a",
+    topContribution: toNumber(raw.topContribution ?? raw.top_contribution, families[0]?.contribution ?? 0),
+    families,
+    latentLabel,
+    latentNextLabel,
+    latentTransition: toNumber(raw.latentTransition ?? raw.latent_transition, 0),
+    latentShiftLabel: String(raw.latentShiftLabel || raw.latent_shift_label || "").trim() || buildReplayLatentShiftLabel(latentLabel, latentNextLabel),
+    synthetic,
+    dreamSource: String(raw.dreamSource || raw.dream_source || (synthetic ? "synthetic" : "real")).trim() || (synthetic ? "synthetic" : "real"),
+    sampleWeight: toNumber(raw.sampleWeight ?? raw.sample_weight, synthetic ? 0.2 : 1),
+    dreamCount: Math.max(0, Math.round(toNumber(raw.dreamCount ?? raw.dream_count, 0))),
+    dreamWeight: toNumber(raw.dreamWeight ?? raw.dream_weight, 0),
+    failureSource: formatReplayFailureSource(raw.failureSource || raw.failure_source) || null,
+    failureReasons: Array.isArray(failureReasonsValue)
+      ? failureReasonsValue.map((item) => String(item || "").trim()).filter(Boolean)
+      : [],
+    failureBlocking: Boolean(raw.failureBlocking ?? raw.failure_blocking),
+    agentLearningRates,
+  };
+}
+
+function resolveRawChartAnchorPrice(
+  marketMicro: JsonMap | null,
+  marketDepth: JsonMap | null,
+  latestQuote: JsonMap | null,
+  fallback: number,
+): number {
+  const rawAnchor = toNumber(marketMicro?.raw_chart_anchor_price, 0);
+  if (rawAnchor > 0) {
+    return rawAnchor;
+  }
+
+  const microBid = toNumber(marketMicro?.best_bid, 0);
+  const microAsk = toNumber(marketMicro?.best_ask, 0);
+  if (microBid > 0 && microAsk > 0) {
+    return (microBid + microAsk) * 0.5;
+  }
+
+  const depthBid = toNumber(marketDepth?.best_bid, 0);
+  const depthAsk = toNumber(marketDepth?.best_ask, 0);
+  if (depthBid > 0 && depthAsk > 0) {
+    return (depthBid + depthAsk) * 0.5;
+  }
+
+  return microBid || microAsk || depthBid || depthAsk || toNumber(latestQuote?.last, fallback);
+}
+
+function clampPredictorOrderbookSignal(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function derivePredictorOrderbookSignals(marketDepth: JsonMap | null): { quoteFadeRate: number; bookFlipSignal: number; orderbookBids: number[][]; orderbookAsks: number[][] } {
+  const depthPayload = (marketDepth?.depth_payload as JsonMap | undefined) || {};
+  const normalizeRows = (value: unknown): number[][] => {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+    return value
+      .map((row) => {
+        const level = Array.isArray(row) ? row : [];
+        const price = toNumber(level[0], 0);
+        const size = toNumber(level[1], 0);
+        return price > 0 && size > 0 ? [price, size] : null;
+      })
+      .filter((row): row is number[] => Array.isArray(row));
+  };
+  const orderbookBids = normalizeRows(depthPayload.bids).slice(0, 12);
+  const orderbookAsks = normalizeRows(depthPayload.asks).slice(0, 12);
+  if (orderbookBids.length === 0 || orderbookAsks.length === 0) {
+    return { quoteFadeRate: 0, bookFlipSignal: 0, orderbookBids, orderbookAsks };
+  }
+  const sumNotional = (rows: number[][], limit: number) => rows.slice(0, limit).reduce((total, row) => total + row[0] * row[1], 0);
+  const top3Bid = sumNotional(orderbookBids, 3);
+  const top3Ask = sumNotional(orderbookAsks, 3);
+  const top10Bid = sumNotional(orderbookBids, 10);
+  const top10Ask = sumNotional(orderbookAsks, 10);
+  const totalTop3 = top3Bid + top3Ask;
+  const totalTop10 = top10Bid + top10Ask;
+  const touchDensity = totalTop3 / Math.max(totalTop10, 1e-9);
+  const top3Imbalance = (top3Bid - top3Ask) / Math.max(totalTop3, 1e-9);
+  const top10Imbalance = (top10Bid - top10Ask) / Math.max(totalTop10, 1e-9);
+  return {
+    quoteFadeRate: clampPredictorOrderbookSignal((1 - touchDensity) * 3, 0, 3),
+    bookFlipSignal: clampPredictorOrderbookSignal(top3Imbalance - top10Imbalance, -1, 1),
+    orderbookBids,
+    orderbookAsks,
+  };
 }
 
 function instrumentLabel(item: JsonMap): string {
@@ -1063,13 +1759,7 @@ function emaLast(values: number[], period: number): number {
 }
 
 function timeframeSeconds(timeframe: string): number {
-  if (timeframe === "5m") {
-    return 300;
-  }
-  if (timeframe === "15m") {
-    return 900;
-  }
-  return 60;
+  return Math.max(1, Math.round(timeframeToMs(timeframe) / 1000));
 }
 
 function nextChartMotionPreset(current: ChartMotionPreset): ChartMotionPreset {
@@ -1195,6 +1885,286 @@ function weightedVwap(points: QuotePoint[]): number {
   return weightedVolume === 0 ? points[points.length - 1].value : weightedPrice / weightedVolume;
 }
 
+function pointTimestamp(label: string): number {
+  const value = Date.parse(label);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function distanceBps(price: number, reference: number): number {
+  if (!(price > 0) || !(reference > 0)) {
+    return 0;
+  }
+  return ((price - reference) / reference) * 10000;
+}
+
+function anchoredPointsFrom(points: QuotePoint[], thresholdMs: number): QuotePoint[] {
+  if (!Number.isFinite(thresholdMs) || thresholdMs <= 0 || points.length === 0) {
+    return points;
+  }
+  const filtered = points.filter((point) => pointTimestamp(point.label) >= thresholdMs);
+  return filtered.length > 0 ? filtered : points;
+}
+
+function startOfUtcDay(timestamp: number): number {
+  const date = new Date(timestamp);
+  date.setUTCHours(0, 0, 0, 0);
+  return date.getTime();
+}
+
+function startOfUtcWeek(timestamp: number): number {
+  const date = new Date(timestamp);
+  const day = (date.getUTCDay() + 6) % 7;
+  date.setUTCDate(date.getUTCDate() - day);
+  date.setUTCHours(0, 0, 0, 0);
+  return date.getTime();
+}
+
+function startOfUtcMonth(timestamp: number): number {
+  const date = new Date(timestamp);
+  date.setUTCDate(1);
+  date.setUTCHours(0, 0, 0, 0);
+  return date.getTime();
+}
+
+function deriveMarketSessionLabel(timestamp: number): string {
+  const resolved = Number.isFinite(timestamp) && timestamp > 0 ? timestamp : Date.now();
+  const hour = new Date(resolved).getUTCHours();
+  if (hour < 8) {
+    return "asia";
+  }
+  if (hour < 13) {
+    return "london";
+  }
+  if (hour < 21) {
+    return "new-york";
+  }
+  return "off";
+}
+
+function findImpulseAnchorIndex(points: QuotePoint[]): number {
+  if (points.length <= 6) {
+    return Math.max(0, points.length - 1);
+  }
+  const start = Math.max(0, points.length - 36);
+  const current = points[points.length - 1]?.value || 0;
+  let bestIndex = start;
+  let bestScore = -1;
+  for (let index = start; index < points.length - 2; index += 1) {
+    const anchor = points[index]?.value || 0;
+    if (!(anchor > 0)) {
+      continue;
+    }
+    const segment = points.slice(index);
+    const move = Math.abs((current - anchor) / anchor);
+    const persistence = Math.min(1, segment.length / 18);
+    const realizedVol = average(segment.slice(1).map((point, offset) => {
+      const previous = segment[offset]?.value || point.value;
+      return previous > 0 ? Math.abs((point.value - previous) / previous) : 0;
+    }));
+    const score = move * 0.7 + persistence * 0.2 + Math.min(0.2, realizedVol * 18);
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = index;
+    }
+  }
+  return bestIndex;
+}
+
+function findSwingAnchorIndex(points: QuotePoint[]): number {
+  if (points.length <= 5) {
+    return Math.max(0, points.length - 1);
+  }
+  const start = Math.max(2, points.length - 48);
+  let bestIndex = start;
+  let bestScore = -1;
+  for (let index = start; index < points.length - 2; index += 1) {
+    const left = points.slice(Math.max(0, index - 2), index).map((point) => point.value);
+    const right = points.slice(index + 1, index + 3).map((point) => point.value);
+    const current = points[index]?.value || 0;
+    if (left.length === 0 || right.length === 0 || !(current > 0)) {
+      continue;
+    }
+    const leftMax = Math.max(...left);
+    const leftMin = Math.min(...left);
+    const rightMax = Math.max(...right);
+    const rightMin = Math.min(...right);
+    const isPivot = current >= Math.max(leftMax, rightMax) || current <= Math.min(leftMin, rightMin);
+    if (!isPivot) {
+      continue;
+    }
+    const neighborMean = average([...left, ...right]);
+    const score = Math.abs((current - neighborMean) / Math.max(Math.abs(neighborMean), 1e-9));
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = index;
+    }
+  }
+  return bestIndex;
+}
+
+function buildMultiAnchorVwap(points: QuotePoint[]): MultiAnchorVwapSnapshot {
+  if (points.length === 0) {
+    return {
+      session: 0,
+      day: 0,
+      week: 0,
+      month: 0,
+      swing: 0,
+      impulse: 0,
+      sessionDistanceBps: 0,
+      dayDistanceBps: 0,
+      weekDistanceBps: 0,
+      monthDistanceBps: 0,
+      swingDistanceBps: 0,
+      impulseDistanceBps: 0,
+      primaryLabel: "n/a",
+      primaryDistanceBps: 0,
+      anchorCompressionBps: 0,
+      confluenceScore: 0,
+    };
+  }
+  const lastPoint = points[points.length - 1];
+  const currentPrice = lastPoint?.value || 0;
+  const currentTs = pointTimestamp(lastPoint?.label || "") || Date.now();
+  const sessionPoints = points.slice(-12);
+  const dayPoints = anchoredPointsFrom(points, startOfUtcDay(currentTs));
+  const weekPoints = anchoredPointsFrom(points, startOfUtcWeek(currentTs));
+  const monthPoints = anchoredPointsFrom(points, startOfUtcMonth(currentTs));
+  const swingIndex = findSwingAnchorIndex(points);
+  const impulseIndex = findImpulseAnchorIndex(points);
+  const swingPoints = points.slice(swingIndex);
+  const impulsePoints = points.slice(impulseIndex);
+  const session = weightedVwap(sessionPoints);
+  const day = weightedVwap(dayPoints);
+  const week = weightedVwap(weekPoints);
+  const month = weightedVwap(monthPoints);
+  const swing = weightedVwap(swingPoints);
+  const impulse = weightedVwap(impulsePoints);
+  const anchors = [
+    { label: "session", value: session },
+    { label: "day", value: day },
+    { label: "week", value: week },
+    { label: "month", value: month },
+    { label: "swing", value: swing },
+    { label: "impulse", value: impulse },
+  ].filter((anchor) => anchor.value > 0);
+  const distances = anchors.map((anchor) => ({ label: anchor.label, distance: distanceBps(currentPrice, anchor.value) }));
+  const primary = distances.reduce((best, candidate) => (Math.abs(candidate.distance) < Math.abs(best.distance) ? candidate : best), distances[0] || { label: "n/a", distance: 0 });
+  const anchorValues = anchors.map((anchor) => anchor.value);
+  const anchorMean = average(anchorValues);
+  const anchorCompressionBps = anchorValues.length > 1 && anchorMean > 0
+    ? ((Math.max(...anchorValues) - Math.min(...anchorValues)) / anchorMean) * 10000
+    : 0;
+  const anchorsNearPrice = distances.filter((item) => Math.abs(item.distance) <= 12).length;
+  const confluenceScore = clamp(
+    anchorsNearPrice * 0.22 + (anchorCompressionBps <= 18 ? 0.22 : anchorCompressionBps <= 32 ? 0.1 : 0),
+    0,
+    1,
+  );
+  return {
+    session,
+    day,
+    week,
+    month,
+    swing,
+    impulse,
+    sessionDistanceBps: distanceBps(currentPrice, session),
+    dayDistanceBps: distanceBps(currentPrice, day),
+    weekDistanceBps: distanceBps(currentPrice, week),
+    monthDistanceBps: distanceBps(currentPrice, month),
+    swingDistanceBps: distanceBps(currentPrice, swing),
+    impulseDistanceBps: distanceBps(currentPrice, impulse),
+    primaryLabel: primary.label,
+    primaryDistanceBps: primary.distance,
+    anchorCompressionBps,
+    confluenceScore,
+  };
+}
+
+function buildLiquidityEngineSnapshot(
+  orderbookBids: number[][],
+  orderbookAsks: number[][],
+  spreadBps: number,
+  quoteFadeRate: number,
+  bookFlipSignal: number,
+  orderflowImbalance: number,
+  anchors: MultiAnchorVwapSnapshot,
+): LiquidityEngineSnapshot {
+  const sumNotional = (rows: number[][], limit: number) => rows.slice(0, limit).reduce((total, row) => total + row[0] * row[1], 0);
+  const top3Bid = sumNotional(orderbookBids, 3);
+  const top3Ask = sumNotional(orderbookAsks, 3);
+  const top5Bid = sumNotional(orderbookBids, 5);
+  const top5Ask = sumNotional(orderbookAsks, 5);
+  const top10Bid = sumNotional(orderbookBids, 10);
+  const top10Ask = sumNotional(orderbookAsks, 10);
+  const touchDensity = (top3Bid + top3Ask) / Math.max(top10Bid + top10Ask, 1e-9);
+  const restingImbalance = (top5Bid - top5Ask) / Math.max(top5Bid + top5Ask, 1e-9);
+  const thinTouch = clamp(1 - touchDensity, 0, 1);
+  const spreadStress = clamp(spreadBps / 12, 0, 1);
+  const liquidityVacuum = clamp(thinTouch * 0.56 + clamp(quoteFadeRate / 3, 0, 1) * 0.24 + spreadStress * 0.2, 0, 1);
+  const sweepRisk = clamp(
+    thinTouch * 0.4
+      + Math.abs(bookFlipSignal) * 0.2
+      + clamp(quoteFadeRate / 3, 0, 1) * 0.16
+      + spreadStress * 0.12
+      + Math.abs(orderflowImbalance) * 0.12,
+    0,
+    1,
+  );
+  const liquidityPressure = clamp(
+    restingImbalance * 0.46
+      + orderflowImbalance * 0.24
+      + bookFlipSignal * 0.14
+      - Math.sign(anchors.primaryDistanceBps || 0) * Math.min(0.26, Math.abs(anchors.primaryDistanceBps) / 40)
+      - Math.max(0, liquidityVacuum - 0.52) * 0.14,
+    -1,
+    1,
+  );
+  const supportScore = clamp(
+    Math.max(0, restingImbalance) * 0.5
+      + Math.max(0, liquidityPressure) * 0.28
+      + anchors.confluenceScore * 0.22,
+    0,
+    1,
+  );
+  const resistanceScore = clamp(
+    Math.max(0, -restingImbalance) * 0.5
+      + Math.max(0, -liquidityPressure) * 0.28
+      + anchors.confluenceScore * 0.22,
+    0,
+    1,
+  );
+  const liquidityEngineScore = clamp(
+    Math.abs(liquidityPressure) * 0.34
+      + Math.abs(restingImbalance) * 0.22
+      + sweepRisk * 0.2
+      + liquidityVacuum * 0.12
+      + anchors.confluenceScore * 0.12,
+    0,
+    1,
+  );
+  const stateLabel = sweepRisk >= 0.68 && liquidityVacuum >= 0.45
+    ? "vacuum"
+    : liquidityPressure >= 0.18
+      ? "bid-support"
+      : liquidityPressure <= -0.18
+        ? "ask-wall"
+        : "balanced";
+  return {
+    restingBidUsd: top10Bid,
+    restingAskUsd: top10Ask,
+    restingImbalance,
+    touchDensity: clamp(touchDensity, 0, 1),
+    sweepRisk,
+    liquidityVacuum,
+    supportScore,
+    resistanceScore,
+    liquidityPressure,
+    liquidityEngineScore,
+    stateLabel,
+  };
+}
+
 async function fetchJson(path: string, options?: { allowUnauthorized?: boolean }): Promise<unknown | null> {
   const response = await fetch(path, { cache: "no-store" });
   if (response.status === 401 && options?.allowUnauthorized) {
@@ -1289,16 +2259,26 @@ function buildExecutionTelemetryWsUrl(
 }
 
 function buildControlPlaneWsBase(): string {
-  if (typeof window === "undefined") {
-    return "ws://localhost:8000";
-  }
-
-  const currentProtocol = window.location.protocol === "https:" ? "wss" : "ws";
-  const currentBase = `${currentProtocol}://${window.location.host}`;
   const configured =
     process.env.NEXT_PUBLIC_CONTROL_PLANE_WS_BASE?.trim() ||
     process.env.NEXT_PUBLIC_CONTROL_PLANE_URL?.trim() ||
     "";
+
+  if (typeof window === "undefined") {
+    if (!configured) {
+      return "";
+    }
+    try {
+      const parsed = new URL(configured);
+      const protocol = parsed.protocol === "https:" || parsed.protocol === "wss:" ? "wss" : "ws";
+      return `${protocol}://${parsed.host}`;
+    } catch {
+      return "";
+    }
+  }
+
+  const currentProtocol = window.location.protocol === "https:" ? "wss" : "ws";
+  const currentBase = `${currentProtocol}://${window.location.host}`;
 
   if (!configured) {
     return currentBase;
@@ -1309,7 +2289,10 @@ function buildControlPlaneWsBase(): string {
     if (["localhost", "127.0.0.1", "0.0.0.0", "control-plane"].includes(parsed.hostname)) {
       return currentBase;
     }
-    const protocol = parsed.protocol === "https:" ? "wss" : "ws";
+    const protocol = parsed.protocol === "https:" || parsed.protocol === "wss:" ? "wss" : "ws";
+    if (window.location.protocol === "https:" && protocol !== "wss") {
+      return currentBase;
+    }
     return `${protocol}://${parsed.host}`;
   } catch {
     return currentBase;
@@ -1380,6 +2363,10 @@ export default function TradingTerminalPage() {
   const [quotes, setQuotes] = useState<JsonMap[]>([]);
   const [positions, setPositions] = useState<JsonMap[]>([]);
   const [balance, setBalance] = useState<JsonMap | null>(null);
+  const [performanceSummary, setPerformanceSummary] = useState<PerformanceSummaryPayload | null>(null);
+  const [performanceAttribution, setPerformanceAttribution] = useState<PerformanceAttributionItem[]>([]);
+  const [performanceCapitalSources, setPerformanceCapitalSources] = useState<PerformanceCapitalSource[]>([]);
+  const [investorReports, setInvestorReports] = useState<InvestorReportItem[]>([]);
   const [orderbook, setOrderbook] = useState<JsonMap | null>(null);
   const [marketDepth, setMarketDepth] = useState<JsonMap | null>(null);
   const [marketMicro, setMarketMicro] = useState<JsonMap | null>(null);
@@ -1387,6 +2374,7 @@ export default function TradingTerminalPage() {
   const [nativeTrades, setNativeTrades] = useState<JsonMap[]>([]);
   const [sessionState, setSessionState] = useState<JsonMap | null>(null);
   const [marketBusMeta, setMarketBusMeta] = useState<JsonMap | null>(null);
+  const [marketBusKernelTelemetry, setMarketBusKernelTelemetry] = useState<MarketDataBusKernelTelemetry>(DEFAULT_MARKET_BUS_KERNEL_TELEMETRY);
   const [marketBusLastSyncAt, setMarketBusLastSyncAt] = useState<string | null>(null);
   const [routingScore, setRoutingScore] = useState<JsonMap | null>(null);
   const [executionTelemetry, setExecutionTelemetry] = useState<JsonMap[]>([]);
@@ -1395,6 +2383,7 @@ export default function TradingTerminalPage() {
   const [telemetryStreamState, setTelemetryStreamState] = useState<"offline" | "connecting" | "live">("offline");
   const [replayDecisionId, setReplayDecisionId] = useState("");
   const [replayPayload, setReplayPayload] = useState<JsonMap | null>(null);
+  const [replayNetworkByDecisionId, setReplayNetworkByDecisionId] = useState<Record<string, JsonMap>>({});
   const [replayLoading, setReplayLoading] = useState(false);
   const [replayError, setReplayError] = useState<string | null>(null);
   const [authStatus, setAuthStatus] = useState<AuthSessionStatus>("unknown");
@@ -1407,6 +2396,33 @@ export default function TradingTerminalPage() {
   const [signalConfidenceDrift, setSignalConfidenceDrift] = useState<SignalConfidenceDrift>("FLAT");
   const [busy, setBusy] = useState(false);
   const [tradeResult, setTradeResult] = useState<JsonMap | null>(null);
+  const [chartKernelPerf, setChartKernelPerf] = useState({ fps: 60, frameTimeMs: 16.7, cpuLoad: 1, workerLatencyMs: 0 });
+  const [chartPerceptualTelemetry, setChartPerceptualTelemetry] = useState<ChartPerceptualTelemetry | null>(null);
+  const [gpuPerceptualTelemetry, setGpuPerceptualTelemetry] = useState<GpuPerceptualTelemetry | null>(null);
+  const [chartPerceptualDebugOpen, setChartPerceptualDebugOpen] = useState(false);
+  const [terminalComputePerfEnabled, setTerminalComputePerfEnabled] = useState(false);
+  const [terminalComputePerfSummary, setTerminalComputePerfSummary] = useState<TerminalComputePerfEntry[]>([]);
+  const [kernelBenchmarkRate, setKernelBenchmarkRate] = useState(0);
+  const [v8TrainingStats, setV8TrainingStats] = useState<PredictorEngineV8TrainingStats>({ trainedSamples: 0, updatedAt: null, weightShift: 0 });
+  const [v8PersistenceLoaded, setV8PersistenceLoaded] = useState(false);
+  const [backendPredictorSnapshot, setBackendPredictorSnapshot] = useState<JsonMap | null>(null);
+  const [backendPredictorStats, setBackendPredictorStats] = useState<JsonMap | null>(null);
+  const [replayAttributionByDecisionId, setReplayAttributionByDecisionId] = useState<Record<string, BrainReplayAttributionSnapshot>>({});
+
+  const toggleTerminalComputePerf = useCallback(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    setTerminalComputePerfEnabled((current) => {
+      const next = !current;
+      window.localStorage.setItem(TERMINAL_COMPUTE_PERF_STORAGE_KEY, next ? "1" : "0");
+      if (!next) {
+        clearTerminalComputePerf();
+        setTerminalComputePerfSummary([]);
+      }
+      return next;
+    });
+  }, []);
 
   const [environmentFilter, setEnvironmentFilter] = useState("all");
   const [marketFilter, setMarketFilter] = useState("all");
@@ -1426,6 +2442,8 @@ export default function TradingTerminalPage() {
   const [chartReleaseSendMode, setChartReleaseSendMode] = useChartReleaseSendMode();
   const [chartHapticMode, setChartHapticMode] = useChartHapticMode();
   const [layoutPreset, setLayoutPreset] = useState<LayoutPreset>("swing");
+  const [terminalDensityMode, setTerminalDensityMode] = useState<"focus" | "full">("focus");
+  const [focusDecks, setFocusDecks] = useState<TerminalFocusDeckId[]>([]);
   const [layoutWorkspaceName, setLayoutWorkspaceName] = useState(DEFAULT_LAYOUT_WORKSPACE_NAME);
   const [layoutWorkspaceOptions, setLayoutWorkspaceOptions] = useState<string[]>(DEFAULT_LAYOUT_WORKSPACE_OPTIONS);
   const [workspaceHintBadge, setWorkspaceHintBadge] = useState<string | null>(null);
@@ -1471,6 +2489,9 @@ export default function TradingTerminalPage() {
   const localTerminalCaptureLastPostedSignatureRef = useRef("");
   const localTerminalCaptureLastPostedAtRef = useRef(0);
   const localTerminalCaptureLastIncidentTicketKeyRef = useRef("");
+  const terminalDensityModeRef = useRef<"focus" | "full">("focus");
+  const focusDecksRef = useRef<TerminalFocusDeckId[]>([]);
+  const focusDeckFeedUpdatedAtRef = useRef<Record<string, number>>({});
 
   const INDICATOR_CATALOG = [
     { category: "trend",      ids: ["ema9","ema21","ema50","ema200","sma","wma","dema","vwap"] },
@@ -1662,6 +2683,10 @@ export default function TradingTerminalPage() {
   const chartOrderDragRef = useRef<ChartDragState | null>(null);
   const chartLongPressTimerRef = useRef<number | null>(null);
   const chartOrderTicketRef = useRef<ChartOrderTicket>(chartOrderTicket);
+  const executionEngineV7Ref = useRef(new ExecutionEngineV7());
+  const predictorEngineV8Ref = useRef(new PredictorEngineV8());
+  const predictorTrainingBufferRef = useRef<JsonMap[]>([]);
+  const predictorTrainingQueuedIdsRef = useRef(new Set<string>());
   const chartSnapStateRef = useRef<ChartSnapState>(null);
   const chartSnapHapticSignatureRef = useRef("");
   const marketMetricsAbortRef = useRef<AbortController | null>(null);
@@ -1782,6 +2807,8 @@ export default function TradingTerminalPage() {
     const persistedGpuGrid = window.localStorage.getItem("txt.terminal.gpu-grid");
     const forcedSmoothing = query.get("smoothingMs");
     const persistedSmoothing = window.localStorage.getItem("txt.terminal.smoothing-ms");
+    const forcedPerfDebug = query.get("perfDebug");
+    const persistedPerfDebug = window.localStorage.getItem(TERMINAL_COMPUTE_PERF_STORAGE_KEY);
     const webgl2 = isWebGL2Available();
     if (forced === "1" || persisted === "1") {
       setTerminalV2Enabled(true);
@@ -1802,6 +2829,12 @@ export default function TradingTerminalPage() {
       window.localStorage.setItem("txt.terminal.engine", effectiveEngine);
     }
 
+    if (forcedPerfDebug === "1" || persistedPerfDebug === "1") {
+      setTerminalComputePerfEnabled(true);
+    } else if (forcedPerfDebug === "0" || persistedPerfDebug === "0") {
+      setTerminalComputePerfEnabled(false);
+    }
+
     console.info("[terminal] engine runtime selection", {
       requestedEngine,
       effectiveEngine,
@@ -1818,6 +2851,25 @@ export default function TradingTerminalPage() {
       setChartSmoothingMs(parsedSmoothing);
     }
   }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    if (!terminalComputePerfEnabled) {
+      clearTerminalComputePerf();
+      setTerminalComputePerfSummary([]);
+      return;
+    }
+    clearTerminalComputePerf();
+    setTerminalComputePerfSummary(snapshotTerminalComputePerf());
+    const handle = window.setInterval(() => {
+      setTerminalComputePerfSummary(snapshotTerminalComputePerf());
+    }, 1200);
+    return () => {
+      window.clearInterval(handle);
+    };
+  }, [terminalComputePerfEnabled]);
 
   const toggleTerminalV2 = useCallback(() => {
     setTerminalV2Enabled((current) => {
@@ -1951,7 +3003,7 @@ export default function TradingTerminalPage() {
       return;
     }
     const syncPausedState = () => {
-      setPublicOpsRefreshPaused(shouldPausePublicOpsRefresh());
+      setPublicOpsRefreshPaused(shouldPauseNonEssentialRefresh());
     };
     syncPausedState();
     document.addEventListener("visibilitychange", syncPausedState);
@@ -1991,28 +3043,30 @@ export default function TradingTerminalPage() {
     return candidates;
   }, [selectedChartInstrument, selectedChartMetricSymbol, selectedChartSymbol]);
   const selectedChartMetric = useMemo<MarketMetric | null>(() => {
-    if (!marketMicro) {
-      return null;
-    }
-    const activeEvents = Array.isArray(marketMicro.active_events) ? marketMicro.active_events as {type: string}[] : [];
-    return {
-      fundingRate: toNumber(marketMicro.funding_rate, 0),
-      openInterest: toNumber(marketMicro.open_interest, 0),
-      volume: toNumber(marketMicro.buy_volume, 0) + toNumber(marketMicro.sell_volume, 0),
-      depthImbalance: toNumber(marketMicro.depth_imbalance, 0),
-      tapeAcceleration: toNumber(marketMicro.tape_acceleration, 0),
-      cvd: toNumber(marketMicro.cvd, 0),
-      cvdDelta: toNumber(marketMicro.cvd_delta, 0),
-      cvdTrend: (String(marketMicro.cvd_trend || "flat") as MarketMetric["cvdTrend"]),
-      flowImbalance: toNumber(marketMicro.flow_imbalance, 0),
-      spreadBps: toNumber(marketMicro.spread_bps, 0),
-      tradeAggressiveness: toNumber(marketMicro.trade_aggressiveness, 0),
-      avgLatencyMs: toNumber(marketMicro.avg_latency_ms, 0),
-      latencyTier: (String(marketMicro.latency_tier || "normal") as MarketMetric["latencyTier"]),
-      activeEventCount: activeEvents.length,
-      lastEventType: activeEvents.length > 0 ? String(activeEvents[activeEvents.length - 1].type) : null,
-    };
-  }, [marketMicro]);
+    return measureTerminalCompute("selectedChartMetric", terminalComputePerfEnabled, () => {
+      if (!marketMicro) {
+        return null;
+      }
+      const activeEvents = Array.isArray(marketMicro.active_events) ? marketMicro.active_events as {type: string}[] : [];
+      return {
+        fundingRate: toNumber(marketMicro.funding_rate, 0),
+        openInterest: toNumber(marketMicro.open_interest, 0),
+        volume: toNumber(marketMicro.buy_volume, 0) + toNumber(marketMicro.sell_volume, 0),
+        depthImbalance: toNumber(marketMicro.depth_imbalance, 0),
+        tapeAcceleration: toNumber(marketMicro.tape_acceleration, 0),
+        cvd: toNumber(marketMicro.cvd, 0),
+        cvdDelta: toNumber(marketMicro.cvd_delta, 0),
+        cvdTrend: (String(marketMicro.cvd_trend || "flat") as MarketMetric["cvdTrend"]),
+        flowImbalance: toNumber(marketMicro.flow_imbalance, 0),
+        spreadBps: toNumber(marketMicro.spread_bps, 0),
+        tradeAggressiveness: toNumber(marketMicro.trade_aggressiveness, 0),
+        avgLatencyMs: toNumber(marketMicro.avg_latency_ms, 0),
+        latencyTier: (String(marketMicro.latency_tier || "normal") as MarketMetric["latencyTier"]),
+        activeEventCount: activeEvents.length,
+        lastEventType: activeEvents.length > 0 ? String(activeEvents[activeEvents.length - 1].type) : null,
+      };
+    });
+  }, [marketMicro, terminalComputePerfEnabled]);
 
   useEffect(() => {
     activeChartConfigRef.current = {
@@ -2674,7 +3728,7 @@ export default function TradingTerminalPage() {
         setSelectedChartSymbol(nextSymbol);
       }
     }
-    if (chartLinkTimeframeEnabled && (payload.timeframe === "1m" || payload.timeframe === "5m" || payload.timeframe === "15m")) {
+    if (chartLinkTimeframeEnabled && payload.timeframe && CHART_TIMEFRAMES.includes(payload.timeframe)) {
       setChartTimeframe(payload.timeframe);
     }
   };
@@ -2694,6 +3748,96 @@ export default function TradingTerminalPage() {
       termCoreGroupRef.current.setLayout([next.coreSplit, 100 - next.coreSplit]);
     }
   };
+
+  useEffect(() => {
+    if (terminalDensityMode !== "focus") {
+      return;
+    }
+    if (chartPerfMode !== "ultra") {
+      setChartPerfMode("ultra");
+    }
+    if (chartVisualMode !== "clean") {
+      setChartVisualMode("clean");
+    }
+    if (gpuViewportGrid !== 1) {
+      setGpuViewportGrid(1);
+    }
+  }, [chartPerfMode, chartVisualMode, gpuViewportGrid, terminalDensityMode]);
+
+  useEffect(() => {
+    terminalDensityModeRef.current = terminalDensityMode;
+  }, [terminalDensityMode]);
+
+  useEffect(() => {
+    focusDecksRef.current = focusDecks;
+  }, [focusDecks]);
+
+  const renderExtendedTerminalModules = terminalDensityMode === "full";
+  const focusDeckSet = useMemo(() => new Set<TerminalFocusDeckId>(focusDecks), [focusDecks]);
+  const showMicroDeck = renderExtendedTerminalModules || focusDeckSet.has("micro");
+  const showMarketsDeck = renderExtendedTerminalModules || focusDeckSet.has("markets");
+  const showMonitoringDeck = renderExtendedTerminalModules || focusDeckSet.has("monitoring");
+  const showCapitalDeck = renderExtendedTerminalModules || focusDeckSet.has("capital");
+  const showMetaRiskDeck = renderExtendedTerminalModules || focusDeckSet.has("metaRisk");
+  const showCorrelationDeck = renderExtendedTerminalModules || focusDeckSet.has("correlation");
+  const showCalibrationDeck = renderExtendedTerminalModules || focusDeckSet.has("calibration");
+  const chartSidecarMicroRealtimeEnabled = renderExtendedTerminalModules || focusDeckSet.has("micro");
+  const sidecarProfileCards = CHART_SIDECAR_PROFILE_LAYOUTS[chartSidecarProfile].cards;
+  const hasDomTapeSidecarConsumer = chartSidecarMicroRealtimeEnabled && sidecarProfileCards.includes("domTape");
+  const hasFootprintHeatSidecarConsumer = chartSidecarMicroRealtimeEnabled && sidecarProfileCards.includes("footprintHeat");
+  const hasFastNativeTradesConsumer = showMicroDeck || hasDomTapeSidecarConsumer || hasFootprintHeatSidecarConsumer;
+  const hasFastDepthConsumer = showMicroDeck || hasDomTapeSidecarConsumer || hasFootprintHeatSidecarConsumer;
+  const hasFastMarketMicroConsumer = showMicroDeck;
+
+  const toggleFocusDeck = (deckId: TerminalFocusDeckId) => {
+    setFocusDecks((current) => (
+      current.includes(deckId)
+        ? current.filter((item) => item !== deckId)
+        : [...current, deckId]
+    ));
+  };
+
+  const shouldCommitThrottledChannel = useCallback((channelKey: string, throttleMs: number): boolean => {
+    if (terminalDensityModeRef.current !== "focus") {
+      return true;
+    }
+    const now = Date.now();
+    const lastUpdatedAt = focusDeckFeedUpdatedAtRef.current[channelKey] || 0;
+    if (now - lastUpdatedAt < throttleMs) {
+      return false;
+    }
+    focusDeckFeedUpdatedAtRef.current[channelKey] = now;
+    return true;
+  }, []);
+
+  const shouldCommitFocusDeckFeed = useCallback((deckIds: TerminalFocusDeckId[]): boolean => {
+    const activeDecks = focusDecksRef.current;
+    for (const deckId of deckIds) {
+      if (!activeDecks.includes(deckId)) {
+        continue;
+      }
+      if (shouldCommitThrottledChannel(`deck:${deckId}`, TERMINAL_FOCUS_DECK_THROTTLE_MS[deckId])) {
+        return true;
+      }
+    }
+    return false;
+  }, [shouldCommitThrottledChannel]);
+
+  const shouldPauseNonEssentialRefresh = useCallback((): boolean => {
+    if (shouldPausePublicOpsRefresh()) {
+      return true;
+    }
+    if (terminalDensityModeRef.current !== "focus") {
+      return false;
+    }
+    return !focusDecksRef.current.some((deckId) => (
+      deckId === "monitoring"
+      || deckId === "capital"
+      || deckId === "metaRisk"
+      || deckId === "correlation"
+      || deckId === "calibration"
+    ));
+  }, []);
 
   const resetFloatingPanels = () => {
     setFloatingPanels((current) => {
@@ -2842,8 +3986,8 @@ export default function TradingTerminalPage() {
     setChartVenueOverride(venueValue ? venueValue.trim() : null);
   };
 
-  const setActiveChartTimeframe = (timeframeValue: "1m" | "5m" | "15m") => {
-    if (CHART_TIMEFRAMES.includes(timeframeValue)) {
+  const setActiveChartTimeframe = (timeframeValue: string) => {
+    if (isTimeframeSupported(timeframeValue) && CHART_TIMEFRAMES.includes(timeframeValue)) {
       setChartTimeframe(timeframeValue);
     }
   };
@@ -3161,7 +4305,7 @@ export default function TradingTerminalPage() {
   };
 
   const loadAll = async (force = false) => {
-    if (!force && shouldPausePublicOpsRefresh()) {
+    if (!force && shouldPauseNonEssentialRefresh()) {
       return;
     }
     const authenticated = await refreshAuthSession();
@@ -3191,7 +4335,7 @@ export default function TradingTerminalPage() {
       }
     };
 
-    const [snapshotPayload, readinessPayload, aiPayload, overviewPayload, incidentPayload, pendingPayload, outcomePayload, mt5Payload, quotesPayload, positionsPayload, balancePayload] = await Promise.all([
+    const [snapshotPayload, readinessPayload, aiPayload, overviewPayload, incidentPayload, pendingPayload, outcomePayload, mt5Payload, quotesPayload, positionsPayload, balancePayload, performanceSummaryPayload, performanceAttributionPayload, accountsPayload, connectorAccountsPayload, investorReportsPayload] = await Promise.all([
       fetchMaybeUnauthorized("/api/connectors/status"),
       fetchMaybeUnauthorized("/api/live-readiness/overview"),
       fetchMaybeUnauthorized("/api/ai/health"),
@@ -3203,6 +4347,11 @@ export default function TradingTerminalPage() {
       fetchMaybeUnauthorized("/api/market/quotes"),
       fetchMaybeUnauthorized("/api/broker/positions"),
       fetchMaybeUnauthorized("/api/broker/balance"),
+      fetchMaybeUnauthorized("/api/performance/summary?scope_type=strategy&scope_id=mt5-live"),
+      fetchMaybeUnauthorized("/api/performance/attribution?scope_type=strategy&scope_id=mt5-live&group_by=strategy,symbol,venue"),
+      fetchMaybeUnauthorized("/api/accounts"),
+      fetchMaybeUnauthorized("/api/connectors/accounts"),
+      fetchMaybeUnauthorized("/api/investor-reports?portfolio_id=pf-internal-main&limit=1"),
     ]);
 
     if (sawUnauthorized) {
@@ -3221,7 +4370,7 @@ export default function TradingTerminalPage() {
     setAiHealth(aiPayload && typeof aiPayload === "object" ? (aiPayload as JsonMap) : null);
     setOverview(overviewPayload && typeof overviewPayload === "object" ? (overviewPayload as JsonMap) : null);
     const incidentItems = incidentPayload && typeof incidentPayload === "object"
-      ? ((((incidentPayload as JsonMap).items as JsonMap[] | undefined) || []).slice(0, 12))
+      ? ((((incidentPayload as JsonMap).items as JsonMap[] | undefined) || []))
       : [];
     setIncidents(incidentItems);
     setPendingLive(Array.isArray(pendingPayload) ? (pendingPayload as JsonMap[]) : []);
@@ -3230,6 +4379,18 @@ export default function TradingTerminalPage() {
     setQuotes(nextQuotes);
     setPositions(Array.isArray(positionsPayload) ? (positionsPayload as JsonMap[]) : []);
     setBalance(balancePayload && typeof balancePayload === "object" ? (balancePayload as JsonMap) : null);
+    setPerformanceSummary(performanceSummaryPayload && typeof performanceSummaryPayload === "object" ? (performanceSummaryPayload as PerformanceSummaryPayload) : null);
+    setPerformanceAttribution(
+      performanceAttributionPayload && typeof performanceAttributionPayload === "object"
+        ? ((((performanceAttributionPayload as JsonMap).rows as PerformanceAttributionItem[] | undefined) || []).slice(0, 6))
+        : [],
+    );
+    setPerformanceCapitalSources(normalizePerformanceCapitalSources(accountsPayload, connectorAccountsPayload));
+    setInvestorReports(
+      investorReportsPayload && typeof investorReportsPayload === "object"
+        ? ((((investorReportsPayload as JsonMap).items as InvestorReportItem[] | undefined) || []).slice(0, 4))
+        : [],
+    );
 
     setQuoteHistory((current) => {
       const updated: QuoteHistoryMap = { ...current };
@@ -3259,7 +4420,7 @@ export default function TradingTerminalPage() {
 
     let active = true;
     const refresh = async () => {
-      if (shouldPausePublicOpsRefresh()) {
+      if (shouldPauseNonEssentialRefresh()) {
         return;
       }
       try {
@@ -3432,17 +4593,42 @@ export default function TradingTerminalPage() {
       marketDataBusRef.current = createMarketDataBus();
     }
     const unsubscribe = marketDataBusRef.current.subscribe((snapshot) => {
+      const allowFastNativeTradesFeed = hasFastNativeTradesConsumer
+        && shouldCommitThrottledChannel("feed:nativeTrades:fast", 250);
+      const allowSlowNativeTradesFeed = !hasFastNativeTradesConsumer
+        && shouldCommitThrottledChannel("feed:nativeTrades:slow", 1800);
+      const allowFastDepthFeed = hasFastDepthConsumer
+        && shouldCommitThrottledChannel("feed:depth:fast", 250);
+      const allowSlowDepthFeed = !hasFastDepthConsumer
+        && shouldCommitThrottledChannel("feed:depth:slow", 1800);
+      const allowFastMarketMicroFeed = hasFastMarketMicroConsumer
+        && shouldCommitThrottledChannel("feed:marketMicro:fast", 250);
+      const allowSlowMarketMicroFeed = !hasFastMarketMicroConsumer
+        && shouldCommitThrottledChannel("feed:marketMicro:slow", 1800);
+      const allowOpsFeed = shouldCommitFocusDeckFeed(["monitoring", "capital", "metaRisk", "correlation", "calibration"]);
       setOhlcvBars((current) => {
-          const activeConfig = activeChartConfigRef.current;
+        const activeConfig = activeChartConfigRef.current;
         if (snapshot.ohlcvBars.length > 0) {
-            const snapshotInstrument = normalizeInstrument(String(snapshot.ohlcvBars[0]?.instrument || activeConfig.instrument));
-            const snapshotVenue = String(snapshot.ohlcvBars[0]?.venue || activeConfig.venue);
-            const snapshotTimeframe = String(snapshot.ohlcvBars[0]?.tf || activeConfig.timeframe);
-            return chartInstrumentsMatch(snapshotInstrument, activeConfig.instrument)
-              && snapshotVenue === activeConfig.venue
-              && snapshotTimeframe === activeConfig.timeframe
-              ? snapshot.ohlcvBars
-              : current;
+          const snapshotInstrument = normalizeInstrument(String(snapshot.ohlcvBars[0]?.instrument || activeConfig.instrument));
+          const snapshotVenue = String(snapshot.ohlcvBars[0]?.venue || activeConfig.venue);
+          const snapshotTimeframe = String(snapshot.ohlcvBars[0]?.tf || activeConfig.timeframe);
+          const matchesActiveConfig = chartInstrumentsMatch(snapshotInstrument, activeConfig.instrument)
+            && snapshotVenue === activeConfig.venue
+            && snapshotTimeframe === activeConfig.timeframe;
+          if (!matchesActiveConfig) {
+            return current;
+          }
+          const currentLast = current[current.length - 1];
+          const nextLast = snapshot.ohlcvBars[snapshot.ohlcvBars.length - 1];
+          if (
+            current.length === snapshot.ohlcvBars.length
+            && currentLast?.t === nextLast?.t
+            && currentLast?.c === nextLast?.c
+            && currentLast?.v === nextLast?.v
+          ) {
+            return current;
+          }
+          return snapshot.ohlcvBars;
         }
         if (current.length === 0) {
           return current;
@@ -3462,23 +4648,46 @@ export default function TradingTerminalPage() {
           ? current
           : snapshot.ohlcvBars;
       });
-      setNativeTrades(snapshot.nativeTrades);
-      setMarketMicro(snapshot.marketMicro);
-      setSessionState(snapshot.sessionState);
-      setMarketBusMeta(snapshot.busMeta);
-      setMarketBusLastSyncAt(snapshot.lastSyncAt);
-      setRoutingScore(snapshot.routingScore);
-      setOrderbook(snapshot.orderbook);
-      setMarketDepth(snapshot.marketDepth);
+      if (allowFastNativeTradesFeed || allowSlowNativeTradesFeed) {
+        startTransition(() => {
+          setNativeTrades(snapshot.nativeTrades);
+        });
+      }
+      if (allowFastMarketMicroFeed || allowSlowMarketMicroFeed) {
+        startTransition(() => {
+          setMarketMicro(snapshot.marketMicro);
+          setSessionState(snapshot.sessionState);
+        });
+      }
+      if (allowFastDepthFeed || allowSlowDepthFeed) {
+        startTransition(() => {
+          setOrderbook(snapshot.orderbook);
+          setMarketDepth(snapshot.marketDepth);
+          setDepthStreamState(snapshot.depthStreamState);
+        });
+      }
+      if (allowOpsFeed) {
+        startTransition(() => {
+          setMarketBusMeta(snapshot.busMeta);
+          setMarketBusKernelTelemetry(snapshot.kernelTelemetry);
+          setMarketBusLastSyncAt(snapshot.lastSyncAt);
+          setRoutingScore(snapshot.routingScore);
+        });
+      }
       setOhlcvStreamState(snapshot.ohlcvStreamState);
       setChartLoading(snapshot.chartLoading);
-      setDepthStreamState(snapshot.depthStreamState);
     });
     return () => {
       unsubscribe();
       marketDataBusRef.current?.disconnect();
     };
-  }, []);
+  }, [
+    hasFastDepthConsumer,
+    hasFastMarketMicroConsumer,
+    hasFastNativeTradesConsumer,
+    shouldCommitFocusDeckFeed,
+    shouldCommitThrottledChannel,
+  ]);
 
   useEffect(() => {
     if (authSessionRequired) {
@@ -3487,6 +4696,7 @@ export default function TradingTerminalPage() {
       setMarketMicro(null);
       setSessionState(null);
       setMarketBusMeta(null);
+      setMarketBusKernelTelemetry(DEFAULT_MARKET_BUS_KERNEL_TELEMETRY);
       setMarketBusLastSyncAt(null);
       setRoutingScore(null);
       setOrderbook(null);
@@ -3500,6 +4710,26 @@ export default function TradingTerminalPage() {
     setChartLoading(true);
     marketDataBusRef.current?.connect({ instrument: selectedChartInstrument, venue: selectedChartVenue, timeframe: chartTimeframe });
   }, [authSessionRequired, chartTimeframe, selectedChartInstrument, selectedChartVenue]);
+
+  useEffect(() => {
+    marketDataBusRef.current?.setSchedulerHint({
+      fps: chartKernelPerf.fps,
+      frameTimeMs: chartKernelPerf.frameTimeMs,
+      cpuLoad: chartKernelPerf.cpuLoad,
+    });
+  }, [chartKernelPerf.cpuLoad, chartKernelPerf.fps, chartKernelPerf.frameTimeMs]);
+
+  useEffect(() => {
+    if (chartEngineMode === "v4") {
+      setChartPerceptualTelemetry(null);
+      return;
+    }
+    setGpuPerceptualTelemetry(null);
+  }, [chartEngineMode]);
+
+  useEffect(() => {
+    marketDataBusRef.current?.setBenchmarkMode(kernelBenchmarkRate > 0, kernelBenchmarkRate);
+  }, [kernelBenchmarkRate]);
 
   useEffect(() => {
     if (authSessionRequired || authStatus !== "authenticated") {
@@ -3867,16 +5097,99 @@ export default function TradingTerminalPage() {
     };
   }, [replayDecisionId]);
 
-  async function submitTradeTicket(overrides?: {
-    symbol?: string;
-    side?: "buy" | "sell";
-    lots?: number;
-    notional?: number;
-    maxSpread?: number;
-    rationale?: string;
-    orderIntent?: JsonMap;
-    metadata?: JsonMap;
-  }): Promise<void> {
+  useEffect(() => {
+    const replayNetwork = replayPayload?.network && typeof replayPayload.network === "object"
+      ? replayPayload.network as JsonMap
+      : null;
+    if (!replayDecisionId || !replayNetwork) {
+      return;
+    }
+    setReplayNetworkByDecisionId((current) => ({
+      ...current,
+      [replayDecisionId]: {
+        ...replayNetwork,
+        decision_id: replayDecisionId,
+      },
+    }));
+  }, [replayDecisionId, replayPayload]);
+
+  useEffect(() => {
+    const brainReplay = replayPayload?.brain_replay && typeof replayPayload.brain_replay === "object"
+      ? replayPayload.brain_replay as JsonMap
+      : null;
+    if (!brainReplay) {
+      return;
+    }
+    const attribution = brainReplay.attribution && typeof brainReplay.attribution === "object"
+      ? normalizeReplayAttributionSnapshot(brainReplay.attribution as JsonMap)
+      : null;
+    const experienceRows = Array.isArray(brainReplay.experience_rows)
+      ? brainReplay.experience_rows.filter((row): row is JsonMap => Boolean(row) && typeof row === "object")
+      : [];
+    if (!attribution && experienceRows.length === 0) {
+      return;
+    }
+    setReplayAttributionByDecisionId((current) => {
+      const next = { ...current };
+      if (attribution?.id) {
+        next[attribution.id] = attribution;
+        return next;
+      }
+      for (const row of experienceRows) {
+        const snapshot = buildReplayAttributionSnapshotFromExperience(row);
+        if (!snapshot) {
+          continue;
+        }
+        if (snapshot.synthetic && snapshot.dreamSource && snapshot.dreamSource !== snapshot.id) {
+          next[snapshot.dreamSource] = mergeReplayDreamEcho(next[snapshot.dreamSource], snapshot);
+        }
+        const existing = next[snapshot.id];
+        next[snapshot.id] = existing
+          ? {
+              ...snapshot,
+              dreamCount: existing.dreamCount,
+              dreamWeight: existing.dreamWeight,
+            }
+          : snapshot;
+      }
+      return next;
+    });
+  }, [replayPayload]);
+
+  function buildTradeTicketBody(overrides?: TradeTicketOverrides): JsonMap {
+    return {
+      account_id: accountId,
+      symbol: overrides?.symbol || symbol,
+      side: overrides?.side || side,
+      lots: Number.isFinite(overrides?.lots) ? overrides?.lots : lots,
+      estimated_notional_usd: Number.isFinite(overrides?.notional) ? overrides?.notional : notional,
+      max_spread_bps: Number.isFinite(overrides?.maxSpread) ? overrides?.maxSpread : maxSpread,
+      preferred_venue: overrides?.preferredVenue,
+      rationale: overrides?.rationale || rationale,
+      predictor_context: predictorRequestPayload,
+      order_intent: overrides?.orderIntent,
+      metadata: overrides?.metadata,
+    };
+  }
+
+  async function executeTradeTicketRequest(overrides?: TradeTicketOverrides): Promise<JsonMap> {
+    void marketDataBusRef.current?.refreshNow("execution");
+    const response = await fetch("/api/mt5/orders/filter", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...buildRoutingRequestHeaders("execution", overrides?.symbol || symbol),
+      },
+      body: JSON.stringify(buildTradeTicketBody(overrides)),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(String(payload?.detail || "Ticket d'ordre rejete"));
+    }
+    return (payload || null) as JsonMap;
+  }
+
+  async function submitTradeTicket(overrides?: TradeTicketOverrides): Promise<void> {
     if (replayState.enabled) {
       setError("Replay Mode actif — execution live desactivee.");
       return;
@@ -3885,29 +5198,7 @@ export default function TradingTerminalPage() {
     setError(null);
     setTradeResult(null);
     try {
-      void marketDataBusRef.current?.refreshNow("execution");
-      const response = await fetch("/api/mt5/orders/filter", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...buildRoutingRequestHeaders("execution", overrides?.symbol || symbol),
-        },
-        body: JSON.stringify({
-          account_id: accountId,
-          symbol: overrides?.symbol || symbol,
-          side: overrides?.side || side,
-          lots: Number.isFinite(overrides?.lots) ? overrides?.lots : lots,
-          estimated_notional_usd: Number.isFinite(overrides?.notional) ? overrides?.notional : notional,
-          max_spread_bps: Number.isFinite(overrides?.maxSpread) ? overrides?.maxSpread : maxSpread,
-          rationale: overrides?.rationale || rationale,
-          order_intent: overrides?.orderIntent,
-          metadata: overrides?.metadata,
-        }),
-      });
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(String(payload?.detail || "Ticket d'ordre rejete"));
-      }
+      const payload = await executeTradeTicketRequest(overrides);
       setTradeResult(payload);
       await loadAll();
     } catch (err) {
@@ -3917,7 +5208,222 @@ export default function TradingTerminalPage() {
     }
   }
 
+  async function executeV7ArbOpportunity(decision: V7Decision, confirmAck = false): Promise<void> {
+    const opportunity = decision.opportunity;
+    if (!opportunity || decision.routeMode !== "dualVenueExecution") {
+      await submitChartOrder(confirmAck);
+      return;
+    }
+    if (!decision.shouldExecute) {
+      setError(`V7 blocked: ${decision.reasons.join(", ") || "net edge unavailable"}`);
+      pushChartSendHistory("blocked-loss");
+      return;
+    }
+    if (replayState.enabled) {
+      setError("Replay Mode actif — execution live desactivee.");
+      return;
+    }
+
+    const arbNotional = Math.max(1000, autoExecutionMode === "full-auto" ? autoSizingV3.finalNotional : notional);
+    const maxLegSpread = Math.max(2, Math.min(maxSpread, Math.ceil(opportunity.expectedNetEdgeBps + opportunity.expectedSlippageBps + 2)));
+    const baseMetadata: JsonMap = {
+      ui_feature: "v7-arb-execution",
+      route_mode: decision.routeMode,
+      expected_net_edge_bps: Number(opportunity.expectedNetEdgeBps.toFixed(3)),
+      expected_slippage_bps: Number(opportunity.expectedSlippageBps.toFixed(3)),
+      latency_cost_bps: Number(opportunity.latencyCostBps.toFixed(3)),
+      confidence: Number(opportunity.confidence.toFixed(3)),
+      predictor_governor_mode: backendBrainGovernorMode,
+      predictor_strategy_mode: backendBrainStrategyMode,
+    };
+    const baseIntent: JsonMap = {
+      source: "terminal-v7",
+      mode: "v7-arbitrage",
+      risk_preview: {
+        notional: arbNotional,
+        max_spread_bps: maxLegSpread,
+        confirm_ack: confirmAck,
+      },
+      hedge: {
+        enabled: true,
+        buy_venue: opportunity.buyVenue,
+        sell_venue: opportunity.sellVenue,
+      },
+      predictor_execution_adjustments: {
+        governor_mode: backendBrainGovernorMode,
+        size_multiplier: backendBrainGovernorSizeMultiplier,
+        strategy_mode: backendBrainStrategyMode,
+        strategy_switch_mode: backendBrainStrategySwitchMode,
+        route_mode_override: backendBrainStrategyRouteModeOverride,
+        execution_style: backendBrainStrategyExecutionStyle,
+        max_spread_multiplier: backendBrainStrategyMaxSpreadMultiplier,
+        size_multiplier_cap: backendBrainStrategySizeCap,
+      },
+    };
+
+    setBusy(true);
+    setError(null);
+    setTradeResult(null);
+    try {
+      const result = await executionEngineV7Ref.current.executeArb({
+        opportunity,
+        buyOrder: {
+          symbol: selectedChartSymbol,
+          side: "buy",
+          notionalUsd: arbNotional,
+          venue: opportunity.buyVenue,
+          maxSpreadBps: maxLegSpread,
+          rationale: `${rationale || "V7 arbitrage"} | buy leg ${opportunity.buyVenue} edge=${opportunity.expectedNetEdgeBps.toFixed(2)}bps`,
+          metadata: { ...baseMetadata, leg: "buy", preferred_venue: opportunity.buyVenue },
+          orderIntent: { ...baseIntent, leg: "buy" },
+        },
+        sellOrder: {
+          symbol: selectedChartSymbol,
+          side: "sell",
+          notionalUsd: arbNotional,
+          venue: opportunity.sellVenue,
+          maxSpreadBps: maxLegSpread,
+          rationale: `${rationale || "V7 arbitrage"} | sell leg ${opportunity.sellVenue} edge=${opportunity.expectedNetEdgeBps.toFixed(2)}bps`,
+          metadata: { ...baseMetadata, leg: "sell", preferred_venue: opportunity.sellVenue },
+          orderIntent: { ...baseIntent, leg: "sell" },
+        },
+        sendOrder: async (order) => {
+          try {
+            const payload = await executeTradeTicketRequest({
+              symbol: order.symbol,
+              side: order.side,
+              notional: order.notionalUsd,
+              preferredVenue: order.venue,
+              maxSpread: order.maxSpreadBps,
+              rationale: order.rationale,
+              orderIntent: order.orderIntent,
+              metadata: order.metadata,
+            });
+            const routed = (payload.routed_execution && typeof payload.routed_execution === "object") ? (payload.routed_execution as JsonMap) : {};
+            executionEngineV7Ref.current.updateFeedback({
+              venue: order.venue || String(routed.venue || ""),
+              latencyMs: toNumber(payload.latency_ms ?? payload.latency_e2e_ms, 0),
+              realizedSlippageBps: toNumber(payload.realized_slippage_bps, 0),
+            });
+            return { ok: true, venue: order.venue || "", payload };
+          } catch (error) {
+            return { ok: false, venue: order.venue || "", error: error instanceof Error ? error.message : "order_failed" };
+          }
+        },
+        hedgeImmediately: async (failedLeg, succeeded) => {
+          const payload = succeeded.payload || {};
+          const venue = String((payload.routed_execution as JsonMap | undefined)?.venue || succeeded.venue || "");
+          executionEngineV7Ref.current.updateFeedback({
+            venue,
+            latencyMs: toNumber(payload.latency_ms ?? payload.latency_e2e_ms, 0),
+            realizedSlippageBps: toNumber(payload.realized_slippage_bps, 0),
+          });
+          setError(`V7 hedge required: ${failedLeg} leg failed after ${venue || "counterparty"} filled.`);
+        },
+      });
+      setTradeResult({
+        mode: "v7-arbitrage",
+        ok: result.ok,
+        hedged: result.hedged,
+        buy: result.buy.payload || { error: result.buy.error, venue: result.buy.venue },
+        sell: result.sell.payload || { error: result.sell.error, venue: result.sell.venue },
+        expected_net_edge_bps: opportunity.expectedNetEdgeBps,
+        expected_slippage_bps: opportunity.expectedSlippageBps,
+      });
+      pushChartSendHistory(result.ok ? "submitted" : "blocked-loss");
+      await loadAll();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Erreur inconnue");
+    } finally {
+      setBusy(false);
+      setChartHudConfirmArmed(false);
+      setChartOrderPreviewOpen(false);
+    }
+  }
+
+  function buildV7LocalGateDecision(notionalUsd: number): V7Decision {
+    const avgLatencyMs = executionTelemetry.length > 0
+      ? average(executionTelemetry.map((item) => toNumber(item.latency_e2e_ms, 0)))
+      : average(filteredOutcomes.map((item) => toNumber(item.latency_ms, 0)));
+    const effectiveLatencyMs = Math.max(avgLatencyMs, marketBusKernelTelemetry.tickLatencyMs);
+    const routingCandidates = Array.isArray(routingScore?.candidates)
+      ? routingScore.candidates as JsonMap[]
+      : [];
+    const decision = executionEngineV7Ref.current.buildDecision({
+      arbitrage: (routingScore?.arbitrage as JsonMap | undefined) || null,
+      routingCandidates,
+      bestRoute: (routingScore?.best as JsonMap | undefined) || null,
+      backupRoute: (routingScore?.backup as JsonMap | undefined) || null,
+      marketMicro,
+      avgExecutionLatencyMs: avgLatencyMs,
+      renderFrameMs: chartKernelPerf.frameTimeMs,
+      renderFps: chartKernelPerf.fps,
+      notionalUsd,
+      feePenaltyBps: 6,
+    });
+    if (decision.routeMode === "dualVenueExecution" && !dataReliabilitySnapshot.ready) {
+      return {
+        ...decision,
+        shouldExecute: false,
+        reasons: [...decision.reasons, ...dataReliabilitySnapshot.reasons, "data_reliability_gate"],
+      };
+    }
+    if (decision.routeMode === "dualVenueExecution" && effectiveLatencyMs >= V8_LATENCY_GUARD_MS) {
+      return {
+        ...decision,
+        shouldExecute: false,
+        reasons: [...decision.reasons, "latency_guard_arbitrage_disabled"],
+      };
+    }
+    return decision;
+  }
+
+  function getV7LocalGateDecision(): V7Decision {
+    return buildV7LocalGateDecision(autoExecutionMode === "full-auto" ? autoSizingV3.finalNotional : notional);
+  }
+
+  function getV7ExecutionDecision(): V7Decision {
+    const decision = getV7LocalGateDecision();
+    if (decision.routeMode !== "dualVenueExecution") {
+      return decision;
+    }
+    if (backendBrainGovernorBlocked) {
+      return {
+        ...decision,
+        shouldExecute: false,
+        reasons: Array.from(new Set([...decision.reasons, ...backendBrainGovernorReasons, "brain_governor_blocked"])),
+      };
+    }
+    if (backendBrainStrategyRouteModeOverride === "bestSingleVenue") {
+      return {
+        ...decision,
+        routeMode: "bestSingleVenue",
+        shouldExecute: false,
+        reasons: Array.from(new Set([...decision.reasons, ...backendBrainStrategyReasons, `strategy_switch:${backendBrainStrategyMode || backendBrainStrategySwitchMode || "single_venue"}`])),
+      };
+    }
+    const backendPredictorShouldExecute = typeof backendPredictorSnapshot?.should_execute === "boolean"
+      ? Boolean(backendPredictorSnapshot.should_execute)
+      : false;
+    const backendPredictorReasons = Array.isArray(backendPredictorSnapshot?.reasons)
+      ? (backendPredictorSnapshot.reasons as unknown[]).map((reason) => String(reason))
+      : ["v8_backend_gate_pending"];
+    if (decision.routeMode === "dualVenueExecution" && !backendPredictorShouldExecute) {
+      return {
+        ...decision,
+        shouldExecute: false,
+        reasons: Array.from(new Set([...decision.reasons, ...backendPredictorReasons])),
+      };
+    }
+    return decision;
+  }
+
   async function submitChartOrder(confirmAck = false): Promise<void> {
+    if (backendBrainGovernorBlocked) {
+      setError(`Brain governor blocked: ${backendBrainGovernorReasons.join(", ") || "execution disabled"}`);
+      pushChartSendHistory("blocked-loss");
+      return;
+    }
     if (!(chartOrderTicket.entry > 0) || !(chartRiskPerUnit > 0) || !(chartRewardPerUnit > 0)) {
       setError("Bracket invalide: verifier Entry / SL / TP avant envoi.");
       return;
@@ -3957,6 +5463,16 @@ export default function TradingTerminalPage() {
         guard_enabled: chartRiskGuardEnabled,
         confirm_ack: confirmAck,
       },
+      predictor_execution_adjustments: {
+        governor_mode: backendBrainGovernorMode,
+        size_multiplier: backendBrainGovernorSizeMultiplier,
+        strategy_mode: backendBrainStrategyMode,
+        strategy_switch_mode: backendBrainStrategySwitchMode,
+        route_mode_override: backendBrainStrategyRouteModeOverride,
+        execution_style: backendBrainStrategyExecutionStyle,
+        max_spread_multiplier: backendBrainStrategyMaxSpreadMultiplier,
+        size_multiplier_cap: backendBrainStrategySizeCap,
+      },
     };
     await submitTradeTicket({
       symbol: selectedChartSymbol,
@@ -3992,6 +5508,18 @@ export default function TradingTerminalPage() {
     const matchesMarket = marketFilter === "all" || market === marketFilter;
     return matchesSymbol && matchesMarket;
   });
+
+  const uniqueFilteredQuotes = useMemo(() => {
+    const seenSymbols = new Set<string>();
+    return filteredQuotes.filter((quote) => {
+      const quoteSymbol = instrumentLabel(quote);
+      if (seenSymbols.has(quoteSymbol)) {
+        return false;
+      }
+      seenSymbols.add(quoteSymbol);
+      return true;
+    });
+  }, [filteredQuotes]);
 
   const filteredOutcomes = outcomes.filter((item) => {
     const outcomeSymbol = instrumentLabel(item);
@@ -4114,6 +5642,66 @@ export default function TradingTerminalPage() {
   });
 
   const replayTelemetry = (replayPayload?.telemetry as JsonMap | undefined) || null;
+  const replayNetwork = replayPayload?.network && typeof replayPayload.network === "object"
+    ? replayPayload.network as JsonMap
+    : null;
+  const replayGlobalNetworkMetrics = replayPayload?.network_metrics && typeof replayPayload.network_metrics === "object"
+    ? replayPayload.network_metrics as JsonMap
+    : null;
+  const replayNetworkState = String(replayNetwork?.network_state ?? replayPayload?.network_state ?? "healthy").toLowerCase();
+  const replayRetryCount = Math.max(0, toNumber(replayNetwork?.retry_count ?? replayPayload?.retry_count, 0));
+  const replayDegradedFlag = Boolean(replayNetwork?.degraded_flag ?? replayPayload?.degraded_flag);
+  const replayFailureClassification = String(replayNetwork?.failure_classification || replayPayload?.failure_classification || "none").toLowerCase();
+  const replayFailureDetail = String(replayNetwork?.failure_detail || replayPayload?.failure_detail || "");
+  const replayAttemptedTargets = Array.isArray(replayNetwork?.attempted_targets)
+    ? (replayNetwork.attempted_targets as unknown[]).map((item) => String(item)).filter(Boolean)
+    : [];
+  const replayAttemptedBaseUrls = Array.isArray(replayNetwork?.attempted_base_urls)
+    ? (replayNetwork.attempted_base_urls as unknown[]).map((item) => String(item)).filter(Boolean)
+    : [];
+  const replayInfraHealthScore = (() => {
+    if (replayDegradedFlag) {
+      return 0.2;
+    }
+    let score = 1;
+    if (replayRetryCount > 0) {
+      score -= Math.min(0.3, replayRetryCount * 0.1);
+    }
+    if (replayFailureClassification === "dns_transient") {
+      score -= 0.12;
+    } else if (replayFailureClassification === "timeout") {
+      score -= 0.16;
+    } else if (replayFailureClassification === "connection_reset") {
+      score -= 0.1;
+    } else if (replayFailureClassification === "connection_refused") {
+      score -= 0.2;
+    } else if (replayFailureClassification === "aborted") {
+      score -= 0.08;
+    } else if (replayFailureClassification === "network_unknown") {
+      score -= 0.12;
+    }
+    return clamp(score, 0.2, 1);
+  })();
+  const replayInfraLabel = replayInfraHealthScore >= 0.85
+    ? "stable"
+    : replayInfraHealthScore >= 0.6
+      ? "watch"
+      : "fragile";
+  const replayNetworkSamples = Object.values(replayNetworkByDecisionId);
+  const replayNetworkSampleCount = replayNetworkSamples.length;
+  const replayDnsTransientRateFallback = replayNetworkSampleCount > 0
+    ? replayNetworkSamples.filter((row) => String(row.failure_classification || "none").toLowerCase() === "dns_transient").length / replayNetworkSampleCount
+    : 0;
+  const replayTimeoutRateFallback = replayNetworkSampleCount > 0
+    ? replayNetworkSamples.filter((row) => String(row.failure_classification || "none").toLowerCase() === "timeout").length / replayNetworkSampleCount
+    : 0;
+  const replayDegradedUsageRatioFallback = replayNetworkSampleCount > 0
+    ? replayNetworkSamples.filter((row) => Boolean(row.degraded_flag)).length / replayNetworkSampleCount
+    : 0;
+  const replayDnsTransientRate = clamp(toNumber(replayGlobalNetworkMetrics?.dns_transient_rate, replayDnsTransientRateFallback), 0, 1);
+  const replayTimeoutRate = clamp(toNumber(replayGlobalNetworkMetrics?.timeout_rate, replayTimeoutRateFallback), 0, 1);
+  const replayDegradedUsageRatio = clamp(toNumber(replayGlobalNetworkMetrics?.degraded_usage_ratio, replayDegradedUsageRatioFallback), 0, 1);
+  const replayNetworkGlobalSampleCount = Math.max(0, toNumber(replayGlobalNetworkMetrics?.total_requests, replayNetworkSampleCount));
   const replayFills = ((replayPayload?.fills as JsonMap[] | undefined) || []).slice(0, 60);
   const replayTimeline = replayTelemetry
     ? [
@@ -4128,18 +5716,17 @@ export default function TradingTerminalPage() {
     : [];
 
   const renderableOhlcvBars = useMemo(
-    () => normalizeOhlcvRows(ohlcvBars, {
+    () => measureTerminalCompute("renderableOhlcvBars", terminalComputePerfEnabled, () => normalizeOhlcvRows(ohlcvBars, {
       instrument: selectedChartInstrument,
       venue: selectedChartVenue,
       timeframe: chartTimeframe,
-    }),
-    [chartTimeframe, ohlcvBars, selectedChartInstrument, selectedChartVenue],
+    })),
+    [chartTimeframe, ohlcvBars, selectedChartInstrument, selectedChartVenue, terminalComputePerfEnabled],
   );
 
-  // ── Engine V3 : tick injection via le bus (single source of truth) ────────
-  // Le bus déroute le tick au MarketDataEngineV3 qui met à jour la série
-  // canonique et émet → setOhlcvBars → renderableOhlcvBars se met à jour.
-  // On n'a plus besoin de liveTickBars (useMemo patch visuel supprimé).
+  // V5 trades-first: les quotes live n'altèrent plus les candles canoniques.
+  // Elles servent à la microstructure / latence, tandis que les candles viennent
+  // du flux trades snapshot/backfill reconstruit côté moteur.
   useEffect(() => {
     const liveQuote = quotes.find((q) => instrumentLabel(q) === selectedChartSymbol);
     const tickPrice = liveQuote
@@ -4159,12 +5746,12 @@ export default function TradingTerminalPage() {
   }, [quotes, selectedChartSymbol]);
 
   const localOhlcvAnalysis = useMemo(
-    () => analyzeOhlcvRows(ohlcvBars, {
+    () => measureTerminalCompute("localOhlcvAnalysis", terminalComputePerfEnabled, () => analyzeOhlcvRows(ohlcvBars, {
       instrument: selectedChartInstrument,
       venue: selectedChartVenue,
       timeframe: chartTimeframe,
-    }),
-    [chartTimeframe, ohlcvBars, selectedChartInstrument, selectedChartVenue],
+    })),
+    [chartTimeframe, ohlcvBars, selectedChartInstrument, selectedChartVenue, terminalComputePerfEnabled],
   );
   const localOhlcvFeedLabel = `${selectedChartInstrument} · ${selectedChartVenue} · ${chartTimeframe}`;
   const localOhlcvSignalTone = localOhlcvAnalysis.signal === "OHLCV_RENDERABLE"
@@ -4180,13 +5767,224 @@ export default function TradingTerminalPage() {
   const localOhlcvReasonsLabel = localOhlcvAnalysis.reasons.length > 0
     ? localOhlcvAnalysis.reasons.join(" · ")
     : "none";
-  const hasRenderableCandles = renderableOhlcvBars.length > 0;
+  const avgExecutionLatencyForPredictor = executionTelemetry.length > 0
+    ? average(executionTelemetry.map((item) => toNumber(item.latency_e2e_ms, 0)))
+    : average(filteredOutcomes.map((item) => toNumber(item.latency_ms, 0)));
+  const avgExecutionSlippageForPredictor = executionTelemetry.length > 0
+    ? average(executionTelemetry.map((item) => Math.abs(toNumber(item.realized_slippage_bps, 0))))
+    : average(filteredOutcomes.map((item) => Math.abs(toNumber(item.slippage_real_bps ?? item.realized_slippage_bps, 0))));
+  const nativeTradeVolume30s = useMemo(() => {
+    return measureTerminalCompute("nativeTradeVolume30s", terminalComputePerfEnabled, () => {
+      const cutoff = Date.now() - 30_000;
+      return nativeTrades.reduce((sum, item) => {
+        const tradedAt = typeof item.traded_at === "string" ? Date.parse(item.traded_at) : NaN;
+        if (!Number.isFinite(tradedAt) || tradedAt < cutoff) {
+          return sum;
+        }
+        return sum + toNumber(item.price, 0) * toNumber(item.size, 0);
+      }, 0);
+    });
+  }, [nativeTrades, terminalComputePerfEnabled]);
+  const microBurstTrades10ms = useMemo(() => {
+    return measureTerminalCompute("microBurstTrades10ms", terminalComputePerfEnabled, () => {
+      const cutoff = Date.now() - 10;
+      return nativeTrades.reduce((count, item) => {
+        const tradedAt = typeof item.traded_at === "string" ? Date.parse(item.traded_at) : NaN;
+        return Number.isFinite(tradedAt) && tradedAt >= cutoff ? count + 1 : count;
+      }, 0);
+    });
+  }, [nativeTrades, terminalComputePerfEnabled]);
+  const dataReliabilitySnapshot = useMemo(() => {
+    return measureTerminalCompute("dataReliabilitySnapshot", terminalComputePerfEnabled, () => {
+      const reasons: string[] = [];
+      if (!localOhlcvAnalysis.renderable || localOhlcvAnalysis.renderableRows < localOhlcvAnalysis.minimumRenderableBars) {
+        reasons.push("insufficient_renderable_bars");
+      }
+      if (marketMicro?.depth_imbalance == null) {
+        reasons.push("missing_depth_imbalance");
+      }
+      if (chartLoading) {
+        reasons.push("chart_loading");
+      }
+      if (Math.max(avgExecutionLatencyForPredictor, marketBusKernelTelemetry.tickLatencyMs) >= V8_LATENCY_GUARD_MS) {
+        reasons.push("latency_guard");
+      }
+      if (marketBusKernelTelemetry.bufferBacklog >= V8_DATA_RELIABILITY_MAX_BACKLOG) {
+        reasons.push("kernel_backlog_guard");
+      }
+      if (nativeTradeVolume30s <= 0) {
+        reasons.push("missing_volume_30s");
+      }
+      return {
+        ready: reasons.length === 0,
+        reasons,
+        renderableRows: localOhlcvAnalysis.renderableRows,
+        minimumRenderableBars: localOhlcvAnalysis.minimumRenderableBars,
+      };
+    });
+  }, [avgExecutionLatencyForPredictor, chartLoading, localOhlcvAnalysis, marketBusKernelTelemetry.bufferBacklog, marketBusKernelTelemetry.tickLatencyMs, marketMicro, nativeTradeVolume30s, terminalComputePerfEnabled]);
+  const predictorRenderPressure = Math.max(
+    0,
+    ((chartKernelPerf.frameTimeMs - 16.7) / 4.8)
+      + Math.max(0, 55 - chartKernelPerf.fps) / 20
+      + Math.max(0, chartKernelPerf.cpuLoad - 1),
+  );
+  const chartSeriesForAnchors = useMemo(
+    () => measureTerminalCompute("chartSeriesForAnchors", terminalComputePerfEnabled, () => renderableOhlcvBars.map((bar) => ({ label: String(bar.t || "-"), value: toNumber(bar.c, 0) }))),
+    [renderableOhlcvBars, terminalComputePerfEnabled],
+  );
+  const multiAnchorVwap = useMemo(() => measureTerminalCompute("multiAnchorVwap", terminalComputePerfEnabled, () => buildMultiAnchorVwap(chartSeriesForAnchors)), [chartSeriesForAnchors, terminalComputePerfEnabled]);
+  const predictorMarketSession = useMemo(() => deriveMarketSessionLabel(pointTimestamp(chartSeriesForAnchors[chartSeriesForAnchors.length - 1]?.label || "")), [chartSeriesForAnchors]);
+  const predictorOrderbookSignals = useMemo(() => measureTerminalCompute("predictorOrderbookSignals", terminalComputePerfEnabled, () => derivePredictorOrderbookSignals(marketDepth)), [marketDepth, terminalComputePerfEnabled]);
+  const predictorOrderflowSnapshot = useMemo(() => {
+    return measureTerminalCompute("predictorOrderflowSnapshot", terminalComputePerfEnabled, () => {
+      const bidVolume = Math.max(0, toNumber(marketMicro?.buy_volume, 0));
+      const askVolume = Math.max(0, toNumber(marketMicro?.sell_volume, 0));
+      const totalVolume = bidVolume + askVolume;
+      const delta = bidVolume - askVolume;
+      const fallbackImbalance = totalVolume > 0 ? delta / totalVolume : 0;
+      const imbalance = clamp(toNumber(marketMicro?.flow_imbalance, fallbackImbalance), -1, 1);
+      const cumulativeDelta = toNumber(marketMicro?.cvd, 0);
+      const recentSeries = chartSeriesForAnchors.slice(-12);
+      const currentPrice = recentSeries[recentSeries.length - 1]?.value || toNumber(marketMicro?.mid_price, 0);
+      const firstPrice = recentSeries[0]?.value || currentPrice;
+      const recentMovePct = firstPrice > 0 ? (currentPrice - firstPrice) / firstPrice : 0;
+      const anchoredVwap = multiAnchorVwap.impulse || multiAnchorVwap.session || multiAnchorVwap.day;
+      const distanceToVwapBps = multiAnchorVwap.primaryDistanceBps;
+      const vwapSlopeBps = multiAnchorVwap.impulse > 0 && multiAnchorVwap.session > 0
+        ? ((multiAnchorVwap.impulse - multiAnchorVwap.session) / multiAnchorVwap.session) * 10000
+        : 0;
+      const absorptionSignal = Math.abs(imbalance) >= 0.16 && Math.abs(recentMovePct) <= 0.0025 && Math.sign(delta) !== 0 && Math.sign(delta) !== Math.sign(recentMovePct)
+        ? (delta >= 0 ? -1 : 1)
+        : 0;
+      const spoofingScore = clamp(Math.abs(predictorOrderbookSignals.bookFlipSignal) * clamp(predictorOrderbookSignals.quoteFadeRate / 3, 0, 1), 0, 1)
+        * (predictorOrderbookSignals.bookFlipSignal >= 0 ? 1 : -1);
+      const liquidityTrapSignal = Math.abs(absorptionSignal) > 0 && Math.abs(spoofingScore) >= 0.28
+        ? absorptionSignal
+        : 0;
+      const liquidityEngine = buildLiquidityEngineSnapshot(
+        predictorOrderbookSignals.orderbookBids,
+        predictorOrderbookSignals.orderbookAsks,
+        toNumber(marketMicro?.spread_bps, 0),
+        predictorOrderbookSignals.quoteFadeRate,
+        predictorOrderbookSignals.bookFlipSignal,
+        imbalance,
+        multiAnchorVwap,
+      );
+      const orderflowQuality = clamp(
+        Math.abs(imbalance) * 0.34
+          + Math.min(1, Math.abs(delta) / Math.max(totalVolume, 1)) * 0.2
+          + Math.abs(absorptionSignal) * 0.22
+          + Math.abs(liquidityTrapSignal) * 0.16
+          + Math.min(1, Math.abs(spoofingScore)) * 0.08,
+        0,
+        1,
+      );
+      return {
+        bidVolume,
+        askVolume,
+        delta,
+        cumulativeDelta,
+        imbalance,
+        absorptionSignal,
+        liquidityTrapSignal,
+        spoofingScore,
+        anchoredVwap,
+        distanceToVwapBps,
+        vwapSlopeBps,
+        orderflowQuality: clamp(orderflowQuality * 0.78 + liquidityEngine.liquidityEngineScore * 0.22, 0, 1),
+        multiAnchorVwap,
+        liquidityEngine,
+      };
+    });
+  }, [chartSeriesForAnchors, marketMicro, multiAnchorVwap, predictorOrderbookSignals, terminalComputePerfEnabled]);
+  const predictorRequestPayload = useMemo(() => {
+    const bestRouteCandidate = (routingScore?.best as JsonMap | undefined) || {};
+    const arbitrage = (routingScore?.arbitrage as JsonMap | undefined) || {};
+    const networkMetrics = routingScore?.network_metrics && typeof routingScore.network_metrics === "object"
+      ? routingScore.network_metrics as JsonMap
+      : null;
+    const infraHealth = clamp(toNumber(routingScore?.infra_health, 1), 0.05, 1);
+    const networkRegime = String(routingScore?.network_regime || "stable");
+    const v7GateDecision = buildV7LocalGateDecision(notional);
+    return {
+      spread_bps: toNumber(bestRouteCandidate.spread_bps ?? bestRouteCandidate.spread, toNumber(marketMicro?.spread_bps, 0)),
+      depth_imbalance: marketMicro?.depth_imbalance ?? null,
+      latency_ms: Math.max(avgExecutionLatencyForPredictor, marketBusKernelTelemetry.tickLatencyMs),
+      slippage_bps: avgExecutionSlippageForPredictor,
+      latency_cost_bps: v7GateDecision.latencyCostBps,
+      available_depth_usd: toNumber(bestRouteCandidate.available_depth_usd, 0),
+      volume_30s: nativeTradeVolume30s,
+      volatility_bps: Math.abs(toNumber(marketMicro?.fusion_deviation_bps, 0)),
+      arb_edge_bps: toNumber(arbitrage.net_spread ?? marketMicro?.arbitrage_net_spread, 0),
+      fill_probability: toNumber(bestRouteCandidate.fill_probability, 0),
+      cvd_delta: toNumber(marketMicro?.cvd_delta, 0),
+      bid_volume: predictorOrderflowSnapshot.bidVolume,
+      ask_volume: predictorOrderflowSnapshot.askVolume,
+      orderflow_delta: predictorOrderflowSnapshot.delta,
+      cumulative_delta: predictorOrderflowSnapshot.cumulativeDelta,
+      orderflow_imbalance: predictorOrderflowSnapshot.imbalance,
+      absorption_signal: predictorOrderflowSnapshot.absorptionSignal,
+      liquidity_trap_signal: predictorOrderflowSnapshot.liquidityTrapSignal,
+      spoofing_score: predictorOrderflowSnapshot.spoofingScore,
+      anchored_vwap: predictorOrderflowSnapshot.anchoredVwap,
+      distance_to_vwap_bps: predictorOrderflowSnapshot.distanceToVwapBps,
+      vwap_slope_bps: predictorOrderflowSnapshot.vwapSlopeBps,
+      session_vwap: predictorOrderflowSnapshot.multiAnchorVwap.session,
+      day_vwap: predictorOrderflowSnapshot.multiAnchorVwap.day,
+      week_vwap: predictorOrderflowSnapshot.multiAnchorVwap.week,
+      month_vwap: predictorOrderflowSnapshot.multiAnchorVwap.month,
+      swing_vwap: predictorOrderflowSnapshot.multiAnchorVwap.swing,
+      impulse_vwap: predictorOrderflowSnapshot.multiAnchorVwap.impulse,
+      session_vwap_distance_bps: predictorOrderflowSnapshot.multiAnchorVwap.sessionDistanceBps,
+      day_vwap_distance_bps: predictorOrderflowSnapshot.multiAnchorVwap.dayDistanceBps,
+      week_vwap_distance_bps: predictorOrderflowSnapshot.multiAnchorVwap.weekDistanceBps,
+      month_vwap_distance_bps: predictorOrderflowSnapshot.multiAnchorVwap.monthDistanceBps,
+      swing_vwap_distance_bps: predictorOrderflowSnapshot.multiAnchorVwap.swingDistanceBps,
+      impulse_vwap_distance_bps: predictorOrderflowSnapshot.multiAnchorVwap.impulseDistanceBps,
+      vwap_anchor_primary: predictorOrderflowSnapshot.multiAnchorVwap.primaryLabel,
+      anchor_compression_bps: predictorOrderflowSnapshot.multiAnchorVwap.anchorCompressionBps,
+      anchor_confluence: predictorOrderflowSnapshot.multiAnchorVwap.confluenceScore,
+      resting_bid_usd: predictorOrderflowSnapshot.liquidityEngine.restingBidUsd,
+      resting_ask_usd: predictorOrderflowSnapshot.liquidityEngine.restingAskUsd,
+      resting_imbalance: predictorOrderflowSnapshot.liquidityEngine.restingImbalance,
+      touch_density: predictorOrderflowSnapshot.liquidityEngine.touchDensity,
+      sweep_risk: predictorOrderflowSnapshot.liquidityEngine.sweepRisk,
+      liquidity_vacuum: predictorOrderflowSnapshot.liquidityEngine.liquidityVacuum,
+      support_score: predictorOrderflowSnapshot.liquidityEngine.supportScore,
+      resistance_score: predictorOrderflowSnapshot.liquidityEngine.resistanceScore,
+      liquidity_pressure: predictorOrderflowSnapshot.liquidityEngine.liquidityPressure,
+      liquidity_engine_score: predictorOrderflowSnapshot.liquidityEngine.liquidityEngineScore,
+      liquidity_engine_state: predictorOrderflowSnapshot.liquidityEngine.stateLabel,
+      orderflow_quality: predictorOrderflowSnapshot.orderflowQuality,
+      market_session: predictorMarketSession,
+      micro_burst_10ms: microBurstTrades10ms,
+      quote_fade_rate: predictorOrderbookSignals.quoteFadeRate,
+      book_flip_signal: predictorOrderbookSignals.bookFlipSignal,
+      orderbook_bids: predictorOrderbookSignals.orderbookBids,
+      orderbook_asks: predictorOrderbookSignals.orderbookAsks,
+      route_mode: v7GateDecision.routeMode,
+      v7_should_execute: v7GateDecision.shouldExecute,
+      v7_reasons: v7GateDecision.reasons,
+      infra_health: infraHealth,
+      network_regime: networkRegime,
+      dns_transient_rate: toNumber(networkMetrics?.dns_transient_rate, 0),
+      timeout_rate: toNumber(networkMetrics?.timeout_rate, 0),
+      degraded_usage_ratio: toNumber(networkMetrics?.degraded_usage_ratio, 0),
+      retry_recovered_ratio: toNumber(networkMetrics?.retry_recovered_ratio, 0),
+      backlog_pressure: marketBusKernelTelemetry.backlogPressure,
+      render_pressure: predictorRenderPressure,
+      renderable_rows: localOhlcvAnalysis.renderableRows,
+      backlog: marketBusKernelTelemetry.bufferBacklog,
+    };
+  }, [avgExecutionLatencyForPredictor, avgExecutionSlippageForPredictor, localOhlcvAnalysis.renderableRows, marketBusKernelTelemetry.backlogPressure, marketBusKernelTelemetry.bufferBacklog, marketBusKernelTelemetry.tickLatencyMs, marketMicro, microBurstTrades10ms, nativeTradeVolume30s, notional, predictorMarketSession, predictorOrderbookSignals, predictorOrderflowSnapshot, predictorRenderPressure, routingScore]);
+  const hasRenderableCandles = localOhlcvAnalysis.renderable && renderableOhlcvBars.length >= localOhlcvAnalysis.minimumRenderableBars;
   const chartAuthBlocked = authSessionRequired || authStatus !== "authenticated";
-  const chartRenderBlocked = localOhlcvAnalysis.signal === "OHLCV_UNUSABLE" && !hasRenderableCandles;
+  const chartRenderBlocked = !chartAuthBlocked && localOhlcvAnalysis.signal === "OHLCV_UNUSABLE" && !hasRenderableCandles;
   const localFeedSidecarMessage = localOhlcvAnalysis.signal === "OHLCV_RENDERABLE"
     ? "Ce chart et son feed local sont rendables."
     : localOhlcvAnalysis.signal === "OHLCV_PARTIAL"
-      ? "Le chart peut dessiner, mais le feed local reste partiel sur cet instrument."
+      ? "Le feed local reste partiel sur cet instrument; le chart bascule en mode preview tant que le seuil canonique n'est pas atteint."
       : "Ce chart est sain, mais ce feed local n’est pas rendable.";
 
   const ohlcvCandles = useMemo(() => {
@@ -4195,7 +5993,7 @@ export default function TradingTerminalPage() {
     // chartWindow reste utilisé comme hint pour la fenêtre initiale visible.
     const windowSize = Math.max(20, Math.min(chartWindow, 500));
     chartViewportRef.current.window = windowSize;
-    return renderableOhlcvBars.slice(-Math.max(windowSize, renderableOhlcvBars.length)).map((bar) => ({
+    return renderableOhlcvBars.slice(-windowSize).map((bar) => ({
       label: String(bar.t || "-"),
       open: toNumber(bar.o, 0),
       high: toNumber(bar.h, 0),
@@ -4205,6 +6003,13 @@ export default function TradingTerminalPage() {
     }));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [renderableOhlcvBars, chartTimeframe]);
+  const latestQuote = filteredQuotes.find((quote) => instrumentLabel(quote) === selectedChartSymbol) || quotes.find((quote) => instrumentLabel(quote) === selectedChartSymbol) || null;
+  const previewAnchorPrice = resolveRawChartAnchorPrice(
+    marketMicro,
+    marketDepth,
+    latestQuote,
+    toNumber(renderableOhlcvBars[renderableOhlcvBars.length - 1]?.c, 100),
+  );
   const fallbackChartCandles = !hasRenderableCandles
     ? (() => {
       // Generate 80 plausible 1-minute preview bars so the chart looks sensible
@@ -4212,7 +6017,7 @@ export default function TradingTerminalPage() {
       // so the shape is stable across renders rather than jumping on every tick.
       const BARS = 80;
       const INTERVAL_MS = 60_000;
-      const base = 100;
+      const base = previewAnchorPrice > 0 ? previewAnchorPrice : 100;
       const now = Math.floor(Date.now() / INTERVAL_MS) * INTERVAL_MS;
       const bars: Array<{ label: string; open: number; high: number; low: number; close: number; volume: number }> = [];
       let price = base;
@@ -4224,12 +6029,12 @@ export default function TradingTerminalPage() {
       };
       for (let i = BARS - 1; i >= 0; i--) {
         const t = now - i * INTERVAL_MS;
-        const drift = (rand() - 0.495) * 0.003;
+        const drift = (rand() - 0.5) * 0.003;
         const open = price;
         const close = open * (1 + drift);
-        const bodyHalf = Math.abs(close - open) * (0.5 + rand() * 0.8);
-        const high = Math.max(open, close) + bodyHalf;
-        const low = Math.min(open, close) - bodyHalf * 0.6;
+        const wickPad = Math.max(open * 0.00018, Math.abs(close - open) * 0.25 + open * 0.00004);
+        const high = Math.max(open, close) + wickPad;
+        const low = Math.min(open, close) - wickPad;
         price = close;
         bars.push({
           label: new Date(t).toISOString(),
@@ -4297,7 +6102,6 @@ export default function TradingTerminalPage() {
       cancelled = true;
     };
     }, [barHash, activeIndicatorKey, activeIndicators]);
-  const latestQuote = filteredQuotes.find((quote) => instrumentLabel(quote) === selectedChartSymbol) || quotes.find((quote) => instrumentLabel(quote) === selectedChartSymbol) || null;
   const selectedQuoteRows = quotes.filter((quote) => instrumentLabel(quote) === selectedChartSymbol);
   const chartValues = chartMode === "candles"
     ? chartCandles.flatMap((candle) => [candle.low, candle.high]).filter((value) => Number.isFinite(value) && value > 0)
@@ -4312,7 +6116,28 @@ export default function TradingTerminalPage() {
   const chartMax = chartValues.length > 0 ? Math.max(...chartValues) : 0;
   const chartChange = chartLastValue - chartFirstValue;
   const chartChangePct = chartFirstValue !== 0 ? (chartChange / chartFirstValue) * 100 : 0;
-  const chartAnchorPrice = toNumber(latestQuote?.last, chartLastValue || chartFirstValue || 0);
+  const chartSeriesAnchorPrice = chartLastValue || chartFirstValue || 0;
+  const chartLiveAnchorPrice = resolveRawChartAnchorPrice(marketMicro, marketDepth, latestQuote, chartSeriesAnchorPrice);
+  const chartBarsHardFail = (() => {
+    const health = (marketBusMeta?.health as JsonMap | undefined) || null;
+    const components = (health?.components as JsonMap | undefined) || null;
+    const ohlcvHealth = (components?.ohlcv as JsonMap | undefined) || null;
+    const freshnessMs = Number(ohlcvHealth?.freshness_ms);
+    return !Number.isFinite(freshnessMs) || freshnessMs < 0 || freshnessMs > 180_000;
+  })();
+  const chartAnchorOutOfRange = (() => {
+    if (!(chartLiveAnchorPrice > 0) || !(chartMax > chartMin)) {
+      return false;
+    }
+    const chartSpan = Math.max(chartMax - chartMin, chartSeriesAnchorPrice * 0.0012);
+    return chartLiveAnchorPrice < chartMin - chartSpan * 0.35 || chartLiveAnchorPrice > chartMax + chartSpan * 0.35;
+  })();
+  const chartShouldLockAnchorToSeries = chartMode === "candles"
+    && hasRenderableCandles
+    && (chartBarsHardFail || chartAnchorOutOfRange);
+  const chartAnchorPrice = chartShouldLockAnchorToSeries
+    ? (chartSeriesAnchorPrice > 0 ? chartSeriesAnchorPrice : chartLiveAnchorPrice)
+    : chartLiveAnchorPrice;
   const chartRangePad = chartMax > chartMin ? (chartMax - chartMin) * 0.08 : Math.max(1, chartAnchorPrice * 0.015);
   const chartPriceRangeMin = Math.max(0.0000001, (chartMin || chartAnchorPrice || 1) - chartRangePad);
   const chartPriceRangeMax = (chartMax || chartAnchorPrice || 1) + chartRangePad;
@@ -4363,9 +6188,9 @@ export default function TradingTerminalPage() {
     }, 0);
   })();
   const dailyDrawdownPct = accountFreeUsd > 0 ? Math.max(0, (-dailyPnLUsd / accountFreeUsd) * 100) : 0;
-  const dayVwap = weightedVwap(chartSeries.slice(-12));
-  const weekVwap = weightedVwap(chartSeries.slice(-24));
-  const monthVwap = weightedVwap(chartSeries);
+  const dayVwap = multiAnchorVwap.day;
+  const weekVwap = multiAnchorVwap.week;
+  const monthVwap = multiAnchorVwap.month;
   const overlayZones = buildOverlayZones(chartSeries);
   const liquidityZones = buildLiquidityZones(chartSeries);
   const chartPriceStep = inferChartPriceStep(selectedChartSymbol, chartAnchorPrice > 0 ? chartAnchorPrice : chartLastValue || chartFirstValue || 1);
@@ -4500,6 +6325,11 @@ export default function TradingTerminalPage() {
     }
     const ack = chartEffectiveSendMode !== "confirm-required" || chartHudConfirmArmed;
     setChartHudConfirmArmed(false);
+    const v7Decision = getV7ExecutionDecision();
+    if (v7Decision.routeMode === "dualVenueExecution" && v7Decision.shouldExecute) {
+      await executeV7ArbOpportunity(v7Decision, ack);
+      return;
+    }
     await submitChartOrder(ack);
   };
 
@@ -4573,7 +6403,7 @@ export default function TradingTerminalPage() {
       if (authSessionRequired || Date.now() < authBackoffUntilRef.current) {
         return;
       }
-      if (shouldPausePublicOpsRefresh()) {
+      if (shouldPauseNonEssentialRefresh()) {
         return;
       }
       inFlight = true;
@@ -4649,7 +6479,7 @@ export default function TradingTerminalPage() {
       if (authSessionRequired || Date.now() < authBackoffUntilRef.current) {
         return;
       }
-      if (shouldPausePublicOpsRefresh()) {
+      if (shouldPauseNonEssentialRefresh()) {
         return;
       }
       inFlight = true;
@@ -5595,7 +7425,7 @@ export default function TradingTerminalPage() {
     };
   }, [selfLearningScopedOutcomesV4]);
   const selfLearningV4DriftLabel = selfLearningDriftV4.shouldDemote ? "DRIFT" : selfLearningDriftV4.enoughSamples ? "STABLE" : "WARMUP";
-  const selfLearningV4Active = selfLearningV4Enabled && selfLearningScopedOutcomesV4.length >= 4;
+  const selfLearningV4Active = hasRenderableCandles && selfLearningV4Enabled && selfLearningScopedOutcomesV4.length >= 4;
   const selfLearningV4WeightsLabel = selfLearningAutoAdaptEnabled ? "ADAPTED" : "MANUAL";
   const selfLearningV4ModelLabel = selfLearningModelUpdatedAt ? "UPDATED" : "BOOTING";
 
@@ -5791,30 +7621,63 @@ export default function TradingTerminalPage() {
       window.removeEventListener("pointercancel", onCancel);
     };
   }, [chartPriceDigits, chartPriceRangeMax, chartPriceRangeMin, chartPriceStep, chartRoundMagnetStep, chartSnapEnabled, chartSnapThreshold, chartAnchorPrice, chartLastValue, crosshair, showLiquidity, showVwap, dayVwap, weekVwap, monthVwap, liquidityZones, chartSnapState]);
-  const tape = nativeTrades.length > 0 ? buildTapeFromTrades(nativeTrades, chartTimeframe) : buildTape(chartSeries, chartTimeframe);
-  const footprintRows = buildFootprintFromOhlcv(renderableOhlcvBars, chartTimeframe);
+  const chartSignalComputationEnabled = replayState.enabled || hasRenderableCandles;
+  const {
+    tape,
+    footprintRows,
+    domLevels,
+    domDisplayLevels,
+    heatmapLevels,
+    tapeByTimeKey,
+    footprintByTimeKey,
+  } = useMemo(() => {
+    if (!chartSignalComputationEnabled) {
+      return {
+        tape: [] as TapePrint[],
+        footprintRows: [] as FootprintRow[],
+        domLevels: [] as DomLevel[],
+        domDisplayLevels: [] as DomLevel[],
+        heatmapLevels: [] as DomLevel[],
+        tapeByTimeKey: new Map<string, TapePrint[]>(),
+        footprintByTimeKey: new Map<string, FootprintRow[]>(),
+      };
+    }
+
+    const nextTape = nativeTrades.length > 0 ? buildTapeFromTrades(nativeTrades, chartTimeframe) : buildTape(chartSeries, chartTimeframe);
+    const nextFootprintRows = buildFootprintFromOhlcv(hasRenderableCandles ? renderableOhlcvBars : [], chartTimeframe);
+    const domLevels = marketDepth ? buildDomLevelsFromDepth(marketDepth) : buildDomLevels(orderbook);
+    const nextDomDisplayLevels = domLevels.slice(0, 14);
+    const buyLevels = domLevels.filter((level) => level.side === "bid");
+    const sellLevels = domLevels.filter((level) => level.side === "ask");
+    const nextHeatmapLevels = [...[...sellLevels].reverse(), ...buyLevels].slice(0, 20);
+    const nextTapeByTimeKey = nextTape.reduce((acc, entry) => {
+      if (entry.timeKey) {
+        acc.set(entry.timeKey, [...(acc.get(entry.timeKey) || []), entry]);
+      }
+      return acc;
+    }, new Map<string, TapePrint[]>());
+    const nextFootprintByTimeKey = nextFootprintRows.reduce((acc, entry) => {
+      if (entry.timeKey) {
+        acc.set(entry.timeKey, [...(acc.get(entry.timeKey) || []), entry]);
+      }
+      return acc;
+    }, new Map<string, FootprintRow[]>());
+
+    return {
+      tape: nextTape,
+      footprintRows: nextFootprintRows,
+      domLevels,
+      domDisplayLevels: nextDomDisplayLevels,
+      heatmapLevels: nextHeatmapLevels,
+      tapeByTimeKey: nextTapeByTimeKey,
+      footprintByTimeKey: nextFootprintByTimeKey,
+    };
+  }, [chartSeries, chartSignalComputationEnabled, chartTimeframe, hasRenderableCandles, marketDepth, nativeTrades, orderbook, renderableOhlcvBars]);
   const displayDepthStreamState: "offline" | "connecting" | "live" = depthStreamState === "live"
     || marketDepth !== null
     || orderbook !== null
     ? "live"
     : depthStreamState;
-  const domLevels = marketDepth ? buildDomLevelsFromDepth(marketDepth) : buildDomLevels(orderbook);
-  const domDisplayLevels = domLevels.slice(0, 14);
-  const buyLevels = domLevels.filter((level) => level.side === "bid");
-  const sellLevels = domLevels.filter((level) => level.side === "ask");
-  const heatmapLevels = [...[...sellLevels].reverse(), ...buyLevels].slice(0, 20);
-  const tapeByTimeKey = tape.reduce((acc, entry) => {
-    if (entry.timeKey) {
-      acc.set(entry.timeKey, [...(acc.get(entry.timeKey) || []), entry]);
-    }
-    return acc;
-  }, new Map<string, TapePrint[]>());
-  const footprintByTimeKey = footprintRows.reduce((acc, entry) => {
-    if (entry.timeKey) {
-      acc.set(entry.timeKey, [...(acc.get(entry.timeKey) || []), entry]);
-    }
-    return acc;
-  }, new Map<string, FootprintRow[]>());
   const depthPayload = (marketDepth?.depth_payload as JsonMap | undefined) || {};
   const depthEventTime = toNumber(depthPayload.event_time, 0);
   const depthSnapshotAt = String(marketDepth?.snapshot_at || "");
@@ -6007,10 +7870,14 @@ export default function TradingTerminalPage() {
       if (!timeKey) {
         continue;
       }
+      const outcomeId = decisionIdFrom(outcome);
+      const outcomeAttribution = outcomeId ? replayAttributionByDecisionId[outcomeId] || null : null;
       const pnl = toNumber(outcome.pnl_usd, NaN);
       const pnlPct = toNumber(outcome.pnl_pct, 0);
       const pnlSign = Number.isFinite(pnl) ? (pnl >= 0 ? "+" : "") : "";
-      const label = Number.isFinite(pnl) ? `${pnlSign}${pnl.toFixed(0)}$` : "PnL";
+      const familySuffix = outcomeAttribution ? ` ${compactFeatureFamilyLabel(outcomeAttribution.topFamily)}` : "";
+      const label = Number.isFinite(pnl) ? `${pnlSign}${pnl.toFixed(0)}$${familySuffix}` : `PnL${familySuffix}`;
+      const dreamDetail = outcomeAttribution ? ` · ${buildReplayDreamSummary(outcomeAttribution)}` : "";
       markers.push({
         id: `outcome-${index}-${timeKey}`,
         label,
@@ -6018,8 +7885,35 @@ export default function TradingTerminalPage() {
         timeKey,
         frameIndex: resolveFrameIndexForEvent(timeKey),
         critical: Number.isFinite(pnl) && pnl < -500,
-        detail: `${instrumentLabel(outcome)} ${pnlSign}${pnlPct.toFixed(2)}% MAE:${toNumber(outcome.mae_bps, 0).toFixed(0)}bps MFE:${toNumber(outcome.mfe_bps, 0).toFixed(0)}bps`,
+        detail: `${instrumentLabel(outcome)} ${pnlSign}${pnlPct.toFixed(2)}% MAE:${toNumber(outcome.mae_bps, 0).toFixed(0)}bps MFE:${toNumber(outcome.mfe_bps, 0).toFixed(0)}bps${outcomeAttribution ? ` · ${formatFeatureFamilyLabel(outcomeAttribution.topFamily)} ${outcomeAttribution.topContribution >= 0 ? "+" : ""}${outcomeAttribution.topContribution.toFixed(2)} · ${outcomeAttribution.contextLabel}` : ""}${dreamDetail}`,
       });
+      if (
+        outcomeAttribution
+        && (
+          outcomeAttribution.latentLabel !== outcomeAttribution.latentNextLabel
+          || outcomeAttribution.latentTransition >= 0.12
+          || outcomeAttribution.dreamCount > 0
+          || outcomeAttribution.synthetic
+        )
+      ) {
+        const latentCompact = outcomeAttribution.latentLabel === outcomeAttribution.latentNextLabel
+          ? compactReplayLatentLabel(outcomeAttribution.latentLabel)
+          : `${compactReplayLatentLabel(outcomeAttribution.latentLabel)}→${compactReplayLatentLabel(outcomeAttribution.latentNextLabel)}`;
+        const provenanceCompact = outcomeAttribution.synthetic
+          ? " SYN"
+          : outcomeAttribution.dreamCount > 0
+            ? ` D${outcomeAttribution.dreamCount}`
+            : "";
+        markers.push({
+          id: `latent-${index}-${timeKey}`,
+          label: `${latentCompact}${provenanceCompact}`,
+          kind: "latent",
+          timeKey,
+          frameIndex: resolveFrameIndexForEvent(timeKey),
+          critical: outcomeAttribution.latentLabel !== outcomeAttribution.latentNextLabel && outcomeAttribution.latentTransition >= 0.38,
+          detail: `${outcomeAttribution.latentShiftLabel} · shift ${(outcomeAttribution.latentTransition * 100).toFixed(0)}% · ${buildReplayDreamSummary(outcomeAttribution)}`,
+        });
+      }
     }
 
     return markers
@@ -6094,22 +7988,42 @@ export default function TradingTerminalPage() {
   const replayFrame = replayState.enabled && replayFrames.length > 0
     ? replayFrames[clampIndex(replayState.cursorIndex, replayMaxIndex)] || null
     : null;
+  const chartHeavyFeaturesEnabled = chartSignalComputationEnabled;
   const activeDomLevels = replayState.enabled
     ? (replayFrame?.domLevels || [])
-    : domDisplayLevels;
+    : (chartHeavyFeaturesEnabled ? domDisplayLevels : []);
   const activeHeatmapLevels = replayState.enabled
     ? (replayFrame?.heatmapLevels || [])
-    : heatmapLevels;
+    : (chartHeavyFeaturesEnabled ? heatmapLevels : []);
   const activeFootprintRows = replayState.enabled
     ? (replayFrame?.footprintRows || [])
-    : footprintRows.slice(0, 8);
+    : (chartHeavyFeaturesEnabled ? footprintRows.slice(0, 8) : []);
   const activeTape = replayState.enabled
     ? (replayFrame?.tapeEvents || [])
-    : tape.slice(0, 12);
+    : (chartHeavyFeaturesEnabled ? tape.slice(0, 12) : []);
   const activePrice = replayState.enabled
     ? toNumber(replayFrame?.quoteValue, chartLastValue)
     : (crosshair?.price ?? chartLastValue);
   var marketSignalV1 = useMemo<MarketSignalSnapshot>(() => {
+    if (!chartSignalComputationEnabled) {
+      return {
+        buyPressurePct: 50,
+        sellPressurePct: 50,
+        directionalLongPct: 50,
+        directionalShortPct: 50,
+        directionalConfidencePct: 50,
+        directionalConfidenceLabel: "LOW",
+        dominantDirection: "neutral",
+        headline: "Signal standby while chart is partial",
+        convictionLabel: "standby",
+        focusMode: false,
+        calibrationLabel: resolveSignalCalibration(selectedChartSymbol, chartTimeframe).label,
+        criticalSignalCount: 0,
+        criticalSignalIds: [],
+        signals: [],
+      };
+    }
+
     const calibration = resolveSignalCalibration(selectedChartSymbol, chartTimeframe);
     const bidDepth = activeDomLevels
       .filter((level) => level.side === "bid")
@@ -6378,8 +8292,12 @@ export default function TradingTerminalPage() {
       criticalSignalIds: criticalSignals.map((signal) => signal.id),
       signals: sortedSignals,
     };
-  }, [activeDomLevels, activeFootprintRows, activePrice, chartAtrLocalPct, chartCandles, chartPriceStep, chartSeries, chartTimeframe, liquidityZones, selectedChartSymbol]);
+  }, [activeDomLevels, activeFootprintRows, activePrice, chartAtrLocalPct, chartCandles, chartPriceStep, chartSeries, chartSignalComputationEnabled, chartTimeframe, liquidityZones, selectedChartSymbol]);
+  const selfLearningComputationEnabled = chartSignalComputationEnabled && selfLearningV4Enabled;
   const selfLearningRegimeV4 = useMemo<LearningRegimeV4>(() => {
+    if (!selfLearningComputationEnabled) {
+      return "chop";
+    }
     const points = chartSeries.slice(-24);
     if (points.length < 8) {
       return "chop";
@@ -6412,25 +8330,31 @@ export default function TradingTerminalPage() {
       return "trend";
     }
     return "chop";
-  }, [chartSeries]);
-  const selfLearningScenarioHint: MarketDecisionScenario = marketSignalV1.signals.some((signal) => signal.id === "continuation")
-    ? "continuation"
-    : marketSignalV1.signals.some((signal) => signal.id === "absorption" || signal.id === "fake-breakout" || signal.id === "liquidity-trap" || signal.id === "exhaustion")
-      ? "reversal"
-      : "balance";
-  const selfLearningProfile = signalHistoricalLearningBundle.byScenario[selfLearningScenarioHint] || signalHistoricalLearningBundle.mixed;
+  }, [chartSeries, selfLearningComputationEnabled]);
+  const selfLearningScenarioHint: MarketDecisionScenario = !selfLearningComputationEnabled
+    ? "balance"
+    : marketSignalV1.signals.some((signal) => signal.id === "continuation")
+      ? "continuation"
+      : marketSignalV1.signals.some((signal) => signal.id === "absorption" || signal.id === "fake-breakout" || signal.id === "liquidity-trap" || signal.id === "exhaustion")
+        ? "reversal"
+        : "balance";
+  const selfLearningProfile = !selfLearningComputationEnabled
+    ? signalHistoricalLearningBundle.mixed
+    : signalHistoricalLearningBundle.byScenario[selfLearningScenarioHint] || signalHistoricalLearningBundle.mixed;
   const selfLearningRegimeTemplate: MarketConfluenceWeights = selfLearningRegimeV4 === "trend"
     ? { dom: 1.18, footprint: 1.04, liquidity: 0.88, "price-action": 1.22 }
     : selfLearningRegimeV4 === "chop"
       ? { dom: 0.9, footprint: 1.15, liquidity: 1.2, "price-action": 0.88 }
       : { dom: 0.82, footprint: 1.2, liquidity: 1.24, "price-action": 0.94 };
-  const selfLearningAdaptiveWeights: MarketConfluenceWeights = {
-    dom: clamp(selfLearningProfile.learnedWeights.dom * selfLearningRegimeTemplate.dom, 0.72, 1.55),
-    footprint: clamp(selfLearningProfile.learnedWeights.footprint * selfLearningRegimeTemplate.footprint, 0.72, 1.6),
-    liquidity: clamp(selfLearningProfile.learnedWeights.liquidity * selfLearningRegimeTemplate.liquidity, 0.72, 1.62),
-    "price-action": clamp(selfLearningProfile.learnedWeights["price-action"] * selfLearningRegimeTemplate["price-action"], 0.72, 1.58),
-  };
-  const selfLearningEffectiveWeights: MarketConfluenceWeights = selfLearningAutoAdaptEnabled
+  const selfLearningAdaptiveWeights: MarketConfluenceWeights = !selfLearningComputationEnabled
+    ? { dom: 1, footprint: 1, liquidity: 1, "price-action": 1 }
+    : {
+      dom: clamp(selfLearningProfile.learnedWeights.dom * selfLearningRegimeTemplate.dom, 0.72, 1.55),
+      footprint: clamp(selfLearningProfile.learnedWeights.footprint * selfLearningRegimeTemplate.footprint, 0.72, 1.6),
+      liquidity: clamp(selfLearningProfile.learnedWeights.liquidity * selfLearningRegimeTemplate.liquidity, 0.72, 1.62),
+      "price-action": clamp(selfLearningProfile.learnedWeights["price-action"] * selfLearningRegimeTemplate["price-action"], 0.72, 1.58),
+    };
+  const selfLearningEffectiveWeights: MarketConfluenceWeights = selfLearningComputationEnabled && selfLearningAutoAdaptEnabled
     ? {
       dom: clamp(confluenceWeights.dom * selfLearningAdaptiveWeights.dom, 0.2, 2.4),
       footprint: clamp(confluenceWeights.footprint * selfLearningAdaptiveWeights.footprint, 0.2, 2.4),
@@ -6440,6 +8364,35 @@ export default function TradingTerminalPage() {
     : { ...confluenceWeights };
 
   var marketDecisionV1 = useMemo<MarketDecisionSnapshot>(() => {
+    if (!chartSignalComputationEnabled) {
+      return {
+        scenario: "balance",
+        scenarioLabel: "Signal standby",
+        scenarioProbabilityPct: 50,
+        probableReversalZone: null,
+        probableReversalZoneLabel: "No reversal zone",
+        globalConfidencePct: 44,
+        biasDirection: "neutral",
+        criticalConfirmed: false,
+        evidence: [
+          { id: "dom", label: "DOM", scorePct: 0, direction: "neutral", detail: "suspended while chart is partial" },
+          { id: "footprint", label: "Footprint", scorePct: 0, direction: "neutral", detail: "suspended while chart is partial" },
+          { id: "liquidity", label: "Liquidity", scorePct: 0, direction: "neutral", detail: "waiting for renderable candles" },
+          { id: "price-action", label: "Price", scorePct: 0, direction: "neutral", detail: "waiting for renderable candles" },
+        ],
+        confluenceScorePct: 0,
+        actionTitle: "Wait for renderable candles",
+        actionBody: "DOM, footprint and confluence calculations stay paused until the chart returns to a renderable state.",
+        suggestedBracket: null,
+        historicalLearning: signalHistoricalLearning,
+        executionPlan: {
+          snapPriority: "vwap",
+          preset: chartTimeframe === "15m" ? "swing" : "scalp",
+          guardEnabled: true,
+        },
+      };
+    }
+
     const topSignal = marketSignalV1.signals[0] || null;
     const hasAbsorption = marketSignalV1.criticalSignalIds.includes("absorption");
     const hasTrap = marketSignalV1.criticalSignalIds.includes("liquidity-trap");
@@ -6653,7 +8606,7 @@ export default function TradingTerminalPage() {
       historicalLearning: selectedLearning,
       executionPlan,
     };
-  }, [activeDomLevels, activeFootprintRows, activePrice, chartAtrLocalPct, chartPriceDigits, chartPriceStep, chartSeries, chartTimeframe, liquidityZones, marketSignalV1, selfLearningEffectiveWeights, signalHistoricalLearning, signalHistoricalLearningBundle]);
+  }, [activeDomLevels, activeFootprintRows, activePrice, chartAtrLocalPct, chartPriceDigits, chartPriceStep, chartSeries, chartSignalComputationEnabled, chartTimeframe, liquidityZones, marketSignalV1, selfLearningEffectiveWeights, signalHistoricalLearning, signalHistoricalLearningBundle]);
   useEffect(() => {
     signalConfidenceTrailRef.current = [];
     setSignalConfidenceDrift("FLAT");
@@ -6679,7 +8632,7 @@ export default function TradingTerminalPage() {
     }
   }, [marketSignalV1.directionalConfidencePct]);
   useEffect(() => {
-    if (!selfLearningV4Enabled) {
+    if (!selfLearningV4Enabled || !selfLearningComputationEnabled) {
       return;
     }
     const signature = [
@@ -6703,6 +8656,7 @@ export default function TradingTerminalPage() {
   }, [
     chartTimeframe,
     selfLearningAutoAdaptEnabled,
+    selfLearningComputationEnabled,
     selfLearningProfile.sampleSize,
     selfLearningProfile.winratePct,
     selfLearningRegimeV4,
@@ -6711,7 +8665,7 @@ export default function TradingTerminalPage() {
     selectedChartSymbol,
   ]);
   useEffect(() => {
-    if (!selfLearningV4Enabled || !selfLearningAutoAdaptEnabled || !selfLearningDriftV4.shouldDemote) {
+    if (!selfLearningV4Enabled || !selfLearningComputationEnabled || !selfLearningAutoAdaptEnabled || !selfLearningDriftV4.shouldDemote) {
       return;
     }
     const signature = [selectedChartSymbol, chartTimeframe, selfLearningDriftV4.signature].join(":");
@@ -6726,13 +8680,14 @@ export default function TradingTerminalPage() {
   }, [
     chartTimeframe,
     selfLearningAutoAdaptEnabled,
+    selfLearningComputationEnabled,
     selfLearningDriftV4.shouldDemote,
     selfLearningDriftV4.signature,
     selfLearningV4Enabled,
     selectedChartSymbol,
   ]);
   useEffect(() => {
-    if (!selfLearningV4Enabled || selfLearningScopedOutcomesV4.length === 0) {
+    if (!selfLearningV4Enabled || !selfLearningComputationEnabled || selfLearningScopedOutcomesV4.length === 0) {
       return;
     }
     const latest = selfLearningScopedOutcomesV4[0];
@@ -6796,6 +8751,7 @@ export default function TradingTerminalPage() {
     });
   }, [
     chartTimeframe,
+    selfLearningComputationEnabled,
     selfLearningEffectiveWeights,
     selfLearningRegimeV4,
     selfLearningScopedOutcomesV4,
@@ -6803,6 +8759,9 @@ export default function TradingTerminalPage() {
     selectedChartSymbol,
   ]);
   useEffect(() => {
+    if (!selfLearningComputationEnabled) {
+      return;
+    }
     if (typeof window === "undefined") {
       return;
     }
@@ -6871,7 +8830,7 @@ export default function TradingTerminalPage() {
     return () => {
       window.clearTimeout(timer);
     };
-  }, [accountId, chartTimeframe, selectedChartSymbol, selfLearningAdaptiveWeights, selfLearningAutoAdaptEnabled, selfLearningDriftAutoDemotedAt, selfLearningDriftV4, selfLearningEffectiveWeights, selfLearningJournalV4RegimeFilter, selfLearningJournalV4ScenarioFilter, selfLearningJournalV4Trail, selfLearningModelUpdatedAt, selfLearningProfile, selfLearningRegimeV4, selfLearningScenarioHint, selfLearningV4Active, selfLearningV4DriftLabel, selfLearningV4Enabled]);
+  }, [accountId, chartTimeframe, selectedChartSymbol, selfLearningAdaptiveWeights, selfLearningAutoAdaptEnabled, selfLearningComputationEnabled, selfLearningDriftAutoDemotedAt, selfLearningDriftV4, selfLearningEffectiveWeights, selfLearningJournalV4RegimeFilter, selfLearningJournalV4ScenarioFilter, selfLearningJournalV4Trail, selfLearningModelUpdatedAt, selfLearningProfile, selfLearningRegimeV4, selfLearningScenarioHint, selfLearningV4Active, selfLearningV4DriftLabel, selfLearningV4Enabled]);
   useEffect(() => {
     let cancelled = false;
     if (authSessionRequired) {
@@ -6886,7 +8845,7 @@ export default function TradingTerminalPage() {
       };
     }
     const loadScopes = async () => {
-      if (shouldPausePublicOpsRefresh()) {
+      if (shouldPauseNonEssentialRefresh()) {
         return;
       }
       try {
@@ -6992,6 +8951,7 @@ export default function TradingTerminalPage() {
     if (autoExecutionMode === "assisted") {
       return;
     }
+    const v7Decision = getV7ExecutionDecision();
     const signature = [
       selectedChartSymbol,
       chartTimeframe,
@@ -7004,6 +8964,9 @@ export default function TradingTerminalPage() {
       autoSymbolLoss.pass ? "l1" : "l0",
       autoExecutionKillSwitch ? "k1" : "k0",
       autoSizingV3.finalNotional.toFixed(0),
+      v7Decision.routeMode,
+      v7Decision.shouldExecute ? "v71" : "v70",
+      v7Decision.expectedNetEdgeBps.toFixed(2),
     ].join(":");
     if (autoExecutionAuditSignatureRef.current === signature) {
       return;
@@ -7016,6 +8979,9 @@ export default function TradingTerminalPage() {
     if (!autoSymbolLoss.pass) reasons.push("symbol-loss-cap");
     if (autoRiskEngine.killSwitchActive) reasons.push("kill-switch");
     if (!autoEntryReady) reasons.push("entry-not-ready");
+    if (v7Decision.routeMode === "dualVenueExecution" && !v7Decision.shouldExecute) {
+      reasons.push(...v7Decision.reasons.map((reason) => `v7:${reason}`));
+    }
     setAutoExecutionAuditTrail((current) => [
       {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -7051,6 +9017,11 @@ export default function TradingTerminalPage() {
     autoSymbolLoss.pass,
     chartTimeframe,
     selectedChartSymbol,
+    executionTelemetry,
+    filteredOutcomes,
+    marketMicro,
+    notional,
+    routingScore,
   ]);
   useEffect(() => {
     if (replayState.enabled || autoExecutionMode === "assisted" || autoExecutionKillSwitch) {
@@ -7087,6 +9058,10 @@ export default function TradingTerminalPage() {
     if (!autoExecutionGate.ready || autoExecutionMode !== "full-auto") {
       return;
     }
+    const v7Decision = getV7ExecutionDecision();
+    if (v7Decision.routeMode === "dualVenueExecution" && !v7Decision.shouldExecute) {
+      return;
+    }
     const now = Date.now();
     if (now - autoExecutionLastAtRef.current < 45000) {
       return;
@@ -7097,7 +9072,12 @@ export default function TradingTerminalPage() {
     }
     autoExecutionSignatureRef.current = stagedSignature;
     void (async () => {
-      await approveAllAndSend();
+      if (v7Decision.routeMode === "dualVenueExecution") {
+        const ack = chartEffectiveSendMode !== "confirm-required" || chartHudConfirmArmed;
+        await executeV7ArbOpportunity(v7Decision, ack);
+      } else {
+        await approveAllAndSend();
+      }
       if (chartHudConfirmArmed || chartEffectiveSendMode !== "confirm-required") {
         autoExecutionLastAtRef.current = Date.now();
       }
@@ -7113,11 +9093,17 @@ export default function TradingTerminalPage() {
     chartHudConfirmArmed,
     chartPriceDigits,
     chartTimeframe,
+    executeV7ArbOpportunity,
     marketDecisionV1.executionPlan,
     marketDecisionV1.scenario,
     marketDecisionV1.suggestedBracket,
     replayState.enabled,
     selectedChartSymbol,
+    executionTelemetry,
+    filteredOutcomes,
+    marketMicro,
+    notional,
+    routingScore,
   ]);
   const strictDepthTimeMatch = replayState.enabled
     ? Boolean(replayFrame && activeTimeKey && replayFrame.timeKey === activeTimeKey)
@@ -7271,8 +9257,32 @@ export default function TradingTerminalPage() {
       };
     })
     .sort((left, right) => left.spread - right.spread);
+  const routingCandidatesV6 = Array.isArray(routingScore?.candidates)
+    ? routingScore.candidates as JsonMap[]
+    : [];
+  const executionRouteCandidates = routingCandidatesV6.length > 0
+    ? routingCandidatesV6
+    : routeCandidates.map((candidate) => ({
+      venue: candidate.venue,
+      instrument: candidate.instrument,
+      score: 0,
+      spread_bps: candidate.spread,
+      available_depth_usd: 0,
+      freshness_ms: 0,
+      fill_probability: 0,
+      liquidity: 0,
+      stability_score: 0,
+      stability_state: "n/a",
+    }));
   const preferredRoute = (routingScore?.best as JsonMap | undefined) || routeCandidates[0] || null;
   const backupRoute = (routingScore?.backup as JsonMap | undefined) || routeCandidates[1] || null;
+  const routingReasonLabel = String(routingScore?.reason || (routingCandidatesV6.length > 0 ? "best_route_candidate" : "best_quote_spread")).replace(/_/g, " ");
+  const routingInfraHealth = clamp(toNumber(routingScore?.infra_health, 1), 0.05, 1);
+  const routingNetworkRegime = String(routingScore?.network_regime || "stable");
+  const preferredRouteStability = toNumber((preferredRoute as JsonMap | null)?.stability_score, 0);
+  const preferredRouteState = String((preferredRoute as JsonMap | null)?.stability_state || (preferredRouteStability > 0 ? "watch" : "n/a"));
+  const backupRouteStability = toNumber((backupRoute as JsonMap | null)?.stability_score, 0);
+  const backupRouteState = String((backupRoute as JsonMap | null)?.stability_state || (backupRouteStability > 0 ? "watch" : "n/a"));
   const replayItems = executionTelemetry.length > 0 ? executionTelemetry.slice(0, 6) : filteredOutcomes.slice(0, 6);
   const replayOptions = replayItems.reduce((acc, item) => {
     const id = decisionIdFrom(item);
@@ -7334,6 +9344,611 @@ export default function TradingTerminalPage() {
     ? toNumber((preferredRoute as JsonMap).spread, toNumber((preferredRoute as JsonMap).spread_bps, 0))
     : 0;
   const backupScore = backupRoute ? toNumber((backupRoute as JsonMap).score, 0) : 0;
+  const fusionPrice = toNumber(marketMicro?.fusion_price, toNumber(routingScore?.fusion_price, 0));
+  const predictedPrice = toNumber(marketMicro?.predicted_price, 0);
+  const fusionVenueCount = Math.max(0, toNumber(marketMicro?.fusion_venue_count, 0));
+  const fusionDeviationBps = toNumber(marketMicro?.fusion_deviation_bps, toNumber(routingScore?.deviation_bps, 0));
+  const predictedDeltaBps = fusionPrice > 0 && predictedPrice > 0
+    ? ((predictedPrice - fusionPrice) / fusionPrice) * 10000
+    : 0;
+  const v8Prediction = predictorEngineV8Ref.current.assess({
+    marketMicro,
+    routingScore,
+    executionTelemetry: executionTelemetry.length > 0 ? executionTelemetry : outcomes,
+    kernelTelemetry: marketBusKernelTelemetry,
+    horizonMs: marketBusKernelTelemetry.tickLatencyMs > 45 ? 100 : 50,
+    notionalUsd: autoExecutionMode === "full-auto" ? autoSizingV3.finalNotional : notional,
+  });
+  const backendMultiHorizon = backendPredictorSnapshot?.multi_horizon && typeof backendPredictorSnapshot.multi_horizon === "object"
+    ? backendPredictorSnapshot.multi_horizon as JsonMap
+    : null;
+  const backendP20 = toNumber((backendMultiHorizon?.["20"] as JsonMap | undefined)?.probability, 0);
+  const backendP50 = toNumber((backendMultiHorizon?.["50"] as JsonMap | undefined)?.probability, 0);
+  const backendP100 = toNumber((backendMultiHorizon?.["100"] as JsonMap | undefined)?.probability, 0);
+  const backendBrainDecision = backendPredictorSnapshot?.autonomous_brain && typeof backendPredictorSnapshot.autonomous_brain === "object"
+    ? backendPredictorSnapshot.autonomous_brain as JsonMap
+    : null;
+  const backendBrainMetaPolicy = backendBrainDecision?.meta_policy && typeof backendBrainDecision.meta_policy === "object"
+    ? backendBrainDecision.meta_policy as JsonMap
+    : null;
+  const backendBrainStats = backendPredictorStats?.brain && typeof backendPredictorStats.brain === "object"
+    ? backendPredictorStats.brain as JsonMap
+    : null;
+  const backendBrainAction = String(backendBrainDecision?.action || "n/a").toUpperCase();
+  const backendBrainConfidence = toNumber(backendBrainDecision?.confidence, 0);
+  const backendBrainConsensus = toNumber(backendBrainDecision?.consensus, 0);
+  const backendBrainShouldExecute = typeof backendBrainDecision?.should_execute === "boolean"
+    ? Boolean(backendBrainDecision.should_execute)
+    : false;
+  const backendBrainRegime = String(backendBrainDecision?.regime || ((backendBrainDecision?.state as JsonMap | undefined)?.regime) || "n/a").toUpperCase();
+  const backendBrainReason = String(backendBrainDecision?.reason || "");
+  const backendBrainOrderflowQuality = toNumber(backendBrainMetaPolicy?.orderflow_quality, 0);
+  const backendBrainDisabledAgents = Array.isArray(backendBrainMetaPolicy?.disabled_agents)
+    ? (backendBrainMetaPolicy?.disabled_agents as unknown[]).map((item) => String(item)).filter(Boolean)
+    : [];
+  const backendBrainFeatureContext = backendBrainMetaPolicy?.feature_context && typeof backendBrainMetaPolicy.feature_context === "object"
+    ? backendBrainMetaPolicy.feature_context as JsonMap
+    : null;
+  const backendBrainFeatureLeader = String(backendBrainMetaPolicy?.feature_leader || "n/a");
+  const backendBrainFeatureLeaderContribution = toNumber(backendBrainMetaPolicy?.feature_leader_contribution, 0);
+  const backendBrainFeatureSession = String(backendBrainFeatureContext?.session || backendBrainMetaPolicy?.market_session || predictorMarketSession || "n/a");
+  const backendBrainFeatureVolatility = String(backendBrainFeatureContext?.volatility || "n/a");
+  const backendBrainFeatureSpread = String(backendBrainFeatureContext?.spread || "n/a");
+  const backendBrainFeatureAttribution = backendBrainMetaPolicy?.feature_attribution && typeof backendBrainMetaPolicy.feature_attribution === "object"
+    ? backendBrainMetaPolicy.feature_attribution as Record<string, JsonMap>
+    : {};
+  const backendBrainAnchorPrimary = String(backendBrainMetaPolicy?.anchor_primary || predictorOrderflowSnapshot.multiAnchorVwap.primaryLabel || "n/a");
+  const backendBrainAnchorCompression = toNumber(backendBrainMetaPolicy?.anchor_compression_bps, predictorOrderflowSnapshot.multiAnchorVwap.anchorCompressionBps);
+  const backendBrainAnchorConfluence = toNumber(backendBrainMetaPolicy?.anchor_confluence, predictorOrderflowSnapshot.multiAnchorVwap.confluenceScore);
+  const backendBrainLiquidityPressure = toNumber(backendBrainMetaPolicy?.liquidity_pressure, predictorOrderflowSnapshot.liquidityEngine.liquidityPressure);
+  const backendBrainSweepRisk = toNumber(backendBrainMetaPolicy?.sweep_risk, predictorOrderflowSnapshot.liquidityEngine.sweepRisk);
+  const backendBrainLiquidityVacuum = toNumber(backendBrainMetaPolicy?.liquidity_vacuum, predictorOrderflowSnapshot.liquidityEngine.liquidityVacuum);
+  const backendBrainLiquidityState = String(backendBrainMetaPolicy?.liquidity_state || predictorOrderflowSnapshot.liquidityEngine.stateLabel || "balanced");
+  const backendBrainReplayStats = (backendBrainStats?.replay_buffer as JsonMap | undefined) || null;
+  const backendBrainLatentStats = (backendBrainStats?.latent_encoder as JsonMap | undefined) || null;
+  const backendBrainReplaySize = toNumber(backendBrainReplayStats?.size, 0);
+  const backendBrainLearnSteps = toNumber(backendBrainStats?.learn_steps, 0);
+  const backendBrainWinRate = toNumber(backendBrainStats?.global_win_rate, 0);
+  const backendBrainDreamSize = toNumber(backendBrainReplayStats?.dream_size, 0);
+  const backendBrainDreamRatio = toNumber(backendBrainReplayStats?.dream_ratio, 0);
+  const backendBrainDreamWeight = toNumber(backendBrainReplayStats?.dream_avg_weight, 0);
+  const backendBrainLatentLabel = String(backendBrainMetaPolicy?.latent_label || backendBrainLatentStats?.current_label || "uninitialized");
+  const backendBrainLatentConfidence = toNumber(backendBrainMetaPolicy?.latent_confidence, toNumber(backendBrainLatentStats?.confidence_ema, 0));
+  const backendBrainLatentTransition = toNumber(backendBrainMetaPolicy?.latent_transition, toNumber(backendBrainLatentStats?.transition_ema, 0));
+  const backendBrainLatentFactor = String(backendBrainMetaPolicy?.latent_factor || backendBrainLatentStats?.dominant_factor || "n/a");
+  const backendBrainLatentObservations = toNumber(backendBrainLatentStats?.observations, 0);
+  const backendBrainVotes = Array.isArray(backendBrainDecision?.agent_votes)
+    ? [...(backendBrainDecision.agent_votes as JsonMap[])].sort((left, right) => {
+      const leftScore = toNumber(left.calibrated_confidence, 0) * Math.max(1, toNumber(left.weight, 0));
+      const rightScore = toNumber(right.calibrated_confidence, 0) * Math.max(1, toNumber(right.weight, 0));
+      return rightScore - leftScore;
+    })
+    : [];
+  const backendBrainTopVotes = backendBrainVotes.slice(0, 3);
+  const backendBrainAttributionRows = Object.entries(backendBrainFeatureAttribution)
+    .map(([family, raw]) => ({
+      family,
+      alpha: toNumber(raw?.alpha, toNumber(raw?.avg_contribution, 0)),
+      marginal: toNumber(raw?.context_avg_marginal_impact ?? raw?.avg_marginal_impact, 0),
+      correlation: toNumber(raw?.rolling_correlation, 0),
+      learningRateHint: toNumber(raw?.learning_rate_hint, 1),
+      wrongWayRate: toNumber(raw?.wrong_way_rate, 0),
+    }))
+    .sort((left, right) => Math.abs(right.alpha) - Math.abs(left.alpha))
+    .slice(0, 4);
+  const backendBrainAttributionPills = backendBrainAttributionRows.map((row) => (
+    `${compactFeatureFamilyLabel(row.family)} α${row.alpha >= 0 ? "+" : ""}${row.alpha.toFixed(2)} · SHAP ${row.marginal >= 0 ? "+" : ""}${row.marginal.toFixed(2)} · ρ ${row.correlation.toFixed(2)} · lr x${row.learningRateHint.toFixed(2)}${row.wrongWayRate >= 0.4 ? " · risk" : ""}`
+  ));
+  const backendBrainLearningRates = backendBrainMetaPolicy?.agent_learning_rates && typeof backendBrainMetaPolicy.agent_learning_rates === "object"
+    ? backendBrainMetaPolicy.agent_learning_rates as Record<string, JsonMap>
+    : {};
+  const backendBrainGovernor = backendBrainMetaPolicy?.governor && typeof backendBrainMetaPolicy.governor === "object"
+    ? backendBrainMetaPolicy.governor as JsonMap
+    : null;
+  const backendBrainGovernorMode = String(backendBrainGovernor?.mode || "idle");
+  const backendBrainGovernorBlocked = Boolean(backendBrainGovernor?.blocked);
+  const backendBrainGovernorSizeMultiplier = toNumber(backendBrainGovernor?.size_multiplier, 1);
+  const backendBrainGovernorReasons = Array.isArray(backendBrainGovernor?.reasons)
+    ? (backendBrainGovernor?.reasons as unknown[]).map((item) => String(item)).filter(Boolean)
+    : [];
+  const backendBrainGovernorFailureSource = String(backendBrainGovernor?.failure_source || "");
+  const backendBrainGovernorCalibrationConfidence = toNumber(backendBrainGovernor?.calibration_confidence, 0);
+  const backendBrainMetaAgent = backendBrainMetaPolicy?.meta_agent && typeof backendBrainMetaPolicy.meta_agent === "object"
+    ? backendBrainMetaPolicy.meta_agent as JsonMap
+    : null;
+  const backendBrainMetaMode = String(backendBrainMetaAgent?.global_mode || "");
+  const backendBrainMetaProfileId = String(backendBrainMetaAgent?.profile_id || "");
+  const backendBrainMetaVenueAction = String(backendBrainMetaAgent?.venue_action || "");
+  const backendBrainMetaExecutionDelayMs = toNumber(backendBrainMetaAgent?.execution_delay_ms, 0);
+  const backendBrainMetaSimulationProfile = String(backendBrainMetaAgent?.simulation_profile || "");
+  const backendBrainMetaCloseOnly = Boolean(backendBrainMetaAgent?.close_only);
+  const backendBrainMetaHaltNewExposure = Boolean(backendBrainMetaAgent?.halt_new_exposure);
+  const backendBrainMetaReasons = Array.isArray(backendBrainMetaAgent?.reasons)
+    ? (backendBrainMetaAgent?.reasons as unknown[]).map((item) => String(item)).filter(Boolean)
+    : [];
+  const backendBrainActionShield = backendBrainMetaPolicy?.action_shield && typeof backendBrainMetaPolicy.action_shield === "object"
+    ? backendBrainMetaPolicy.action_shield as JsonMap
+    : null;
+  const backendBrainActionShieldMode = String(backendBrainActionShield?.mode || "pass");
+  const backendBrainSafeAction = String(backendBrainActionShield?.projected_action || "");
+  const backendBrainShieldDelayMs = toNumber(backendBrainActionShield?.delay_ms, 0);
+  const backendBrainShieldRisk = toNumber(backendBrainActionShield?.execution_risk_score, 0);
+  const backendBrainShieldReasons = Array.isArray(backendBrainActionShield?.reasons)
+    ? (backendBrainActionShield?.reasons as unknown[]).map((item) => String(item)).filter(Boolean)
+    : [];
+  const backendBrainWorldModel = backendBrainDecision?.world_model && typeof backendBrainDecision.world_model === "object"
+    ? backendBrainDecision.world_model as JsonMap
+    : null;
+  const backendBrainWorldSummary = backendBrainWorldModel?.summary && typeof backendBrainWorldModel.summary === "object"
+    ? backendBrainWorldModel.summary as JsonMap
+    : null;
+  const backendBrainWorldFutureRegime = String(backendBrainWorldSummary?.future_regime || "");
+  const backendBrainWorldDirectionBias = String(backendBrainWorldSummary?.direction_bias || "");
+  const backendBrainWorldHorizonMs = toNumber(backendBrainWorldSummary?.horizon_ms, 0);
+  const backendBrainWorldPredictedSlippage = toNumber(backendBrainWorldSummary?.expected_slippage_bps, 0);
+  const backendBrainWorldPredictedFill = toNumber(backendBrainWorldSummary?.expected_fill_probability, 0);
+  const backendBrainWorldPredictedLatency = toNumber(backendBrainWorldSummary?.expected_latency_ms, 0);
+  const backendBrainWorldRecommendedDelayMs = toNumber(backendBrainWorldSummary?.recommended_delay_ms, 0);
+  const backendBrainStrategySwitch = backendBrainMetaPolicy?.strategy_switch && typeof backendBrainMetaPolicy.strategy_switch === "object"
+    ? backendBrainMetaPolicy.strategy_switch as JsonMap
+    : null;
+  const backendBrainStrategyMode = String(backendBrainStrategySwitch?.strategy_mode || "");
+  const backendBrainStrategySwitchMode = String(backendBrainStrategySwitch?.mode || "default");
+  const backendBrainStrategyRouteModeOverride = String(backendBrainStrategySwitch?.route_mode_override || "");
+  const backendBrainStrategyExecutionStyle = String(backendBrainStrategySwitch?.execution_style || "");
+  const backendBrainStrategyMaxSpreadMultiplier = toNumber(backendBrainStrategySwitch?.max_spread_multiplier, 1);
+  const backendBrainStrategySizeCap = toNumber(backendBrainStrategySwitch?.size_multiplier_cap, 1);
+  const backendBrainStrategyMemoryConfidence = toNumber(backendBrainStrategySwitch?.policy_memory_confidence, 0);
+  const backendBrainStrategyReasons = Array.isArray(backendBrainStrategySwitch?.reasons)
+    ? (backendBrainStrategySwitch?.reasons as unknown[]).map((item) => String(item)).filter(Boolean)
+    : [];
+  const backendBrainLearningRatePills = Object.entries(backendBrainLearningRates)
+    .map(([name, raw]) => ({
+      name,
+      effective: toNumber(raw?.effective, 0),
+      multiplier: toNumber(raw?.multiplier, 1),
+    }))
+    .sort((left, right) => right.effective - left.effective)
+    .slice(0, 4)
+    .map((row) => `${row.name} lr x${row.multiplier.toFixed(2)} → ${row.effective.toFixed(3)}`);
+  const backendBrainFailureCalibration = backendBrainStats?.failure_lr_calibration && typeof backendBrainStats.failure_lr_calibration === "object"
+    ? backendBrainStats.failure_lr_calibration as JsonMap
+    : null;
+  const backendBrainFailureCalibrationSources = backendBrainFailureCalibration?.sources && typeof backendBrainFailureCalibration.sources === "object"
+    ? backendBrainFailureCalibration.sources as Record<string, JsonMap>
+    : {};
+  const backendBrainCalibrationRows = ["infra", "market", "execution"].map((source) => {
+    const raw = backendBrainFailureCalibrationSources[source] && typeof backendBrainFailureCalibrationSources[source] === "object"
+      ? backendBrainFailureCalibrationSources[source]
+      : {};
+    const multipliersRaw = raw?.multipliers && typeof raw.multipliers === "object"
+      ? raw.multipliers as Record<string, unknown>
+      : {};
+    const multiplierRows = Object.entries(multipliersRaw)
+      .map(([agent, value]) => ({
+        agent,
+        multiplier: toNumber(value, 1),
+      }))
+      .sort((left, right) => left.multiplier - right.multiplier || left.agent.localeCompare(right.agent));
+    return {
+      source,
+      calibrated: Boolean(raw?.calibrated),
+      confidence: toNumber(raw?.confidence, 0),
+      sampleCount: Math.max(0, Math.round(toNumber(raw?.sample_count, 0))),
+      realCount: Math.max(0, Math.round(toNumber(raw?.real_count, 0))),
+      syntheticCount: Math.max(0, Math.round(toNumber(raw?.synthetic_count, 0))),
+      effectiveSampleWeight: toNumber(raw?.effective_sample_weight, 0),
+      averageReward: toNumber(raw?.average_reward, 0),
+      multiplierRows,
+    };
+  });
+  const backendBrainCalibrationLeader = [...backendBrainCalibrationRows]
+    .sort((left, right) => right.confidence - left.confidence || right.sampleCount - left.sampleCount)[0] || null;
+  const backendBrainCalibrationHeadline = backendBrainCalibrationLeader && backendBrainCalibrationLeader.confidence > 0
+    ? `${formatFailureSourceLabel(backendBrainCalibrationLeader.source)} ${(backendBrainCalibrationLeader.confidence * 100).toFixed(0)}% conf · n ${backendBrainCalibrationLeader.sampleCount}`
+    : "Priors only · awaiting real failure slice";
+  const effectiveV8Probability = toNumber(backendPredictorSnapshot?.probability, v8Prediction.probability);
+  const effectiveV8ShouldExecute = typeof backendPredictorSnapshot?.should_execute === "boolean"
+    ? Boolean(backendPredictorSnapshot.should_execute)
+    : v8Prediction.shouldExecute;
+  const effectiveV8DataReliable = typeof backendPredictorSnapshot?.data_reliable === "boolean"
+    ? Boolean(backendPredictorSnapshot.data_reliable)
+    : dataReliabilitySnapshot.ready;
+  const arbPayload = (routingScore?.arbitrage as JsonMap | undefined) || null;
+  const arbOpportunity = Boolean(arbPayload?.opportunity ?? marketMicro?.arbitrage_opportunity);
+  const arbNetSpread = toNumber(arbPayload?.net_spread ?? marketMicro?.arbitrage_net_spread, 0);
+  const arbBuyVenue = String(arbPayload?.buy ?? marketMicro?.arbitrage_buy_venue ?? "").replace("-public", "").replace("paper-", "");
+  const arbSellVenue = String(arbPayload?.sell ?? marketMicro?.arbitrage_sell_venue ?? "").replace("-public", "").replace("paper-", "");
+  const v7ExecutionDecision = getV7ExecutionDecision();
+  const backendEdgeNetBps = toNumber(backendPredictorSnapshot?.edge_net_bps, arbNetSpread);
+  const backendLatencyCostBps = toNumber(backendPredictorSnapshot?.latency_cost_bps, v7ExecutionDecision.latencyCostBps);
+  const backendFinalEdgeBps = toNumber(backendPredictorSnapshot?.final_edge_bps, v7ExecutionDecision.expectedNetEdgeBps);
+  const backendPredictorReasonsLabel = Array.isArray(backendPredictorSnapshot?.reasons)
+    ? (backendPredictorSnapshot.reasons as unknown[]).slice(0, 3).map((item) => String(item)).join(" · ")
+    : dataReliabilitySnapshot.reasons.slice(0, 3).join(" · ");
+  const v7StatusTone = v7ExecutionDecision.shouldExecute
+    ? "good"
+    : arbOpportunity
+      ? "warn"
+      : "neutral";
+  const v7StatusLabel = v7ExecutionDecision.routeMode === "dualVenueExecution"
+    ? `V7 ARB ${v7ExecutionDecision.expectedNetEdgeBps.toFixed(1)}bps`
+    : `V7 ROUTE ${toNumber(v7ExecutionDecision.bestCandidate?.score, 0).toFixed(2)}`;
+  const preferredRouteLabel = preferredRoute
+    ? String(preferredRoute.venue || "–").replace("-public", "").replace("paper-", "")
+    : "–";
+  const preferredRouteScore = preferredRoute ? toNumber((preferredRoute as JsonMap).score, 0) : 0;
+  const fusionChipTone = fusionPrice > 0 ? (fusionDeviationBps <= 8 ? "good" : "warn") : "neutral";
+  const predictedChipTone = predictedPrice > 0 ? (Math.abs(predictedDeltaBps) <= 6 ? "good" : "warn") : "neutral";
+  const arbChipTone = arbOpportunity ? "warn" : "neutral";
+  const routeChipTone = preferredRoute ? "good" : "neutral";
+  const kernelChipTone = marketBusKernelTelemetry.tickLatencyMs <= 14 && marketBusKernelTelemetry.bufferBacklog <= 64
+    ? "good"
+    : marketBusKernelTelemetry.tickLatencyMs <= 28 && marketBusKernelTelemetry.bufferBacklog <= 180
+      ? "warn"
+      : "neutral";
+  const schedulerChipTone = marketBusKernelTelemetry.backlogPressure <= 0.8 && chartKernelPerf.frameTimeMs <= 16.7
+    ? "good"
+    : marketBusKernelTelemetry.backlogPressure <= 1.8
+      ? "warn"
+      : "neutral";
+  const v8ChipTone = effectiveV8ShouldExecute ? (v8Prediction.confidence === "high" ? "good" : "warn") : effectiveV8DataReliable ? "neutral" : "warn";
+  const benchmarkChipTone = kernelBenchmarkRate > 0 ? "warn" : "neutral";
+  const kernelTelemetryLabel = `KERN ${marketBusKernelTelemetry.tickLatencyMs.toFixed(1)}ms q${marketBusKernelTelemetry.bufferBacklog} d${marketBusKernelTelemetry.drainedTicksPerFrame} sk${marketBusKernelTelemetry.skippedFrames}`;
+  const schedulerLabel = `SCHED ${marketBusKernelTelemetry.schedulerBudgetMs.toFixed(1)}ms/${marketBusKernelTelemetry.schedulerPullLimit}`;
+  const candleProbeAgeMs = marketBusKernelTelemetry.lastCandleUpdateAt
+    ? Math.max(0, Date.now() - Date.parse(marketBusKernelTelemetry.lastCandleUpdateAt))
+    : -1;
+  const candleLastUpdateAgeLabel = candleProbeAgeMs >= 0 ? formatFreshness(candleProbeAgeMs) : "n/a";
+  const candleProbeTone = candleProbeAgeMs < 0
+    ? "neutral"
+    : candleProbeAgeMs <= 15_000
+      ? "good"
+      : candleProbeAgeMs <= 60_000
+        ? "warn"
+        : "bad";
+  const candleProbeLabel = `CANDLE t${marketBusKernelTelemetry.receivedTicks} u${marketBusKernelTelemetry.candleUpdates} hb${marketBusKernelTelemetry.syntheticHeartbeatOpens} age ${candleLastUpdateAgeLabel}`;
+  const v8Label = `V8 HOLD ${(effectiveV8Probability * 100).toFixed(0)}% ${backendP20 > 0 ? "20/50/100" : v8Prediction.horizonMs}ms`;
+  const benchmarkLabel = kernelBenchmarkRate > 0 ? `BENCH ${kernelBenchmarkRate}tps` : "BENCH OFF";
+  const v8TopDrivers = v8Prediction.contributions.slice(0, 3);
+  const v8TrainingFreshnessMs = v8TrainingStats.updatedAt ? Math.max(0, Date.now() - Date.parse(v8TrainingStats.updatedAt)) : -1;
+  const v8TrainingFreshnessLabel = v8TrainingFreshnessMs >= 0 ? formatFreshness(v8TrainingFreshnessMs) : "n/a";
+  const v8PersistenceLabel = !v8PersistenceLoaded
+    ? "loading"
+    : v8TrainingStats.updatedAt
+      ? `persisted ${v8TrainingFreshnessLabel}`
+      : "session-only";
+  const availableAgentCount = providerRows.filter((item) => Boolean(item.available)).length;
+  const lifecycleTelemetry = executionTelemetry.length > 0 ? executionTelemetry : filteredOutcomes.slice(0, 20);
+  const omsLifecycleLastEventIso = lifecycleTelemetry.reduce<string | null>((latest, item) => {
+    const candidate = pickTimestamp(item, ["ts_fill_final", "ts_fill_partial", "ts_broker_accept", "closed_at", "timestamp", "created_at", "ts"]);
+    if (!candidate) {
+      return latest;
+    }
+    if (!latest) {
+      return candidate;
+    }
+    const latestTs = Date.parse(latest);
+    const candidateTs = Date.parse(candidate);
+    if (Number.isFinite(candidateTs) && (!Number.isFinite(latestTs) || candidateTs > latestTs)) {
+      return candidate;
+    }
+    return latest;
+  }, null);
+  const omsLifecycleSummary = {
+    pendingApprovals: pendingLive.length,
+    routedCount: lifecycleTelemetry.filter((item) => String(item.route_chosen || item.route || "").trim().length > 0).length,
+    acceptedCount: lifecycleTelemetry.filter((item) => {
+      const status = String(item.status || "").toLowerCase();
+      return Boolean(item.ts_broker_accept) || /accept|ack|submit|work|partial|fill/.test(status);
+    }).length,
+    partialCount: lifecycleTelemetry.filter((item) => {
+      const status = String(item.status || "").toLowerCase();
+      const fillRatio = toNumber(item.fill_ratio ?? item.executed_ratio, NaN);
+      return Boolean(item.ts_fill_partial) || /partial/.test(status) || (Number.isFinite(fillRatio) && fillRatio > 0 && fillRatio < 0.99);
+    }).length,
+    filledCount: lifecycleTelemetry.filter((item) => {
+      const status = String(item.status || "").toLowerCase();
+      const fillRatio = toNumber(item.fill_ratio ?? item.executed_ratio, NaN);
+      return Boolean(item.ts_fill_final) || /fill|closed|done|complete/.test(status) || (Number.isFinite(fillRatio) && fillRatio >= 0.99);
+    }).length,
+    blockedCount: lifecycleTelemetry.filter((item) => /reject|block|cancel|error|fail/.test(String(item.status || "").toLowerCase())).length,
+    avgLatencyMs: avgLatency,
+    avgSlippageBps: avgSlippage,
+    lastEventIso: omsLifecycleLastEventIso,
+    agentReadyCount: availableAgentCount,
+    agentTotalCount: providerRows.length,
+  };
+  const dominantPortfolioBook = [...marketBuckets]
+    .sort((left, right) => Math.abs(right.exposure) - Math.abs(left.exposure) || Math.abs(right.pnl) - Math.abs(left.pnl))
+    .find((bucket) => bucket.quoteCount > 0 || Math.abs(bucket.exposure) > 0 || Math.abs(bucket.pnl) > 0);
+  const portfolioOverlaySummary = {
+    accountFreeUsd,
+    openTradesCount,
+    grossExposureUsd,
+    exposureRatioPct: exposureRatio * 100,
+    dailyPnLUsd,
+    dailyDrawdownPct,
+    dominantBookLabel: dominantPortfolioBook
+      ? `${dominantPortfolioBook.market} | expo ${dominantPortfolioBook.exposure.toFixed(0)} | pnl ${dominantPortfolioBook.pnl.toFixed(0)}`
+      : "no active market bucket",
+  };
+  const aiBridgeSummary = {
+    routeLabel: preferredRouteLabel,
+    routeScore: preferredRouteScore,
+    v7Label: v7StatusLabel,
+    v7Tone: v7StatusTone as "good" | "warn" | "neutral",
+    edgeBps: backendFinalEdgeBps,
+    v8Execute: effectiveV8ShouldExecute,
+    v8ProbabilityPct: effectiveV8Probability * 100,
+    brainAction: backendBrainAction,
+    brainConfidencePct: backendBrainConfidence * 100,
+    brainRegime: backendBrainRegime,
+    reasonLabel: backendPredictorReasonsLabel || backendBrainReason,
+  };
+
+  const refreshBackendPredictorStats = useCallback(async () => {
+    try {
+      const response = await fetch("/api/predictor/stats", { cache: "no-store" });
+      const payload = await response.json().catch(() => null);
+      if (response.ok && payload && typeof payload === "object") {
+        setBackendPredictorStats(payload as JsonMap);
+      }
+    } catch {
+      // Ignore predictor stats refresh failures.
+    }
+  }, []);
+
+  const flushBackendPredictorTrainingBuffer = useCallback(async () => {
+    const batch = predictorTrainingBufferRef.current.splice(0, V8_BACKEND_TRAINING_FLUSH_SIZE);
+    if (batch.length === 0) {
+      return;
+    }
+    try {
+      const response = await fetch("/api/predictor/train", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items: batch }),
+      });
+      if (!response.ok) {
+        predictorTrainingBufferRef.current.unshift(...batch);
+        return;
+      }
+      const payload = await response.json().catch(() => null);
+      const degradedTrainResponse = Boolean(
+        payload
+        && typeof payload === "object"
+        && (
+          (payload as JsonMap).degraded_flag === true
+          || (
+            (payload as JsonMap).network
+            && typeof (payload as JsonMap).network === "object"
+            && ((payload as JsonMap).network as JsonMap).degraded_flag === true
+          )
+        )
+      );
+      if (degradedTrainResponse) {
+        predictorTrainingBufferRef.current.unshift(...batch);
+        return;
+      }
+      const brainPayload = payload && typeof payload === "object" && (payload as JsonMap).brain && typeof (payload as JsonMap).brain === "object"
+        ? (payload as JsonMap).brain as JsonMap
+        : null;
+      const experienceRows = Array.isArray(brainPayload?.experience_rows)
+        ? brainPayload.experience_rows as JsonMap[]
+        : [];
+      if (experienceRows.length > 0) {
+        setReplayAttributionByDecisionId((current) => {
+          const next = { ...current };
+          for (const row of experienceRows) {
+            const snapshot = buildReplayAttributionSnapshotFromExperience(row);
+            if (snapshot) {
+              if (snapshot.synthetic && snapshot.dreamSource && snapshot.dreamSource !== snapshot.id) {
+                next[snapshot.dreamSource] = mergeReplayDreamEcho(next[snapshot.dreamSource], snapshot);
+              }
+              const existing = next[snapshot.id];
+              next[snapshot.id] = existing
+                ? {
+                    ...snapshot,
+                    dreamCount: existing.dreamCount,
+                    dreamWeight: existing.dreamWeight,
+                  }
+                : snapshot;
+            }
+          }
+          return next;
+        });
+      }
+      await refreshBackendPredictorStats();
+    } catch {
+      predictorTrainingBufferRef.current.unshift(...batch);
+    }
+  }, [refreshBackendPredictorStats]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const response = await fetch("/api/predictor/predict", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              ...buildRoutingRequestHeaders("execution", selectedChartSymbol),
+            },
+            body: JSON.stringify(predictorRequestPayload),
+            signal: controller.signal,
+          });
+          const payload = await response.json().catch(() => null);
+          if (!controller.signal.aborted) {
+            setBackendPredictorSnapshot(payload && typeof payload === "object" ? payload as JsonMap : null);
+          }
+        } catch {
+          if (!controller.signal.aborted) {
+            setBackendPredictorSnapshot(null);
+          }
+        }
+      })();
+    }, V8_BACKEND_PREDICT_DEBOUNCE_MS);
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [predictorRequestPayload, selectedChartSymbol]);
+
+  useEffect(() => {
+    void refreshBackendPredictorStats();
+    const timer = window.setInterval(() => {
+      void refreshBackendPredictorStats();
+    }, V8_BACKEND_STATS_POLL_MS);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [refreshBackendPredictorStats]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      setV8PersistenceLoaded(true);
+      return;
+    }
+    const raw = window.localStorage.getItem(V8_PREDICTOR_STORAGE_KEY);
+    if (!raw) {
+      setV8PersistenceLoaded(true);
+      return;
+    }
+    try {
+      const parsed = JSON.parse(raw);
+      if (predictorEngineV8Ref.current.loadState(parsed)) {
+        setV8TrainingStats(predictorEngineV8Ref.current.getTrainingStats());
+      }
+    } catch {
+      window.localStorage.removeItem(V8_PREDICTOR_STORAGE_KEY);
+    }
+    setV8PersistenceLoaded(true);
+  }, []);
+
+  useEffect(() => {
+    executionTelemetry.slice(0, 8).forEach((item) => {
+      executionEngineV7Ref.current.updateFeedback({
+        venue: String(item.route_chosen || ""),
+        latencyMs: toNumber(item.latency_e2e_ms, 0),
+        realizedSlippageBps: toNumber(item.realized_slippage_bps, 0),
+      });
+    });
+  }, [executionTelemetry]);
+
+  useEffect(() => {
+    if (!v8PersistenceLoaded) {
+      return;
+    }
+    predictorEngineV8Ref.current.trainFromTelemetry(executionTelemetry);
+    predictorEngineV8Ref.current.trainFromTelemetry(outcomes.slice(0, 24));
+    const stats = predictorEngineV8Ref.current.getTrainingStats();
+    setV8TrainingStats(stats);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(V8_PREDICTOR_STORAGE_KEY, JSON.stringify(predictorEngineV8Ref.current.getState()));
+    }
+  }, [executionTelemetry, outcomes, v8PersistenceLoaded]);
+
+  useEffect(() => {
+    const telemetryItems = [...executionTelemetry, ...outcomes.slice(0, 24)];
+    for (const item of telemetryItems) {
+      const sampleId = String(item.decision_id || item.id || item.event_id || "").trim();
+      if (!sampleId || predictorTrainingQueuedIdsRef.current.has(sampleId)) {
+        continue;
+      }
+      predictorTrainingQueuedIdsRef.current.add(sampleId);
+      const predictorContext = item.predictor_context && typeof item.predictor_context === "object"
+        ? item.predictor_context as JsonMap
+        : predictorRequestPayload;
+      const pnlBps = toNumber(item.pnl_bps ?? item.realized_pnl_bps, 0);
+      const pnlUsd = toNumber(item.pnl_usd ?? item.net_result_usd ?? item.realized_pnl_usd, 0);
+      const slippageBps = Math.abs(toNumber(item.realized_slippage_bps ?? item.slippage_real_bps, avgExecutionSlippageForPredictor));
+      const latencyMs = toNumber(item.latency_e2e_ms ?? item.latency_ms, avgExecutionLatencyForPredictor);
+      const arbEdgeBps = toNumber(item.expected_net_edge_bps ?? item.net_edge_bps, predictorRequestPayload.arb_edge_bps);
+      const fillProbability = clamp(toNumber(item.fill_ratio ?? item.fill_probability, predictorRequestPayload.fill_probability), 0, 1);
+      const label = pnlBps > 0 && slippageBps <= Math.max(1, arbEdgeBps * 1.15 + 1.5) && latencyMs < V8_LATENCY_GUARD_MS ? 1 : 0;
+      const rawAction = String(item.action || item.side || item.intent_side || item.order_side || item.direction || item.position_side || "HOLD").trim().toUpperCase();
+      const experienceAction = rawAction.includes("SELL") || rawAction === "SHORT"
+        ? "SELL"
+        : rawAction.includes("BUY") || rawAction === "LONG"
+          ? "BUY"
+          : "HOLD";
+      const experienceReward = pnlBps - slippageBps * 0.75 - Math.max(0, latencyMs - 25) * 0.04;
+      const experienceState = {
+        ...predictorContext,
+        probability: effectiveV8Probability,
+        model_probability: effectiveV8Probability,
+        final_edge_bps: arbEdgeBps,
+        fill_probability: fillProbability,
+        market_session: String(predictorContext.market_session || predictorMarketSession || "off"),
+      };
+      const experienceNextState = {
+        ...experienceState,
+        latency_ms: latencyMs,
+        latency_e2e_ms: latencyMs,
+        slippage_bps: slippageBps,
+        realized_slippage_bps: slippageBps,
+        pnl: pnlBps,
+        realized_pnl_usd: pnlUsd,
+        drawdown_pct: toNumber(item.drawdown_pct ?? item.current_drawdown_pct ?? item.drawdown, 0),
+        position_size: toNumber(item.position_size ?? item.position, 0),
+      };
+      predictorTrainingBufferRef.current.push({
+        id: sampleId,
+        features: {
+          ...predictorContext,
+          latency_ms: latencyMs,
+          slippage_bps: slippageBps,
+          arb_edge_bps: arbEdgeBps,
+          fill_probability: fillProbability,
+          venue: String(item.route_chosen || item.venue || ""),
+          notional_usd: toNumber(item.notional_usd ?? item.estimated_notional_usd, notional),
+        },
+        experience_id: sampleId,
+        action: experienceAction,
+        reward: experienceReward,
+        state: experienceState,
+        next_state: experienceNextState,
+        prediction: toNumber(item.v8_probability ?? item.prediction_probability, effectiveV8Probability),
+        outcome: {
+          pnl_bps: pnlBps,
+          latency_ms: latencyMs,
+          slippage_bps: slippageBps,
+          status: String(item.status || "filled"),
+        },
+        latency: latencyMs,
+        pnl: pnlBps,
+        slippage: slippageBps,
+        venue: String(item.route_chosen || item.venue || ""),
+        label,
+      });
+    }
+    if (predictorTrainingBufferRef.current.length >= V8_BACKEND_TRAINING_FLUSH_SIZE) {
+      void flushBackendPredictorTrainingBuffer();
+    }
+  }, [avgExecutionLatencyForPredictor, avgExecutionSlippageForPredictor, effectiveV8Probability, executionTelemetry, flushBackendPredictorTrainingBuffer, notional, outcomes, predictorRequestPayload]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void flushBackendPredictorTrainingBuffer();
+    }, V8_BACKEND_TRAINING_FLUSH_INTERVAL_MS);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [flushBackendPredictorTrainingBuffer]);
+
+  const cycleKernelBenchmark = useCallback(() => {
+    setKernelBenchmarkRate((current) => {
+      if (current === 0) {
+        return 400;
+      }
+      if (current === 400) {
+        return 800;
+      }
+      return 0;
+    });
+  }, []);
 
   // ── OVERLAY COMPUTED VARS ─────────────────────────────────────────────
   const overlayAiDecision = (replayPayload?.ai_decision as JsonMap | undefined) || null;
@@ -7460,6 +10075,54 @@ export default function TradingTerminalPage() {
     }
     return null;
   })();
+  const activeReplayAttributionId = replayDecisionId || (calibMatchedOutcome ? decisionIdFrom(calibMatchedOutcome) : "") || "";
+  const replayAttributionSnapshot = activeReplayAttributionId ? replayAttributionByDecisionId[activeReplayAttributionId] || null : null;
+  const replayAttributionHeadline = replayAttributionSnapshot
+    ? `${formatFeatureFamilyLabel(replayAttributionSnapshot.topFamily)} ${replayAttributionSnapshot.topContribution >= 0 ? "+" : ""}${replayAttributionSnapshot.topContribution.toFixed(2)} · reward ${replayAttributionSnapshot.reward >= 0 ? "+" : ""}${replayAttributionSnapshot.reward.toFixed(2)}${replayAttributionSnapshot.failureSource ? ` · ${replayAttributionSnapshot.failureSource}${replayAttributionSnapshot.rewardScale < 0.999 ? ` x${replayAttributionSnapshot.rewardScale.toFixed(2)}` : ""}` : ""}`
+    : `Live leader ${formatFeatureFamilyLabel(backendBrainFeatureLeader)} ${backendBrainFeatureLeaderContribution >= 0 ? "+" : ""}${backendBrainFeatureLeaderContribution.toFixed(2)}`;
+  const replayAttributionPills = replayAttributionSnapshot
+    ? [
+        ...replayAttributionSnapshot.families.map((family) => `${compactFeatureFamilyLabel(family.family)} ${family.contribution >= 0 ? "+" : ""}${family.contribution.toFixed(2)} · SH ${family.shapLike >= 0 ? "+" : ""}${family.shapLike.toFixed(2)}${family.wrongWay ? " · penalized" : ""}`),
+        replayAttributionSnapshot.failureSource
+          ? `cause ${replayAttributionSnapshot.failureSource}${replayAttributionSnapshot.failureBlocking ? " · blocked" : ""}${replayAttributionSnapshot.rewardScale < 0.999 ? ` · x${replayAttributionSnapshot.rewardScale.toFixed(2)}` : ""}`
+          : "",
+        replayAttributionSnapshot.failureReasons[0] ? `why ${replayAttributionSnapshot.failureReasons[0]}` : "",
+      ].filter(Boolean)
+    : backendBrainAttributionPills;
+  const replayAttributionContextLabel = replayAttributionSnapshot?.contextLabel || buildFeatureContextLabel(backendBrainFeatureContext);
+  const replayLatentHeadline = replayAttributionSnapshot
+    ? `${replayAttributionSnapshot.latentShiftLabel} · shift ${(replayAttributionSnapshot.latentTransition * 100).toFixed(0)}%`
+    : `${formatReplayLatentLabel(backendBrainLatentLabel)} · shift ${(backendBrainLatentTransition * 100).toFixed(0)}%`;
+  const replayDreamHeadline = replayAttributionSnapshot
+    ? buildReplayDreamSummary(replayAttributionSnapshot)
+    : `desk ${backendBrainDreamSize} synth · w x${backendBrainDreamWeight.toFixed(2)}`;
+  const replayAgentLearningRows = replayAttributionSnapshot?.agentLearningRates || [];
+  const replaySlowestAgentLearning = replayAgentLearningRows.length > 0
+    ? [...replayAgentLearningRows].sort((left, right) => left.combinedMultiplier - right.combinedMultiplier)[0] || null
+    : null;
+  const replayFastestAgentLearning = replayAgentLearningRows.length > 0
+    ? [...replayAgentLearningRows].sort((left, right) => right.combinedMultiplier - left.combinedMultiplier)[0] || null
+    : null;
+  const replayAgentLearningHeadline = replaySlowestAgentLearning && replayFastestAgentLearning
+    ? `${formatReplayAgentLabel(replaySlowestAgentLearning.agent)} x${replaySlowestAgentLearning.combinedMultiplier.toFixed(2)} slow · ${formatReplayAgentLabel(replayFastestAgentLearning.agent)} x${replayFastestAgentLearning.combinedMultiplier.toFixed(2)} fast`
+    : "Agent LR warming up";
+  const replayAgentLearningPills = replayAgentLearningRows.map((row) => {
+    const familyLead = row.families[0] ? ` · ${row.families[0]}` : "";
+    return `${compactReplayAgentLabel(row.agent)} x${row.combinedMultiplier.toFixed(2)} = F${row.featureMultiplier.toFixed(2)} · S${row.failureMultiplier.toFixed(2)}${row.failureSource ? ` · ${row.failureSource}` : ""}${familyLead}`;
+  });
+  const replayLatentPills = replayAttributionSnapshot
+    ? [
+        `latent ${compactReplayLatentLabel(replayAttributionSnapshot.latentLabel)}${replayAttributionSnapshot.latentLabel !== replayAttributionSnapshot.latentNextLabel ? ` -> ${compactReplayLatentLabel(replayAttributionSnapshot.latentNextLabel)}` : ""}`,
+        `shift ${(replayAttributionSnapshot.latentTransition * 100).toFixed(0)}%`,
+        replayAttributionSnapshot.synthetic ? `synthetic x${replayAttributionSnapshot.sampleWeight.toFixed(2)}` : `real x${replayAttributionSnapshot.sampleWeight.toFixed(2)}`,
+        replayAttributionSnapshot.dreamCount > 0 ? `spawn ${replayAttributionSnapshot.dreamCount} · x${replayAttributionSnapshot.dreamWeight.toFixed(2)}` : `source ${formatReplayDreamSource(replayAttributionSnapshot.dreamSource)}`,
+      ]
+    : [
+        `latent ${compactReplayLatentLabel(backendBrainLatentLabel)}`,
+        `shift ${(backendBrainLatentTransition * 100).toFixed(0)}%`,
+        `dream ${backendBrainDreamSize}`,
+        `weight x${backendBrainDreamWeight.toFixed(2)}`,
+      ];
 
   // Agent accuracy tracking across historical outcomes
   const calibAgentAccuracy = (() => {
@@ -8057,7 +10720,13 @@ export default function TradingTerminalPage() {
           : microSpreadBps < 8 ? 0.8
           : microSpreadBps < 15 ? 0.55
           : 0.3;
-        return latScore * 0.4 + slipScore * 0.4 + spreadScore * 0.2;
+        return (
+          latScore * 0.28
+          + slipScore * 0.28
+          + spreadScore * 0.14
+          + venueQualityScore * 0.1
+          + replayInfraHealthScore * 0.2
+        );
       })()
     : null;
   const execQualityLabel =
@@ -8914,12 +11583,12 @@ export default function TradingTerminalPage() {
 
   useEffect(() => {
     if (!AUTO_TUNING_WRITEBACK_ENABLED) return;
-    if (!shouldPausePublicOpsRefresh()) {
+    if (!shouldPauseNonEssentialRefresh()) {
       void refreshRollbackGuardState();
     }
     const intervalMs = isGtixPublicBrowserHost() ? PUBLIC_TERMINAL_BACKGROUND_REFRESH_MS : 60_000;
     const timer = window.setInterval(() => {
-      if (shouldPausePublicOpsRefresh()) {
+      if (shouldPauseNonEssentialRefresh()) {
         return;
       }
       void refreshRollbackGuardState();
@@ -8931,7 +11600,7 @@ export default function TradingTerminalPage() {
     if (!AUTO_TUNING_WRITEBACK_ENABLED || !rollbackGuardSession || rollbackGuardSession.status !== "active") return;
 
     const pushObservation = async () => {
-      if (shouldPausePublicOpsRefresh()) {
+      if (shouldPauseNonEssentialRefresh()) {
         return;
       }
       try {
@@ -9079,6 +11748,33 @@ export default function TradingTerminalPage() {
         venue: String(quote.venue || "-"),
       };
     });
+  const buildSyntheticMiniCandles = useCallback((symbol: string, price: number) => {
+    const bars: Array<{ label: string; open: number; high: number; low: number; close: number; volume: number }> = [];
+    const safePrice = price > 0 ? price : 100;
+    const now = Math.floor(Date.now() / 60_000) * 60_000;
+    let seed = symbol.split("").reduce((acc, char, index) => acc + char.charCodeAt(0) * (index + 17), 0) || 1;
+    const rand = () => {
+      seed = (seed * 1664525 + 1013904223) & 0xffffffff;
+      return (seed >>> 0) / 0xffffffff;
+    };
+    let lastPrice = safePrice;
+    for (let index = 47; index >= 0; index -= 1) {
+      const drift = (rand() - 0.5) * 0.004;
+      const open = lastPrice;
+      const close = Math.max(0.0001, open * (1 + drift));
+      const wick = Math.max(0.0001, Math.abs(close - open) * (0.4 + rand() * 0.7));
+      bars.push({
+        label: new Date(now - index * 60_000).toISOString(),
+        open: Number(open.toFixed(5)),
+        high: Number((Math.max(open, close) + wick).toFixed(5)),
+        low: Number((Math.min(open, close) - wick * 0.65).toFixed(5)),
+        close: Number(close.toFixed(5)),
+        volume: Math.round(20 + rand() * 80),
+      });
+      lastPrice = close;
+    }
+    return bars;
+  }, []);
   const gpuMultiSymbolFeeds = useMemo(() => (
     gpuMatrixRows.map((row) => {
       const history = quoteHistory[row.symbol] || [];
@@ -9098,14 +11794,15 @@ export default function TradingTerminalPage() {
               volume: Math.abs(close - open) * 1000 + 1,
             };
           })
-        : chartDisplayCandles;
+        : buildSyntheticMiniCandles(row.symbol, row.price);
       return {
         id: `${row.symbol}-${row.venue}`,
         symbol: row.symbol,
         candles,
       };
     })
-  ), [gpuMatrixRows, quoteHistory, chartDisplayCandles]);
+  ), [buildSyntheticMiniCandles, gpuMatrixRows, quoteHistory]);
+  const activeGpuMultiSymbolFeeds = renderExtendedTerminalModules ? gpuMultiSymbolFeeds : [];
   const {
     marketBusHealth,
     marketBusHealthComponents,
@@ -9170,19 +11867,77 @@ export default function TradingTerminalPage() {
       barsAge: formatFreshness(marketBusOhlcvHealth?.freshness_ms),
       depthAge: formatFreshness(marketBusDepthHealth?.freshness_ms),
       tradesAge: formatFreshness(marketBusTradesHealth?.freshness_ms),
+      candleTicks: marketBusKernelTelemetry.receivedTicks,
+      candleUpdates: marketBusKernelTelemetry.candleUpdates,
+      syntheticHeartbeatOpens: marketBusKernelTelemetry.syntheticHeartbeatOpens,
+      candleLastUpdateAge: candleLastUpdateAgeLabel,
       chartCompactAlertLabel,
       chartFlowAlertText,
+      perceptual: chartEngineMode === "v4"
+        ? (gpuPerceptualTelemetry ? {
+          engine: gpuPerceptualTelemetry.engine,
+          densityLevel: gpuPerceptualTelemetry.spacing.denseMode,
+          visibleBars: gpuPerceptualTelemetry.visibleBars,
+          candleStepPx: gpuPerceptualTelemetry.candleStepPx,
+          profile: null,
+          renderer: gpuPerceptualTelemetry.renderer,
+          gridLabel: gpuPerceptualTelemetry.grid.label,
+          pixelSnapping: gpuPerceptualTelemetry.spacing.pixelSnapping,
+          denseMode: gpuPerceptualTelemetry.spacing.denseMode,
+          preferredBodyWidthPx: gpuPerceptualTelemetry.spacing.preferredBodyWidthPx,
+          wickWidthPx: gpuPerceptualTelemetry.spacing.wickWidthPx,
+          minGapPx: gpuPerceptualTelemetry.spacing.minGapPx,
+          fps: gpuPerceptualTelemetry.performance.fps,
+          frameTimeMs: gpuPerceptualTelemetry.performance.fps > 0 ? 1000 / gpuPerceptualTelemetry.performance.fps : null,
+          cpuLoad: null,
+          workerLatencyMs: null,
+          drawCalls: gpuPerceptualTelemetry.performance.drawCalls,
+          batchSize: gpuPerceptualTelemetry.performance.batchSize,
+          reframeCount: null,
+          transitionMode: null,
+          lastPriceDriftPx: null,
+          peakPriceDriftPx: null,
+          updatedAt: gpuPerceptualTelemetry.updatedAt,
+        } : null)
+        : (chartPerceptualTelemetry ? {
+          engine: chartPerceptualTelemetry.engine,
+          densityLevel: chartPerceptualTelemetry.densityLevel,
+          visibleBars: chartPerceptualTelemetry.visibleBars,
+          candleStepPx: chartPerceptualTelemetry.candleStepPx,
+          profile: chartPerceptualTelemetry.spacing.profile,
+          renderer: null,
+          gridLabel: null,
+          pixelSnapping: false,
+          denseMode: chartPerceptualTelemetry.densityLevel,
+          preferredBodyWidthPx: chartPerceptualTelemetry.spacing.preferredBodyWidthPx,
+          wickWidthPx: null,
+          minGapPx: chartPerceptualTelemetry.spacing.minGapPx,
+          fps: chartPerceptualTelemetry.performance.fps,
+          frameTimeMs: chartPerceptualTelemetry.performance.frameTimeMs,
+          cpuLoad: chartPerceptualTelemetry.performance.cpuLoad,
+          workerLatencyMs: chartPerceptualTelemetry.performance.workerLatencyMs,
+          drawCalls: null,
+          batchSize: null,
+          reframeCount: chartPerceptualTelemetry.autoscale.reframeCount,
+          transitionMode: chartPerceptualTelemetry.autoscale.transitionMode,
+          lastPriceDriftPx: chartPerceptualTelemetry.stability.lastPriceDriftPx,
+          peakPriceDriftPx: chartPerceptualTelemetry.stability.peakPriceDriftPx,
+          updatedAt: chartPerceptualTelemetry.updatedAt,
+        } : null),
     }) : null),
     [
       authSessionRequired,
       authStatus,
       chartCompactAlertLabel,
+      chartEngineMode,
       chartFlowAlertText,
       chartMode,
+      chartPerceptualTelemetry,
       chartTimeframe,
       chartVisualMode,
       depthFreshnessState,
       displayDepthStreamState,
+      gpuPerceptualTelemetry,
       localFeedSidecarMessage,
       localOhlcvAnalysis,
       localOhlcvFeedLabel,
@@ -9190,6 +11945,9 @@ export default function TradingTerminalPage() {
       marketBusDepthHealth,
       marketBusHealthStatus,
       marketBusHealthTone,
+      marketBusKernelTelemetry.candleUpdates,
+      marketBusKernelTelemetry.receivedTicks,
+      marketBusKernelTelemetry.syntheticHeartbeatOpens,
       marketBusOhlcvContiguous,
       marketBusOhlcvHealth,
       marketBusOhlcvLatestSeq,
@@ -9199,6 +11957,7 @@ export default function TradingTerminalPage() {
       selectedChartInstrument,
       selectedChartSymbol,
       selectedChartVenue,
+      candleLastUpdateAgeLabel,
       tradesFreshnessState,
     ],
   );
@@ -9498,6 +12257,41 @@ export default function TradingTerminalPage() {
       }
       return right.severityRank - left.severityRank;
     });
+  const topPerformanceAttribution = performanceAttribution.slice(0, 4);
+  const performanceCapitalBreakdown = [
+    {
+      label: "Broker live",
+      tone: "go",
+      rows: performanceCapitalSources.filter((row) => row.sourceType === "broker" && row.environment === "live"),
+    },
+    {
+      label: "Broker paper",
+      tone: "caution",
+      rows: performanceCapitalSources.filter((row) => row.sourceType === "broker" && row.environment === "paper"),
+    },
+    {
+      label: "Exchange",
+      tone: "watch",
+      rows: performanceCapitalSources.filter((row) => row.sourceType === "exchange"),
+    },
+    {
+      label: "Wallet",
+      tone: "watch",
+      rows: performanceCapitalSources.filter((row) => row.sourceType === "wallet"),
+    },
+  ].map((group) => ({
+    ...group,
+    count: group.rows.length,
+    equityUsd: group.rows.reduce((sum, row) => sum + (row.latestEquityUsd || 0), 0),
+  }));
+  const performanceCapitalPreview = performanceCapitalSources.slice(0, 4);
+  const latestInvestorReport = investorReports[0] || null;
+  const latestInvestorReportSummary = latestInvestorReport?.summary && typeof latestInvestorReport.summary === "object"
+    ? latestInvestorReport.summary
+    : null;
+  const performanceDeskTone = performanceSummary && performanceSummary.trade_count > 0
+    ? (performanceSummary.realized_pnl_usd < 0 ? "caution" : "go")
+    : "watch";
 
   const highlightedFootprintIndex = activeTimeKey
     ? activeFootprintRows.findIndex((row) => row.timeKey === activeTimeKey)
@@ -9654,6 +12448,14 @@ export default function TradingTerminalPage() {
           captureClientId={localTerminalCapturePersistenceStatus.clientId}
           autoIncidentTicketKey={localTerminalCapturePersistenceStatus.autoIncidentTicketKey}
           autoIncidentStatus={localTerminalCapturePersistenceStatus.autoIncidentStatus}
+          attributionHeadline={replayAttributionHeadline}
+          attributionContextLabel={replayAttributionContextLabel}
+          attributionPills={replayAttributionPills}
+          agentLearningHeadline={replayAgentLearningHeadline}
+          agentLearningPills={replayAgentLearningPills}
+          latentHeadline={replayLatentHeadline}
+          provenanceHeadline={replayDreamHeadline}
+          latentPills={replayLatentPills}
           frames={localTerminalCapturePersistenceStatus.captureHistory
             .slice(-12)
             .reverse()
@@ -9664,6 +12466,8 @@ export default function TradingTerminalPage() {
               blockedByFiveStateFailure: capture.runtime.blockedByFiveStateFailure,
               noCandlesExpected: capture.runtime.noCandlesExpected,
               exactStateVector: capture.runtime.exactStateVector,
+              replayLatentLabel: replayLatentHeadline,
+              replayOriginLabel: replayDreamHeadline,
             }))}
         />
       );
@@ -9916,6 +12720,9 @@ export default function TradingTerminalPage() {
         selfLearningModelUpdatedAt={selfLearningModelUpdatedAt}
         selfLearningDriftAutoDemotedAt={selfLearningDriftAutoDemotedAt}
         selfLearningAdaptiveWeights={selfLearningAdaptiveWeights}
+        brainAttributionHeadline={`${formatFeatureFamilyLabel(backendBrainFeatureLeader)} ${backendBrainFeatureLeaderContribution >= 0 ? "+" : ""}${backendBrainFeatureLeaderContribution.toFixed(2)} · ${backendBrainFeatureSession}/${backendBrainFeatureVolatility}/${backendBrainFeatureSpread}`}
+        brainAttributionPills={backendBrainAttributionPills}
+        brainLearningRatePills={backendBrainLearningRatePills}
         executionAdaptMode={executionAdaptMode}
         onSetExecutionAdaptMode={setExecutionAdaptMode}
         pendingExecutionAdaptation={pendingExecutionAdaptation}
@@ -9976,7 +12783,7 @@ export default function TradingTerminalPage() {
       case "blotter":
         return <BlotterDockPanel filteredOutcomes={filteredOutcomes} instrumentLabel={instrumentLabel} />;
       case "brokers":
-        return <BrokersDockPanel providerRows={providerRows} balances={balances} positions={positions} instrumentLabel={instrumentLabel} />;
+        return <BrokersDockPanel providerRows={providerRows} balances={balances} positions={positions} instrumentLabel={instrumentLabel} omsLifecycle={omsLifecycleSummary} portfolioOverlay={portfolioOverlaySummary} aiBridge={aiBridgeSummary} />;
       case "alerts":
         return <AlertsDockPanel filteredAlerts={filteredAlerts} />;
       case "incidents":
@@ -9999,6 +12806,56 @@ export default function TradingTerminalPage() {
 
   const hardAlertThreshold = Math.max(20, Math.min(95, riskHardAlertThresholdPct));
   const hardAlertActive = Boolean(riskHardAlertEnabled) && toNumber(riskSummary?.ratio_miss_window, 0) * 100 >= hardAlertThreshold;
+  const riskMissRatioPct = toNumber(riskSummary?.ratio_miss_window, 0) * 100;
+  const killSwitchActive = String(overview?.kill_switch_active) === "true";
+  const mt5Healthy = String(mt5Health?.status || "") === "ok";
+  const routeDeviationBps = toNumber(routingScore?.deviation_bps, 0);
+  const decisionBracket = marketDecisionV1.suggestedBracket;
+  const topDecisionEvidence = [...marketDecisionV1.evidence]
+    .sort((left, right) => right.scorePct - left.scorePct)
+    .slice(0, 3);
+  const decisionGateTone = (() => {
+    if (killSwitchActive || hardAlertActive) {
+      return "blocked";
+    }
+    if (!chartSignalComputationEnabled || marketDecisionV1.biasDirection === "neutral" || !decisionBracket) {
+      return "watch";
+    }
+    if (!mt5Healthy || openIncidents > 0 || Boolean(riskSummary?.alert)) {
+      return "caution";
+    }
+    if (marketDecisionV1.globalConfidencePct >= 72 && marketDecisionV1.confluenceScorePct >= 58 && displayDepthStreamState === "live") {
+      return "go";
+    }
+    return "watch";
+  })();
+  const decisionGateLabel = decisionGateTone === "blocked"
+    ? "NO-GO"
+    : decisionGateTone === "caution"
+      ? "CAUTION"
+      : decisionGateTone === "go"
+        ? "GO"
+        : "MONITOR";
+  const decisionGateBody = (() => {
+    if (decisionGateTone === "blocked") {
+      return killSwitchActive
+        ? "Kill switch actif: aucune exécution discrétionnaire ne doit partir tant que le contrôle central reste verrouillé."
+        : `Hard alert risque: miss ratio ${riskMissRatioPct.toFixed(0)}%. Réduire immédiatement l’agression et stopper les nouveaux envois.`;
+    }
+    if (decisionGateTone === "caution") {
+      return "Signal exploitable mais infrastructure dégradée. Vérifier MT5, incidents ouverts et budget de risque avant tout envoi.";
+    }
+    if (decisionGateTone === "go") {
+      return `${marketDecisionV1.actionBody} Priorité à une exécution disciplinée sur ${preferredRouteLabel || "la meilleure route disponible"}.`;
+    }
+    return `${marketDecisionV1.actionBody} L’objectif est d’attendre confirmation, pas de sur-trader.`;
+  })();
+  const executionGuardLabel = marketDecisionV1.executionPlan.guardEnabled ? "Guard ON" : "Guard OFF";
+  const persistenceTone = !selfLearningV4PersistenceStatus.healthy
+    ? "caution"
+    : displayDepthStreamState === "live" && mt5Healthy
+      ? "go"
+      : "watch";
 
   if (!isHydrated) {
     return (
@@ -10060,6 +12917,22 @@ export default function TradingTerminalPage() {
             <button type="button" className={`th-mode-btn${layoutEditMode ? " active" : ""}`} onClick={() => setLayoutEditMode((v) => !v)}>
               Layout Edit <span className="th-hotkey">Alt+E</span>
             </button>
+            <button
+              type="button"
+              className={`th-mode-btn${terminalDensityMode === "focus" ? " active" : ""}`}
+              onClick={() => setTerminalDensityMode("focus")}
+              title="Principal chart only"
+            >
+              Live Focus
+            </button>
+            <button
+              type="button"
+              className={`th-mode-btn${terminalDensityMode === "full" ? " active" : ""}`}
+              onClick={() => setTerminalDensityMode("full")}
+              title="All modules"
+            >
+              Full Surface
+            </button>
             <button type="button" className={`th-mode-btn${layoutPreset === "scalp" ? " active" : ""}`} onClick={() => applyLayoutPreset("scalp")} title="Alt+1">Scalp <span className="th-hotkey">1</span></button>
             <button type="button" className={`th-mode-btn${layoutPreset === "swing" ? " active" : ""}`} onClick={() => applyLayoutPreset("swing")} title="Alt+2">Swing <span className="th-hotkey">2</span></button>
             <button type="button" className={`th-mode-btn${layoutPreset === "monitoring" ? " active" : ""}`} onClick={() => applyLayoutPreset("monitoring")} title="Alt+3">Monitoring <span className="th-hotkey">3</span></button>
@@ -10067,6 +12940,31 @@ export default function TradingTerminalPage() {
             <button type="button" className="th-mode-btn" onClick={restoreSavedLayout} title="Alt+R">Restore <span className="th-hotkey">R</span></button>
             <button type="button" className="th-mode-btn" onClick={resetFloatingPanels} title="Alt+0">Reset Floating <span className="th-hotkey">0</span></button>
           </div>
+          {terminalDensityMode === "focus" ? (
+            <div className="th-mode-toggle" role="group" aria-label="Focus panel controls">
+              {TERMINAL_FOCUS_DECKS.map((deck) => {
+                const toggleTestId = deck.id === "micro"
+                  ? "terminal-focus-toggle-micro"
+                  : deck.id === "markets"
+                    ? "terminal-focus-toggle-markets"
+                    : deck.id === "monitoring"
+                      ? "terminal-focus-toggle-ops"
+                      : undefined;
+                return (
+                  <button
+                    key={deck.id}
+                    type="button"
+                    data-testid={toggleTestId}
+                    className={`th-mode-btn${focusDeckSet.has(deck.id) ? " active" : ""}`}
+                    onClick={() => toggleFocusDeck(deck.id)}
+                    title="Reactivate this panel family in focus mode"
+                  >
+                    {deck.label}
+                  </button>
+                );
+              })}
+            </div>
+          ) : null}
           <div className="th-mode-toggle" role="group" aria-label="Workspace controls">
             <button type="button" className="th-mode-btn" onClick={() => cycleWorkspace(-1)} title="Alt+Left">◀</button>
             <input
@@ -10155,6 +13053,147 @@ export default function TradingTerminalPage() {
         </div>
       </section>
 
+      <section className="term-decision-layer">
+        <article className={`term-decision-card tone-${decisionGateTone}`}>
+          <div className="term-decision-card-head">
+            <div>
+              <span className="eyebrow">Decision Layer</span>
+              <div className="term-decision-title">{decisionGateLabel} · {marketDecisionV1.scenarioLabel}</div>
+            </div>
+            <span className={`term-decision-badge tone-${decisionGateTone}`}>{decisionGateLabel}</span>
+          </div>
+          <div className="term-decision-metrics">
+            <span className="term-decision-metric"><strong>{marketDecisionV1.globalConfidencePct}%</strong><span>confidence</span></span>
+            <span className="term-decision-metric"><strong>{marketDecisionV1.confluenceScorePct}%</strong><span>confluence</span></span>
+            <span className="term-decision-metric"><strong>{marketDecisionV1.scenarioProbabilityPct}%</strong><span>probabilité</span></span>
+            <span className="term-decision-metric"><strong>{executionGuardLabel}</strong><span>discipline</span></span>
+          </div>
+          <div className="term-decision-summary">{marketDecisionV1.actionTitle}</div>
+          <div className="term-decision-body">{decisionGateBody}</div>
+          {decisionBracket ? (
+            <div className="term-decision-bracket">
+              <span className={`term-decision-side ${decisionBracket.side}`}>{decisionBracket.side === "buy" ? "Acheter" : "Vendre"}</span>
+              <span>Entry {decisionBracket.entry.toFixed(chartPriceDigits)}</span>
+              <span>SL {decisionBracket.sl.toFixed(chartPriceDigits)}</span>
+              <span>TP {decisionBracket.tp.toFixed(chartPriceDigits)}</span>
+              <span>RR {decisionBracket.rr.toFixed(2)}</span>
+            </div>
+          ) : (
+            <div className="term-decision-bracket inactive">
+              <span>Aucun bracket tant que le biais reste neutre ou insuffisamment confirmé.</span>
+            </div>
+          )}
+          <div className="term-decision-evidence-list">
+            {topDecisionEvidence.map((item) => (
+              <div key={`decision-evidence-${item.id}`} className="term-decision-evidence-row">
+                <span className={`term-decision-evidence-direction ${item.direction}`}>{item.label}</span>
+                <span className="term-decision-evidence-detail">{item.detail}</span>
+                <span className="term-decision-evidence-score">{item.scorePct}%</span>
+              </div>
+            ))}
+          </div>
+        </article>
+
+        <div className="term-state-stack">
+          <div className="term-state-grid">
+            <article className="term-state-card">
+              <span className="term-state-card-label">Signal</span>
+              <strong>{marketDecisionV1.biasDirection === "neutral" ? "Neutre" : marketDecisionV1.biasDirection === "buy" ? "Long bias" : "Short bias"}</strong>
+              <span>{marketDecisionV1.probableReversalZoneLabel}</span>
+              <span>{marketDecisionV1.historicalLearning.sampleSize} samples · WR {marketDecisionV1.historicalLearning.winratePct.toFixed(0)}%</span>
+            </article>
+            <article className={`term-state-card tone-${riskSummary?.alert || hardAlertActive ? "caution" : "go"}`}>
+              <span className="term-state-card-label">Risk</span>
+              <strong>{hardAlertActive ? "Escalade" : riskSummary?.alert ? "Sous surveillance" : "Contrôlé"}</strong>
+              <span>Miss {riskSummary ? `${riskSummary.miss_in_window}/${riskSummary.window_size}` : "–"}</span>
+              <span>Kill {killSwitchActive ? "ON" : "OFF"} · incidents {openIncidents}</span>
+            </article>
+            <article className={`term-state-card tone-${avgLatency > 200 || avgSlippage > 15 ? "caution" : "go"}`}>
+              <span className="term-state-card-label">Execution</span>
+              <strong>{preferredRouteLabel || "Route indisponible"}</strong>
+              <span>Spread {preferredSpread.toFixed(4)} · slip {avgSlippage.toFixed(1)} bps</span>
+              <span>Lat {avgLatency.toFixed(0)} ms · deviation {routeDeviationBps.toFixed(2)} bps</span>
+            </article>
+            <article className={`term-state-card tone-${persistenceTone}`}>
+              <span className="term-state-card-label">Etat système</span>
+              <strong>{displayDepthStreamState === "live" ? "Market bus live" : "Flux dégradé"}</strong>
+              <span>MT5 {String(mt5Health?.status || "–")} · RG {String(riskGateway?.healthy ?? "–")}</span>
+              <span>Persist {selfLearningStorageLabel} · {selfLearningV4PersistenceStatus.message || "ready"}</span>
+            </article>
+          </div>
+
+          <div className="term-performance-grid">
+            <article className={`term-performance-card tone-${performanceDeskTone}`}>
+              <div className="term-performance-head">
+                <div>
+                  <span className="eyebrow">Performance Desk <HelpHint text="Le Performance Desk relie les chiffres de performance au type de capital sous-jacent: broker live, broker paper, exchange ou wallet." examples={["Avant de lire une bonne perf comme du vrai live, regarde la ligne source-capital juste en dessous.", "Si une source exchange n'est pas canonique, elle ne doit pas etre lue comme du capital pleinement gouverne."]} /></span>
+                  <div className="term-performance-title">Attribution stratégie · symbole · venue</div>
+                </div>
+                <span className={`term-decision-badge tone-${performanceDeskTone}`}>{performanceSummary?.trade_count || 0} trades</span>
+              </div>
+              <div className="term-report-body" style={{ marginBottom: 12 }}>
+                <span>Scope agrégé: <strong>strategy = mt5-live</strong>, mais lecture source-capital désormais explicitée ci-dessous.</span>
+                <span>Le desk distingue les comptes broker live, broker paper, les sources exchange et les wallets pour éviter une lecture client ambiguë.</span>
+                <span><Link href="/live-capital">Ouvrir Live Capital</Link> pour canoniser une source, vérifier ses fonds et poser un cap USD portefeuille.</span>
+              </div>
+              <div className="term-performance-metrics">
+                <span><strong>{performanceSummary ? performanceSummary.realized_pnl_usd.toLocaleString("fr-FR", { style: "currency", currency: "USD", maximumFractionDigits: 0 }) : "–"}</strong><span>PnL réalisé</span></span>
+                <span><strong>{performanceSummary ? `${performanceSummary.win_rate_pct.toFixed(0)}%` : "–"}</strong><span>win rate</span></span>
+                <span><strong>{performanceSummary ? `${performanceSummary.avg_slippage_bps.toFixed(1)} bps` : "–"}</strong><span>slippage</span></span>
+                <span><strong>{performanceSummary ? `${performanceSummary.avg_latency_ms.toFixed(0)} ms` : "–"}</strong><span>latence</span></span>
+              </div>
+              <div className="term-performance-table">
+                {performanceCapitalBreakdown.map((group) => (
+                  <div key={group.label} className="term-performance-row">
+                    <span>{group.label}</span>
+                    <span>{group.count} source(s)</span>
+                    <span>{group.equityUsd > 0 ? formatCurrency(group.equityUsd) : "-"}</span>
+                    <span>{group.rows.some((row) => !row.canonical) ? "linked" : "canonique"}</span>
+                    <strong>{group.rows.length > 0 ? group.rows.map((row) => row.displayName).slice(0, 2).join(", ") : "aucune source"}</strong>
+                  </div>
+                ))}
+                {performanceCapitalPreview.length > 0 ? performanceCapitalPreview.map((row) => (
+                  <div key={row.key} className="term-performance-row">
+                    <span>{row.displayName}</span>
+                    <span>{row.platform}</span>
+                    <span>{row.environment}</span>
+                    <span>{row.status}</span>
+                    <strong>{row.latestEquityUsd != null ? formatCurrency(row.latestEquityUsd) : (row.canonical ? "canonique" : "à canoniser")}</strong>
+                  </div>
+                )) : null}
+                {topPerformanceAttribution.length > 0 ? topPerformanceAttribution.map((row, index) => (
+                  <div key={`perf-row-${row.strategy_id || "none"}-${row.symbol || "none"}-${row.venue || "none"}-${index}`} className="term-performance-row">
+                    <span>{row.symbol || row.strategy_id || "n/a"}</span>
+                    <span>{row.venue || "–"}</span>
+                    <span>{row.trade_count} tr</span>
+                    <span>{`${row.pnl_contribution_pct.toFixed(0)}%`}</span>
+                    <strong>{row.realized_pnl_usd.toLocaleString("fr-FR", { style: "currency", currency: "USD", maximumFractionDigits: 0 })}</strong>
+                  </div>
+                )) : (
+                  <div className="term-performance-empty">Aucune attribution exploitable sur le scope courant.</div>
+                )}
+              </div>
+            </article>
+
+            <article className={`term-performance-card tone-${latestInvestorReport ? "go" : "watch"}`}>
+              <div className="term-performance-head">
+                <div>
+                  <span className="eyebrow">Investor Report <HelpHint text="Résumé du dernier reporting investisseur généré pour donner une lecture client ou comité du portefeuille." examples={["Si aucun rapport n'apparait, le desk reste lisible pour l'ops mais pas encore pour un reporting client propre.", "Le scope du rapport aide a comprendre quel portefeuille ou quelle strategie est couverte."]} /></span>
+                  <div className="term-performance-title">Dernier rapport généré</div>
+                </div>
+                <span className={`term-decision-badge tone-${latestInvestorReport ? "go" : "watch"}`}>{latestInvestorReport?.status || "none"}</span>
+              </div>
+              <div className="term-report-body">
+                <strong>{latestInvestorReportSummary ? String(latestInvestorReportSummary.headline || latestInvestorReport?.report_id || "Rapport") : "Aucun rapport généré"}</strong>
+                <span>{latestInvestorReport ? `${latestInvestorReport.report_type} · ${latestInvestorReport.report_month}` : "Génère un report via l’endpoint investor-reports pour alimenter cette zone."}</span>
+                <span>{latestInvestorReport?.published_at ? `Publié ${new Date(latestInvestorReport.published_at).toLocaleString("fr-FR")}` : "Pas encore publié"}</span>
+                <span>{latestInvestorReportSummary ? String((((latestInvestorReportSummary.supplemental_strategy as JsonMap | undefined)?.strategy_id) || ((latestInvestorReportSummary.scope as JsonMap | undefined)?.portfolio_name) || "Scope interne")) : "Scope interne"}</span>
+              </div>
+            </article>
+          </div>
+        </div>
+      </section>
+
       {/* ═══════════════ CORE: CHART + EXECUTION LANE ══════════ */}
       <section className="term-core">
         <PanelGroup
@@ -10188,7 +13227,7 @@ export default function TradingTerminalPage() {
             </div>
             <div className="chart-toolbar-right">
               <select value={selectedChartSymbol} onChange={(event) => setActiveChartSymbol(event.target.value)} className="chart-symbol-selector" aria-label="Symbol selector">
-                {filteredQuotes.slice(0, 18).map((quote) => {
+                {uniqueFilteredQuotes.slice(0, 18).map((quote) => {
                   const symbolValue = instrumentLabel(quote);
                   return <option key={`sel-${symbolValue}`} value={symbolValue}>{symbolValue}</option>;
                 })}
@@ -10217,6 +13256,39 @@ export default function TradingTerminalPage() {
                   {mode === "auto" ? "Perf:A" : mode === "balanced" ? "Perf:B" : "Perf:U"}
                 </button>
               ))}
+              <button
+                type="button"
+                className={`chart-chip ${chartPerceptualDebugOpen ? "active" : ""}`}
+                onClick={() => setChartPerceptualDebugOpen((current) => !current)}
+                title="Afficher le panneau debug perceptif du chart"
+              >
+                Percept {chartPerceptualDebugOpen ? "ON" : "OFF"}
+              </button>
+              <button
+                type="button"
+                data-testid="terminal-compute-perf-toggle"
+                className={`chart-chip ${terminalComputePerfEnabled ? "active" : ""}`}
+                onClick={toggleTerminalComputePerf}
+                title="Activer le profiling des derives Terminal cote navigateur"
+              >
+                CPU {terminalComputePerfEnabled ? "ON" : "OFF"}
+              </button>
+              {terminalComputePerfEnabled ? (
+                <span
+                  data-testid="terminal-compute-perf-summary"
+                  className={`chart-chip ${terminalComputePerfSummary.length > 0 ? "active" : ""}`}
+                  title={terminalComputePerfSummary.length > 0
+                    ? terminalComputePerfSummary
+                      .slice(0, 3)
+                      .map((entry) => `${entry.label}: total ${entry.totalMs.toFixed(1)}ms avg ${entry.avgMs.toFixed(1)}ms count ${entry.count}`)
+                      .join(" | ")
+                    : "Profiling actif, attente d'un cycle de calcul"}
+                >
+                  {terminalComputePerfSummary[0]
+                    ? `${terminalComputePerfSummary[0].label} ${terminalComputePerfSummary[0].totalMs.toFixed(1)}ms`
+                    : "CPU warming"}
+                </span>
+              ) : null}
               {(["auto", "clean", "full"] as const).map((mode) => (
                 <button
                   key={`visual-${mode}`}
@@ -10243,8 +13315,11 @@ export default function TradingTerminalPage() {
                   {m === "line" ? "L" : m === "candles" ? "C" : "FP"}
                 </button>
               ))}
-              {(["1m", "5m", "15m"] as const).map((tf) => (
-                <button key={tf} type="button" className={`chart-chip ${chartTimeframe === tf ? "active" : ""}`} onClick={() => setActiveChartTimeframe(tf)}>{tf}</button>
+              {CHART_TIMEFRAME_SELECTOR_PRIMARY.map((tf) => (
+                <button key={tf} type="button" className={`chart-chip ${chartTimeframe === tf ? "active" : ""}`} aria-pressed={chartTimeframe === tf} onClick={() => setActiveChartTimeframe(tf)}>{tf}</button>
+              ))}
+              {CHART_TIMEFRAME_SELECTOR_SECONDARY.map((tf) => (
+                <button key={tf} type="button" className={`chart-chip ${chartTimeframe === tf ? "active" : ""}`} aria-pressed={chartTimeframe === tf} onClick={() => setActiveChartTimeframe(tf)}>{tf}</button>
               ))}
               <button type="button" className="chart-chip" onClick={() => setChartWindow((v) => Math.max(30, v - 20))}>+</button>
               <button type="button" className="chart-chip" onClick={() => setChartWindow((v) => Math.min(500, v + 20))}>−</button>
@@ -10398,7 +13473,7 @@ export default function TradingTerminalPage() {
             )}
             {uiMode === "expert" ? <div className="replay-marker-filter-row">
               <button type="button" className={`replay-filter-toggle${replayFilterKinds.length === 0 && !replayFilterCritical ? " active" : ""}`} onClick={() => { setReplayFilterKinds([]); setReplayFilterCritical(false); }}>All</button>
-              {(["intent", "routing", "approval", "fill", "incident", "outcome"] as const).map((kind) => (
+              {(["intent", "routing", "approval", "fill", "incident", "outcome", "latent"] as const).map((kind) => (
                 <button key={kind} type="button" className={`replay-filter-toggle replay-filter-${kind}${replayFilterKinds.includes(kind) ? " active" : ""}`} onClick={() => toggleReplayFilterKind(kind)}>{kind}</button>
               ))}
               <button type="button" className={`replay-filter-toggle replay-filter-critical${replayFilterCritical ? " active" : ""}`} onClick={() => setReplayFilterCritical((v) => !v)}>★ critical</button>
@@ -10424,7 +13499,7 @@ export default function TradingTerminalPage() {
           </div>
 
           <div className="chart-symbol-chips">
-            {filteredQuotes.slice(0, 8).map((quote) => {
+            {uniqueFilteredQuotes.slice(0, 8).map((quote) => {
               const s = instrumentLabel(quote);
               return (
                 <button key={s} type="button" className={`chart-chip ${selectedChartSymbol === s ? "active" : ""}`} onClick={() => setActiveChartSymbol(s)}>{s}</button>
@@ -10470,6 +13545,9 @@ export default function TradingTerminalPage() {
             <button type="button" className={`chart-chip ${chartSmoothingMs === 220 ? "active" : ""}`} onClick={() => setChartSmoothingMode(220)}>
               Smooth 220ms
             </button>
+            <button type="button" className={`chart-chip ${kernelBenchmarkRate > 0 ? "active" : ""}`} onClick={cycleKernelBenchmark}>
+              {benchmarkLabel}
+            </button>
             <span className="chart-overlay-chip">Feature flag: NEXT_PUBLIC_TERMINAL_V2 or ?v2=1</span>
             <span className="chart-overlay-chip">Engine flag: NEXT_PUBLIC_TERMINAL_ENGINE_V4 or ?engine=v4</span>
           </div>
@@ -10480,6 +13558,7 @@ export default function TradingTerminalPage() {
               onToggleEnabled={toggleTerminalV2}
               symbol={selectedChartSymbol}
               timeframe={chartTimeframe}
+              liveFeedKey={`${selectedChartInstrument}|${selectedChartVenue}|${chartTimeframe}`}
               onTimeframeChange={setActiveChartTimeframe}
               chartWindow={chartWindow}
               onZoomIn={() => setChartWindow((value) => Math.max(30, value - 20))}
@@ -10585,6 +13664,16 @@ export default function TradingTerminalPage() {
                   <span className={`chart-flow-pill tone-${marketBusHealthTone}`}>BUS {marketBusHealthStatus.toUpperCase()}</span>
                   <span className={`chart-flow-pill tone-${marketBusOhlcvContiguous ? "good" : "warn"}`}>{marketBusOhlcvContiguous ? "SEQ OK" : "SEQ GAP"} {marketBusOhlcvLatestSeq > 0 ? `#${marketBusOhlcvLatestSeq}` : "#-"}</span>
                   <span className={`chart-flow-pill tone-${marketFlowAlerts.length > 0 ? "warn" : "good"}`}>{chartCompactAlertLabel}</span>
+                  <span className={`chart-flow-pill tone-${fusionChipTone}`}>FUSION {fusionPrice > 0 ? `${fusionPrice.toFixed(2)} · ${fusionVenueCount}V` : "OFF"}</span>
+                  <span className={`chart-flow-pill tone-${predictedChipTone}`}>PRED {predictedPrice > 0 ? `${predictedPrice.toFixed(2)} ${predictedDeltaBps >= 0 ? "+" : ""}${predictedDeltaBps.toFixed(1)}bps` : "IDLE"}</span>
+                  <span className={`chart-flow-pill tone-${arbChipTone}`}>ARB {arbOpportunity ? `${arbBuyVenue || "?"}→${arbSellVenue || "?"} ${arbNetSpread.toFixed(2)}` : "NONE"}</span>
+                  <span className={`chart-flow-pill tone-${kernelChipTone}`}>{kernelTelemetryLabel}</span>
+                  <span className={`chart-flow-pill tone-${schedulerChipTone}`}>{schedulerLabel}</span>
+                  <span className={`chart-flow-pill tone-${candleProbeTone}`}>{candleProbeLabel}</span>
+                  <span className={`chart-flow-pill tone-${v8ChipTone}`}>{v8Label}</span>
+                  <span className={`chart-flow-pill tone-${benchmarkChipTone}`}>{benchmarkLabel}</span>
+                  <span className={`chart-flow-pill tone-${v7StatusTone}`}>{v7StatusLabel}</span>
+                  <span className={`chart-flow-pill tone-${routeChipTone}`}>ROUTE {preferredRoute ? `${preferredRouteLabel} ${preferredRouteScore.toFixed(2)}` : "NONE"}</span>
                 </div>
               ) : (
                 <div className="chart-flow-banner" aria-live="polite">
@@ -10599,8 +13688,24 @@ export default function TradingTerminalPage() {
                   <span className="chart-flow-pill tone-neutral">SYNC {marketBusSyncLabel}</span>
                   <span className="chart-flow-pill tone-neutral">BOOK {marketBusDepthUpdateId > 0 ? marketBusDepthUpdateId : "-"}</span>
                   <span className="chart-flow-pill tone-neutral" title={localTerminalCapturePersistenceStatus.clientId || "no-client-id"}>CLIENT {localTerminalCapturePersistenceStatus.clientId || "pending"}</span>
+                  <span className={`chart-flow-pill tone-${fusionChipTone}`}>FUSION {fusionPrice > 0 ? `${fusionPrice.toFixed(2)} · dev ${fusionDeviationBps.toFixed(1)}bps · ${fusionVenueCount} venues` : "OFF"}</span>
+                  <span className={`chart-flow-pill tone-${predictedChipTone}`}>PRED {predictedPrice > 0 ? `${predictedPrice.toFixed(2)} (${predictedDeltaBps >= 0 ? "+" : ""}${predictedDeltaBps.toFixed(1)}bps)` : "IDLE"}</span>
+                  <span className={`chart-flow-pill tone-${arbChipTone}`}>ARB {arbOpportunity ? `${arbBuyVenue || "?"}→${arbSellVenue || "?"} net ${arbNetSpread.toFixed(2)}` : "NONE"}</span>
+                  <span className={`chart-flow-pill tone-${kernelChipTone}`}>{kernelTelemetryLabel}</span>
+                  <span className={`chart-flow-pill tone-${schedulerChipTone}`}>{schedulerLabel}</span>
+                  <span className={`chart-flow-pill tone-${candleProbeTone}`}>{candleProbeLabel}</span>
+                  <span className={`chart-flow-pill tone-${v8ChipTone}`}>{v8Label}</span>
+                  <span className={`chart-flow-pill tone-${benchmarkChipTone}`}>{benchmarkLabel}</span>
+                  <span className={`chart-flow-pill tone-${v7StatusTone}`}>{v7StatusLabel}{v7ExecutionDecision.renderThrottleActive ? " THROTTLED" : ""}</span>
+                  <span className={`chart-flow-pill tone-${routeChipTone}`}>BEST {preferredRoute ? `${preferredRouteLabel} score ${preferredRouteScore.toFixed(2)}` : "NONE"}</span>
                 </div>
               )}
+              <ChartPerceptualDebugPanel
+                open={chartPerceptualDebugOpen}
+                telemetry={chartPerceptualTelemetry}
+                gpuTelemetry={gpuPerceptualTelemetry}
+                engineMode={chartEngineMode}
+              />
               {marketFlowAlerts.length > 0 && !chartUltraCleanCandles ? (
                 <div className={`chart-flow-alert ${chartOverlayCompactMode ? "chart-flow-alert-compact" : ""}`} aria-live="assertive">
                   <strong>{chartOverlayCompactMode ? "Data" : "Market data alert"}</strong>
@@ -10622,9 +13727,11 @@ export default function TradingTerminalPage() {
               {chartLoading ? <div className="chart-loader">Switching symbol…</div> : null}
               {chartEngineMode === "v4" ? (
                 <GpuChartV4Surface
+                  key={`${selectedChartInstrument}|${selectedChartVenue}|${chartTimeframe}|v4|${chartMode}`}
                   className={`chart-stage-premium ${chartActiveSnapLine ? "execution-focus" : ""} ${marketSignalV1.focusMode ? "signal-focus" : ""}`}
                   symbol={selectedChartSymbol}
                   timeframe={chartTimeframe}
+                  liveFeedKey={`${selectedChartInstrument}|${selectedChartVenue}|${chartTimeframe}`}
                   mode={chartMode}
                   chartMotionPreset={chartMotionPreset}
                   visualMode={chartVisualMode}
@@ -10644,13 +13751,16 @@ export default function TradingTerminalPage() {
                   engineMode="v4"
                   viewportGrid={gpuViewportGrid}
                   smoothingMs={chartSmoothingMs}
-                  multiSymbolFeeds={gpuMultiSymbolFeeds}
+                  multiSymbolFeeds={activeGpuMultiSymbolFeeds}
+                  onPerceptualTelemetry={setGpuPerceptualTelemetry}
                 />
               ) : (
                 <InstitutionalChart
+                  key={`${selectedChartInstrument}|${selectedChartVenue}|${chartTimeframe}|v3|${chartMode}`}
                   className={`chart-stage-premium ${chartActiveSnapLine ? "execution-focus" : ""} ${marketSignalV1.focusMode ? "signal-focus" : ""}`}
                   symbol={selectedChartSymbol}
                   timeframe={chartTimeframe}
+                  liveFeedKey={`${selectedChartInstrument}|${selectedChartVenue}|${chartTimeframe}`}
                   mode={chartMode}
                   chartMotionPreset={chartMotionPreset}
                   visualMode={chartVisualMode}
@@ -10667,6 +13777,15 @@ export default function TradingTerminalPage() {
                   footprintRows={chartMode === "footprint" ? activeFootprintRows : undefined}
                   candleTransform="none"
                   onCrosshairMove={(payload) => setCrosshair(payload)}
+                  onPerformanceTelemetry={(payload) => {
+                    setChartKernelPerf({
+                      fps: payload.fps,
+                      frameTimeMs: payload.frameTimeMs,
+                      cpuLoad: payload.cpuLoad,
+                      workerLatencyMs: payload.workerLatencyMs || 0,
+                    });
+                  }}
+                  onPerceptualTelemetry={setChartPerceptualTelemetry}
                 />
               )}
               {chartMaskActive ? (
@@ -11082,9 +14201,17 @@ export default function TradingTerminalPage() {
                 <span className="eov-label">e2e</span>
                 <span className={`eov-value ${replayLatency > 200 ? "warn" : "good"}`}>{replayLatency.toFixed(0)}ms</span>
               </div>
+              <div className="eov-block">
+                <span className="eov-label">Net</span>
+                <span className={`eov-value ${replayNetworkState === "healthy" ? "good" : "warn"}`}>{formatControlPlaneStateLabel(replayNetworkState)}</span>
+              </div>
+              <div className="eov-block">
+                <span className="eov-label">Retry</span>
+                <span className={`eov-value ${replayRetryCount > 0 || replayDegradedFlag ? "warn" : "good"}`}>{replayRetryCount} · {compactControlPlaneFailureLabel(replayFailureClassification)}</span>
+              </div>
               {execQualityScore !== null && (
                 <div className="eov-block">
-                  <span className="eov-label">Exec</span>
+                  <span className="eov-label">Reliability</span>
                   <span className={`eov-value exec-qual-${execQualityLabel}`}>
                     {execQualityLabel} {(execQualityScore * 100).toFixed(0)}%
                   </span>
@@ -11097,7 +14224,189 @@ export default function TradingTerminalPage() {
             <div className="exec-route-label">Route préférée</div>
             <div className="exec-route-value">{preferredRoute ? String(preferredRoute.venue || "–") : "–"}</div>
             <div className="subtle mini">spread {preferredSpread.toFixed(4)}</div>
-            <div className="subtle mini">Backup: {backupRoute ? `${String(backupRoute.venue || "–")} · score ${backupScore.toFixed(1)}` : "n/a"}</div>
+            <div className="subtle mini">reason {routingReasonLabel}</div>
+            <div className="subtle mini">
+              stability {preferredRouteStability > 0 ? `${preferredRouteState} ${(preferredRouteStability * 100).toFixed(0)}%` : preferredRouteState}
+            </div>
+            <div className="subtle mini">
+              infra {routingNetworkRegime} {(routingInfraHealth * 100).toFixed(0)}%
+            </div>
+            <div className="subtle mini">
+              Backup: {backupRoute ? `${String(backupRoute.venue || "–")} · score ${backupScore.toFixed(1)} · ${backupRouteStability > 0 ? `${backupRouteState} ${(backupRouteStability * 100).toFixed(0)}%` : backupRouteState}` : "n/a"}
+            </div>
+          </div>
+          <div className="exec-route-block" style={{ gap: 6 }}>
+            <div className="chart-stat-label" style={{ marginBottom: 2 }}>Candidats V6</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1.2fr 0.7fr 0.9fr 0.9fr 0.8fr 0.8fr", gap: 6, fontSize: 10, opacity: 0.7 }}>
+              <span>Venue</span>
+              <span>Score</span>
+              <span>Stable</span>
+              <span>Depth</span>
+              <span>Fresh</span>
+              <span>Fill</span>
+            </div>
+            {executionRouteCandidates.map((candidate, index) => {
+              const score = toNumber(candidate.score, 0);
+              const depthUsd = toNumber(candidate.available_depth_usd, 0);
+              const freshnessMs = toNumber(candidate.freshness_ms, 0);
+              const fillProbability = toNumber(candidate.fill_probability, 0);
+              const stabilityScore = toNumber(candidate.stability_score, 0);
+              const stabilityState = String(candidate.stability_state || (stabilityScore > 0 ? "watch" : "n/a"));
+              const isBest = index === 0 && routingCandidatesV6.length > 0;
+              const venueLabel = String(candidate.venue || "–").replace("-public", "").replace("paper-", "");
+              const stabilityColor = stabilityState === "stable"
+                ? "#cfe9b9"
+                : stabilityState === "watch"
+                  ? "#f2cb88"
+                  : stabilityState === "avoid"
+                    ? "#f0a0a0"
+                    : undefined;
+              return (
+                <div
+                  key={`exec-route-candidate-${venueLabel}-${index}`}
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "1.2fr 0.7fr 0.9fr 0.9fr 0.8fr 0.8fr",
+                    gap: 6,
+                    fontSize: 11,
+                    padding: "6px 0",
+                    borderTop: index === 0 ? "1px solid rgba(255,255,255,0.08)" : "1px solid rgba(255,255,255,0.05)",
+                    color: isBest ? "#f4f1d0" : undefined,
+                  }}
+                >
+                  <span>{isBest ? `${venueLabel} *` : venueLabel}</span>
+                  <strong>{score.toFixed(2)}</strong>
+                  <span style={{ color: stabilityColor }}>{stabilityScore > 0 ? `${(stabilityScore * 100).toFixed(0)}%` : stabilityState}</span>
+                  <span>{depthUsd > 0 ? `$${(depthUsd / 1000).toFixed(1)}k` : "n/a"}</span>
+                  <span>{freshnessMs > 0 ? formatFreshness(freshnessMs) : "n/a"}</span>
+                  <span>{fillProbability > 0 ? `${(fillProbability * 100).toFixed(0)}%` : "n/a"}</span>
+                </div>
+              );
+            })}
+          </div>
+          <div className="exec-route-block" style={{ gap: 6 }}>
+            <div className="chart-stat-label" style={{ marginBottom: 2 }}>Predictor V8</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, fontSize: 11 }}>
+              <div>
+                <div className="subtle mini">Hold probability</div>
+                <strong style={{ color: effectiveV8ShouldExecute ? "#d7f7cf" : "#f1d498" }}>
+                  {(effectiveV8Probability * 100).toFixed(1)}%
+                </strong>
+              </div>
+              <div>
+                <div className="subtle mini">Confidence</div>
+                <strong>{v8Prediction.confidence.toUpperCase()}</strong>
+              </div>
+              <div>
+                <div className="subtle mini">Threshold / horizon</div>
+                <span>{(v8Prediction.threshold * 100).toFixed(0)}% / {backendP20 > 0 ? "20|50|100" : `${v8Prediction.horizonMs}ms`}</span>
+              </div>
+              <div>
+                <div className="subtle mini">Training</div>
+                <span>{v8TrainingStats.trainedSamples} local · {toNumber(backendPredictorStats?.samples, 0)} backend</span>
+              </div>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, fontSize: 10 }}>
+              <span>P20 {backendP20 > 0 ? `${(backendP20 * 100).toFixed(0)}%` : "n/a"}</span>
+              <span>P50 {backendP50 > 0 ? `${(backendP50 * 100).toFixed(0)}%` : "n/a"}</span>
+              <span>P100 {backendP100 > 0 ? `${(backendP100 * 100).toFixed(0)}%` : "n/a"}</span>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, fontSize: 10 }}>
+              <span style={{ color: backendBrainShouldExecute ? "#cfe9b9" : "#efc28f" }}>BRAIN {backendBrainAction}</span>
+              <span>{backendBrainRegime !== "N/A" ? backendBrainRegime : "REGIME n/a"}</span>
+              <span>{(backendBrainConfidence * 100).toFixed(0)}% conf · {(backendBrainConsensus * 100).toFixed(0)}% vote</span>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, fontSize: 10 }}>
+              <span style={{ color: backendEdgeNetBps >= 0 ? "#cfe9b9" : "#efc28f" }}>EDGE NET {backendEdgeNetBps >= 0 ? "+" : ""}{backendEdgeNetBps.toFixed(2)}bps</span>
+              <span style={{ color: "#efc28f" }}>LAT COST -{backendLatencyCostBps.toFixed(2)}bps</span>
+              <span style={{ color: backendFinalEdgeBps >= 0 ? "#cfe9b9" : "#efc28f" }}>FINAL EDGE {backendFinalEdgeBps >= 0 ? "+" : ""}{backendFinalEdgeBps.toFixed(2)}bps</span>
+            </div>
+            <div className="subtle mini" data-testid="terminal-brain-stats">Brain stats: replay {backendBrainReplaySize} · learns {backendBrainLearnSteps} · win {(backendBrainWinRate * 100).toFixed(1)}%</div>
+            <div className="subtle mini">Governor {backendBrainGovernorMode}{backendBrainGovernorBlocked ? " · blocked" : backendBrainGovernorSizeMultiplier < 0.999 ? ` · size x${backendBrainGovernorSizeMultiplier.toFixed(2)}` : " · pass"}{backendBrainGovernorFailureSource ? ` · ${backendBrainGovernorFailureSource}` : ""}{backendBrainGovernorCalibrationConfidence > 0 ? ` · c ${(backendBrainGovernorCalibrationConfidence * 100).toFixed(0)}%` : ""}{backendBrainGovernorReasons.length > 0 ? ` · ${backendBrainGovernorReasons.join(",")}` : ""}</div>
+            <div className="subtle mini">Meta {backendBrainMetaMode || backendBrainMetaProfileId || "balanced"}{backendBrainMetaProfileId ? ` · ${backendBrainMetaProfileId}` : ""}{backendBrainMetaVenueAction ? ` · venue ${backendBrainMetaVenueAction}` : ""}{backendBrainMetaExecutionDelayMs > 0 ? ` · delay ${backendBrainMetaExecutionDelayMs}ms` : ""}{backendBrainMetaSimulationProfile ? ` · sim ${backendBrainMetaSimulationProfile}` : ""}{backendBrainMetaCloseOnly ? " · close-only" : backendBrainMetaHaltNewExposure ? " · halt-new" : ""}{backendBrainMetaReasons.length > 0 ? ` · ${backendBrainMetaReasons.join(",")}` : ""}</div>
+            <div className="subtle mini">Strategy {backendBrainStrategyMode || backendBrainStrategySwitchMode}{backendBrainStrategyRouteModeOverride ? ` · route ${backendBrainStrategyRouteModeOverride}` : ""}{backendBrainStrategyExecutionStyle ? ` · ${backendBrainStrategyExecutionStyle}` : ""}{backendBrainStrategyMaxSpreadMultiplier < 0.999 ? ` · spread x${backendBrainStrategyMaxSpreadMultiplier.toFixed(2)}` : ""}{backendBrainStrategySizeCap < 0.999 ? ` · cap x${backendBrainStrategySizeCap.toFixed(2)}` : ""}{backendBrainStrategyMemoryConfidence > 0 ? ` · mem ${(backendBrainStrategyMemoryConfidence * 100).toFixed(0)}%` : ""}{backendBrainStrategyReasons.length > 0 ? ` · ${backendBrainStrategyReasons.join(",")}` : ""}</div>
+            <div className="subtle mini">World {backendBrainWorldFutureRegime || "n/a"}{backendBrainWorldDirectionBias ? ` · ${backendBrainWorldDirectionBias}` : ""}{backendBrainWorldHorizonMs > 0 ? ` · ${backendBrainWorldHorizonMs}ms` : ""}{backendBrainWorldPredictedSlippage > 0 ? ` · slip ${backendBrainWorldPredictedSlippage.toFixed(2)}bps` : ""}{backendBrainWorldPredictedFill > 0 ? ` · fill ${(backendBrainWorldPredictedFill * 100).toFixed(0)}%` : ""}{backendBrainWorldPredictedLatency > 0 ? ` · lat ${backendBrainWorldPredictedLatency.toFixed(0)}ms` : ""}{backendBrainWorldRecommendedDelayMs > 0 ? ` · delay ${backendBrainWorldRecommendedDelayMs}ms` : ""}</div>
+            <div className="subtle mini">Shield {backendBrainActionShieldMode}{backendBrainSafeAction ? ` · ${backendBrainSafeAction}` : ""}{backendBrainShieldDelayMs > 0 ? ` · wait ${backendBrainShieldDelayMs}ms` : ""}{backendBrainShieldRisk > 0 ? ` · risk ${(backendBrainShieldRisk * 100).toFixed(0)}%` : ""}{backendBrainShieldReasons.length > 0 ? ` · ${backendBrainShieldReasons.join(",")}` : ""}</div>
+            <div style={{ display: "grid", gap: 6 }} data-testid="terminal-brain-calibration">
+              <div className="subtle mini">LR calibration: {backendBrainCalibrationHeadline}</div>
+              {backendBrainCalibrationRows.map((row) => {
+                const sourceColor = row.confidence >= 0.5
+                  ? "#cfe9b9"
+                  : row.confidence > 0
+                    ? "#efc28f"
+                    : "#9fb0c3";
+                return (
+                  <div
+                    key={`brain-calibration-${row.source}`}
+                    style={{
+                      display: "grid",
+                      gap: 4,
+                      padding: "6px 8px",
+                      borderRadius: 8,
+                      border: "1px solid rgba(148, 163, 184, 0.18)",
+                      background: "rgba(15, 23, 42, 0.26)",
+                    }}
+                  >
+                    <div style={{ display: "grid", gridTemplateColumns: "0.8fr 1.15fr 1.15fr", gap: 6, fontSize: 10 }}>
+                      <span style={{ color: sourceColor }}>
+                        {formatFailureSourceLabel(row.source).toUpperCase()} {(row.confidence * 100).toFixed(0)}%
+                      </span>
+                      <span>n {row.sampleCount} · real {row.realCount} · synth {row.syntheticCount}</span>
+                      <span>w {row.effectiveSampleWeight.toFixed(2)} · reward {row.averageReward >= 0 ? "+" : ""}{row.averageReward.toFixed(2)}</span>
+                    </div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                      {row.multiplierRows.map((item) => {
+                        const pillTone = item.multiplier >= 1.02
+                          ? "good"
+                          : item.multiplier <= 0.75
+                            ? "warn"
+                            : "neutral";
+                        return (
+                          <span key={`brain-calibration-${row.source}-${item.agent}`} className={`chart-action-pill chart-action-pill-status ${pillTone}`}>
+                            {compactReplayAgentLabel(item.agent)} x{item.multiplier.toFixed(2)}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="subtle mini">Persistence: {v8PersistenceLabel} · drift {v8TrainingStats.weightShift.toFixed(3)}</div>
+            <div className="subtle mini">Reliability: {effectiveV8DataReliable ? `OK ${dataReliabilitySnapshot.renderableRows}/${dataReliabilitySnapshot.minimumRenderableBars}+` : `SKIP ${backendPredictorReasonsLabel || dataReliabilitySnapshot.reasons.join(" · ") || "gate"}`}</div>
+            <div className="subtle mini">Orderflow {backendBrainOrderflowQuality > 0 ? `${(backendBrainOrderflowQuality * 100).toFixed(0)}%` : "n/a"}{backendBrainDisabledAgents.length > 0 ? ` · disabled ${backendBrainDisabledAgents.join(",")}` : ""}</div>
+            <div className="subtle mini">Attribution {backendBrainFeatureLeader} {backendBrainFeatureLeaderContribution >= 0 ? "+" : ""}{backendBrainFeatureLeaderContribution.toFixed(2)} · ctx {backendBrainFeatureSession}/{backendBrainFeatureVolatility}/{backendBrainFeatureSpread}</div>
+            <div className="subtle mini">Anchors {backendBrainAnchorPrimary} · compression {backendBrainAnchorCompression.toFixed(1)}bps · confluence {(backendBrainAnchorConfluence * 100).toFixed(0)}%</div>
+            <div className="subtle mini">Liquidity {backendBrainLiquidityState} · pressure {backendBrainLiquidityPressure >= 0 ? "+" : ""}{backendBrainLiquidityPressure.toFixed(2)} · sweep {(backendBrainSweepRisk * 100).toFixed(0)}% · vacuum {(backendBrainLiquidityVacuum * 100).toFixed(0)}%</div>
+            <div className="subtle mini">Latent {backendBrainLatentLabel} · conf {(backendBrainLatentConfidence * 100).toFixed(0)}% · shift {(backendBrainLatentTransition * 100).toFixed(0)}% · factor {backendBrainLatentFactor}</div>
+            <div className="subtle mini">Dream {backendBrainDreamSize} synth · ratio {(backendBrainDreamRatio * 100).toFixed(0)}% · weight x{backendBrainDreamWeight.toFixed(2)} · obs {backendBrainLatentObservations}</div>
+            <div style={{ display: "grid", gap: 4 }}>
+              {v8TopDrivers.map((driver) => (
+                <div key={`v8-driver-${driver.label}`} style={{ display: "grid", gridTemplateColumns: "1.2fr 0.8fr", gap: 6, fontSize: 10 }}>
+                  <span className="subtle mini">{driver.label}</span>
+                  <span style={{ color: driver.value >= 0 ? "#cfe9b9" : "#efc28f" }}>{driver.value >= 0 ? "+" : ""}{driver.value.toFixed(3)}</span>
+                </div>
+              ))}
+            </div>
+            {backendBrainTopVotes.length > 0 ? (
+              <div style={{ display: "grid", gap: 4 }}>
+                {backendBrainTopVotes.map((vote, index) => {
+                  const voteName = String(vote.name || `agent-${index + 1}`);
+                  const voteAction = String(vote.action || "HOLD").toUpperCase();
+                  const voteConfidence = toNumber(vote.calibrated_confidence, toNumber(vote.confidence, 0));
+                  const voteWeight = toNumber(vote.weight, 0);
+                  return (
+                    <div key={`brain-vote-${voteName}-${index}`} style={{ display: "grid", gridTemplateColumns: "1fr 0.7fr 1fr", gap: 6, fontSize: 10 }}>
+                      <span className="subtle mini">{voteName}</span>
+                      <span style={{ color: voteAction === "BUY" ? "#cfe9b9" : voteAction === "SELL" ? "#efc28f" : "#d7dbe0" }}>{voteAction}</span>
+                      <span>{(voteConfidence * 100).toFixed(0)}% · w{voteWeight.toFixed(2)}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+            {backendBrainReason ? <div className="subtle mini">Brain: {backendBrainReason}</div> : null}
+            <div className="subtle mini">Decision: {effectiveV8ShouldExecute ? "execute-eligible" : "hold / skip bias"}</div>
           </div>
           <div className="exec-kpis">
             <span className={`status-chip ${avgSlippage > 15 ? "alert-chip" : ""}`}>slip {avgSlippage.toFixed(1)} bps</span>
@@ -11141,6 +14450,50 @@ export default function TradingTerminalPage() {
                 <div><div className="chart-stat-label">Slip</div><div style={{ fontSize: 12 }}>{replaySlippage.toFixed(2)} bps</div></div>
                 <div><div className="chart-stat-label">Lat</div><div style={{ fontSize: 12 }}>{replayLatency.toFixed(0)} ms</div></div>
                 <div><div className="chart-stat-label">Fills</div><div style={{ fontSize: 12 }}>{replayFills.length}</div></div>
+                <div><div className="chart-stat-label">Net</div><div style={{ fontSize: 12 }}>{formatControlPlaneStateLabel(replayNetworkState)}</div></div>
+                <div><div className="chart-stat-label">Retry</div><div style={{ fontSize: 12 }}>{replayRetryCount}</div></div>
+              </div>
+            ) : null}
+            {!replayLoading ? (
+              <div style={{ marginTop: 8 }}>
+                <div className="chart-stat-label" style={{ marginBottom: 6 }}>Infra-aware replay</div>
+                <div className="exec-explainability-pills">
+                  <span className="chart-action-pill chart-action-pill-status neutral">network {formatControlPlaneStateLabel(replayNetworkState)} · {(replayInfraHealthScore * 100).toFixed(0)}%</span>
+                  <span className="chart-action-pill">retry {replayRetryCount} · degraded {replayDegradedFlag ? "yes" : "no"}</span>
+                  <span className="chart-action-pill">dns transient rate {(replayDnsTransientRate * 100).toFixed(0)}%</span>
+                  <span className="chart-action-pill">timeout rate {(replayTimeoutRate * 100).toFixed(0)}%</span>
+                  <span className="chart-action-pill">degraded usage {(replayDegradedUsageRatio * 100).toFixed(0)}%</span>
+                </div>
+                <div className="subtle mini" style={{ marginTop: 6 }}>
+                  Infra {replayInfraLabel} · {replayFailureDetail || compactControlPlaneFailureLabel(replayFailureClassification)}
+                  {replayNetworkGlobalSampleCount > 0 ? ` · sample ${replayNetworkGlobalSampleCount}` : ""}
+                </div>
+                {replayAttemptedTargets.length > 0 || replayAttemptedBaseUrls.length > 0 ? (
+                  <div className="subtle mini">
+                    Path {replayAttemptedTargets.slice(0, 3).join(" -> ") || replayAttemptedBaseUrls.slice(0, 2).join(" -> ")}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+            {!replayLoading ? (
+              <div className="exec-explainability-block">
+                <div className="chart-stat-label" style={{ marginBottom: 6 }}>Attribution Replay</div>
+                <div className="exec-explainability-pills">
+                  <span className="chart-action-pill chart-action-pill-status neutral">Explainable RL {replayAttributionHeadline}</span>
+                  <span className="chart-action-pill">{replayAttributionContextLabel}</span>
+                  <span className="chart-action-pill">{replayLatentHeadline}</span>
+                  <span className="chart-action-pill">{replayDreamHeadline}</span>
+                  {replayAgentLearningRows.length > 0 ? <span className="chart-action-pill">{replayAgentLearningHeadline}</span> : null}
+                  {replayAttributionPills.slice(0, 2).map((pill) => (
+                    <span key={`exec-replay-attr-${pill}`} className="chart-action-pill">{pill}</span>
+                  ))}
+                  {replayAgentLearningPills.slice(0, 2).map((pill) => (
+                    <span key={`exec-replay-agent-${pill}`} className="chart-action-pill">{pill}</span>
+                  ))}
+                  {replayLatentPills.slice(0, 2).map((pill) => (
+                    <span key={`exec-replay-latent-${pill}`} className="chart-action-pill">{pill}</span>
+                  ))}
+                </div>
               </div>
             ) : null}
             {/* ── TRADE LIFECYCLE ── */}
@@ -11213,6 +14566,10 @@ export default function TradingTerminalPage() {
         </PanelGroup>
       </section>
 
+      {showMicroDeck || showMarketsDeck ? (
+      <>
+      {showMicroDeck ? (
+      <>
       {/* ═══════════════ MICROSTRUCTURE 2×2 ════════════════════ */}
       <section
         className={`term-micro-shell${layoutDropPreview?.zone === "micro" ? " is-drop-zone-active" : ""}`}
@@ -11355,8 +14712,11 @@ export default function TradingTerminalPage() {
         </div>
       </div>
       </section>
+      </>
+      ) : null}
 
       {/* ═══════════════ MATRICE MULTI-MARCHÉS ═════════════════ */}
+      {showMarketsDeck ? (
       <section className="term-markets-strip">
         <div className="panel market-matrix-panel">
           <div className="eyebrow">Market Matrix</div>
@@ -11378,6 +14738,9 @@ export default function TradingTerminalPage() {
           </div>
         </div>
       </section>
+      ) : null}
+      </>
+      ) : null}
 
       {/* ═══════════════ LOWER: BLOTTER + BROKERS ══════════════ */}
       <section
@@ -11447,48 +14810,49 @@ export default function TradingTerminalPage() {
           style={{ order: lowerOrderById.brokers ?? 1, display: floatingPanels.some((fp) => fp.id === "brokers") ? "none" : undefined }}
         >
         <PanelShell className="panel term-brokers-panel gtix-panel-resizable-y">
-          <div className="eyebrow">Brokers · Agents · Capital <HelpTooltip termKey="brokers" mode={uiMode} />
+          <div className="eyebrow">Desk Bridge · OMS · Overlay <HelpTooltip termKey="brokers" mode={uiMode} />
             {layoutEditMode && <button type="button" className="panel-detach-btn" title="Floating" onClick={() => detachPanel("brokers", "lower")}>⤡</button>}
           </div>
           <div className="brokers-grid">
             <div className="brokers-section">
-              <div className="chart-stat-label" style={{ marginBottom: 6 }}>Agents IA</div>
-              {providerRows.slice(0, 4).map((item, agI) => (
-                <div key={`ag-${agI}`} className="agent-row">
-                  <span className="agent-name gtix-ellipsis">{String(item.route || "–").slice(0, 14)}</span>
-                  <span className={Boolean(item.available) ? "good mini" : "warn mini"}>{Boolean(item.available) ? "●" : "○"}</span>
-                </div>
-              ))}
+              <div className="chart-stat-label" style={{ marginBottom: 6 }}>OMS Lifecycle</div>
+              <div className="row"><span>Approvals</span><span className={omsLifecycleSummary.pendingApprovals > 0 ? "warn" : "good"}>{omsLifecycleSummary.pendingApprovals}</span></div>
+              <div className="row"><span>Routed / ack</span><span>{omsLifecycleSummary.routedCount} / {omsLifecycleSummary.acceptedCount}</span></div>
+              <div className="row"><span>Partial / final</span><span>{omsLifecycleSummary.partialCount} / {omsLifecycleSummary.filledCount}</span></div>
+              <div className="row"><span>Blocked</span><span className={omsLifecycleSummary.blockedCount > 0 ? "warn" : "good"}>{omsLifecycleSummary.blockedCount}</span></div>
+              <div className="row"><span>Latency / slip</span><span>{omsLifecycleSummary.avgLatencyMs.toFixed(0)} ms | {omsLifecycleSummary.avgSlippageBps.toFixed(1)} bps</span></div>
+              <div className="row"><span>Agents live</span><span className={omsLifecycleSummary.agentReadyCount >= Math.max(1, omsLifecycleSummary.agentTotalCount) ? "good" : "subtle"}>{omsLifecycleSummary.agentReadyCount}/{omsLifecycleSummary.agentTotalCount}</span></div>
             </div>
             <div className="brokers-section">
-              <div className="chart-stat-label" style={{ marginBottom: 6 }}>Capital</div>
-              {balances.slice(0, 4).map((item) => (
-                <div key={String(item.currency || "")} className="balance-row">
-                  <span className="balance-ccy">{String(item.currency || "–")}</span>
-                  <span className="balance-val gtix-ellipsis">{String(item.free || "–")}</span>
-                </div>
-              ))}
-              {balances.length === 0 ? <span className="subtle mini">–</span> : null}
+              <div className="chart-stat-label" style={{ marginBottom: 6 }}>Portfolio Overlay</div>
+              <div className="row"><span>Free equity</span><span>{toNumber(portfolioOverlaySummary.accountFreeUsd, 0).toFixed(0)} USD</span></div>
+              <div className="row"><span>Open books</span><span>{portfolioOverlaySummary.openTradesCount}</span></div>
+              <div className="row"><span>Gross exposure</span><span>{toNumber(portfolioOverlaySummary.grossExposureUsd, 0).toFixed(0)} USD</span></div>
+              <div className="row"><span>Exposure / cash</span><span className={portfolioOverlaySummary.exposureRatioPct >= 100 ? "warn" : portfolioOverlaySummary.exposureRatioPct >= 70 ? "subtle" : "good"}>{portfolioOverlaySummary.exposureRatioPct.toFixed(0)}%</span></div>
+              <div className="row"><span>PnL 24h</span><span className={portfolioOverlaySummary.dailyPnLUsd >= 0 ? "good" : "warn"}>{toNumber(portfolioOverlaySummary.dailyPnLUsd, 0).toFixed(0)} USD</span></div>
+              <div className="row"><span>Intraday DD</span><span className={portfolioOverlaySummary.dailyDrawdownPct >= 2 ? "warn" : portfolioOverlaySummary.dailyDrawdownPct >= 1 ? "subtle" : "good"}>{portfolioOverlaySummary.dailyDrawdownPct.toFixed(2)}%</span></div>
             </div>
             <div className="brokers-section">
-              <div className="chart-stat-label" style={{ marginBottom: 6 }}>Positions</div>
-              {positions.slice(0, 4).map((item) => (
-                <div key={instrumentLabel(item)} className="pos-row">
-                  <span className="pos-sym gtix-ellipsis">{instrumentLabel(item).slice(0, 10)}</span>
-                  <span className="balance-val">{toNumber(item.net_notional_usd, 0).toFixed(0)}</span>
-                </div>
-              ))}
-              {positions.length === 0 ? <span className="subtle mini">–</span> : null}
+              <div className="chart-stat-label" style={{ marginBottom: 6 }}>AI Execution Bridge</div>
+              <div className="row"><span>V7 gate</span><span className={aiBridgeSummary.v7Tone === "good" ? "good" : aiBridgeSummary.v7Tone === "warn" ? "warn" : "subtle"}>{aiBridgeSummary.v7Label}</span></div>
+              <div className="row"><span>Route</span><span>{aiBridgeSummary.routeLabel} | {aiBridgeSummary.routeScore.toFixed(2)}</span></div>
+              <div className="row"><span>Final edge</span><span className={aiBridgeSummary.edgeBps >= 0 ? "good" : "warn"}>{aiBridgeSummary.edgeBps.toFixed(1)} bps</span></div>
+              <div className="row"><span>V8 execute</span><span className={aiBridgeSummary.v8Execute ? "good" : "subtle"}>{aiBridgeSummary.v8Execute ? "yes" : "hold"} | {aiBridgeSummary.v8ProbabilityPct.toFixed(0)}%</span></div>
+              <div className="row"><span>Brain</span><span>{aiBridgeSummary.brainAction} | {aiBridgeSummary.brainConfidencePct.toFixed(0)}%</span></div>
+              <div className="row"><span>Regime</span><span>{aiBridgeSummary.brainRegime}</span></div>
             </div>
           </div>
           <div style={{ marginTop: 10, borderTop: "1px solid var(--line)", paddingTop: 8, fontSize: 12 }}>
-            <div className="row"><span className="chart-stat-label">Footprint dom.</span><span>{dominantFootprint ? `${dominantFootprint.delta.toFixed(0)}Δ` : "–"}</span></div>
-            <div className="row"><span className="chart-stat-label">MT5 Bridge</span><span>{String(mt5Health?.status || "–")}</span></div>
+            <div className="row"><span className="chart-stat-label">Last OMS event</span><span>{omsLifecycleSummary.lastEventIso ? formatClock(omsLifecycleSummary.lastEventIso) : "–"}</span></div>
+            <div className="row"><span className="chart-stat-label">Dominant book</span><span className="gtix-ellipsis">{portfolioOverlaySummary.dominantBookLabel}</span></div>
+            <div className="row"><span className="chart-stat-label">Predictor rationale</span><span className="gtix-ellipsis">{aiBridgeSummary.reasonLabel || "–"}</span></div>
           </div>
         </PanelShell>
         </div>
       </section>
 
+      {showMonitoringDeck ? (
+      <>
       {/* ═══════════════ MONITORING ════════════════════════════ */}
       <section className="panel term-monitoring">
         <div className="term-monitoring-bar">
@@ -11580,9 +14944,11 @@ export default function TradingTerminalPage() {
           </div>
         </div>
       </section>
+      </>
+      ) : null}
 
       {/* ═══════════════ CAPITAL ALLOCATION ENGINE ═══════════════════════════ */}
-      {(strategyPerformance.length > 0 || showDecisionOverlay) && (
+      {showCapitalDeck && (strategyPerformance.length > 0 || showDecisionOverlay) && (
         <section className="panel term-alloc-panel">
           <div className="eyebrow">
             Capital Allocation Engine{" "}
@@ -11748,7 +15114,7 @@ export default function TradingTerminalPage() {
       )}
 
       {/* ── META-RISK OFFICER ────────────────────────────────────────────────── */}
-      {(showDecisionOverlay || filteredOutcomes.length > 0) && (
+      {showMetaRiskDeck && (showDecisionOverlay || filteredOutcomes.length > 0) && (
         <section className="kpi-calib-panel">
           <div className="kpi-calib-title">🛡️ Meta-Risk Officer</div>
           <ModuleGuide
@@ -11961,7 +15327,7 @@ export default function TradingTerminalPage() {
       )}
 
       {/* ── PORTFOLIO CORRELATION DASHBOARD ───────────────────────────────────── */}
-      {strategyPerformance.length > 1 && (
+      {showCorrelationDeck && strategyPerformance.length > 1 && (
         <section className="kpi-calib-panel">
           <div className="kpi-calib-title">🔗 Portfolio Correlation & Exposure</div>
           
@@ -12534,7 +15900,7 @@ export default function TradingTerminalPage() {
       )}
 
       {/* ── CALIBRATION KPI PANEL ─────────────────────────────────────────────── */}
-      {filteredOutcomes.length > 0 && (
+      {showCalibrationDeck && filteredOutcomes.length > 0 && (
         <section className="kpi-calib-panel">
           <div className="kpi-calib-title">📊 Calibration KPI</div>
           

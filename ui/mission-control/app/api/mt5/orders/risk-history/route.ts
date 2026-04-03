@@ -15,6 +15,12 @@ function generateFallback() {
   return [];
 }
 
+function normalizeRiskHistoryShadowShape(payload: unknown): Record<string, unknown> {
+  return {
+    is_array: Array.isArray(payload),
+  };
+}
+
 export async function GET(request: NextRequest): Promise<NextResponse> {
   const limit = request.nextUrl.searchParams.get("limit") || "50";
   const symbol = request.nextUrl.searchParams.get("symbol") || "";
@@ -50,6 +56,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
         return payload;
       },
       getFallback: generateFallback,
+      normalizeForComparison: (payload) => normalizeRiskHistoryShadowShape(payload),
     }
   );
 

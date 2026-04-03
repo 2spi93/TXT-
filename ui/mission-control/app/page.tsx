@@ -98,6 +98,10 @@ export default async function Page() {
           <p style={{ marginTop: 8 }}>
             <Link href="/terminal">TXT Terminal</Link>
             {" | "}
+            <Link href="/fund-manager">Fund Manager</Link>
+            {" | "}
+            <Link href="/live-capital">Live Capital</Link>
+            {" | "}
             <Link href="/learn">TXT Learn</Link>
             {" | "}
             <Link href="/advanced">TXT Advanced</Link>
