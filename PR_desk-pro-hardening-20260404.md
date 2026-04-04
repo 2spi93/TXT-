@@ -52,6 +52,10 @@ This PR consolidates the current desk-pro hardening batch on `desk-pro-hardening
 - `config/kairos_feature_flags.json` keeps `kairos_live=true`; live handoff still depends on env gating and route-level eligibility.
 - `config/risk_policy.json` remains `paper_only=true`, and this PR now enforces that state on real live execution paths.
 
+## Operator / Risk Memo
+
+Short version ready to paste into the PR description or a review comment: see `OPERATOR_RISK_MEMO_SHORT.md`.
+
 ## Follow-up
 
 - Re-auth GitHub on the host and push `desk-pro-hardening-20260404`.
