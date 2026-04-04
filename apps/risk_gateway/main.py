@@ -33,6 +33,61 @@ def load_policy() -> dict:
     return json.loads(POLICY_PATH.read_text())
 
 
+def _normalize_instrument(symbol: object) -> str:
+    return str(symbol or "").replace("-PERP", "").replace("/", "").replace("-", "").upper()
+
+
+def _resolve_regime(payload: object) -> str:
+    explainability = payload if isinstance(payload, dict) else {}
+    return str(
+        explainability.get("regime")
+        or explainability.get("market_regime")
+        or explainability.get("predictor_regime")
+        or "UNKNOWN"
+    ).strip().upper() or "UNKNOWN"
+
+
+def _apply_conditional_instrument_rules(
+    *,
+    rules: object,
+    instrument: str,
+    confidence: float,
+    target_notional_usd: float,
+    regime: str,
+) -> list[str]:
+    if not isinstance(rules, dict):
+        return []
+
+    normalized_instrument = _normalize_instrument(instrument)
+    matched_rule = None
+    for raw_symbol, candidate_rule in rules.items():
+        if _normalize_instrument(raw_symbol) == normalized_instrument and isinstance(candidate_rule, dict):
+            matched_rule = candidate_rule
+            break
+
+    if not isinstance(matched_rule, dict):
+        return []
+
+    reasons: list[str] = []
+    max_trade_notional_usd = float(matched_rule.get("max_trade_notional_usd") or 0.0)
+    if max_trade_notional_usd > 0 and target_notional_usd > max_trade_notional_usd:
+        reasons.append("conditional_trade_notional_exceeds_limit")
+
+    min_confidence = float(matched_rule.get("min_confidence") or 0.0)
+    if min_confidence > 0 and confidence < min_confidence:
+        reasons.append("conditional_confidence_below_threshold")
+
+    allowed_regimes = {
+        str(item).strip().upper()
+        for item in matched_rule.get("allowed_regimes", [])
+        if str(item).strip()
+    }
+    if allowed_regimes and regime not in allowed_regimes:
+        reasons.append("conditional_regime_not_allowed")
+
+    return reasons
+
+
 @app.on_event("startup")
 async def startup() -> None:
     ensure_schema()
@@ -74,6 +129,9 @@ async def pre_trade_check(request: RiskCheckRequest) -> RiskDecision:
     policy = load_policy()
     reasons: list[str] = []
     intent = request.intent
+    normalized_instrument = _normalize_instrument(intent.instrument)
+    normalized_blocked_instruments = {_normalize_instrument(item) for item in policy["blocked_instruments"]}
+    resolved_regime = _resolve_regime(intent.explainability)
 
     if request.system_mode.value not in policy["allowed_system_modes"]:
         reasons.append("system_mode_not_allowed")
@@ -89,8 +147,17 @@ async def pre_trade_check(request: RiskCheckRequest) -> RiskDecision:
         reasons.append("confidence_below_threshold")
     if intent.venue in policy["blocked_venues"]:
         reasons.append("venue_blocked")
-    if intent.instrument in policy["blocked_instruments"]:
+    if normalized_instrument in normalized_blocked_instruments:
         reasons.append("instrument_blocked")
+    reasons.extend(
+        _apply_conditional_instrument_rules(
+            rules=policy.get("conditional_instrument_rules"),
+            instrument=intent.instrument,
+            confidence=float(intent.confidence),
+            target_notional_usd=float(intent.target_notional_usd),
+            regime=resolved_regime,
+        )
+    )
 
     if reasons:
         return RiskDecision(
@@ -125,6 +192,8 @@ async def pre_trade_check(request: RiskCheckRequest) -> RiskDecision:
 async def mt5_order_check(request: Mt5OrderRiskRequest) -> dict:
     policy = load_policy()
     reasons: list[str] = []
+    normalized_symbol = _normalize_instrument(request.symbol)
+    normalized_blocked_instruments = {_normalize_instrument(item) for item in policy["blocked_instruments"]}
 
     if request.system_mode not in policy["allowed_system_modes"]:
         reasons.append("system_mode_not_allowed")
@@ -134,8 +203,17 @@ async def mt5_order_check(request: Mt5OrderRiskRequest) -> dict:
         reasons.append("daily_notional_limit_exceeded")
     if request.max_spread_bps > policy["max_slippage_bps"]:
         reasons.append("spread_too_wide")
-    if request.symbol in policy["blocked_instruments"]:
+    if normalized_symbol in normalized_blocked_instruments:
         reasons.append("instrument_blocked")
+    reasons.extend(
+        _apply_conditional_instrument_rules(
+            rules=policy.get("conditional_instrument_rules"),
+            instrument=request.symbol,
+            confidence=1.0,
+            target_notional_usd=float(request.estimated_notional_usd),
+            regime="UNKNOWN",
+        )
+    )
 
     if reasons:
         return {

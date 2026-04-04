@@ -5486,6 +5486,49 @@ def _sanitize_live_execution_policy(provider_policy: dict[str, Any]) -> dict[str
     }
 
 
+def _resolve_live_rule_reasons(
+    provider_policy: dict[str, Any],
+    *,
+    symbol: str,
+    regime: str,
+    confidence: float,
+) -> list[str]:
+    normalized_symbol = _normalize_symbol(symbol)
+    if not normalized_symbol:
+        return []
+
+    primary_instrument = _normalize_symbol(str(provider_policy.get("primary_live_instrument") or ""))
+    conditional_rules = provider_policy.get("conditional_live_rules") if isinstance(provider_policy.get("conditional_live_rules"), dict) else {}
+    matched_rule = None
+    for raw_symbol, candidate_rule in conditional_rules.items():
+        if _normalize_symbol(str(raw_symbol)) == normalized_symbol and isinstance(candidate_rule, dict):
+            matched_rule = candidate_rule
+            break
+
+    reasons: list[str] = []
+    if primary_instrument and normalized_symbol != primary_instrument and not isinstance(matched_rule, dict):
+        reasons.append("instrument_not_live_enabled")
+        return reasons
+
+    if not isinstance(matched_rule, dict):
+        return reasons
+
+    allowed_regimes = {
+        str(item).strip().upper()
+        for item in matched_rule.get("allowed_regimes", [])
+        if str(item).strip()
+    }
+    resolved_regime = str(regime or "UNKNOWN").strip().upper() or "UNKNOWN"
+    if allowed_regimes and resolved_regime not in allowed_regimes:
+        reasons.append("conditional_live_regime_not_allowed")
+
+    min_confidence = _to_float(matched_rule.get("min_confidence"), 0.0)
+    if min_confidence > 0 and confidence < min_confidence:
+        reasons.append("conditional_live_confidence_below_threshold")
+
+    return reasons
+
+
 def _resolve_live_execution_request(
     provider: str,
     account_id: str,
@@ -5494,6 +5537,9 @@ def _resolve_live_execution_request(
     explicit_flag: bool,
     purpose: str = "execute",
     paper_only: bool = False,
+    symbol: str = "",
+    regime: str = "UNKNOWN",
+    confidence: float = 0.0,
 ) -> dict[str, Any]:
     provider_norm = _normalize_connector_provider(provider)
     policy = _load_live_execution_policy()
@@ -5510,6 +5556,14 @@ def _resolve_live_execution_request(
         reasons.append("live_env_flag_disabled")
     if purpose == "execute" and paper_only:
         reasons.append("risk_policy_paper_only")
+    reasons.extend(
+        _resolve_live_rule_reasons(
+            provider_policy,
+            symbol=symbol,
+            regime=regime,
+            confidence=confidence,
+        )
+    )
 
     linked_account = _linked_connector_account(provider_norm, account_id)
     if not linked_account:
@@ -13130,6 +13184,19 @@ async def _handle_signal_webhook(source: str, payload: dict, provided_secret: st
 
     live_requested = _bool_from_any(route.get("live_enabled"), False)
     policy = await fetch_policy()
+    payload_metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    payload_regime = str(
+        payload.get("regime")
+        or payload.get("market_regime")
+        or payload_metadata.get("regime")
+        or payload_metadata.get("market_regime")
+        or "UNKNOWN"
+    ).strip().upper() or "UNKNOWN"
+    payload_confidence = _clamp(
+        _to_float(payload.get("confidence"), _to_float(payload_metadata.get("confidence"), 0.0)),
+        0.0,
+        1.0,
+    )
     live_execution = _resolve_live_execution_request(
         provider,
         account_id,
@@ -13137,6 +13204,9 @@ async def _handle_signal_webhook(source: str, payload: dict, provided_secret: st
         explicit_flag=live_requested,
         purpose="execute",
         paper_only=_bool_from_any(policy.get("paper_only"), False),
+        symbol=symbol,
+        regime=payload_regime,
+        confidence=payload_confidence,
     )
     if live_requested and not live_execution.get("enabled"):
         raise HTTPException(
@@ -13558,6 +13628,7 @@ async def bingx_live_smoke(payload: dict, auth: AuthContext = Depends(operator_a
         requested_notional_usd=_to_float(payload.get("notional_usd"), 0.0),
         explicit_flag=True,
         purpose="smoke",
+        symbol=symbol,
     )
     smoke_limit = _to_float((policy_hint.get("policy") or {}).get("smoke_test_notional_usd"), 20.0)
     notional = _to_float(payload.get("notional_usd"), smoke_limit if smoke_limit > 0 else 20.0)
@@ -13570,6 +13641,7 @@ async def bingx_live_smoke(payload: dict, auth: AuthContext = Depends(operator_a
         requested_notional_usd=notional,
         explicit_flag=True,
         purpose="smoke",
+        symbol=symbol,
     )
     if not live_execution.get("enabled"):
         raise HTTPException(
@@ -13863,6 +13935,7 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
         "execution_delay_ms": int(_to_float(applied_overrides.get("execution_delay_ms"), 0.0)),
     }
     if bool(live_hint.get("requested")):
+        explainability = effective_intent_payload.get("explainability") if isinstance(effective_intent_payload.get("explainability"), dict) else {}
         live_execution = _resolve_live_execution_request(
             str(live_hint.get("provider") or ""),
             str(live_hint.get("account_id") or ""),
@@ -13870,6 +13943,14 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
             explicit_flag=True,
             purpose="execute",
             paper_only=_bool_from_any(risk_decision.risk_snapshot.get("paper_only"), False),
+            symbol=str(effective_intent_payload.get("instrument") or ""),
+            regime=str(
+                effective_intent_payload.get("regime")
+                or explainability.get("regime")
+                or explainability.get("market_regime")
+                or "UNKNOWN"
+            ).strip().upper() or "UNKNOWN",
+            confidence=_clamp(_to_float(effective_intent_payload.get("confidence"), 0.0), 0.0, 1.0),
         )
         if not live_execution.get("enabled"):
             raise HTTPException(
