@@ -52,6 +52,11 @@ function formatMaybeInt(value: unknown, suffix = ""): string {
   return Number.isFinite(amount) ? `${Math.round(amount)}${suffix}` : "n/a";
 }
 
+function formatCapabilityLabel(value: unknown): string {
+  const label = String(value || "").trim();
+  return label ? label.replace(/_/g, " ").toUpperCase() : "N/A";
+}
+
 function toneClass(value: string): string {
   if (["clean", "ok", "resolved"].includes(value)) {
     return "good";
@@ -475,6 +480,52 @@ export default function ConnectorsPage() {
   const connectorCapitalRows = connectorDeskRows.filter((item) => Number(asMap(item.capital_summary).account_count || 0) > 0);
   const connectorIncidentRows = connectorDeskRows.filter((item) => Number(asMap(item.incident_summary).active_count || 0) > 0 || String(asMap(item.degradation_engine).state || "") !== "ok");
   const canonicalByAccount = new Map(canonicalAccounts.map((item) => [String(item.account_id || ""), item]));
+  const brokerCapabilityRows = linkedConnectorAccounts.map((account) => {
+    const permissionsView = asMap(account.permissions_view);
+    const permissionFlags = asMap(permissionsView.permissions);
+    const brokerCapabilities = asMap(account.broker_capabilities);
+    const accountKey = String(account.account_id || account.reference || "n/a");
+    const canonical = canonicalByAccount.get(accountKey);
+    return {
+      accountId: accountKey,
+      provider: String(account.provider || brokerCapabilities.provider || "unknown"),
+      preferredVenue: String(brokerCapabilities.preferred_venue || account.provider || "n/a"),
+      replaceStrategy: String(brokerCapabilities.replace_strategy || "reslice_only"),
+      supportsModify: Boolean(brokerCapabilities.supports_modify),
+      supportsCancelReplace: Boolean(brokerCapabilities.supports_cancel_replace),
+      supportsLiveCancel: Boolean(brokerCapabilities.supports_live_cancel),
+      capabilitySource: String(brokerCapabilities.capability_source || "unknown"),
+      canTrade: Boolean(permissionFlags.trade),
+      authMethod: String(account.auth_method || "manual"),
+      clientId: String(canonical?.client_id || account.client_id || "-"),
+      portfolioId: String(canonical?.portfolio_id || account.portfolio_id || "-"),
+      mode: String(canonical?.mode || account.mode || "n/a"),
+    };
+  }).sort((left, right) => {
+    if (left.supportsCancelReplace !== right.supportsCancelReplace) {
+      return Number(right.supportsCancelReplace) - Number(left.supportsCancelReplace);
+    }
+    if (left.supportsModify !== right.supportsModify) {
+      return Number(right.supportsModify) - Number(left.supportsModify);
+    }
+    return `${left.provider}:${left.accountId}`.localeCompare(`${right.provider}:${right.accountId}`);
+  });
+  const brokerCapabilitySummary = brokerCapabilityRows.reduce((summary, item) => {
+    summary.totalAccounts += 1;
+    summary.tradableAccounts += Number(item.canTrade);
+    summary.cancelReplaceAccounts += Number(item.supportsCancelReplace);
+    summary.modifyAccounts += Number(item.supportsModify);
+    summary.liveCancelAccounts += Number(item.supportsLiveCancel);
+    summary.resliceOnlyAccounts += Number(item.replaceStrategy === "reslice_only");
+    return summary;
+  }, {
+    totalAccounts: 0,
+    tradableAccounts: 0,
+    cancelReplaceAccounts: 0,
+    modifyAccounts: 0,
+    liveCancelAccounts: 0,
+    resliceOnlyAccounts: 0,
+  });
   const clientPortfolioSummaries = Array.from(
     canonicalAccounts.reduce((map, item) => {
       const clientKey = String(item.client_id || "unknown-client");
@@ -575,6 +626,36 @@ export default function ConnectorsPage() {
                   : " | sync pending"}
               </span>
               <span>{String(item.mode)} / {String(item.status)}</span>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "0.85fr 1.15fr" }}>
+        <div className="panel">
+          <div className="eyebrow">Broker Capability Desk <HelpHint text="Vue operateur dediee pour voir quel compte peut vraiment executer un cancel/replace natif et quel compte reste en reslice." examples={["Si un compte affiche CANCEL REPLACE=true et MODIFY=false, le scheduler doit rester sur cancel_replace et non sur amend natif.", "Si un compte est trade=false, traite ses capacites comme purement informatives tant qu'il n'est pas habilite execution."]} /></div>
+          <div className="row"><span>Comptes lies</span><span>{String(brokerCapabilitySummary.totalAccounts)}</span></div>
+          <div className="row"><span>Comptes trade enabled</span><span>{String(brokerCapabilitySummary.tradableAccounts)}</span></div>
+          <div className="row"><span>Cancel/replace natif</span><span className={brokerCapabilitySummary.cancelReplaceAccounts > 0 ? "good" : "subtle"}>{String(brokerCapabilitySummary.cancelReplaceAccounts)}</span></div>
+          <div className="row"><span>Modify natif</span><span className={brokerCapabilitySummary.modifyAccounts > 0 ? "good" : "subtle"}>{String(brokerCapabilitySummary.modifyAccounts)}</span></div>
+          <div className="row"><span>Live cancel disponible</span><span>{String(brokerCapabilitySummary.liveCancelAccounts)}</span></div>
+          <div className="row"><span>Fallback reslice only</span><span>{String(brokerCapabilitySummary.resliceOnlyAccounts)}</span></div>
+          <p className="subtle" style={{ marginTop: 10 }}>
+            Aucun amend broker natif n'est confirme dans la stack actuelle. La strategie MODIFY reste volontairement inactive tant qu'une vraie route backend broker n'existe pas.
+          </p>
+        </div>
+
+        <div className="panel">
+          <div className="eyebrow">Matrice Compte - Replace Strategy <HelpHint text="Lecture directe du chemin de remplacement expose par le control-plane pour chaque compte lie." examples={["Un compte BingX doit aujourd'hui montrer replace strategy = CANCEL REPLACE et modify = false.", "Si un futur broker confirme amend natif, cette matrice devra montrer MODIFY avant tout basculement du scheduler."]} /></div>
+          {brokerCapabilityRows.length === 0 ? <p className="subtle">Aucun compte lie avec broker_capabilities.</p> : null}
+          {brokerCapabilityRows.map((item) => (
+            <div className="panel" key={`broker-capability-${item.provider}-${item.accountId}`} style={{ marginTop: 12, borderRadius: 12 }}>
+              <div className="row"><span>{item.provider} | {item.accountId}</span><span>{item.canTrade ? "trade enabled" : "read only"}</span></div>
+              <div className="row"><span>Replace strategy</span><span>{formatCapabilityLabel(item.replaceStrategy)}</span></div>
+              <div className="row"><span>Capabilities</span><span><span className={item.supportsCancelReplace ? "good" : "subtle"}>cancel_replace={String(item.supportsCancelReplace)}</span> | <span className={item.supportsModify ? "good" : "subtle"}>modify={String(item.supportsModify)}</span> | <span className={item.supportsLiveCancel ? "good" : "subtle"}>live_cancel={String(item.supportsLiveCancel)}</span></span></div>
+              <div className="row"><span>Venue / auth</span><span>{item.preferredVenue} | {item.authMethod}</span></div>
+              <div className="row"><span>Client / portfolio</span><span>{item.clientId} | {item.portfolioId}</span></div>
+              <div className="row"><span>Mode / source</span><span>{item.mode} | {item.capabilitySource}</span></div>
             </div>
           ))}
         </div>

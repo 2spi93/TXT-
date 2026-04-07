@@ -95,6 +95,18 @@ CREATE TABLE IF NOT EXISTS self_learning_v4_states (
     UNIQUE (user_id, account_id, symbol, timeframe)
 );
 
+CREATE TABLE IF NOT EXISTS self_learning_v5_states (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    account_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    state JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (user_id, account_id, symbol, timeframe)
+);
+
 CREATE TABLE IF NOT EXISTS risk_policies (
   policy_version TEXT PRIMARY KEY,
   policy JSONB NOT NULL,

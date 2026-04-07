@@ -30,12 +30,23 @@ import {
   type PerceptualSpacingPolicy,
   type ResolvePerceptualAutoscaleOptions,
   type PerceptualTransitionMode,
+  quantizePerceptualBarSpacing,
   resolvePerceptualAutoscaleRange,
   resolvePerceptualTimeScaleOptions,
 } from "./chartPerceptual";
+import {
+  computePerceptualCandle,
+  computePerceptualWickWidth,
+  resolvePerceptualDeskMode,
+  type PerceptualCandleFlowState,
+  type PerceptualExecutionSignal,
+  type PerceptualHeatSegment,
+} from "./chartPerceptualEngine";
+import type { MarketSimulation } from "./marketSimulationEngine";
 import { applyPerceptionPipeline, resolvePerceptionDensity, shouldConflatePerceptualUpdate, type PerceptionVisualMetadata } from "./perceptionEngine";
 import { createLatestFrameScheduler } from "./frameEngine";
 import { applyVisualProfile, DEFAULT_VISUAL_PROFILE, mixColors, withAlpha, type VisualProfile, type VisualProfileName } from "./visualProfiles";
+import type { PriceSignalBand } from "../../lib/engine/gpu-chart/PriceSignalLayer";
 
 type CandlePoint = { label: string; open: number; high: number; low: number; close: number; volume: number };
 type OverlayZone = {
@@ -67,6 +78,9 @@ type Props = {
   liquidityZones: LiquidityZone[];
   domLevels?: Array<{ side: "bid" | "ask"; price: number; size: number; intensity: number }>;
   heatmapLevels?: Array<{ side: "bid" | "ask"; price: number; size: number; intensity: number }>;
+  domHistory?: Array<{ time: number; levels: Array<{ side: "bid" | "ask"; price: number; size: number; intensity: number }>; spoofingRisk?: number }>;
+  tradeBubbles?: Array<{ time: number; price: number; volume: number; side: "buy" | "sell"; intensity?: number; kind?: "trade" | "spoof" }>;
+  priceSignalBands?: PriceSignalBand[];
   dayVwap: number;
   weekVwap: number;
   monthVwap: number;
@@ -74,7 +88,9 @@ type Props = {
   /** Pre-computed indicator series from computeAllIndicators().  Overlay (pane="main") only rendered here. */
   indicatorSeries?: IndicatorSeriesData[];
   /** Optional compact footprint rows from terminal context (buy/sell delta by price slice). */
-  footprintRows?: Array<{ low: number; high: number; buyVolume: number; sellVolume: number; delta: number; timeLabel?: string }>;
+  footprintRows?: Array<{ low: number; high: number; buyVolume: number; sellVolume: number; delta: number; timeLabel?: string; timeKey?: string }>;
+  executionSignals?: PerceptualExecutionSignal[];
+  marketSimulation?: MarketSimulation | null;
   /** Apply a candle transform — "heikin-ashi" transforms OHLCV data before rendering. */
   candleTransform?: "none" | "heikin-ashi";
   onCrosshairMove?: (payload: { price: number; timeLabel: string; timeKey: string } | null) => void;
@@ -136,6 +152,26 @@ type FormingCandleState = {
   direction: "up" | "down" | "flat";
 };
 
+type DynamicCandlePresentation = {
+  preferredBodyWidthPx: number;
+  formingWidthPx: number;
+  overlayWidthPx: number;
+  wickWidthPx: number;
+  bodyRadiusPx: number;
+  baseBodyWidthPx: number;
+  timeframeWeight: number;
+  densityFactor: number;
+  volatilityFactor: number;
+  zoomFactor: number;
+  minBodyWidthPx: number;
+  maxBodyWidthPx: number;
+  bodyToSpacingRatio: number;
+  bodyOpacity: number;
+  wickOpacity: number;
+  borderOpacity: number;
+  lastBrightness: number;
+};
+
 type InertiaState = {
   driftX: number;
   driftY: number;
@@ -165,12 +201,14 @@ type CandleRenderPoint = {
   high: number;
   low: number;
   close: number;
+  timeKey?: string;
   color?: string;
   borderColor?: string;
   wickColor?: string;
   wickType?: PerceptionVisualMetadata["wickType"];
   emphasis?: number;
   styleKey?: string;
+  flow?: PerceptualCandleFlowState;
 };
 
 type CandleSeriesPoint = {
@@ -179,12 +217,14 @@ type CandleSeriesPoint = {
   high: number;
   low: number;
   close: number;
+  timeKey?: string;
   color?: string;
   borderColor?: string;
   wickColor?: string;
   wickType?: PerceptionVisualMetadata["wickType"];
   emphasis?: number;
   styleKey?: string;
+  flow?: PerceptualCandleFlowState;
 };
 
 type PerceptualRenderInput = CandleRenderPoint & {
@@ -213,12 +253,14 @@ function normalizeRenderPoint(point: CandleRenderPoint): CandleRenderPoint {
     high,
     low,
     close,
+    timeKey: point.timeKey,
     color: point.color,
     borderColor: point.borderColor,
     wickColor: point.wickColor,
     wickType: point.wickType,
     emphasis: point.emphasis,
     styleKey: point.styleKey,
+    flow: point.flow,
   };
 }
 
@@ -242,12 +284,14 @@ function mergeRenderPointWithPrevious(
   return normalizeRenderPoint({
     ...previous,
     ...next,
+    timeKey: next.timeKey ?? previous?.timeKey,
     color: next.color ?? previous?.color,
     borderColor: next.borderColor ?? previous?.borderColor,
     wickColor: next.wickColor ?? previous?.wickColor,
     wickType: next.wickType ?? previous?.wickType,
     emphasis: next.emphasis ?? previous?.emphasis,
     styleKey: next.styleKey ?? previous?.styleKey,
+    flow: next.flow ?? previous?.flow,
   });
 }
 
@@ -330,20 +374,80 @@ function applyPerceptualRenderPipeline(
     const high = input.precision !== undefined ? roundRenderPrice(bar.high, input.precision) : bar.high;
     const low = input.precision !== undefined ? roundRenderPrice(bar.low, input.precision) : bar.low;
     const colors = resolvePerBarCandleColors(profile, bar.__visual, input.domImbalanceRatio ?? 0);
+    const sourceBar = source.find((candidate) => Number(candidate.time) === Number(bar.time));
     return {
       time: Number(bar.time) as UTCTimestamp,
       open,
       high: Math.max(high, open, close),
       low: Math.min(low, open, close),
       close,
+      timeKey: sourceBar?.timeKey,
       color: colors.color,
       borderColor: colors.borderColor,
       wickColor: colors.wickColor,
       wickType: colors.wickType,
       emphasis: colors.emphasis,
       styleKey: colors.styleKey,
+      flow: sourceBar?.flow,
     };
   });
+}
+
+function resolveViewportVisibleBars(currentVisibleBars: number, fallbackVisibleBars: number): number {
+  const current = Math.max(0, Math.round(currentVisibleBars || 0));
+  if (current > 0) {
+    return current;
+  }
+  return Math.max(1, Math.round(fallbackVisibleBars || 1));
+}
+
+function resolveStableLogicalWidthFromSpacing(input: {
+  containerWidth: number;
+  requestedVisibleBars: number;
+  spacingPolicy: PerceptualSpacingPolicy;
+}): number {
+  const safeContainerWidth = Math.max(1, input.containerWidth || 1);
+  const safeVisibleBars = clamp(
+    input.requestedVisibleBars,
+    input.spacingPolicy.minVisibleBars,
+    input.spacingPolicy.maxVisibleBars,
+  );
+  const stableSpacing = quantizePerceptualBarSpacing(clamp(safeContainerWidth / safeVisibleBars, 2, 80));
+  return clamp(safeContainerWidth / stableSpacing, input.spacingPolicy.minVisibleBars, input.spacingPolicy.maxVisibleBars);
+}
+
+function resolvePixelAlignedBodyAndWickWidths(input: {
+  spacingPx: number;
+  densityLevel: DensityLevel;
+}): { bodyWidthPx: number; wickWidthPx: number } {
+  const pixelRatio = typeof window === "undefined" ? 1 : Math.max(1, window.devicePixelRatio || 1);
+  const stableSpacingPx = quantizePerceptualBarSpacing(clamp(input.spacingPx, 2, 80));
+  const physicalSpacingPx = Math.max(2, Math.round(stableSpacingPx * pixelRatio));
+  const minimumBodyPx = input.densityLevel === "micro" ? 2 : 2;
+  let physicalBodyWidthPx = Math.max(minimumBodyPx, Math.floor(physicalSpacingPx * 0.72));
+  const physicalWickWidthPx = Math.max(1, Math.floor(Math.max(pixelRatio, physicalSpacingPx * 0.12)));
+
+  if (physicalBodyWidthPx % 2 !== physicalWickWidthPx % 2) {
+    physicalBodyWidthPx = Math.max(minimumBodyPx, physicalBodyWidthPx - 1);
+  }
+  if (physicalBodyWidthPx <= physicalWickWidthPx) {
+    physicalBodyWidthPx = physicalWickWidthPx + (physicalWickWidthPx % 2 === 0 ? 2 : 1);
+  }
+
+  return {
+    bodyWidthPx: physicalBodyWidthPx / pixelRatio,
+    wickWidthPx: physicalWickWidthPx / pixelRatio,
+  };
+}
+
+function classifySpacingZone(spacingPx: number): "micro" | "normal" | "macro" {
+  if (spacingPx <= 4) {
+    return "micro";
+  }
+  if (spacingPx <= 8) {
+    return "normal";
+  }
+  return "macro";
 }
 
 function buildPerceptualAutoscaleOptions(input: {
@@ -446,8 +550,9 @@ function resolveProfileWickColor(
   const domShift = profile.perception.domWickSmoothing
     ? Math.min(Math.abs(domImbalanceRatio), 1) * profile.perception.wickDomShiftPct
     : 0;
-  const directionalMix = direction === "up" ? 0.16 : 0.14;
-  const shifted = mixColors(profile.palette.wick, domColor, domShift);
+  const directionalMix = direction === "up" ? 0.26 : 0.24;
+  const liftedBase = mixColors(profile.palette.wick, profile.palette.text, 0.22);
+  const shifted = mixColors(liftedBase, domColor, domShift);
   return withAlpha(mixColors(shifted, direction === "up" ? profile.palette.up : profile.palette.down, directionalMix), opacity);
 }
 
@@ -520,7 +625,7 @@ const CANDLE_OPTIONS: CandlestickSeriesPartialOptions = {
   lastValueVisible: false,
 };
 
-const ENABLE_CUSTOM_V3_CANDLE_RENDERER = true;
+const ENABLE_CUSTOM_V3_CANDLE_RENDERER = process.env.NEXT_PUBLIC_ENABLE_CUSTOM_V3_CANDLE_RENDERER === "1";
 const HIDDEN_NATIVE_CANDLE_COLOR = "rgba(0,0,0,0)";
 
 const DOM_HOLD_THRESHOLD_MS = {
@@ -629,54 +734,148 @@ function resolvePerceptualCandleStyleOptions(
   volatility: number,
   visualProfileName: VisualProfileName,
   domImbalanceRatio: number,
+  presentation: DynamicCandlePresentation,
 ): Partial<CandlestickSeriesPartialOptions> {
   const profile = applyVisualProfile(visualProfileName);
   const assetClass = inferAssetContrastClass(symbol);
-  const isCompressed = densityLevel === "compact" || densityLevel === "micro";
-  const isBalanced = densityLevel === "normal";
-  const borderVisible = visualProfileName === "institutional" || isCompressed || volatility >= 0.0045;
-  const wickBoosted = isCompressed || volatility >= 0.0032 || timeframe === "1m" || timeframe.includes("s");
-  const bodyOpacity = densityLevel === "micro" ? 0.9 : Math.min(0.92, profile.rendering.bodyOpacity);
-  const baseUpColor = withAlpha(profile.palette.up, bodyOpacity);
-  const baseDownColor = withAlpha(profile.palette.down, bodyOpacity);
-  const wickOpacity = wickBoosted ? 0.78 : 0.75;
+  const densityBorderBias = densityLevel === "micro" ? 0.18 : densityLevel === "compact" ? 0.08 : 0;
+  const hasDeskBorders = visualProfileName === "institutional"
+    || presentation.preferredBodyWidthPx + densityBorderBias >= 4.2
+    || volatility >= 0.0035
+    || timeframe === "1m"
+    || timeframe.includes("s");
+  const baseUpColor = withAlpha(profile.palette.up, presentation.bodyOpacity);
+  const baseDownColor = withAlpha(profile.palette.down, presentation.bodyOpacity);
   const vividFx = {
-    upColor: assetClass === "fx" && visualProfileName === "institutional" ? withAlpha(mixColors(profile.palette.up, "#5CE3FF", 0.2), profile.rendering.bodyOpacity) : baseUpColor,
-    downColor: assetClass === "fx" && visualProfileName === "institutional" ? withAlpha(mixColors(profile.palette.down, "#FF8AA6", 0.12), profile.rendering.bodyOpacity) : baseDownColor,
-    wickUpColor: resolveProfileWickColor(profile, "up", domImbalanceRatio, wickOpacity),
-    wickDownColor: resolveProfileWickColor(profile, "down", domImbalanceRatio, wickOpacity),
-    borderUpColor: withAlpha(profile.palette.up, bodyOpacity),
-    borderDownColor: withAlpha(profile.palette.down, bodyOpacity),
+    upColor: assetClass === "fx" && visualProfileName === "institutional" ? withAlpha(mixColors(profile.palette.up, "#5CE3FF", 0.2), presentation.bodyOpacity) : baseUpColor,
+    downColor: assetClass === "fx" && visualProfileName === "institutional" ? withAlpha(mixColors(profile.palette.down, "#FF8AA6", 0.12), presentation.bodyOpacity) : baseDownColor,
+    wickUpColor: resolveProfileWickColor(profile, "up", domImbalanceRatio, presentation.wickOpacity),
+    wickDownColor: resolveProfileWickColor(profile, "down", domImbalanceRatio, presentation.wickOpacity),
+    borderUpColor: withAlpha(profile.palette.up, presentation.borderOpacity),
+    borderDownColor: withAlpha(profile.palette.down, presentation.borderOpacity),
   };
   const vividCrypto = {
     upColor: baseUpColor,
     downColor: baseDownColor,
-    wickUpColor: resolveProfileWickColor(profile, "up", domImbalanceRatio, wickOpacity),
-    wickDownColor: resolveProfileWickColor(profile, "down", domImbalanceRatio, wickOpacity),
-    borderUpColor: withAlpha(profile.palette.up, bodyOpacity),
-    borderDownColor: withAlpha(profile.palette.down, bodyOpacity),
+    wickUpColor: resolveProfileWickColor(profile, "up", domImbalanceRatio, presentation.wickOpacity),
+    wickDownColor: resolveProfileWickColor(profile, "down", domImbalanceRatio, presentation.wickOpacity),
+    borderUpColor: withAlpha(profile.palette.up, presentation.borderOpacity),
+    borderDownColor: withAlpha(profile.palette.down, presentation.borderOpacity),
   };
-
-  if (isCompressed) {
-    return {
-      ...(assetClass === "fx" ? vividFx : vividCrypto),
-      borderVisible,
-      wickVisible: true,
-    };
-  }
-
-  if (isBalanced) {
-    return {
-      ...(assetClass === "fx" ? vividFx : vividCrypto),
-      borderVisible,
-      wickVisible: true,
-    };
-  }
 
   return {
     ...(assetClass === "fx" ? vividFx : vividCrypto),
-    borderVisible: volatility >= 0.0075,
+    borderVisible: hasDeskBorders,
     wickVisible: true,
+  };
+}
+
+function resolveDynamicCandlePresentation(input: {
+  spacingPolicy: PerceptualSpacingPolicy;
+  slotWidthPx: number;
+  visibleBars: number;
+  densityLevel: DensityLevel;
+  timeframe: string;
+  volatility: number;
+  visualProfileName: VisualProfileName;
+  deskMode: ReturnType<typeof resolvePerceptualDeskMode>;
+}): DynamicCandlePresentation {
+  const profile = applyVisualProfile(input.visualProfileName);
+  const tfSeconds = timeframeSeconds(input.timeframe);
+  const devicePixelRatio = typeof window === "undefined" ? 1 : Math.max(1, window.devicePixelRatio || 1);
+  const stableSpacingPx = quantizePerceptualBarSpacing(clamp(
+    Number.isFinite(input.slotWidthPx) && input.slotWidthPx > 0 ? input.slotWidthPx : input.spacingPolicy.barSpacing,
+    2,
+    80,
+  ));
+  const slotWidth = stableSpacingPx;
+  const perceptualCandle = computePerceptualCandle({
+    barSpacingPx: stableSpacingPx,
+    targetSpacingPx: input.spacingPolicy.barSpacing,
+    visibleBars: input.visibleBars,
+    timeframe: input.timeframe,
+    volatility: input.volatility,
+    devicePixelRatio,
+    densityLevel: input.densityLevel,
+    preferredBodyWidthPx: input.spacingPolicy.preferredBodyWidthPx,
+    minGapPx: input.spacingPolicy.minGapPx,
+  });
+  const preferredBodyWidthPx = clamp(
+    perceptualCandle.bodyWidthPx * input.deskMode.bodyWeight,
+    Math.max(perceptualCandle.minBodyWidthPx, input.densityLevel === "micro" ? 2.8 : 3.2),
+    Math.min(12, perceptualCandle.maxBodyWidthPx),
+  );
+  const wickWidthPx = clamp(
+    Math.max(
+      profile.rendering.wickWidthPx,
+      preferredBodyWidthPx * 0.4,
+      perceptualCandle.wickWidthPx * input.deskMode.wickWeight,
+    ),
+    1 / devicePixelRatio,
+    Math.max(1.4, preferredBodyWidthPx - 1 / devicePixelRatio),
+  );
+  const bodyOpacity = clamp(
+    profile.rendering.bodyOpacity
+      + 0.03
+      + (input.densityLevel === "micro" ? 0.05 : input.densityLevel === "compact" ? 0.04 : 0.02)
+      + (tfSeconds <= 5 * 60 ? 0.02 : 0.01),
+    0.94,
+    0.99,
+  );
+  const wickOpacity = clamp(
+    0.9
+      + (tfSeconds <= 5 * 60 ? 0.05 : 0.03)
+      + (input.volatility >= 0.0032 ? 0.03 : 0)
+      + (input.densityLevel === "micro" ? 0.03 : 0),
+    0.9,
+    0.99,
+  );
+  const borderOpacity = clamp(
+    bodyOpacity + (input.visualProfileName === "institutional" ? 0.02 : 0.01) - (slotWidth < 6 ? 0.01 : 0),
+    0.9,
+    1,
+  );
+  const bodyRadiusPx = slotWidth < 4.2 || input.densityLevel === "micro"
+    ? 0
+    : clamp(Math.min(profile.rendering.bodyRadiusPx, preferredBodyWidthPx * 0.18), 0, 2);
+  const formingWidthPx = clamp(
+    perceptualCandle.formingWidthPx * input.deskMode.bodyWeight,
+    perceptualCandle.minBodyWidthPx,
+    perceptualCandle.maxBodyWidthPx,
+  );
+  const overlayWidthPx = clamp(
+    perceptualCandle.overlayWidthPx * input.deskMode.overlayWeight,
+    10,
+    64,
+  );
+  const lastBrightness = clamp(
+    1
+      + profile.perception.lastCandleGlow
+      + (tfSeconds <= 5 * 60 ? 0.03 : 0.015)
+      + (input.densityLevel === "micro" ? 0.015 : 0)
+      + (input.deskMode.mode === "execution" ? 0.02 : 0),
+    1.01,
+    1.1,
+  );
+
+  return {
+    preferredBodyWidthPx,
+    formingWidthPx,
+    overlayWidthPx,
+    wickWidthPx,
+    bodyRadiusPx,
+    baseBodyWidthPx: perceptualCandle.baseBodyWidthPx,
+    timeframeWeight: perceptualCandle.timeframeWeight,
+    densityFactor: perceptualCandle.densityFactor,
+    volatilityFactor: perceptualCandle.volatilityFactor,
+    zoomFactor: perceptualCandle.zoomFactor,
+    minBodyWidthPx: perceptualCandle.minBodyWidthPx,
+    maxBodyWidthPx: perceptualCandle.maxBodyWidthPx,
+    bodyToSpacingRatio: perceptualCandle.bodyToSpacingRatio,
+    bodyOpacity,
+    wickOpacity,
+    borderOpacity,
+    lastBrightness,
   };
 }
 
@@ -824,7 +1023,7 @@ function formatCursorTime(time: Time, timeframe = "1m"): string {
   return "--:--";
 }
 
-function timeToBucketKey(time: Time, timeframe: string): string {
+function timeToBucketKey(time: Time | number, timeframe: string): string {
   const step = timeframeSeconds(timeframe);
   if (typeof time === "number") {
     return String(Math.floor(time / step) * step * 1000);
@@ -841,6 +1040,125 @@ function timeToBucketKey(time: Time, timeframe: string): string {
     return String(Math.floor(parsed / (step * 1000)) * step * 1000);
   }
   return "";
+}
+
+function createNeutralExecutionSignal(timeKey: string): PerceptualExecutionSignal {
+  return {
+    timeKey,
+    fillProbability: 0,
+    slippageBps: 0,
+    latencyMs: 0,
+    routeScore: 0,
+    edgeBps: 0,
+    blockedRatio: 0,
+    partialFillRatio: 0,
+    confidence: 0,
+  };
+}
+
+function resolveFootprintAbsorption(totalVolume: number, deltaRatio: number, baselineVolume: number): number {
+  if (!Number.isFinite(totalVolume) || totalVolume <= 0) {
+    return 0;
+  }
+  const relativeVolume = totalVolume / Math.max(1, baselineVolume);
+  const compression = clamp(1 - Math.abs(deltaRatio) / 0.18, 0, 1);
+  return clamp(relativeVolume * 0.42 + compression * 0.58 - 0.35, 0, 1);
+}
+
+function buildPerceptualHeatSegmentsFromFootprint(input: {
+  buyVolume: number;
+  sellVolume: number;
+  deltaRatio: number;
+  absorption: number;
+  baselineVolume: number;
+}): PerceptualHeatSegment[] {
+  const totalVolume = Math.max(0, input.buyVolume) + Math.max(0, input.sellVolume);
+  if (totalVolume <= 0) {
+    return [];
+  }
+
+  const buyShare = clamp(input.buyVolume / Math.max(1, totalVolume), 0, 1);
+  const relativeVolume = clamp(totalVolume / Math.max(1, input.baselineVolume), 0.25, 1.9);
+  const directionalBias = clamp((input.deltaRatio + 1) * 0.5, 0, 1);
+
+  return new Array(4).fill(null).map((_, index) => {
+    const progress = (index + 0.5) / 4;
+    const segmentBias = input.deltaRatio >= 0 ? progress : 1 - progress;
+    const intensity = clamp(
+      0.12 + relativeVolume * 0.22 + Math.abs(input.deltaRatio) * (0.28 + segmentBias * 0.36) + input.absorption * 0.18,
+      0.08,
+      1,
+    );
+    const segmentDeltaRatio = clamp(
+      input.deltaRatio * (0.72 + segmentBias * 0.55),
+      -1,
+      1,
+    );
+    const segmentBuyShare = clamp(
+      buyShare + (directionalBias - 0.5) * 0.22 + (segmentBias - 0.5) * input.deltaRatio * 0.3,
+      0,
+      1,
+    );
+    return {
+      intensity,
+      deltaRatio: segmentDeltaRatio,
+      buyShare: segmentBuyShare,
+      absorption: input.absorption,
+    };
+  });
+}
+
+function resolvePerceptualFlowState(input: {
+  time: number;
+  timeframe: string;
+  volume: number;
+  footprintRowsByTimeKey: Map<string, Array<{ buyVolume: number; sellVolume: number; delta: number }>>;
+  footprintBaselineVolume: number;
+  executionSignalByTimeKey: Map<string, PerceptualExecutionSignal>;
+}): PerceptualCandleFlowState | undefined {
+  const timeKey = timeToBucketKey(input.time, input.timeframe);
+  if (!timeKey) {
+    return undefined;
+  }
+
+  const rows = input.footprintRowsByTimeKey.get(timeKey) || [];
+  const buyVolume = rows.reduce((sum, row) => sum + Math.max(0, row.buyVolume), 0);
+  const sellVolume = rows.reduce((sum, row) => sum + Math.max(0, row.sellVolume), 0);
+  const footprintVolume = buyVolume + sellVolume;
+  const volume = Math.max(0, Number.isFinite(input.volume) ? input.volume : 0, footprintVolume);
+  const delta = rows.length > 0
+    ? rows.reduce((sum, row) => sum + (Number.isFinite(row.delta) ? row.delta : (row.buyVolume - row.sellVolume)), 0)
+    : 0;
+  const deltaRatio = volume > 0 ? clamp(delta / volume, -1, 1) : 0;
+  const imbalance = volume > 0 ? clamp(Math.abs(delta) / volume, 0, 1) : 0;
+  const absorption = resolveFootprintAbsorption(volume, deltaRatio, input.footprintBaselineVolume);
+  const execution = input.executionSignalByTimeKey.get(timeKey) || createNeutralExecutionSignal(timeKey);
+  const heatSegments = buildPerceptualHeatSegmentsFromFootprint({
+    buyVolume,
+    sellVolume,
+    deltaRatio,
+    absorption,
+    baselineVolume: input.footprintBaselineVolume,
+  });
+
+  if (volume <= 0 && heatSegments.length === 0 && execution.confidence <= 0) {
+    return undefined;
+  }
+
+  return {
+    timeKey,
+    volume,
+    delta,
+    imbalance,
+    absorption,
+    liquidity: {
+      bid: buyVolume,
+      ask: sellVolume,
+      absorption,
+    },
+    execution,
+    heatSegments,
+  };
 }
 
 function formatCompactPrice(value: number): string {
@@ -1744,6 +2062,8 @@ export default function InstitutionalChart({
   showSessions = true,
   indicatorSeries,
   footprintRows,
+  executionSignals,
+  marketSimulation,
   candleTransform = "none",
   onCrosshairMove,
   onPerformanceTelemetry,
@@ -1906,6 +2226,63 @@ export default function InstitutionalChart({
     containerWidth: chartViewportWidth,
     motionPreset: resolvedMotionPreset,
   }), [chartViewportWidth, isLiteMode, mode, resolvedMotionPreset, timeframe]);
+  const [presentationStepPx, setPresentationStepPx] = useState(perceptualSpacingPolicy.barSpacing);
+  const [presentationVisibleBars, setPresentationVisibleBars] = useState(perceptualSpacingPolicy.targetVisibleBars);
+  const footprintRowsByTimeKey = useMemo(() => {
+    const grouped = new Map<string, Array<{ buyVolume: number; sellVolume: number; delta: number }>>();
+    for (const row of footprintRows || []) {
+      if (!row.timeKey) {
+        continue;
+      }
+      grouped.set(row.timeKey, [...(grouped.get(row.timeKey) || []), {
+        buyVolume: Math.max(0, row.buyVolume),
+        sellVolume: Math.max(0, row.sellVolume),
+        delta: Number.isFinite(row.delta) ? row.delta : row.buyVolume - row.sellVolume,
+      }]);
+    }
+    return grouped;
+  }, [footprintRows]);
+  const footprintBaselineVolume = useMemo(() => {
+    const totals = (footprintRows || [])
+      .map((row) => Math.max(0, row.buyVolume) + Math.max(0, row.sellVolume))
+      .filter((value) => Number.isFinite(value) && value > 0)
+      .sort((left, right) => left - right);
+    if (totals.length === 0) {
+      return 1;
+    }
+    return totals[Math.min(totals.length - 1, Math.floor(totals.length * 0.6))] || totals[totals.length - 1] || 1;
+  }, [footprintRows]);
+  const executionSignalByTimeKey = useMemo(() => {
+    const grouped = new Map<string, PerceptualExecutionSignal>();
+    for (const signal of executionSignals || []) {
+      if (!signal.timeKey) {
+        continue;
+      }
+      grouped.set(signal.timeKey, signal);
+    }
+    return grouped;
+  }, [executionSignals]);
+  const perceptualDeskMode = useMemo(() => resolvePerceptualDeskMode({
+    chartMode: mode,
+    timeframe,
+    visibleBars: presentationVisibleBars,
+    volatility: marketVolatility,
+    domImbalanceRatio,
+    domLevels,
+    heatmapLevels,
+    footprintRows,
+    isLiteMode,
+  }), [domImbalanceRatio, domLevels, footprintRows, heatmapLevels, isLiteMode, marketVolatility, mode, presentationVisibleBars, timeframe]);
+  const dynamicCandlePresentation = useMemo(() => resolveDynamicCandlePresentation({
+    spacingPolicy: perceptualSpacingPolicy,
+    slotWidthPx: presentationStepPx,
+    visibleBars: presentationVisibleBars,
+    densityLevel,
+    timeframe,
+    volatility: marketVolatility,
+    visualProfileName: visualProfile,
+    deskMode: perceptualDeskMode,
+  }), [densityLevel, marketVolatility, perceptualDeskMode, perceptualSpacingPolicy, presentationStepPx, presentationVisibleBars, timeframe, visualProfile]);
   const dragStateRef = useRef<DragState | null>(null);
   const candleStepPxRef = useRef(12);
   const lastPriceRef = useRef<number | null>(null);
@@ -2000,7 +2377,8 @@ export default function InstitutionalChart({
   }));
   const lastCommittedCandleRef = useRef<CandleRenderPoint | null>(null);
   const volatilityRef = useRef(marketVolatility);
-  const customV3RendererEnabled = ENABLE_CUSTOM_V3_CANDLE_RENDERER && mode === "candles";
+  const customV3RendererEnabled = mode === "candles" && ENABLE_CUSTOM_V3_CANDLE_RENDERER;
+  const nativeCandlesAuthoritative = mode === "candles" && !customV3RendererEnabled;
 
   const drawCustomV3CandleOverlay = useCallback(() => {
     const canvas = customCandleCanvasRef.current;
@@ -2044,9 +2422,11 @@ export default function InstitutionalChart({
       high: number;
       low: number;
       close: number;
+      timeKey?: string;
       color: string;
       wickColor: string;
       wickType?: PerceptionVisualMetadata["wickType"];
+      flow?: PerceptualCandleFlowState;
       isLast: boolean;
     }> = [];
     let minVisiblePrice = Number.POSITIVE_INFINITY;
@@ -2075,9 +2455,11 @@ export default function InstitutionalChart({
         high,
         low,
         close,
+        timeKey: point.timeKey,
         color: point.color || withAlpha(close >= open ? resolvedVisualProfile.palette.up : resolvedVisualProfile.palette.down, 0.92),
         wickColor: point.wickColor || point.color || withAlpha(close >= open ? resolvedVisualProfile.palette.up : resolvedVisualProfile.palette.down, 0.86),
         wickType: point.wickType,
+        flow: point.flow,
         isLast,
       });
       minVisiblePrice = Math.min(minVisiblePrice, low);
@@ -2152,17 +2534,23 @@ export default function InstitutionalChart({
         viewportWidth: width,
       });
       const visualBoost = Math.pow(priority.importance, 1.8);
-      let visualScale = 0.8 + visualBoost * 0.45;
-      const baseBodyWidth = resolveDeskBodyWidthPx(Math.max(candleStepPxRef.current, 1), densityLevelRef.current);
+      let visualScale = 0.94 + visualBoost * 0.42;
+      const baseBodyWidth = dynamicCandlePresentation.preferredBodyWidthPx;
       const nearLastPrice = Math.abs(entry.close - lastPrice) < Math.max((entry.high - entry.low) * 0.2, activeZoneHalfRange * 0.2);
       if (nearLastPrice) {
-        visualScale *= 1.1;
+        visualScale *= 1.14;
+      }
+      if (priority.crowdedDensity && !priority.deadZone) {
+        visualScale *= 1.06;
+      }
+      if (inActiveZone) {
+        visualScale *= 1.08;
       }
       const bodyWidth = Math.max(
-        priority.isLowRange ? 2 : 1,
+        priority.isLowRange ? 3 : densityLevelRef.current === "micro" ? 2.5 : 3,
         Math.round(baseBodyWidth * visualScale * (rangeRatio > 1.3 ? 0.96 : rangeRatio < 0.92 ? 1.1 : 1.03) * (1 + priority.focusBoost * 0.08)),
       );
-      const radius = densityLevelRef.current === "micro" || bodyWidth < 4 ? 0 : resolveDeskBodyRadiusPx(bodyWidth);
+      const radius = densityLevelRef.current === "micro" || bodyWidth < 4 ? 0 : dynamicCandlePresentation.bodyRadiusPx;
       const bodyTop = snapCssToDevicePixel(Math.min(openY, closeY));
       const bodyBottom = snapCssToDevicePixel(Math.max(openY, closeY));
       const rawBodyHeight = bodyBottom - bodyTop;
@@ -2171,9 +2559,13 @@ export default function InstitutionalChart({
       const wickTop = snapCssToDevicePixel(Math.min(highY, lowY));
       const wickBottom = snapCssToDevicePixel(Math.max(highY, lowY));
       const wickWidth = clamp(
-        priority.wickClass === "rejection" ? 1.8 : priority.wickClass === "absorption" ? 1.2 : 1,
-        1,
-        1.8,
+        computePerceptualWickWidth(
+          bodyWidth,
+          typeof window === "undefined" ? 1 : Math.max(1, window.devicePixelRatio || 1),
+          priority.wickClass === "rejection" ? 1.15 : priority.wickClass === "absorption" ? 1 : 0.92,
+        ),
+        dynamicCandlePresentation.wickWidthPx,
+        Math.max(dynamicCandlePresentation.wickWidthPx, bodyWidth - 1),
       );
       const capWidth = resolveDeskExtremeCapWidthPx(bodyWidth, wickWidth, densityLevelRef.current);
       const capHalfWidth = capWidth * 0.5;
@@ -2186,13 +2578,13 @@ export default function InstitutionalChart({
         wickAlpha *= 0.9;
       }
       if (priority.crowdedDensity && priority.wickClass === "neutral") {
-        wickAlpha *= 0.25;
+        wickAlpha *= 0.52;
       }
       if (priority.deadZone) {
-        wickAlpha *= 0.3;
+        wickAlpha *= 0.58;
       }
       if (priority.suppressNoise) {
-        wickAlpha *= 0.3;
+        wickAlpha *= 0.72;
       }
       wickAlpha = clamp(wickAlpha * (1 + priority.focusBoost * 0.4), 0.08, 1);
       let capAlpha = inActiveZone ? 0.97 : entry.isLast ? 0.95 : 0.92;
@@ -2215,17 +2607,17 @@ export default function InstitutionalChart({
         bodyAlpha = 0.85;
       }
       if (priority.deadZone) {
-        bodyAlpha *= 0.3;
+        bodyAlpha *= 0.62;
       }
       if (priority.suppressNoise) {
-        bodyAlpha *= 0.4;
+        bodyAlpha *= 0.76;
       }
       if (rawBodyHeight < 1.5) {
         bodyHeight = Math.max(bodyHeight, 1.5);
         bodyAlpha = Math.max(bodyAlpha, 0.9);
       }
-      bodyAlpha = clamp(bodyAlpha * (1 + priority.focusBoost * 0.4), priority.isLowRange ? 0.8 : 0.18, 1);
-      const outlineAlpha = clamp((entry.isLast ? 0.28 : inActiveZone ? 0.22 : 0.18) + (priority.isLowRange ? 0.05 : 0), 0.18, 0.32);
+      bodyAlpha = clamp(bodyAlpha * (1 + priority.focusBoost * 0.4), priority.isLowRange ? 0.84 : 0.26, 1);
+      const outlineAlpha = clamp((entry.isLast ? 0.3 : inActiveZone ? 0.24 : 0.2) + (priority.isLowRange ? 0.05 : 0), 0.2, 0.36);
 
       ctx.save();
       ctx.lineCap = "round";
@@ -2260,6 +2652,45 @@ export default function InstitutionalChart({
       ctx.fillStyle = entry.color;
       drawDeskRoundRect(ctx, bodyLeft, bodyTop, bodyWidth, bodyHeight, radius);
 
+      const internalHeatAlpha = clamp(
+        perceptualDeskMode.heatAlpha * (0.55 + priority.importance * 0.45) * (entry.isLast ? 1.12 : 1),
+        0,
+        0.28,
+      );
+      if (internalHeatAlpha > 0.01 && bodyHeight > 2 && bodyWidth > 2) {
+        ctx.globalAlpha = 1;
+        if ((entry.flow?.heatSegments.length || 0) > 0) {
+          const heatSegments = entry.flow?.heatSegments || [];
+          const innerLeft = bodyLeft + 0.5;
+          const innerWidth = Math.max(1, bodyWidth - 1);
+          const segmentHeight = Math.max(1, (Math.max(1, bodyHeight - 1)) / heatSegments.length);
+          for (const [segmentIndex, segment] of heatSegments.entries()) {
+            const segmentTop = bodyTop + 0.5 + segmentIndex * segmentHeight;
+            const segmentBottom = segmentIndex === heatSegments.length - 1
+              ? bodyBottom - 0.5
+              : Math.min(bodyBottom - 0.5, segmentTop + segmentHeight);
+            const segmentColor = mixColors(
+              resolvedVisualProfile.palette.down,
+              resolvedVisualProfile.palette.up,
+              clamp(segment.buyShare + segment.deltaRatio * 0.08, 0, 1),
+            );
+            const segmentTint = mixColors(segmentColor, "#f8fbff", clamp(0.12 + segment.absorption * 0.24, 0.12, 0.42));
+            ctx.fillStyle = withAlpha(
+              segmentTint,
+              internalHeatAlpha * clamp(0.42 + segment.intensity * 0.92, 0.22, 1),
+            );
+            ctx.fillRect(innerLeft, segmentTop, innerWidth, Math.max(1, segmentBottom - segmentTop));
+          }
+        } else {
+          const heatGradient = ctx.createLinearGradient(bodyLeft, bodyTop, bodyLeft + bodyWidth, bodyBottom);
+          heatGradient.addColorStop(0, withAlpha(entry.close >= entry.open ? resolvedVisualProfile.palette.up : resolvedVisualProfile.palette.down, internalHeatAlpha * 1.15));
+          heatGradient.addColorStop(0.5, withAlpha("#f8fbff", internalHeatAlpha * 0.42));
+          heatGradient.addColorStop(1, withAlpha(entry.close >= entry.open ? resolvedVisualProfile.palette.up : resolvedVisualProfile.palette.down, internalHeatAlpha * 0.18));
+          ctx.fillStyle = heatGradient;
+          drawDeskRoundRect(ctx, bodyLeft + 0.5, bodyTop + 0.5, Math.max(1, bodyWidth - 1), Math.max(1, bodyHeight - 1), Math.max(0, radius - 0.25));
+        }
+      }
+
       ctx.globalAlpha = outlineAlpha;
       ctx.strokeStyle = "rgba(244, 251, 255, 0.92)";
       ctx.lineWidth = 1;
@@ -2269,10 +2700,128 @@ export default function InstitutionalChart({
         ctx.globalAlpha = 0.12;
         ctx.fillStyle = "#ffffff";
         drawDeskRoundRect(ctx, bodyLeft, bodyTop, bodyWidth, bodyHeight, radius);
+        if (perceptualDeskMode.mode === "execution" && perceptualDeskMode.coneAlpha > 0.01) {
+          if (marketSimulation) {
+            const horizonX100 = centerX + dynamicCandlePresentation.overlayWidthPx * 0.72;
+            const horizonX250 = centerX + dynamicCandlePresentation.overlayWidthPx * 1.18;
+            const horizonX500 = centerX + dynamicCandlePresentation.overlayWidthPx * 1.72;
+            const simExpected100Y = candleSeries.priceToCoordinate(marketSimulation.t100ms.price);
+            const simExpected250Y = candleSeries.priceToCoordinate(marketSimulation.t250ms.price);
+            const simExpected500Y = candleSeries.priceToCoordinate(marketSimulation.t500ms.price);
+            const simBestY = candleSeries.priceToCoordinate(marketSimulation.cone.best);
+            const simExpectedY = candleSeries.priceToCoordinate(marketSimulation.cone.expected);
+            const simWorstY = candleSeries.priceToCoordinate(marketSimulation.cone.worst);
+            if (
+              simExpected100Y !== null
+              && simExpected250Y !== null
+              && simExpected500Y !== null
+              && simBestY !== null
+              && simExpectedY !== null
+              && simWorstY !== null
+            ) {
+              const simulationColor = marketSimulation.decision.action === "sell"
+                ? resolvedVisualProfile.palette.down
+                : resolvedVisualProfile.palette.up;
+              const simulationAlpha = clamp(
+                perceptualDeskMode.coneAlpha * (0.38 + marketSimulation.confidence * 0.44 + marketSimulation.execution.fillProb * 0.18),
+                0.12,
+                0.76,
+              );
+              const startX = centerX + bodyWidth * 0.45;
+              const startY = (bodyTop + bodyBottom) * 0.5;
+              const fanGradient = ctx.createLinearGradient(startX, startY, horizonX500, simExpectedY);
+              fanGradient.addColorStop(0, withAlpha(simulationColor, simulationAlpha * 0.92));
+              fanGradient.addColorStop(0.6, withAlpha(mixColors(simulationColor, "#f8fbff", 0.18), simulationAlpha * 0.42));
+              fanGradient.addColorStop(1, withAlpha(simulationColor, 0));
+              ctx.globalAlpha = 1;
+              ctx.fillStyle = fanGradient;
+              ctx.beginPath();
+              ctx.moveTo(startX, startY);
+              ctx.lineTo(horizonX100, simExpected100Y);
+              ctx.lineTo(horizonX250, simExpected250Y);
+              ctx.lineTo(horizonX500, simBestY);
+              ctx.lineTo(horizonX500, simWorstY);
+              ctx.lineTo(horizonX250, simExpected250Y);
+              ctx.lineTo(horizonX100, simExpected100Y);
+              ctx.closePath();
+              ctx.fill();
+              ctx.strokeStyle = withAlpha(simulationColor, simulationAlpha * 0.94);
+              ctx.lineWidth = 1.1;
+              ctx.beginPath();
+              ctx.moveTo(startX, startY);
+              ctx.lineTo(horizonX100, simExpected100Y);
+              ctx.lineTo(horizonX250, simExpected250Y);
+              ctx.lineTo(horizonX500, simExpected500Y);
+              ctx.stroke();
+              for (const [dotX, dotY] of [[horizonX100, simExpected100Y], [horizonX250, simExpected250Y], [horizonX500, simExpected500Y]] as const) {
+                ctx.fillStyle = withAlpha(simulationColor, simulationAlpha);
+                ctx.beginPath();
+                ctx.arc(dotX, dotY, 2.4, 0, Math.PI * 2);
+                ctx.fill();
+              }
+              ctx.strokeStyle = withAlpha(simulationColor, simulationAlpha * 0.6);
+              ctx.setLineDash([3, 3]);
+              ctx.beginPath();
+              ctx.moveTo(horizonX500 - 2, simBestY);
+              ctx.lineTo(horizonX500 + 10, simBestY);
+              ctx.moveTo(horizonX500 - 2, simWorstY);
+              ctx.lineTo(horizonX500 + 10, simWorstY);
+              ctx.stroke();
+              ctx.setLineDash([]);
+              ctx.font = '600 10px ui-monospace, SFMono-Regular, Menlo, monospace';
+              ctx.fillStyle = withAlpha("#f4fbff", 0.92);
+              const simLabel = `${marketSimulation.stateLabel.toUpperCase()} ${marketSimulation.decision.shouldExecute ? marketSimulation.decision.action.toUpperCase() : "HOLD"}`;
+              ctx.fillText(simLabel, horizonX100, Math.min(height - 8, Math.max(12, simBestY - 8)));
+            }
+          } else {
+            const executionSignal = entry.flow?.execution || createNeutralExecutionSignal(entry.timeKey || "");
+            const fillProbability = clamp(executionSignal.fillProbability, 0, 1);
+            const riskPenalty = clamp(
+              Math.abs(executionSignal.slippageBps) / Math.max(12, Math.abs(executionSignal.edgeBps) + 12) * 0.34
+                + executionSignal.blockedRatio * 0.48
+                + executionSignal.partialFillRatio * 0.18
+                + executionSignal.latencyMs / 900 * 0.24,
+              0,
+              1,
+            );
+            const coneWidth = dynamicCandlePresentation.overlayWidthPx
+              * (0.92 + perceptualDeskMode.executionScore * 0.92 + fillProbability * 0.9 + executionSignal.confidence * 0.68);
+            const coneRight = centerX + coneWidth;
+            const coneMidY = (bodyTop + bodyBottom) * 0.5;
+            const coneTop = coneMidY - Math.max(4, bodyHeight * (0.72 + executionSignal.partialFillRatio * 0.35 + fillProbability * 0.2));
+            const coneBottom = coneMidY + Math.max(4, bodyHeight * (0.72 + executionSignal.blockedRatio * 0.3 + (1 - fillProbability) * 0.18));
+            const executionColor = executionSignal.edgeBps >= 0
+              ? resolvedVisualProfile.palette.up
+              : resolvedVisualProfile.palette.down;
+            const coneAlpha = clamp(
+              perceptualDeskMode.coneAlpha * (0.45 + fillProbability * 0.34 + executionSignal.confidence * 0.24) * (1 - riskPenalty * 0.42),
+              0.08,
+              0.72,
+            );
+            const coneGradient = ctx.createLinearGradient(centerX, coneMidY, coneRight, coneMidY);
+            coneGradient.addColorStop(0, withAlpha(executionColor, coneAlpha));
+            coneGradient.addColorStop(0.45, withAlpha(mixColors(executionColor, "#f8fbff", 0.2), coneAlpha * 0.42));
+            coneGradient.addColorStop(1, withAlpha(executionColor, 0));
+            ctx.globalAlpha = 1;
+            ctx.fillStyle = coneGradient;
+            ctx.beginPath();
+            ctx.moveTo(centerX + bodyWidth * 0.45, coneTop);
+            ctx.lineTo(coneRight, coneMidY);
+            ctx.lineTo(centerX + bodyWidth * 0.45, coneBottom);
+            ctx.closePath();
+            ctx.fill();
+            ctx.strokeStyle = withAlpha(executionColor, coneAlpha * 0.8);
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(centerX + bodyWidth * 0.35, coneMidY);
+            ctx.lineTo(coneRight - 2, coneMidY);
+            ctx.stroke();
+          }
+        }
       }
       ctx.restore();
     }
-  }, [customV3RendererEnabled, resolvedVisualProfile]);
+  }, [customV3RendererEnabled, dynamicCandlePresentation.overlayWidthPx, perceptualDeskMode.coneAlpha, perceptualDeskMode.executionScore, perceptualDeskMode.heatAlpha, perceptualDeskMode.mode, resolvedVisualProfile, marketSimulation]);
 
   const scheduleCustomV3CandleOverlayDraw = useCallback(() => {
     if (typeof window === "undefined") {
@@ -2362,7 +2911,7 @@ export default function InstitutionalChart({
         })),
         {
           densityLevel: densityLevelRef.current,
-          visibleBars: Math.max(visibleBarsRef.current, frame.candles.length),
+          visibleBars: resolveViewportVisibleBars(visibleBarsRef.current, currentTimeScalePolicyRef.current.targetVisibleBars),
           timeframe,
           volatility: volatilityRef.current,
           visualProfile,
@@ -2442,7 +2991,7 @@ export default function InstitutionalChart({
         });
         if (shouldConflateRenderPointUpdate(lastCommittedCandleRef.current, lastPoint, {
           densityLevel: densityLevelRef.current,
-          visibleBars: Math.max(visibleBarsRef.current, candleData.length),
+          visibleBars: resolveViewportVisibleBars(visibleBarsRef.current, currentTimeScalePolicyRef.current.targetVisibleBars),
           timeframe,
           volatility: volatilityRef.current,
           visualProfile,
@@ -2818,6 +3367,65 @@ export default function InstitutionalChart({
   }, [perceptualSpacingPolicy]);
 
   useEffect(() => {
+    const resetVisibleBars = resolveViewportVisibleBars(0, perceptualSpacingPolicy.targetVisibleBars);
+    visibleBarsRef.current = resetVisibleBars;
+    candleStepPxRef.current = clamp(
+      chartViewportWidth > 0 ? chartViewportWidth / resetVisibleBars : perceptualSpacingPolicy.barSpacing,
+      2,
+      80,
+    );
+    setPresentationStepPx(candleStepPxRef.current);
+    setPresentationVisibleBars(resetVisibleBars);
+
+    const chart = chartRef.current;
+    if (!chart) {
+      return;
+    }
+
+    userAdjustedTimeScaleRef.current = false;
+    hasInitializedRangeRef.current = false;
+    chart.timeScale().applyOptions({
+      rightOffset: perceptualSpacingPolicy.rightOffset,
+      barSpacing: perceptualSpacingPolicy.barSpacing,
+      minBarSpacing: perceptualSpacingPolicy.minBarSpacing,
+    });
+  }, [chartViewportWidth, mode, perceptualSpacingPolicy.barSpacing, perceptualSpacingPolicy.minBarSpacing, perceptualSpacingPolicy.rightOffset, perceptualSpacingPolicy.targetVisibleBars, symbol, timeframe]);
+
+  useEffect(() => {
+    setPresentationStepPx((current) => (
+      Math.abs(current - perceptualSpacingPolicy.barSpacing) < 0.35
+        ? current
+        : perceptualSpacingPolicy.barSpacing
+    ));
+  }, [perceptualSpacingPolicy.barSpacing]);
+
+  useEffect(() => {
+    setPresentationVisibleBars((current) => (
+      Math.abs(current - perceptualSpacingPolicy.targetVisibleBars) < 1
+        ? current
+        : perceptualSpacingPolicy.targetVisibleBars
+    ));
+  }, [perceptualSpacingPolicy.targetVisibleBars]);
+
+  useEffect(() => {
+    if (!candleSeriesRef.current) {
+      return;
+    }
+    candleSeriesRef.current.applyOptions({
+      ...resolvePerceptualCandleStyleOptions(
+        symbol,
+        timeframe,
+        densityLevel,
+        marketVolatility,
+        visualProfile,
+        domImbalanceRatio,
+        dynamicCandlePresentation,
+      ),
+      visible: mode !== "line",
+    });
+  }, [densityLevel, domImbalanceRatio, dynamicCandlePresentation, marketVolatility, mode, symbol, timeframe, visualProfile]);
+
+  useEffect(() => {
     candleAutoscaleSnapshotRef.current = null;
     areaAutoscaleSnapshotRef.current = null;
     candleAutoscaleTelemetryRef.current = {
@@ -2851,7 +3459,7 @@ export default function InstitutionalChart({
   }, [framePerf.cpuLoad, framePerf.fps, framePerf.frameTimeMs, onPerformanceTelemetry, workerLatencyMs]);
 
   useEffect(() => {
-    if (!onPerceptualTelemetry || typeof window === "undefined") {
+    if (typeof window === "undefined") {
       return undefined;
     }
 
@@ -2862,8 +3470,11 @@ export default function InstitutionalChart({
       const activeAutoscaleTelemetry = mode === "line"
         ? areaAutoscaleTelemetryRef.current
         : candleAutoscaleTelemetryRef.current;
+      const pixelRatio = typeof window === "undefined" ? 1 : Math.max(1, window.devicePixelRatio || 1);
+      const rawSpacingPx = candleStepPxRef.current;
+      const quantizedSpacingPx = quantizePerceptualBarSpacing(rawSpacingPx);
 
-      onPerceptualTelemetry({
+      const payload: ChartPerceptualTelemetry = {
         engine: "v3",
         symbol,
         timeframe,
@@ -2874,6 +3485,53 @@ export default function InstitutionalChart({
         visibleBars: Math.max(0, Math.round(visibleBarsRef.current || 0)),
         candleStepPx: candleStepPxRef.current,
         spacing: currentTimeScalePolicyRef.current,
+        pixel: {
+          pixelRatio,
+          rawSpacingPx,
+          quantizedSpacingPx,
+          snapDeltaPx: quantizedSpacingPx - rawSpacingPx,
+          spacingZone: classifySpacingZone(quantizedSpacingPx),
+          preferredBodyWidthPx: dynamicCandlePresentation.preferredBodyWidthPx,
+          wickWidthPx: dynamicCandlePresentation.wickWidthPx,
+          overlayWidthPx: dynamicCandlePresentation.overlayWidthPx,
+          bodyRadiusPx: dynamicCandlePresentation.bodyRadiusPx,
+        },
+        perceptual: {
+          baseBodyWidthPx: dynamicCandlePresentation.baseBodyWidthPx,
+          timeframeWeight: dynamicCandlePresentation.timeframeWeight,
+          densityFactor: dynamicCandlePresentation.densityFactor,
+          volatilityFactor: dynamicCandlePresentation.volatilityFactor,
+          zoomFactor: dynamicCandlePresentation.zoomFactor,
+          minBodyWidthPx: dynamicCandlePresentation.minBodyWidthPx,
+          maxBodyWidthPx: dynamicCandlePresentation.maxBodyWidthPx,
+          bodyToSpacingRatio: dynamicCandlePresentation.bodyToSpacingRatio,
+        },
+        desk: {
+          mode: perceptualDeskMode.mode,
+          authoritativeRenderer: perceptualDeskMode.authoritativeRenderer,
+          liquidityScore: perceptualDeskMode.liquidityScore,
+          heatScore: perceptualDeskMode.heatScore,
+          deltaScore: perceptualDeskMode.deltaScore,
+          executionScore: perceptualDeskMode.executionScore,
+          confidence: perceptualDeskMode.confidence,
+        },
+        simulation: {
+          stateLabel: marketSimulation?.stateLabel || "neutral",
+          decisionAction: marketSimulation?.decision.action || "hold",
+          shouldExecute: marketSimulation?.decision.shouldExecute || false,
+          confidence: marketSimulation?.confidence || 0,
+          liquidityCollapse: marketSimulation?.liquidityCollapse || false,
+          imbalance: marketSimulation?.imbalance || 0,
+          fillProbability: marketSimulation?.execution.fillProb || 0,
+          slippageBps: marketSimulation?.execution.slippage || 0,
+          latencyMs: marketSimulation?.execution.latency || 0,
+          t100msPrice: marketSimulation?.t100ms.price ?? null,
+          t250msPrice: marketSimulation?.t250ms.price ?? null,
+          t500msPrice: marketSimulation?.t500ms.price ?? null,
+          coneBest: marketSimulation?.cone.best ?? null,
+          coneExpected: marketSimulation?.cone.expected ?? null,
+          coneWorst: marketSimulation?.cone.worst ?? null,
+        },
         autoscale: {
           min: activeAutoscaleSnapshot?.min ?? null,
           max: activeAutoscaleSnapshot?.max ?? null,
@@ -2901,12 +3559,30 @@ export default function InstitutionalChart({
           workerLatencyMs,
         },
         updatedAt: new Date().toISOString(),
-      });
+      };
+
+      const host = containerRef.current;
+      if (host) {
+        host.setAttribute("data-chart-perceptual-telemetry", JSON.stringify(payload));
+        host.setAttribute("data-chart-perceptual-timeframe", timeframe);
+        host.setAttribute("data-chart-perceptual-updated-at", payload.updatedAt);
+      }
+
+      (window as Window & {
+        __MC_CHART_PERCEPTUAL_TELEMETRY__?: ChartPerceptualTelemetry | null;
+      }).__MC_CHART_PERCEPTUAL_TELEMETRY__ = payload;
+      onPerceptualTelemetry?.(payload);
     };
 
     publish();
     const intervalId = window.setInterval(publish, 1000);
     return () => {
+      const host = containerRef.current;
+      if (host) {
+        host.removeAttribute("data-chart-perceptual-telemetry");
+        host.removeAttribute("data-chart-perceptual-timeframe");
+        host.removeAttribute("data-chart-perceptual-updated-at");
+      }
       window.clearInterval(intervalId);
     };
   }, [
@@ -2917,9 +3593,21 @@ export default function InstitutionalChart({
     framePerf.frameTimeMs,
     mode,
     onPerceptualTelemetry,
+    perceptualDeskMode.authoritativeRenderer,
+    perceptualDeskMode.confidence,
+    perceptualDeskMode.deltaScore,
+    perceptualDeskMode.executionScore,
+    perceptualDeskMode.heatScore,
+    perceptualDeskMode.liquidityScore,
+    perceptualDeskMode.mode,
     resolvedMotionPreset,
+    marketSimulation,
     symbol,
     timeframe,
+    dynamicCandlePresentation.bodyRadiusPx,
+    dynamicCandlePresentation.overlayWidthPx,
+    dynamicCandlePresentation.preferredBodyWidthPx,
+    dynamicCandlePresentation.wickWidthPx,
     workerLatencyMs,
   ]);
 
@@ -3269,6 +3957,7 @@ export default function InstitutionalChart({
       }
       const timeScale = chart.timeScale();
       const containerWidth = Math.max(1, containerRef.current?.clientWidth ?? 800);
+      const spacingPolicy = currentTimeScalePolicyRef.current;
       if (Math.abs(driftX) > 0.001) {
         const currentScroll = timeScale.scrollPosition();
         const scrollImpulse = Math.sign(driftX) * Math.pow(Math.abs(driftX), 0.92);
@@ -3289,9 +3978,13 @@ export default function InstitutionalChart({
           // Stronger zoom multiplier for responsive wheel feel
           const boostK = adaptiveK * 1.6;
           const zoomFactor = Math.exp(zoomImpulse * boostK);
-          let nextWidth = clamp(width * zoomFactor, 8, 600);
+          let nextWidth = resolveStableLogicalWidthFromSpacing({
+            containerWidth,
+            requestedVisibleBars: width * zoomFactor,
+            spacingPolicy,
+          });
           // Soft snap: finer grid with very tight threshold (almost free zoom)
-          const spacingTargets = [3, 3.5, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 20, 24, 28, 32, 40, 52, 64];
+          const spacingTargets = [2, 4, 6, 8, 10, 12, 16, 20, 24, 28, 32, 40, 52, 64];
           const nextStepPx = clamp(containerWidth / nextWidth, 2, 80);
           let bestStep = nextStepPx;
           let bestGap = Number.POSITIVE_INFINITY;
@@ -3304,7 +3997,11 @@ export default function InstitutionalChart({
           }
           const snapThreshold = clamp(stepPxCurrent * 0.04, 0.15, 0.6);
           if (bestGap <= snapThreshold) {
-            nextWidth = clamp(containerWidth / bestStep, 8, 600);
+            nextWidth = resolveStableLogicalWidthFromSpacing({
+              containerWidth,
+              requestedVisibleBars: containerWidth / bestStep,
+              spacingPolicy,
+            });
           }
           // Cursor-centered zoom: anchored at mouse position, not chart center
           const cursorFrac = clamp(wheelCursorXRef.current / containerWidth, 0, 1);
@@ -3404,11 +4101,16 @@ export default function InstitutionalChart({
         if (range) {
           userAdjustedTimeScaleRef.current = true;
           const width = Math.max(1, range.to - range.from);
+          const spacingPolicy = currentTimeScalePolicyRef.current;
           // Zoom direction: scroll-up (deltaY<0) = zoom IN (fewer bars); scroll-down = zoom OUT
-          const zoomDelta = -event.deltaY;
+          const zoomDelta = event.deltaY;
           const zoomK = 0.0012;
           const zoomFactor = Math.exp(zoomDelta * zoomK);
-          const nextWidth = clamp(width * zoomFactor, 6, 800);
+          const nextWidth = resolveStableLogicalWidthFromSpacing({
+            containerWidth,
+            requestedVisibleBars: width * zoomFactor,
+            spacingPolicy,
+          });
           // Cursor-centered zoom
           const cursorFrac = clamp(cursorX / containerWidth, 0, 1);
           const cursorLogical = range.from + cursorFrac * width;
@@ -3422,6 +4124,13 @@ export default function InstitutionalChart({
       }
     };
 
+    const shouldHandleChartPointer = (target: EventTarget | null) => {
+      if (!(target instanceof Element)) {
+        return false;
+      }
+      return Boolean(target.closest(".chart-canvas-host"));
+    };
+
     const stopRightDrag = () => {
       if (!rightDragActiveRef.current) {
         return;
@@ -3431,12 +4140,11 @@ export default function InstitutionalChart({
     };
 
     const onMouseDown = (event: MouseEvent) => {
-      if (event.button !== 2) {
+      if (event.button !== 0 || !shouldHandleChartPointer(event.target)) {
         return;
       }
       rightDragActiveRef.current = true;
       rightDragLastXRef.current = event.clientX;
-      suppressContextMenuUntilRef.current = Date.now() + 400;
       userAdjustedTimeScaleRef.current = true;
       markUserInteraction(1200);
       host.classList.add("chart-time-pan-active");
@@ -3471,14 +4179,13 @@ export default function InstitutionalChart({
     };
 
     const onMouseUp = (event: MouseEvent) => {
-      if (event.button === 2 || rightDragActiveRef.current) {
-        suppressContextMenuUntilRef.current = Date.now() + 400;
+      if (event.button === 0 || rightDragActiveRef.current) {
         stopRightDrag();
       }
     };
 
     const onContextMenu = (event: MouseEvent) => {
-      if (rightDragActiveRef.current || Date.now() < suppressContextMenuUntilRef.current) {
+      if (rightDragActiveRef.current) {
         event.preventDefault();
       }
     };
@@ -3988,7 +4695,7 @@ export default function InstitutionalChart({
       if (timeCoord !== null) {
         updateActiveCandleOverlay({
           left: clamp(timeCoord, 0, container.clientWidth),
-          width: clamp(candleStepPxRef.current * 0.94, 10, 62),
+          width: dynamicCandlePresentation.overlayWidthPx,
           source: "crosshair",
         });
       }
@@ -4011,11 +4718,63 @@ export default function InstitutionalChart({
       if (!c) return;
       const r = chart.timeScale().getVisibleLogicalRange();
       if (!r) return;
+      const spacingPolicy = currentTimeScalePolicyRef.current;
       const barsVisible = Math.max(1, r.to - r.from);
+      if (barsVisible > spacingPolicy.maxVisibleBars + 1) {
+        const center = (r.from + r.to) * 0.5;
+        const nextWidth = spacingPolicy.maxVisibleBars;
+        chart.timeScale().setVisibleLogicalRange({
+          from: center - nextWidth * 0.5,
+          to: center + nextWidth * 0.5,
+        });
+        return;
+      }
+      if (barsVisible < spacingPolicy.minVisibleBars - 1) {
+        const center = (r.from + r.to) * 0.5;
+        const nextWidth = spacingPolicy.minVisibleBars;
+        chart.timeScale().setVisibleLogicalRange({
+          from: center - nextWidth * 0.5,
+          to: center + nextWidth * 0.5,
+        });
+        return;
+      }
       visibleBarsRef.current = barsVisible;
       const estStepPx = Math.max(2, c.clientWidth / barsVisible);
+      const stableVisibleWidth = resolveStableLogicalWidthFromSpacing({
+        containerWidth: c.clientWidth,
+        requestedVisibleBars: barsVisible,
+        spacingPolicy,
+      });
+      if (Math.abs(stableVisibleWidth - barsVisible) > 1.2) {
+        const center = (r.from + r.to) * 0.5;
+        chart.timeScale().setVisibleLogicalRange({
+          from: center - stableVisibleWidth * 0.5,
+          to: center + stableVisibleWidth * 0.5,
+        });
+        return;
+      }
       candleStepPxRef.current = clamp(estStepPx, 2, 80);
-      const nextOverlayWidth = clamp(candleStepPxRef.current * 0.94, 10, 62);
+      const nextPresentation = resolveDynamicCandlePresentation({
+        spacingPolicy,
+        slotWidthPx: candleStepPxRef.current,
+        visibleBars: barsVisible,
+        densityLevel: densityLevelRef.current,
+        timeframe,
+        volatility: volatilityRef.current,
+        visualProfileName: visualProfile,
+        deskMode: perceptualDeskMode,
+      });
+      const nextOverlayWidth = nextPresentation.overlayWidthPx;
+      setPresentationStepPx((current) => (
+        Math.abs(current - candleStepPxRef.current) < 0.35
+          ? current
+          : candleStepPxRef.current
+      ));
+      setPresentationVisibleBars((current) => (
+        Math.abs(current - barsVisible) < 1
+          ? current
+          : barsVisible
+      ));
       setActiveCandleOverlay((current) => {
         if (!current) {
           return current;
@@ -4120,7 +4879,9 @@ export default function InstitutionalChart({
     }));
 
     const range = chart.timeScale().getVisibleLogicalRange();
-    const visibleBars = range ? Math.max(1, Math.ceil(range.to - range.from)) : rawBarsForRender.length;
+    const visibleBars = range
+      ? Math.max(1, Math.ceil(range.to - range.from))
+      : resolveViewportVisibleBars(visibleBarsRef.current, currentTimeScalePolicyRef.current.targetVisibleBars);
     const shouldGpuSafe = densityLevel === "micro" || visibleBars > 150;
     setGpuSafeMode((current) => (current === shouldGpuSafe ? current : shouldGpuSafe));
 
@@ -4515,6 +5276,15 @@ export default function InstitutionalChart({
 
     let candleData: CandleSeriesPoint[];
 
+    const buildFlowState = (time: number, volume: number) => resolvePerceptualFlowState({
+      time,
+      timeframe,
+      volume,
+      footprintRowsByTimeKey,
+      footprintBaselineVolume,
+      executionSignalByTimeKey,
+    });
+
     if (candleTransform === "heikin-ashi" && lodBars.length > 0) {
       const ha = heikinAshi(lodBars);
       candleData = applyPerceptualRenderPipeline(
@@ -4525,6 +5295,8 @@ export default function InstitutionalChart({
           low: bar.low,
           close: bar.close,
           volume: lodBars[index]?.volume ?? 0,
+          timeKey: timeToBucketKey(Number(bar.time), timeframe),
+          flow: buildFlowState(Number(bar.time), lodBars[index]?.volume ?? 0),
         })),
         {
           densityLevel,
@@ -4537,7 +5309,11 @@ export default function InstitutionalChart({
         },
       );
     } else {
-      candleData = applyPerceptualRenderPipeline(lodBars, {
+      candleData = applyPerceptualRenderPipeline(lodBars.map((bar) => ({
+        ...bar,
+        timeKey: timeToBucketKey(Number(bar.time), timeframe),
+        flow: buildFlowState(Number(bar.time), bar.volume ?? 0),
+      })), {
         densityLevel,
         visibleBars,
         timeframe,
@@ -4570,12 +5346,14 @@ export default function InstitutionalChart({
         high,
         low,
         close,
+        timeKey: bar.timeKey,
         color: bar.color,
         borderColor: bar.borderColor,
         wickColor: bar.wickColor,
         wickType: bar.wickType,
         emphasis: bar.emphasis,
         styleKey: bar.styleKey,
+        flow: bar.flow,
       });
       prevTime = time;
     }
@@ -4662,9 +5440,14 @@ export default function InstitutionalChart({
           high: current.high + (target.high - current.high) * alpha,
           low: current.low + (target.low - current.low) * alpha,
           close: current.close + (target.close - current.close) * alpha,
+          timeKey: target.timeKey ?? current.timeKey,
           color: target.color ?? current.color,
           borderColor: target.borderColor ?? current.borderColor,
           wickColor: target.wickColor ?? current.wickColor,
+          wickType: target.wickType ?? current.wickType,
+          emphasis: target.emphasis ?? current.emphasis,
+          styleKey: target.styleKey ?? current.styleKey,
+          flow: target.flow ?? current.flow,
         };
         next.high = Math.max(next.high, next.open, next.close);
         next.low = Math.min(next.low, next.open, next.close);
@@ -4729,12 +5512,14 @@ export default function InstitutionalChart({
           high,
           low,
           close,
+          timeKey: bar.timeKey,
           color: bar.color,
           borderColor: bar.borderColor,
           wickColor: bar.wickColor,
           wickType: bar.wickType,
           emphasis: bar.emphasis,
           styleKey: bar.styleKey,
+          flow: bar.flow,
         });
         prevTime = time;
       }
@@ -4750,12 +5535,14 @@ export default function InstitutionalChart({
             high: Number(lastPoint.high),
             low: Number(lastPoint.low),
             close: Number(lastPoint.close),
+            timeKey: lastPoint.timeKey,
             color: lastPoint.color,
             borderColor: lastPoint.borderColor,
             wickColor: lastPoint.wickColor,
             wickType: lastPoint.wickType,
             emphasis: lastPoint.emphasis,
             styleKey: lastPoint.styleKey,
+            flow: lastPoint.flow,
           })
           : null;
       } catch {
@@ -4798,12 +5585,14 @@ export default function InstitutionalChart({
           high: Number(lastCandle.high),
           low: Number(lastCandle.low),
           close: Number(lastCandle.close),
+          timeKey: lastCandle.timeKey,
           color: lastCandle.color,
           borderColor: lastCandle.borderColor,
           wickColor: lastCandle.wickColor,
           wickType: lastCandle.wickType,
           emphasis: lastCandle.emphasis,
           styleKey: lastCandle.styleKey,
+          flow: lastCandle.flow,
         });
         const lastPoint = normalizeRenderPoint(rawLastPoint);
         if (!isFiniteCandleRenderPoint(lastPoint)) {
@@ -4871,7 +5660,7 @@ export default function InstitutionalChart({
         intraCandleTargetRef.current = intraCandleCurrentRef.current;
       }
 
-      const seriesStyleKey = `${mode}|${symbol}|${timeframe}|${visualProfile}|${densityLevel}|${Math.round(marketVolatility * 10000)}|${Math.round(domImbalanceRatio * 100)}`;
+      const seriesStyleKey = `${mode}|${symbol}|${timeframe}|${visualProfile}|${densityLevel}|${Math.round(marketVolatility * 10000)}|${Math.round(domImbalanceRatio * 100)}|${Math.round(dynamicCandlePresentation.preferredBodyWidthPx * 10)}|${Math.round(dynamicCandlePresentation.wickWidthPx * 10)}|${Math.round(dynamicCandlePresentation.bodyOpacity * 100)}`;
       if ((candleSeries as any).__prevStyleKey !== seriesStyleKey) {
         areaSeries.applyOptions({
           visible: mode === "line",
@@ -4881,7 +5670,7 @@ export default function InstitutionalChart({
           bottomColor: mode === "line" ? withAlpha(resolvedVisualProfile.palette.backgroundAccent, 0.3) : withAlpha(resolvedVisualProfile.palette.backgroundAccent, 0.08),
         });
         candleSeries.applyOptions({
-          ...resolvePerceptualCandleStyleOptions(symbol, timeframe, densityLevel, marketVolatility, visualProfile, domImbalanceRatio),
+          ...resolvePerceptualCandleStyleOptions(symbol, timeframe, densityLevel, marketVolatility, visualProfile, domImbalanceRatio, dynamicCandlePresentation),
           visible: mode !== "line",
         });
         (candleSeries as any).__prevStyleKey = seriesStyleKey;
@@ -4920,7 +5709,11 @@ export default function InstitutionalChart({
 
     if (!hasInitializedRangeRef.current && activeTimes.length > 12) {
       const rightPad = isLiteMode ? 1 : 2;
-      const visibleBars = currentTimeScalePolicyRef.current.targetVisibleBars;
+      const visibleBars = clamp(
+        currentTimeScalePolicyRef.current.targetVisibleBars,
+        currentTimeScalePolicyRef.current.minVisibleBars,
+        currentTimeScalePolicyRef.current.maxVisibleBars,
+      );
       const to = activeTimes.length - 1 + rightPad;
       const from = Math.max(0, to - visibleBars);
       chart.timeScale().setVisibleLogicalRange({ from, to });
@@ -4936,7 +5729,11 @@ export default function InstitutionalChart({
         // Seuil très bas : intervient uniquement si vraiment cassé (layout collapse)
         const minExpectedVisible = 4;
         if (visibleNow < minExpectedVisible) {
-          const baselineVisible = currentTimeScalePolicyRef.current.targetVisibleBars;
+          const baselineVisible = clamp(
+            currentTimeScalePolicyRef.current.targetVisibleBars,
+            currentTimeScalePolicyRef.current.minVisibleBars,
+            currentTimeScalePolicyRef.current.maxVisibleBars,
+          );
           const rightPad = isLiteMode ? 1 : 2;
           const to = activeTimes.length - 1 + rightPad;
           const from = Math.max(0, to - baselineVisible);
@@ -5020,7 +5817,7 @@ export default function InstitutionalChart({
           if (!cursorVisibleRef.current) {
             updateActiveCandleOverlay({
               left: clamp(lastX, 0, container.clientWidth),
-              width: clamp(candleStepPxRef.current * 0.98, 11, 64),
+              width: dynamicCandlePresentation.overlayWidthPx,
               source: "live",
             });
           }
@@ -5028,7 +5825,7 @@ export default function InstitutionalChart({
       }
     }
 
-    if (!isLiteMode && candleData.length > 0 && mode !== "line") {
+    if (!isLiteMode && customV3RendererEnabled && candleData.length > 0) {
       const forming = candleData[candleData.length - 1];
       const formingX = timeScale.timeToCoordinate(forming.time as Time);
       const openY = activeSeries.priceToCoordinate(forming.open);
@@ -5037,11 +5834,9 @@ export default function InstitutionalChart({
       const lowY = activeSeries.priceToCoordinate(forming.low);
       if (formingX !== null && openY !== null && closeY !== null && highY !== null && lowY !== null) {
         const direction = forming.close > forming.open ? "up" : forming.close < forming.open ? "down" : "flat";
-        const slotWidth = candleStepPxRef.current;
         const range = Math.max(0, forming.high - forming.low);
         const referencePrice = Math.max(Math.abs(forming.close), Math.abs(forming.open), 1);
         const lowRangeForming = range / referencePrice < 0.0015;
-        const deskWidth = Math.max(lowRangeForming ? 2 : 1, resolveDeskBodyWidthPx(Math.max(slotWidth, 1), densityLevel));
         const snappedLeft = snapCssToDevicePixel(clamp(formingX, 0, container.clientWidth));
         const snappedOpenY = snapCssToDevicePixel(clamp(openY, 0, container.clientHeight));
         const snappedCloseY = snapCssToDevicePixel(clamp(closeY, 0, container.clientHeight));
@@ -5049,14 +5844,14 @@ export default function InstitutionalChart({
         const snappedLowY = snapCssToDevicePixel(clamp(lowY, 0, container.clientHeight));
         setFormingCandleTarget({
           left: snappedLeft,
-          width: clamp(deskWidth + (densityLevel === "micro" ? 0 : 1), lowRangeForming ? 2 : densityLevel === "micro" ? 1 : 3, motionTuning.formingWidthMax + 3),
+          width: clamp(dynamicCandlePresentation.formingWidthPx, lowRangeForming ? 2 : densityLevel === "micro" ? 1 : 3, motionTuning.formingWidthMax + 3),
           openY: snappedOpenY,
           closeY: snappedCloseY,
           highY: snappedHighY,
           lowY: snappedLowY,
-          opacity: densityLevel === "micro" ? (lowRangeForming ? 0.75 : 0.72) : (lowRangeForming ? 0.75 : 0.78),
-          wickOpacity: densityLevel === "micro" ? (lowRangeForming ? 0.6 : 0.76) : (lowRangeForming ? 0.6 : 0.82),
-          radiusPx: resolveDeskBodyRadiusPx(slotWidth),
+          opacity: clamp(dynamicCandlePresentation.bodyOpacity - (lowRangeForming ? 0.16 : 0.13), lowRangeForming ? 0.75 : 0.72, 0.84),
+          wickOpacity: clamp(dynamicCandlePresentation.wickOpacity - (lowRangeForming ? 0.28 : 0.12), lowRangeForming ? 0.6 : 0.74, 0.92),
+          radiusPx: dynamicCandlePresentation.bodyRadiusPx,
           direction,
         });
       }
@@ -5241,6 +6036,9 @@ export default function InstitutionalChart({
     overlayPerfProfile.heatmapBandsNormal,
     overlayZones,
     footprintRows,
+    footprintBaselineVolume,
+    footprintRowsByTimeKey,
+    executionSignalByTimeKey,
     domLevels,
     heatmapLevels,
     densityLevel,
@@ -5520,6 +6318,10 @@ export default function InstitutionalChart({
   const suppressLivePulse = gpuSafeMode || candlesCleanLevel !== "off" || (isTradingFocus && overBudgetFrame);
   const suppressNewCandleFlash = gpuSafeMode || candlesCleanLevel !== "off" || (isTradingFocus && overBudgetFrame);
   const suppressFormingCandle = gpuSafeMode || candlesCleanLevel === "hard" || (isTradingFocus && overBudgetFrame);
+  const deskHideDomOverlay = hideDomOverlay || (perceptualDeskMode.mode === "macro" && !isUserInteracting);
+  const deskHideFootprintOverlay = hideFootprintOverlay || (perceptualDeskMode.mode === "macro" && !isUserInteracting);
+  const deskSuppressHeatmapOverlay = suppressHeatmapOverlay || (perceptualDeskMode.mode === "macro" && !isUserInteracting);
+  const deskSuppressFormingCandle = suppressFormingCandle || (perceptualDeskMode.mode === "micro" && overBudgetFrame);
   const showOverlayBadges = densityConfig.showBadges && candlesCleanLevel === "off";
   const visibleWallKeys = domOverlay.levels.filter((level) => level.isWall).map((level) => level.lockKey);
   const lockedVisibleWallCount = visibleWallKeys.reduce((count, key) => count + (domLockedWalls[key] ? 1 : 0), 0);
@@ -5539,8 +6341,8 @@ export default function InstitutionalChart({
     if (volumeProfileOverlay.rows.length > 0) collapsedOverlaySet.add("VP");
     if (footprintOverlay.rows.length > 0) collapsedOverlaySet.add("FP");
   }
-  if (hideDomOverlay && domOverlay.levels.length > 0) collapsedOverlaySet.add("DOM");
-  if (hideFootprintOverlay && footprintOverlay.rows.length > 0) collapsedOverlaySet.add("FP");
+  if (deskHideDomOverlay && domOverlay.levels.length > 0) collapsedOverlaySet.add("DOM");
+  if (deskHideFootprintOverlay && footprintOverlay.rows.length > 0) collapsedOverlaySet.add("FP");
   if (hideVolumeProfileOverlay && volumeProfileOverlay.rows.length > 0) collapsedOverlaySet.add("VP");
   const collapsedOverlays = [...collapsedOverlaySet];
 
@@ -5550,24 +6352,24 @@ export default function InstitutionalChart({
     "--chart-profile-bg": resolvedVisualProfile.palette.background,
     "--chart-profile-bg-accent": resolvedVisualProfile.palette.backgroundAccent,
     "--chart-profile-text": withAlpha(resolvedVisualProfile.palette.text, 0.94),
-    "--chart-profile-up": withAlpha(resolvedVisualProfile.palette.up, resolvedVisualProfile.rendering.bodyOpacity),
-    "--chart-profile-down": withAlpha(resolvedVisualProfile.palette.down, resolvedVisualProfile.rendering.bodyOpacity),
+    "--chart-profile-up": withAlpha(resolvedVisualProfile.palette.up, dynamicCandlePresentation.bodyOpacity),
+    "--chart-profile-down": withAlpha(resolvedVisualProfile.palette.down, dynamicCandlePresentation.bodyOpacity),
     "--chart-profile-wick": withAlpha(resolvedVisualProfile.palette.wick, 0.94),
-    "--chart-profile-wick-up": resolveProfileWickColor(resolvedVisualProfile, "up", domImbalanceRatio, 0.75),
-    "--chart-profile-wick-down": resolveProfileWickColor(resolvedVisualProfile, "down", domImbalanceRatio, 0.75),
-    "--chart-profile-border-up": withAlpha(resolvedVisualProfile.palette.up, 0.92),
-    "--chart-profile-border-down": withAlpha(resolvedVisualProfile.palette.down, 0.92),
+    "--chart-profile-wick-up": resolveProfileWickColor(resolvedVisualProfile, "up", domImbalanceRatio, dynamicCandlePresentation.wickOpacity),
+    "--chart-profile-wick-down": resolveProfileWickColor(resolvedVisualProfile, "down", domImbalanceRatio, dynamicCandlePresentation.wickOpacity),
+    "--chart-profile-border-up": withAlpha(resolvedVisualProfile.palette.up, dynamicCandlePresentation.borderOpacity),
+    "--chart-profile-border-down": withAlpha(resolvedVisualProfile.palette.down, dynamicCandlePresentation.borderOpacity),
     "--chart-profile-transition-ms": `${resolvedVisualProfile.motion.transitionMs}ms`,
     "--chart-profile-easing": resolvedVisualProfile.motion.easing,
-    "--chart-profile-wick-width": `${resolvedVisualProfile.rendering.wickWidthPx}px`,
-    "--chart-profile-body-radius": `${resolvedVisualProfile.rendering.bodyRadiusPx}px`,
-    "--chart-profile-body-opacity": String(resolvedVisualProfile.rendering.bodyOpacity),
+    "--chart-profile-wick-width": `${dynamicCandlePresentation.wickWidthPx}px`,
+    "--chart-profile-body-radius": `${dynamicCandlePresentation.bodyRadiusPx}px`,
+    "--chart-profile-body-opacity": String(dynamicCandlePresentation.bodyOpacity),
     "--chart-profile-breathe-scale": String(resolvedVisualProfile.motion.breathePx > 0 ? 0.015 : 0),
     "--chart-profile-wick-glow": String(resolvedVisualProfile.rendering.extremeWickGlow),
     "--chart-profile-last-glow": String(resolvedVisualProfile.perception.lastCandleGlow),
-    "--chart-profile-last-brightness": String(1 + resolvedVisualProfile.perception.lastCandleGlow + 0.01),
+    "--chart-profile-last-brightness": String(dynamicCandlePresentation.lastBrightness),
     "--chart-profile-micro-pulse": String(visualProfile === "txt-signature" ? 0.01 : 0),
-  }) as CSSProperties, [domImbalanceRatio, resolvedVisualProfile]);
+  }) as CSSProperties, [domImbalanceRatio, dynamicCandlePresentation, resolvedVisualProfile, visualProfile]);
 
   return (
     <div className={[
@@ -5578,6 +6380,8 @@ export default function InstitutionalChart({
       `density-${densityLevel}`,
       `overlay-layout-${overlayLayoutMode}`,
       `candles-clean-${candlesCleanLevel}`,
+      `desk-mode-${perceptualDeskMode.mode}`,
+      perceptualDeskMode.authoritativeRenderer ? "desk-renderer-authoritative" : "",
       gpuSafeMode ? "gpu-safe" : "",
       isTradingFocus ? "price-first-focus" : "",
       className,
@@ -5593,7 +6397,7 @@ export default function InstitutionalChart({
       </div>
       <div className="chart-underlay-layer">
         <div className="chart-underlay-inner" style={{ "--overlay-alpha": focusOverlayAlpha } as CSSProperties}>
-          {!isLiteMode && heatmapOverlay.bands.length > 0 && !suppressHeatmapOverlay ? (
+          {!isLiteMode && heatmapOverlay.bands.length > 0 && !deskSuppressHeatmapOverlay ? (
             <div className={`chart-heatmap-minimal-grid ${heatmapOverlay.degraded ? "chart-heatmap-minimal-grid-degraded" : ""}`} aria-hidden="true">
               {heatmapOverlay.bands.map((band) => (
                 <div
@@ -5607,14 +6411,14 @@ export default function InstitutionalChart({
         </div>
       </div>
       <div ref={containerRef} className="chart-canvas-host" aria-label={`${symbol} chart`} />
-      <div className="chart-timezone-pill" aria-hidden="true">UTC | RMB drag pan</div>
+      <div className="chart-timezone-pill" aria-hidden="true">UTC | drag pan | {perceptualDeskMode.mode.toUpperCase()} {Math.round(perceptualDeskMode.confidence * 100)}%</div>
       <div className="chart-microstructure-layer">
         <div className="chart-microstructure-inner" style={{ "--overlay-alpha": focusOverlayAlpha } as CSSProperties}>
         <div className="chart-microstructure-right-rail">
           {!isLiteMode && !ultraCleanCandles && heatmapOverlay.pausedReason === "perf" && mode === "candles" ? (
             <div className="chart-heatmap-minimal-paused" aria-live="polite">Heatmap paused: frame budget</div>
           ) : null}
-          {!isLiteMode && domOverlay.levels.length > 0 && !hideDomOverlay ? (
+          {!isLiteMode && domOverlay.levels.length > 0 && !deskHideDomOverlay ? (
             <div className={`chart-dom-ladder-lite ${domOverlay.degraded ? "chart-dom-ladder-lite-degraded" : ""}`}>
             <div className="chart-dom-ladder-lite-head">
               <span className="chart-dom-ladder-lite-kicker">DOM LITE</span>
@@ -5647,7 +6451,7 @@ export default function InstitutionalChart({
             </div>
             </div>
           ) : null}
-          {!isLiteMode && domOverlay.pausedReason === "perf" && mode === "candles" && !hideDomOverlay ? (
+          {!isLiteMode && domOverlay.pausedReason === "perf" && mode === "candles" && !deskHideDomOverlay ? (
             <div className="chart-dom-ladder-lite-paused" aria-live="polite">DOM paused: frame budget</div>
           ) : null}
           {!isLiteMode && domToast ? <div className="chart-dom-action-toast" aria-live="polite">{domToast.message}</div> : null}
@@ -5708,7 +6512,7 @@ export default function InstitutionalChart({
           ) : null}
         </div>
         <div className="chart-microstructure-left-rail">
-        {!isLiteMode && footprintOverlay.rows.length > 0 && !hideFootprintOverlay ? (
+        {!isLiteMode && footprintOverlay.rows.length > 0 && !deskHideFootprintOverlay ? (
           <div className={`chart-footprint-compact-overlay ${footprintOverlay.degraded ? "chart-footprint-compact-overlay-degraded" : ""}`} aria-hidden="true">
             <div className="chart-footprint-compact-kicker">FP{footprintOverlay.degraded ? " LITE" : ""}</div>
             <div className="chart-footprint-compact-head">
@@ -5752,7 +6556,7 @@ export default function InstitutionalChart({
           </div>
         ) : null}
         </div>
-        {!isLiteMode && footprintOverlay.pausedReason === "perf" && mode === "footprint" && !hideFootprintOverlay ? (
+        {!isLiteMode && footprintOverlay.pausedReason === "perf" && mode === "footprint" && !deskHideFootprintOverlay ? (
           <div className="chart-footprint-compact-paused" aria-live="polite">Footprint paused: frame budget</div>
         ) : null}
         {!isLiteMode && collapsedOverlays.length > 0 ? (
@@ -5809,13 +6613,13 @@ export default function InstitutionalChart({
             style={{ left: activeCandleOverlay.left, width: activeCandleOverlay.width }}
             aria-hidden="true"
           >
-            <span className="chart-active-candle-core" />
+            {activeCandleOverlay.source === "crosshair" ? <span className="chart-active-candle-core" /> : null}
           </div>
         ) : null}
         {newCandleFlash > 0 && !isLiteMode && !suppressNewCandleFlash ? (
           <div key={`ncf-${newCandleFlash}`} className="chart-new-candle-flash" aria-hidden="true" />
         ) : null}
-        {!isLiteMode && formingCandle && densityConfig.showFormingCandle && !suppressFormingCandle ? (
+        {!customV3RendererEnabled && !nativeCandlesAuthoritative && !isLiteMode && formingCandle && densityConfig.showFormingCandle && !deskSuppressFormingCandle ? (
           <div
             className={`chart-forming-candle chart-forming-candle-${formingCandle.direction} ${Math.abs(formingCandle.closeY - formingCandle.openY) >= 14 ? "is-volatile" : "is-calm"}`}
             style={{ left: formingCandle.left }}

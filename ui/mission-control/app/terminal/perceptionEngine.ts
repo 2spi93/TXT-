@@ -273,6 +273,8 @@ export function perceptionTransform(
 
   return {
     ...candle,
+    high: wick.high,
+    low: wick.low,
     __visual: {
       intensity: visualStyle.intensity,
       direction,

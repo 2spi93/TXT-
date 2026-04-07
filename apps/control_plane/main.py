@@ -1918,6 +1918,83 @@ def _extract_kairos_harness_from_fills(fills: list[dict[str, Any]]) -> dict[str,
     return None
 
 
+def _requested_fill_quantity_from_payload(payload: dict[str, Any] | None) -> float:
+    raw = payload if isinstance(payload, dict) else {}
+    order_intent = raw.get("order_intent") if isinstance(raw.get("order_intent"), dict) else {}
+    raw_payload = raw.get("raw_payload") if isinstance(raw.get("raw_payload"), dict) else {}
+    for candidate in (
+        raw.get("size_base"),
+        raw.get("quantity"),
+        raw.get("qty"),
+        raw.get("lots"),
+        order_intent.get("size_base"),
+        order_intent.get("quantity"),
+        order_intent.get("qty"),
+        order_intent.get("lots"),
+        raw_payload.get("size_base"),
+        raw_payload.get("quantity"),
+        raw_payload.get("qty"),
+        raw_payload.get("lots"),
+    ):
+        numeric = _to_float(candidate, 0.0)
+        if numeric > 0:
+            return numeric
+    return 0.0
+
+
+def _realized_fill_quantity_from_result(result: dict[str, Any] | None) -> float:
+    raw = result if isinstance(result, dict) else {}
+    fills = raw.get("fills") if isinstance(raw.get("fills"), list) else []
+    filled_qty = sum(_to_float(fill.get("size_base"), 0.0) for fill in fills if isinstance(fill, dict))
+    if filled_qty > 0:
+        return filled_qty
+    for candidate in (
+        raw.get("filled_qty"),
+        raw.get("filled_quantity"),
+        raw.get("executed_qty"),
+        raw.get("size_base"),
+        raw.get("quantity"),
+        raw.get("qty"),
+        raw.get("lots"),
+    ):
+        numeric = _to_float(candidate, 0.0)
+        if numeric > 0:
+            return numeric
+    return 0.0
+
+
+def _execution_audit_summary(
+    *,
+    decision_id: str,
+    route: str,
+    reason: str,
+    expected_slippage_bps: float,
+    realized_slippage_bps: float,
+    latency_e2e_ms: int,
+    requested_payload: dict[str, Any] | None,
+    execution_result: dict[str, Any] | None,
+) -> dict[str, Any]:
+    expected_fill_quantity = _requested_fill_quantity_from_payload(requested_payload)
+    realized_fill_quantity = _realized_fill_quantity_from_result(execution_result)
+    fill_ratio = None
+    partial_fill_ratio = None
+    if expected_fill_quantity > 0:
+        fill_ratio = round(_clamp(realized_fill_quantity / expected_fill_quantity, 0.0, 1.5), 6)
+        partial_fill_ratio = round(max(0.0, 1.0 - min(fill_ratio, 1.0)), 6)
+    return {
+        "decision_id": str(decision_id or "").strip(),
+        "route": str(route or "").strip(),
+        "reason": str(reason or "").strip(),
+        "expected_slippage_bps": round(_to_float(expected_slippage_bps, 0.0), 6),
+        "realized_slippage_bps": round(_to_float(realized_slippage_bps, 0.0), 6),
+        "latency_e2e_ms": int(max(0, latency_e2e_ms)),
+        "expected_fill_quantity": round(expected_fill_quantity, 8),
+        "realized_fill_quantity": round(realized_fill_quantity, 8),
+        "fill_ratio": fill_ratio,
+        "partial_fill_ratio": partial_fill_ratio,
+    }
+
+
 def _record_platform_execution_telemetry(
     source: str,
     execution_payload: dict[str, Any],
@@ -2001,8 +2078,16 @@ def _record_platform_execution_telemetry(
         "execution_telemetry_recorded",
         {
             "telemetry_id": telemetry_id,
-            "decision_id": str(routed.get("decision_id") or execution_payload.get("decision_id") or ""),
-            "route": str(chosen.get("venue") or routed.get("venue") or route.get("preferred_venue") or ""),
+            **_execution_audit_summary(
+                decision_id=str(routed.get("decision_id") or execution_payload.get("decision_id") or ""),
+                route=str(chosen.get("venue") or routed.get("venue") or route.get("preferred_venue") or ""),
+                reason=str(route_block.get("reason") or route.get("route_key") or source),
+                expected_slippage_bps=_to_float(routed.get("expected_slippage_bps"), 0.0),
+                realized_slippage_bps=_to_float(routed.get("realized_slippage_bps"), 0.0),
+                latency_e2e_ms=latency_e2e_ms,
+                requested_payload=execution_payload,
+                execution_result=routed,
+            ),
             "source": source,
             "pre_trade_memory_gate": pre_trade_memory_gate,
         },
@@ -2496,6 +2581,7 @@ def _connector_account_public_view(connector_account: dict | None) -> dict | Non
     connector_view.pop("api_secret", None)
     connector_view.pop("passphrase", None)
     connector_view["has_credentials"] = bool(connector_view.get("credential_id"))
+    connector_view["broker_capabilities"] = _derive_broker_capabilities_view(connector_view)
     return connector_view
 
 
@@ -2512,6 +2598,28 @@ def _normalize_connector_provider(value: Any) -> str:
         "paper-okx": "okx",
     }
     return aliases.get(raw, raw)
+
+
+def _derive_broker_capabilities_view(connector_account: dict | None) -> dict[str, Any]:
+    account = connector_account if isinstance(connector_account, dict) else {}
+    provider = _normalize_connector_provider(account.get("provider"))
+    mode = str(account.get("mode") or "trade").strip().lower()
+    provider_type = str(account.get("provider_type") or "manual").strip().lower()
+    preferred_venue = _provider_to_preferred_venue(provider) if provider else ""
+    can_trade = mode == "trade" and provider_type not in {"wallet"}
+    supports_cancel_replace = can_trade and provider == "bingx"
+    supports_modify = False
+    replace_strategy = "modify" if supports_modify else "cancel_replace" if supports_cancel_replace else "reslice_only"
+    capability_source = "provider-matrix" if provider else "unknown"
+    return {
+        "provider": provider or "unknown",
+        "preferred_venue": preferred_venue,
+        "supports_modify": supports_modify,
+        "supports_cancel_replace": supports_cancel_replace,
+        "supports_live_cancel": supports_cancel_replace,
+        "replace_strategy": replace_strategy,
+        "capability_source": capability_source,
+    }
 
 
 def _normalize_scope_values(raw: Any) -> list[str]:
@@ -3370,6 +3478,14 @@ def _connector_row_payload(
         "permissions_summary": {
             "aggregate": aggregate_permissions,
             "linked_accounts": permission_rows,
+        },
+        "broker_capabilities": {
+            **_derive_broker_capabilities_view({"provider": provider, "mode": "trade"}),
+            "linked_trade_accounts": sum(
+                1
+                for row in permission_rows
+                if bool((((row.get("permissions_view") or {}).get("permissions") or {}).get("trade")))
+            ),
         },
         "capital_summary": capital,
         "incident_summary": incidents,
@@ -5397,6 +5513,39 @@ def _provider_to_preferred_venue(provider: str) -> str:
 def _default_live_execution_policy() -> dict[str, Any]:
     return {
         "enabled": False,
+        "go_live_hardening": {
+            "enabled": True,
+            "min_live_confidence": 0.7,
+            "require_human_approval_above_notional_usd": 5.0,
+            "approval_exposure_threshold_pct": 40.0,
+            "max_total_exposure_pct": 60.0,
+            "max_symbol_exposure_pct": 25.0,
+            "max_pending_live_approvals": 8,
+            "drawdown_warning_ratio": 0.7,
+            "enforce_memory_gate": True,
+            "autonomous_sources": [
+                "kairos-shadow-runtime",
+                "tradingview",
+                "quantower",
+                "webhook",
+                "signal-webhook",
+            ],
+            "anti_loop": {
+                "enabled": True,
+                "lookback_minutes": 20,
+                "same_signal_limit": 3,
+                "block_after_repeats": 5,
+                "degraded_confidence_multiplier": 0.6,
+            },
+            "watchdog": {
+                "enabled": True,
+                "max_latency_e2e_ms": 1500,
+                "max_realized_slippage_bps": 15,
+                "max_block_rate": 0.35,
+                "max_partial_fill_ratio": 0.55,
+                "kill_on_consecutive_failures": 4,
+            },
+        },
         "providers": {
             "bingx": {
                 "enabled": False,
@@ -5427,7 +5576,7 @@ def _load_live_execution_policy() -> dict[str, Any]:
             raw = json.loads(LIVE_EXECUTION_POLICY_PATH.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
                 merged = dict(policy)
-                merged.update({key: value for key, value in raw.items() if key != "providers"})
+                merged.update({key: value for key, value in raw.items() if key not in {"providers", "go_live_hardening"}})
                 merged_providers = dict(policy.get("providers") or {})
                 raw_providers = raw.get("providers") if isinstance(raw.get("providers"), dict) else {}
                 for provider_key, provider_value in raw_providers.items():
@@ -5437,10 +5586,351 @@ def _load_live_execution_policy() -> dict[str, Any]:
                         merged_provider.update(provider_value)
                     merged_providers[provider_key] = merged_provider
                 merged["providers"] = merged_providers
+                default_hardening = policy.get("go_live_hardening") if isinstance(policy.get("go_live_hardening"), dict) else {}
+                merged_hardening = dict(default_hardening)
+                raw_hardening = raw.get("go_live_hardening") if isinstance(raw.get("go_live_hardening"), dict) else {}
+                if isinstance(raw_hardening, dict):
+                    merged_hardening.update({
+                        key: value
+                        for key, value in raw_hardening.items()
+                        if key not in {"anti_loop", "watchdog"}
+                    })
+                    default_anti_loop = default_hardening.get("anti_loop") if isinstance(default_hardening.get("anti_loop"), dict) else {}
+                    merged_anti_loop = dict(default_anti_loop)
+                    raw_anti_loop = raw_hardening.get("anti_loop") if isinstance(raw_hardening.get("anti_loop"), dict) else {}
+                    merged_anti_loop.update(raw_anti_loop)
+                    merged_hardening["anti_loop"] = merged_anti_loop
+                    default_watchdog = default_hardening.get("watchdog") if isinstance(default_hardening.get("watchdog"), dict) else {}
+                    merged_watchdog = dict(default_watchdog)
+                    raw_watchdog = raw_hardening.get("watchdog") if isinstance(raw_hardening.get("watchdog"), dict) else {}
+                    merged_watchdog.update(raw_watchdog)
+                    merged_hardening["watchdog"] = merged_watchdog
+                merged["go_live_hardening"] = merged_hardening
                 return merged
     except Exception:
         pass
     return policy
+
+
+def _go_live_hardening_policy() -> dict[str, Any]:
+    policy = _load_live_execution_policy()
+    hardening = policy.get("go_live_hardening") if isinstance(policy.get("go_live_hardening"), dict) else {}
+    default_hardening = _default_live_execution_policy().get("go_live_hardening")
+    merged = dict(default_hardening) if isinstance(default_hardening, dict) else {}
+    merged.update({key: value for key, value in hardening.items() if key not in {"anti_loop", "watchdog"}})
+    default_anti_loop = merged.get("anti_loop") if isinstance(merged.get("anti_loop"), dict) else {}
+    hardening_anti_loop = hardening.get("anti_loop") if isinstance(hardening.get("anti_loop"), dict) else {}
+    merged["anti_loop"] = {**default_anti_loop, **hardening_anti_loop}
+    default_watchdog = merged.get("watchdog") if isinstance(merged.get("watchdog"), dict) else {}
+    hardening_watchdog = hardening.get("watchdog") if isinstance(hardening.get("watchdog"), dict) else {}
+    merged["watchdog"] = {**default_watchdog, **hardening_watchdog}
+    return merged
+
+
+def _sanitize_go_live_hardening_policy(policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    hardening = policy if isinstance(policy, dict) else _go_live_hardening_policy()
+    anti_loop = hardening.get("anti_loop") if isinstance(hardening.get("anti_loop"), dict) else {}
+    watchdog = hardening.get("watchdog") if isinstance(hardening.get("watchdog"), dict) else {}
+    return {
+        "enabled": _bool_from_any(hardening.get("enabled"), True),
+        "min_live_confidence": _to_float(hardening.get("min_live_confidence"), 0.7),
+        "require_human_approval_above_notional_usd": _to_float(hardening.get("require_human_approval_above_notional_usd"), 0.0),
+        "approval_exposure_threshold_pct": _to_float(hardening.get("approval_exposure_threshold_pct"), 0.0),
+        "max_total_exposure_pct": _to_float(hardening.get("max_total_exposure_pct"), 0.0),
+        "max_symbol_exposure_pct": _to_float(hardening.get("max_symbol_exposure_pct"), 0.0),
+        "max_pending_live_approvals": int(_to_float(hardening.get("max_pending_live_approvals"), 0.0)),
+        "drawdown_warning_ratio": _to_float(hardening.get("drawdown_warning_ratio"), 0.0),
+        "enforce_memory_gate": _bool_from_any(hardening.get("enforce_memory_gate"), True),
+        "autonomous_sources": [str(item).strip() for item in hardening.get("autonomous_sources", []) if str(item).strip()],
+        "anti_loop": {
+            "enabled": _bool_from_any(anti_loop.get("enabled"), True),
+            "lookback_minutes": int(_to_float(anti_loop.get("lookback_minutes"), 20.0)),
+            "same_signal_limit": int(_to_float(anti_loop.get("same_signal_limit"), 3.0)),
+            "block_after_repeats": int(_to_float(anti_loop.get("block_after_repeats"), 5.0)),
+            "degraded_confidence_multiplier": _to_float(anti_loop.get("degraded_confidence_multiplier"), 0.6),
+        },
+        "watchdog": {
+            "enabled": _bool_from_any(watchdog.get("enabled"), True),
+            "max_latency_e2e_ms": int(_to_float(watchdog.get("max_latency_e2e_ms"), 1500.0)),
+            "max_realized_slippage_bps": _to_float(watchdog.get("max_realized_slippage_bps"), 15.0),
+            "max_block_rate": _to_float(watchdog.get("max_block_rate"), 0.35),
+            "max_partial_fill_ratio": _to_float(watchdog.get("max_partial_fill_ratio"), 0.55),
+            "kill_on_consecutive_failures": int(_to_float(watchdog.get("kill_on_consecutive_failures"), 4.0)),
+        },
+    }
+
+
+def _extract_trade_governance(payload: dict[str, Any] | None) -> dict[str, Any]:
+    raw = payload if isinstance(payload, dict) else {}
+    metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+    order_intent = raw.get("order_intent") if isinstance(raw.get("order_intent"), dict) else {}
+    governance = metadata.get("governance") if isinstance(metadata.get("governance"), dict) else order_intent.get("governance") if isinstance(order_intent.get("governance"), dict) else {}
+    return {
+        "approved": _bool_from_any(governance.get("approved"), False),
+        "approver": str(governance.get("approver") or "").strip(),
+        "approval_id": str(governance.get("approval_id") or "").strip(),
+        "approval_mode": str(governance.get("approval_mode") or "").strip(),
+        "override": _bool_from_any(governance.get("override"), False),
+    }
+
+
+def _account_live_exposure_snapshot(account_id: str, symbol: str, requested_notional_usd: float) -> dict[str, Any]:
+    account_key = str(account_id or "").strip()
+    normalized_symbol = _normalize_symbol(symbol)
+    if not account_key:
+        return {
+            "account_id": "",
+            "equity_usd": 0.0,
+            "gross_exposure_usd": 0.0,
+            "gross_exposure_pct": 0.0,
+            "symbol_gross_exposure_usd": 0.0,
+            "symbol_exposure_pct": 0.0,
+            "projected_total_exposure_pct": 0.0,
+            "projected_symbol_exposure_pct": 0.0,
+            "portfolio_ids": [],
+            "positions_count": 0,
+            "exposure_known": False,
+        }
+
+    balances = _latest_account_balances(account_key)
+    positions = _latest_account_positions(account_key)
+    equity_usd = sum(_to_float(item.get("equity_usd"), 0.0) for item in balances if isinstance(item, dict))
+    gross_exposure_usd = sum(abs(_to_float(item.get("notional_usd"), 0.0)) for item in positions if isinstance(item, dict))
+    symbol_gross_exposure_usd = sum(
+        abs(_to_float(item.get("notional_usd"), 0.0))
+        for item in positions
+        if isinstance(item, dict) and _normalize_symbol(str(item.get("symbol") or item.get("instrument") or "")) == normalized_symbol
+    )
+    gross_exposure_pct = (gross_exposure_usd / equity_usd * 100.0) if equity_usd > 0 else 0.0
+    symbol_exposure_pct = (symbol_gross_exposure_usd / equity_usd * 100.0) if equity_usd > 0 else 0.0
+    projected_total_exposure_pct = ((gross_exposure_usd + max(0.0, requested_notional_usd)) / equity_usd * 100.0) if equity_usd > 0 else 0.0
+    projected_symbol_exposure_pct = ((symbol_gross_exposure_usd + max(0.0, requested_notional_usd)) / equity_usd * 100.0) if equity_usd > 0 else 0.0
+    return {
+        "account_id": account_key,
+        "equity_usd": round(equity_usd, 8),
+        "gross_exposure_usd": round(gross_exposure_usd, 8),
+        "gross_exposure_pct": round(gross_exposure_pct, 4),
+        "symbol_gross_exposure_usd": round(symbol_gross_exposure_usd, 8),
+        "symbol_exposure_pct": round(symbol_exposure_pct, 4),
+        "projected_total_exposure_pct": round(projected_total_exposure_pct, 4),
+        "projected_symbol_exposure_pct": round(projected_symbol_exposure_pct, 4),
+        "portfolio_ids": _portfolio_ids_for_account(account_key),
+        "positions_count": len([item for item in positions if isinstance(item, dict)]),
+        "exposure_known": equity_usd > 0,
+    }
+
+
+def _recent_pending_live_approval_count(account_id: str = "") -> int:
+    if account_id:
+        row = fetch_one(
+            "SELECT COUNT(*) AS count FROM mt5_live_approvals WHERE status = 'pending' AND account_id = %s",
+            (account_id,),
+        ) or {"count": 0}
+    else:
+        row = fetch_one("SELECT COUNT(*) AS count FROM mt5_live_approvals WHERE status = 'pending'") or {"count": 0}
+    return int(row.get("count") or 0)
+
+
+def _go_live_signal_loop_snapshot(account_id: str, symbol: str, side: str, source: str, lookback_minutes: int) -> dict[str, Any]:
+    safe_lookback = max(1, min(24 * 60, int(lookback_minutes or 20)))
+    normalized_symbol = _normalize_symbol(symbol)
+    source_key = str(source or "").strip()
+    rows = fetch_all(
+        """
+        SELECT COALESCE(payload->>'status', '') AS status,
+               COALESCE(payload->>'account_id', '') AS account_id,
+               COALESCE(payload->>'symbol', '') AS symbol,
+               COALESCE(payload->>'side', '') AS side,
+               COALESCE(payload->>'source', '') AS source,
+               created_at
+        FROM audit_events
+        WHERE category = 'go_live_hardening_decision'
+          AND created_at >= NOW() - (%s * INTERVAL '1 minute')
+          AND COALESCE(payload->>'account_id', '') = %s
+          AND COALESCE(payload->>'symbol', '') = %s
+          AND COALESCE(payload->>'side', '') = %s
+        ORDER BY created_at DESC
+        LIMIT 24
+        """,
+        (safe_lookback, str(account_id or "").strip(), normalized_symbol, str(side or "").strip().lower()),
+    )
+    same_source_repeats = sum(1 for row in rows if not source_key or str(row.get("source") or "").strip() == source_key)
+    blocked_count = sum(1 for row in rows if str(row.get("status") or "") == "blocked")
+    return {
+        "lookback_minutes": safe_lookback,
+        "repeat_count": len(rows),
+        "same_source_repeat_count": same_source_repeats,
+        "blocked_repeat_count": blocked_count,
+    }
+
+
+def _go_live_status_rank(status: str) -> int:
+    return {"approved": 0, "require_human": 1, "blocked": 2}.get(str(status or "approved"), 0)
+
+
+def _promote_go_live_status(current: str, candidate: str) -> str:
+    return candidate if _go_live_status_rank(candidate) > _go_live_status_rank(current) else current
+
+
+def _evaluate_go_live_hardening(
+    *,
+    source: str,
+    provider: str,
+    account_id: str,
+    symbol: str,
+    side: str,
+    requested_notional_usd: float,
+    confidence: float,
+    live_requested: bool,
+    purpose: str,
+    pre_trade_memory_gate: dict[str, Any] | None = None,
+    governance: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    policy = _sanitize_go_live_hardening_policy()
+    governance_view = governance if isinstance(governance, dict) else {
+        "approved": False,
+        "approver": "",
+        "approval_id": "",
+        "approval_mode": "",
+        "override": False,
+    }
+    normalized_symbol = _normalize_symbol(symbol)
+    normalized_side = str(side or "buy").strip().lower() or "buy"
+    status = "approved"
+    reasons: list[str] = []
+    active = _bool_from_any(policy.get("enabled"), True) and (live_requested or purpose == "smoke")
+    effective_confidence = _clamp(_to_float(confidence, 0.0), 0.0, 1.0)
+    exposure = _account_live_exposure_snapshot(account_id, normalized_symbol, requested_notional_usd)
+    anti_loop_policy = policy.get("anti_loop") if isinstance(policy.get("anti_loop"), dict) else {}
+    anti_loop = _go_live_signal_loop_snapshot(
+        account_id,
+        normalized_symbol,
+        normalized_side,
+        source,
+        int(_to_float(anti_loop_policy.get("lookback_minutes"), 20.0)),
+    ) if active and _bool_from_any(anti_loop_policy.get("enabled"), True) else {
+        "lookback_minutes": int(_to_float(anti_loop_policy.get("lookback_minutes"), 20.0)),
+        "repeat_count": 0,
+        "same_source_repeat_count": 0,
+        "blocked_repeat_count": 0,
+    }
+    kill_state = _kill_switch_state()
+    drawdown_threshold = max(_kill_switch_thresholds().get("max_drawdown_intraday", 1.0), 1.0)
+    drawdown_intraday_usd = _to_float(((kill_state.get("stats") or {}) if isinstance(kill_state.get("stats"), dict) else {}).get("drawdown_intraday_usd"), 0.0)
+    pending_live_approvals = _recent_pending_live_approval_count(account_id)
+
+    if active and kill_state.get("active"):
+        reasons.append("kill_switch_active")
+        status = _promote_go_live_status(status, "blocked")
+
+    if active and _bool_from_any(policy.get("enforce_memory_gate"), True):
+        memory_gate = pre_trade_memory_gate if isinstance(pre_trade_memory_gate, dict) else {}
+        if _bool_from_any(memory_gate.get("block_execution"), False):
+            reasons.append("memory_pretrade_gate_blocked")
+            status = _promote_go_live_status(status, "blocked")
+
+    same_signal_limit = max(1, int(_to_float(anti_loop_policy.get("same_signal_limit"), 3.0)))
+    block_after_repeats = max(same_signal_limit, int(_to_float(anti_loop_policy.get("block_after_repeats"), 5.0)))
+    degraded_confidence_multiplier = _clamp(_to_float(anti_loop_policy.get("degraded_confidence_multiplier"), 0.6), 0.1, 1.0)
+    anti_loop_degraded = anti_loop.get("repeat_count", 0) >= same_signal_limit
+    anti_loop_blocked = anti_loop.get("repeat_count", 0) >= block_after_repeats
+    if active and anti_loop_degraded:
+        effective_confidence = _clamp(effective_confidence * degraded_confidence_multiplier, 0.0, 1.0)
+        reasons.append("anti_loop_confidence_degraded")
+    if active and anti_loop_blocked:
+        reasons.append("anti_loop_repetition_blocked")
+        status = _promote_go_live_status(status, "blocked")
+
+    min_live_confidence = _to_float(policy.get("min_live_confidence"), 0.7)
+    if active and min_live_confidence > 0 and effective_confidence < min_live_confidence:
+        reasons.append("confidence_below_governance_threshold")
+        status = _promote_go_live_status(status, "blocked")
+
+    max_total_exposure_pct = _to_float(policy.get("max_total_exposure_pct"), 0.0)
+    max_symbol_exposure_pct = _to_float(policy.get("max_symbol_exposure_pct"), 0.0)
+    approval_exposure_threshold_pct = _to_float(policy.get("approval_exposure_threshold_pct"), 0.0)
+    if active and not exposure.get("exposure_known"):
+        reasons.append("live_exposure_unknown")
+        if not governance_view.get("approved"):
+            status = _promote_go_live_status(status, "require_human")
+    if active and max_total_exposure_pct > 0 and _to_float(exposure.get("projected_total_exposure_pct"), 0.0) > max_total_exposure_pct:
+        reasons.append("max_total_exposure_exceeded")
+        status = _promote_go_live_status(status, "blocked")
+    if active and max_symbol_exposure_pct > 0 and _to_float(exposure.get("projected_symbol_exposure_pct"), 0.0) > max_symbol_exposure_pct:
+        reasons.append("max_symbol_exposure_exceeded")
+        status = _promote_go_live_status(status, "blocked")
+
+    max_pending_live_approvals = max(0, int(_to_float(policy.get("max_pending_live_approvals"), 0.0)))
+    if active and max_pending_live_approvals > 0 and pending_live_approvals >= max_pending_live_approvals:
+        reasons.append("pending_live_approval_backlog")
+        status = _promote_go_live_status(status, "blocked")
+
+    drawdown_warning_ratio = _clamp(_to_float(policy.get("drawdown_warning_ratio"), 0.7), 0.0, 1.0)
+    drawdown_ratio = drawdown_intraday_usd / drawdown_threshold if drawdown_threshold > 0 else 0.0
+    if active and drawdown_warning_ratio > 0 and drawdown_ratio >= drawdown_warning_ratio and not governance_view.get("approved"):
+        reasons.append("drawdown_near_limit_requires_governance")
+        status = _promote_go_live_status(status, "require_human")
+
+    autonomous_sources = {str(item).strip() for item in policy.get("autonomous_sources", []) if str(item).strip()}
+    require_human_above_notional_usd = _to_float(policy.get("require_human_approval_above_notional_usd"), 0.0)
+    if active and not governance_view.get("approved"):
+        if require_human_above_notional_usd > 0 and requested_notional_usd >= require_human_above_notional_usd:
+            reasons.append("governance_approval_required_notional")
+            status = _promote_go_live_status(status, "require_human")
+        if source in autonomous_sources:
+            reasons.append("governance_approval_required_autonomous_source")
+            status = _promote_go_live_status(status, "require_human")
+        if approval_exposure_threshold_pct > 0 and _to_float(exposure.get("projected_total_exposure_pct"), 0.0) >= approval_exposure_threshold_pct:
+            reasons.append("governance_approval_required_exposure")
+            status = _promote_go_live_status(status, "require_human")
+
+    result = {
+        "active": active,
+        "status": status,
+        "source": source,
+        "provider": provider,
+        "account_id": str(account_id or "").strip(),
+        "symbol": normalized_symbol,
+        "side": normalized_side,
+        "requested_notional_usd": round(max(0.0, requested_notional_usd), 8),
+        "input_confidence": _clamp(_to_float(confidence, 0.0), 0.0, 1.0),
+        "effective_confidence": effective_confidence,
+        "reasons": sorted(set(reasons)),
+        "governance": governance_view,
+        "policy": policy,
+        "exposure": exposure,
+        "anti_loop": {
+            **anti_loop,
+            "degraded": anti_loop_degraded,
+            "blocked": anti_loop_blocked,
+            "degraded_confidence_multiplier": degraded_confidence_multiplier,
+        },
+        "drawdown_intraday_usd": round(drawdown_intraday_usd, 8),
+        "drawdown_ratio": round(drawdown_ratio, 6),
+        "kill_switch_active": bool(kill_state.get("active")),
+        "pending_live_approvals": pending_live_approvals,
+        "purpose": purpose,
+    }
+    if active:
+        append_audit(
+            "go_live_hardening_decision",
+            {
+                "status": result["status"],
+                "source": source,
+                "provider": provider,
+                "account_id": result["account_id"],
+                "symbol": normalized_symbol,
+                "side": normalized_side,
+                "requested_notional_usd": result["requested_notional_usd"],
+                "effective_confidence": effective_confidence,
+                "reasons": result["reasons"],
+                "governance": governance_view,
+                "anti_loop": result["anti_loop"],
+                "exposure": exposure,
+                "purpose": purpose,
+            },
+        )
+    return result
 
 
 def _provider_live_env_enabled(provider: str) -> bool:
@@ -5883,6 +6373,364 @@ def _list_self_learning_v4_scopes(user_id: int, account_id: str = "", symbol: st
             }
         )
     return items
+
+def _normalize_self_learning_v5_scope(payload: dict | None) -> tuple[str, str, str] | None:
+    if not isinstance(payload, dict):
+        return None
+    account_id = str(payload.get("accountId") or payload.get("account_id") or "").strip()
+    symbol = str(payload.get("symbol") or "").strip().upper()
+    timeframe = str(payload.get("timeframe") or "").strip().lower()
+    if not account_id or not symbol or not timeframe:
+        return None
+    return account_id, symbol, timeframe
+
+def _normalize_self_learning_v5_state(payload: dict | None) -> dict | None:
+    scope = _normalize_self_learning_v5_scope(payload)
+    if not scope:
+        return None
+    account_id, symbol, timeframe = scope
+    raw = payload if isinstance(payload, dict) else {}
+    snapshot = raw.get("snapshot") if isinstance(raw.get("snapshot"), dict) else {}
+    cycles_raw = raw.get("cycles") if isinstance(raw.get("cycles"), list) else []
+    cycles: list[dict] = []
+    seen_ids: set[str] = set()
+    for item in cycles_raw:
+        if not isinstance(item, dict):
+            continue
+        cycle_id = str(item.get("id") or "").strip()
+        if not cycle_id or cycle_id in seen_ids:
+            continue
+        seen_ids.add(cycle_id)
+        cycles.append(
+            {
+                "id": cycle_id,
+                "timestampIso": str(item.get("timestampIso") or _now_utc().isoformat()),
+                "summary": str(item.get("summary") or ""),
+                "bestStrategyId": item.get("bestStrategyId"),
+                "acceptedVariants": int(_to_float(item.get("acceptedVariants"), 0.0)),
+                "liveBlocked": bool(item.get("liveBlocked", True)),
+            }
+        )
+        if len(cycles) >= 40:
+            break
+
+    updated_at = _now_utc().isoformat()
+    return {
+        "version": max(1, int(raw.get("version", 1))) if str(raw.get("version", "")).strip() else 1,
+        "accountId": account_id,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "enabled": bool(raw.get("enabled", True)),
+        "strictValidation": bool(raw.get("strictValidation", True)),
+        "allowLiveDeployment": bool(raw.get("allowLiveDeployment", False)),
+        "modelUpdatedAt": raw.get("modelUpdatedAt") if isinstance(raw.get("modelUpdatedAt"), str) else None,
+        "snapshot": snapshot if isinstance(snapshot, dict) else {},
+        "cycles": cycles,
+        "updatedAt": updated_at,
+    }
+
+def _get_self_learning_v5_state(user_id: int, account_id: str, symbol: str, timeframe: str) -> tuple[dict | None, str | None]:
+    row = fetch_one(
+        """
+        SELECT state, updated_at
+        FROM self_learning_v5_states
+        WHERE user_id = %s AND account_id = %s AND symbol = %s AND timeframe = %s
+        """,
+        (user_id, account_id, symbol.upper(), timeframe.lower()),
+    )
+    if not row:
+        return None, None
+    state = row.get("state") if isinstance(row.get("state"), dict) else {}
+    normalized = _normalize_self_learning_v5_state(
+        {
+            **state,
+            "accountId": account_id,
+            "symbol": symbol.upper(),
+            "timeframe": timeframe.lower(),
+        }
+    )
+    updated_at = row.get("updated_at")
+    return normalized, (updated_at.isoformat() if updated_at else None)
+
+def _save_self_learning_v5_state(user_id: int, payload: dict) -> tuple[dict, str]:
+    normalized = _normalize_self_learning_v5_state(payload)
+    if not normalized:
+        raise HTTPException(status_code=400, detail="invalid self-learning-v5 payload")
+    execute(
+        """
+        INSERT INTO self_learning_v5_states (user_id, account_id, symbol, timeframe, state)
+        VALUES (%s, %s, %s, %s, %s::jsonb)
+        ON CONFLICT (user_id, account_id, symbol, timeframe)
+        DO UPDATE SET state = EXCLUDED.state, updated_at = NOW()
+        """,
+        (
+            user_id,
+            normalized["accountId"],
+            normalized["symbol"],
+            normalized["timeframe"],
+            json_dumps(normalized),
+        ),
+    )
+    row = fetch_one(
+        """
+        SELECT updated_at
+        FROM self_learning_v5_states
+        WHERE user_id = %s AND account_id = %s AND symbol = %s AND timeframe = %s
+        """,
+        (
+            user_id,
+            normalized["accountId"],
+            normalized["symbol"],
+            normalized["timeframe"],
+        ),
+    )
+    updated_at = row.get("updated_at").isoformat() if row and row.get("updated_at") else _now_utc().isoformat()
+    normalized["updatedAt"] = updated_at
+    return normalized, updated_at
+
+def _list_self_learning_v5_scopes(user_id: int, account_id: str = "", symbol: str = "", timeframe: str = "", limit: int = 120) -> list[dict]:
+    where_clauses = ["user_id = %s"]
+    params: list[object] = [user_id]
+    if account_id:
+        where_clauses.append("account_id = %s")
+        params.append(account_id)
+    if symbol:
+        where_clauses.append("symbol = %s")
+        params.append(symbol.upper())
+    if timeframe:
+        where_clauses.append("timeframe = %s")
+        params.append(timeframe.lower())
+    params.append(max(1, min(500, int(limit))))
+    rows = fetch_all(
+        f"""
+        SELECT account_id, symbol, timeframe, state, updated_at
+        FROM self_learning_v5_states
+        WHERE {' AND '.join(where_clauses)}
+        ORDER BY updated_at DESC
+        LIMIT %s
+        """,
+        tuple(params),
+    )
+    items: list[dict] = []
+    for row in rows:
+        state = row.get("state") if isinstance(row.get("state"), dict) else {}
+        snapshot = state.get("snapshot") if isinstance(state.get("snapshot"), dict) else {}
+        registry = snapshot.get("registry") if isinstance(snapshot.get("registry"), dict) else {}
+        validation = snapshot.get("validation") if isinstance(snapshot.get("validation"), dict) else {}
+        items.append(
+            {
+                "accountId": row.get("account_id"),
+                "symbol": row.get("symbol"),
+                "timeframe": row.get("timeframe"),
+                "updatedAt": row.get("updated_at").isoformat() if row.get("updated_at") else None,
+                "cycleCount": len(state.get("cycles") or []) if isinstance(state.get("cycles"), list) else 0,
+                "registryCount": len(registry.get("entries") or []) if isinstance(registry.get("entries"), list) else 0,
+                "enabled": bool(state.get("enabled", True)),
+                "strictValidation": bool(state.get("strictValidation", True)),
+                "liveBlocked": bool(validation.get("liveBlocked", True)),
+            }
+        )
+    return items
+
+
+SELF_LEARNING_V5_PROMOTION_REQUIRED_SHADOW_CYCLES = 3
+SELF_LEARNING_V5_PROMOTION_REQUIRED_OBSERVATION_HOURS = 6.0
+SELF_LEARNING_V5_MANUAL_PROMOTION_ALLOWED_BLOCKERS = {
+    "live_handoff_disabled_by_policy",
+    "shadow_drawdown_requires_more_observation",
+    "shadow_overfit_gap_requires_more_observation",
+}
+
+
+def _default_self_learning_v5_observation(strategy_id: str | None = None) -> dict:
+    return {
+        "candidateStrategyId": strategy_id,
+        "requiredShadowCycles": SELF_LEARNING_V5_PROMOTION_REQUIRED_SHADOW_CYCLES,
+        "requiredObservationHours": SELF_LEARNING_V5_PROMOTION_REQUIRED_OBSERVATION_HOURS,
+        "observedShadowCycles": 0,
+        "observedObservationHours": 0.0,
+        "eligibleForPromotion": False,
+        "firstObservedAt": None,
+        "lastObservedAt": None,
+        "reasons": ["shadow_strategy_not_found"] if strategy_id else ["no_active_shadow_strategy"],
+    }
+
+
+def _compute_self_learning_v5_promotion_observation(state: dict | None, strategy_id: str | None = None) -> dict:
+    if not isinstance(state, dict):
+        return _default_self_learning_v5_observation(strategy_id)
+    snapshot = state.get("snapshot") if isinstance(state.get("snapshot"), dict) else {}
+    registry = snapshot.get("registry") if isinstance(snapshot.get("registry"), dict) else {}
+    entries = registry.get("entries") if isinstance(registry.get("entries"), list) else []
+    cycles = state.get("cycles") if isinstance(state.get("cycles"), list) else []
+    shadow_id = str(strategy_id or registry.get("activeShadowStrategyId") or "").strip() or None
+    observation = _default_self_learning_v5_observation(shadow_id)
+    if not shadow_id:
+        return observation
+
+    entry = next((item for item in entries if isinstance(item, dict) and str(item.get("id") or "").strip() == shadow_id), None)
+    matching_cycles = [
+        item for item in cycles
+        if isinstance(item, dict) and str(item.get("bestStrategyId") or "").strip() == shadow_id
+    ]
+    cycle_times = sorted(
+        [
+            parsed for parsed in (
+                _parse_iso_utc(str(item.get("timestampIso") or "")) for item in matching_cycles
+            )
+            if parsed is not None
+        ]
+    )
+    first_observed_at = cycle_times[0].isoformat() if cycle_times else None
+    last_observed_at = cycle_times[-1].isoformat() if cycle_times else None
+    observed_hours = 0.0
+    if len(cycle_times) >= 2:
+        observed_hours = max(0.0, (cycle_times[-1] - cycle_times[0]).total_seconds() / 3600.0)
+
+    reasons: list[str] = []
+    if not isinstance(entry, dict):
+        reasons.append("shadow_strategy_not_found")
+    else:
+        validation = entry.get("validation") if isinstance(entry.get("validation"), dict) else {}
+        live_blocked_reasons = validation.get("liveBlockedReasons") if isinstance(validation.get("liveBlockedReasons"), list) else []
+        if not bool(validation.get("accepted", False)):
+            reasons.append("strategy_not_accepted")
+        if str(registry.get("activeShadowStrategyId") or "").strip() != shadow_id:
+            reasons.append("strategy_not_active_shadow")
+        status = str(entry.get("status") or "registry").strip()
+        if status not in {"shadow", "live-blocked"}:
+            reasons.append(f"strategy_status_{status}")
+        for reason in live_blocked_reasons:
+            normalized = str(reason or "").strip()
+            if normalized and normalized not in SELF_LEARNING_V5_MANUAL_PROMOTION_ALLOWED_BLOCKERS:
+                reasons.append(normalized)
+
+    if len(matching_cycles) < SELF_LEARNING_V5_PROMOTION_REQUIRED_SHADOW_CYCLES:
+        reasons.append(f"shadow_cycle_count_below_{SELF_LEARNING_V5_PROMOTION_REQUIRED_SHADOW_CYCLES}")
+    if observed_hours < SELF_LEARNING_V5_PROMOTION_REQUIRED_OBSERVATION_HOURS:
+        reasons.append(f"shadow_observation_hours_below_{int(SELF_LEARNING_V5_PROMOTION_REQUIRED_OBSERVATION_HOURS)}")
+
+    return {
+        "candidateStrategyId": shadow_id,
+        "requiredShadowCycles": SELF_LEARNING_V5_PROMOTION_REQUIRED_SHADOW_CYCLES,
+        "requiredObservationHours": SELF_LEARNING_V5_PROMOTION_REQUIRED_OBSERVATION_HOURS,
+        "observedShadowCycles": len(matching_cycles),
+        "observedObservationHours": round(observed_hours, 2),
+        "eligibleForPromotion": len(reasons) == 0,
+        "firstObservedAt": first_observed_at,
+        "lastObservedAt": last_observed_at,
+        "reasons": reasons,
+    }
+
+
+def _promote_self_learning_v5_state(user_id: int, payload: dict, promoted_by: str) -> tuple[dict, str, dict, dict]:
+    scope = _normalize_self_learning_v5_scope(payload)
+    if not scope:
+        raise HTTPException(status_code=400, detail="invalid self-learning-v5 scope")
+    account_id, symbol, timeframe = scope
+    strategy_id = str(payload.get("strategyId") or payload.get("strategy_id") or "").strip()
+    rationale = str(payload.get("rationale") or "manual_shadow_to_live").strip() or "manual_shadow_to_live"
+    if not strategy_id:
+        raise HTTPException(status_code=400, detail="strategyId is required")
+
+    state, _updated_at = _get_self_learning_v5_state(user_id, account_id, symbol, timeframe)
+    if not isinstance(state, dict):
+        raise HTTPException(status_code=404, detail="self-learning-v5 state not found")
+
+    observation = _compute_self_learning_v5_promotion_observation(state, strategy_id)
+    if not bool(observation.get("eligibleForPromotion")):
+        raise HTTPException(status_code=409, detail={"promotion_blocked": observation.get("reasons", []), "observation": observation})
+
+    snapshot = state.get("snapshot") if isinstance(state.get("snapshot"), dict) else {}
+    validation = snapshot.get("validation") if isinstance(snapshot.get("validation"), dict) else {}
+    registry = snapshot.get("registry") if isinstance(snapshot.get("registry"), dict) else {}
+    entries = registry.get("entries") if isinstance(registry.get("entries"), list) else []
+    promotion_audit_trail = registry.get("promotionAuditTrail") if isinstance(registry.get("promotionAuditTrail"), list) else []
+    target_entry = next((item for item in entries if isinstance(item, dict) and str(item.get("id") or "").strip() == strategy_id), None)
+    if not isinstance(target_entry, dict):
+        raise HTTPException(status_code=404, detail="self-learning-v5 strategy not found")
+
+    from_status = str(target_entry.get("status") or "shadow").strip() or "shadow"
+    promoted_at = _now_utc().isoformat()
+    updated_entries: list[dict] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        cloned = dict(entry)
+        validation_block = cloned.get("validation") if isinstance(cloned.get("validation"), dict) else {}
+        if str(cloned.get("id") or "").strip() == strategy_id:
+            cloned["status"] = "live"
+            cloned["validation"] = {
+                **validation_block,
+                "liveEligible": True,
+                "liveBlockedReasons": [],
+            }
+        elif str(cloned.get("status") or "").strip() == "live":
+            cloned["status"] = "registry"
+        elif str(cloned.get("status") or "").strip() == "live-blocked":
+            cloned["status"] = "shadow"
+        updated_entries.append(cloned)
+
+    audit_payload = {
+        "strategyId": strategy_id,
+        "promotedAt": promoted_at,
+        "promotedBy": promoted_by,
+        "rationale": rationale,
+        "fromStatus": from_status,
+        "toStatus": "live",
+        "observation": {
+            "requiredShadowCycles": observation.get("requiredShadowCycles"),
+            "requiredObservationHours": observation.get("requiredObservationHours"),
+            "observedShadowCycles": observation.get("observedShadowCycles"),
+            "observedObservationHours": observation.get("observedObservationHours"),
+        },
+    }
+    next_state = {
+        **state,
+        "modelUpdatedAt": promoted_at,
+        "snapshot": {
+            **snapshot,
+            "validation": {
+                **validation,
+                "liveBlocked": False,
+                "liveBlockReasons": [],
+            },
+            "registry": {
+                **registry,
+                "activeShadowStrategyId": None,
+                "activeLiveStrategyId": strategy_id,
+                "observation": {
+                    **observation,
+                    "eligibleForPromotion": True,
+                    "reasons": [],
+                },
+                "promotionAuditTrail": [audit_payload, *promotion_audit_trail][:24],
+                "entries": updated_entries,
+            },
+        },
+        "updatedAt": promoted_at,
+    }
+    saved_state, saved_updated_at = _save_self_learning_v5_state(user_id, next_state)
+    append_audit(
+        "self_learning_v5_promoted_live",
+        {
+            "user_id": user_id,
+            "account_id": account_id,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "strategy_id": strategy_id,
+            "from_status": from_status,
+            "to_status": "live",
+            "observation": observation,
+            "rationale": rationale,
+            "approved_by": promoted_by,
+        },
+    )
+    return saved_state, saved_updated_at, {
+        **observation,
+        "eligibleForPromotion": True,
+        "reasons": [],
+    }, audit_payload
 
 
 def _activate_kill_switch(source: str, reason: str, payload: dict) -> dict:
@@ -8740,6 +9588,34 @@ async def get_kill_switch(auth: AuthContext = Depends(viewer_auth)) -> dict:
         "status": "ok",
         "state": _kill_switch_state(),
         "thresholds": _kill_switch_thresholds(),
+        "go_live_hardening": _sanitize_go_live_hardening_policy(),
+    }
+
+
+@app.post("/v1/system/kill-switch/activate")
+async def activate_kill_switch(payload: dict | None = None, auth: AuthContext = Depends(admin_auth)) -> dict:
+    global CURRENT_SYSTEM_MODE
+    request_payload = payload if isinstance(payload, dict) else {}
+    source = str(request_payload.get("source") or "external-watchdog").strip() or "external-watchdog"
+    reason = str(request_payload.get("reason") or "manual_activation").strip() or "manual_activation"
+    details = request_payload.get("payload") if isinstance(request_payload.get("payload"), dict) else {}
+    state = _activate_kill_switch(
+        source,
+        reason,
+        {
+            **details,
+            "by": auth.username,
+        },
+    )
+    requested_mode = str(request_payload.get("system_mode") or "").strip().lower()
+    if requested_mode in {mode.value for mode in SystemMode}:
+        CURRENT_SYSTEM_MODE = SystemMode(requested_mode)
+        persist_system_mode()
+        append_audit("system_mode_changed", {"mode": CURRENT_SYSTEM_MODE, "source": source, "reason": reason})
+    return {
+        "status": "activated",
+        "state": state,
+        "system_mode": CURRENT_SYSTEM_MODE,
     }
 
 
@@ -9509,6 +10385,72 @@ async def list_self_learning_v4_scopes(
         "status": "ok",
         "items": items,
         "total": len(items),
+    }
+
+@app.get("/v1/strategies/self-learning-v5")
+async def get_self_learning_v5_state(
+    account_id: str,
+    symbol: str,
+    timeframe: str,
+    auth: AuthContext = Depends(relaxed_auth),
+) -> dict:
+    state, updated_at = _get_self_learning_v5_state(auth.user_id, account_id, symbol, timeframe)
+    return {
+        "status": "ok",
+        "state": state,
+        "updated_at": updated_at,
+    }
+
+@app.put("/v1/strategies/self-learning-v5")
+async def put_self_learning_v5_state(payload: dict, auth: AuthContext = Depends(relaxed_auth)) -> dict:
+    state, updated_at = _save_self_learning_v5_state(auth.user_id, payload)
+    append_audit(
+        "self_learning_v5_state_upserted",
+        {
+            "user_id": auth.user_id,
+            "account_id": state.get("accountId"),
+            "symbol": state.get("symbol"),
+            "timeframe": state.get("timeframe"),
+            "best_strategy_id": state.get("snapshot", {}).get("optimizer", {}).get("bestStrategyId") if isinstance(state.get("snapshot"), dict) else None,
+        },
+    )
+    return {
+        "status": "ok",
+        "state": state,
+        "updated_at": updated_at,
+    }
+
+@app.get("/v1/strategies/self-learning-v5/scopes")
+async def list_self_learning_v5_scopes(
+    account_id: str = "",
+    symbol: str = "",
+    timeframe: str = "",
+    limit: int = 120,
+    auth: AuthContext = Depends(relaxed_auth),
+) -> dict:
+    items = _list_self_learning_v5_scopes(
+        user_id=auth.user_id,
+        account_id=account_id,
+        symbol=symbol,
+        timeframe=timeframe,
+        limit=limit,
+    )
+    return {
+        "status": "ok",
+        "items": items,
+        "total": len(items),
+    }
+
+
+@app.post("/v1/strategies/self-learning-v5/promote")
+async def promote_self_learning_v5_state(payload: dict, auth: AuthContext = Depends(operator_auth)) -> dict:
+    state, updated_at, observation, audit_payload = _promote_self_learning_v5_state(auth.user_id, payload, auth.username)
+    return {
+        "status": "ok",
+        "state": state,
+        "updated_at": updated_at,
+        "observation": observation,
+        "audit": audit_payload,
     }
 
 
@@ -10489,6 +11431,48 @@ async def proxy_mt5_filtered_order(payload: dict, auth: AuthContext = Depends(op
         if account_response.status_code >= 400:
             raise HTTPException(status_code=502, detail="MT5 bridge unavailable")
         account = account_response.json().get("account", {})
+    account_mode = str(account.get("mode") or "paper").strip().lower() or "paper"
+
+    payload_metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    payload_order_intent = payload.get("order_intent") if isinstance(payload.get("order_intent"), dict) else {}
+    payload_source = str(
+        payload_order_intent.get("source")
+        or payload_metadata.get("source")
+        or "mission-control-ui"
+    ).strip() or "mission-control-ui"
+    payload_governance = _extract_trade_governance(payload)
+    payload_memory_gate = _extract_pre_trade_memory_gate(payload)
+    hardening_snapshot = _evaluate_go_live_hardening(
+        source=payload_source,
+        provider="mt5",
+        account_id=str(account_id),
+        symbol=str(payload.get("symbol") or ""),
+        side=str(payload.get("side") or "buy"),
+        requested_notional_usd=_to_float(payload.get("estimated_notional_usd"), 0.0),
+        confidence=_to_float(
+            payload.get("confidence"),
+            _to_float(payload_metadata.get("confidence"), 1.0 if account_mode != "live" else 0.0),
+        ),
+        live_requested=account_mode == "live",
+        purpose="execute",
+        pre_trade_memory_gate=payload_memory_gate,
+        governance=payload_governance,
+    ) if account_mode == "live" else {
+        "active": False,
+        "status": "approved",
+        "reasons": [],
+        "governance": payload_governance,
+        "exposure": {},
+        "anti_loop": {},
+    }
+    if account_mode == "live" and hardening_snapshot.get("status") == "blocked":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "status": "blocked_by_go_live_hardening",
+                "hardening": hardening_snapshot,
+            },
+        )
 
     risk_eval = _evaluate_chart_risk_rules(payload)
     if risk_eval["loss_exceeded"]:
@@ -10536,7 +11520,13 @@ async def proxy_mt5_filtered_order(payload: dict, auth: AuthContext = Depends(op
         "target_rr": risk_eval["target_rr"],
         "target_miss": risk_eval["target_miss"],
         "compliant": not risk_eval["loss_exceeded"] and not risk_eval["target_miss"],
+        "go_live_hardening": hardening_snapshot,
     }
+
+    payload.setdefault("metadata", {})
+    if isinstance(payload.get("metadata"), dict):
+        payload["metadata"]["go_live_target"] = account_mode
+        payload["metadata"]["go_live_hardening"] = hardening_snapshot
 
     if account_mode != "live":
         body = await _execute_mt5_filtered_order(payload)
@@ -10571,12 +11561,14 @@ async def proxy_mt5_filtered_order(payload: dict, auth: AuthContext = Depends(op
             "symbol": payload.get("symbol", ""),
             "side": payload.get("side", "buy"),
             "risk_context": risk_context,
+            "go_live_hardening": hardening_snapshot,
         },
     )
     return {
         "status": "pending_second_approval",
         "approval_id": approval_id,
         "message": "Live order requires a second approval by another operator/admin",
+        "hardening": hardening_snapshot,
     }
 
 
@@ -11542,7 +12534,16 @@ async def mt5_live_second_approve(approval_id: str, auth: AuthContext = Depends(
     if approval["first_approved_by"] == auth.username:
         raise HTTPException(status_code=403, detail="Second approval must be from a different operator")
 
-    body = await _execute_mt5_filtered_order(approval["order_payload"])
+    order_payload = approval["order_payload"] if isinstance(approval["order_payload"], dict) else {}
+    metadata = order_payload.setdefault("metadata", {}) if isinstance(order_payload, dict) else {}
+    if isinstance(metadata, dict):
+        metadata["governance"] = {
+            "approved": True,
+            "approver": auth.username,
+            "approval_id": approval_id,
+            "approval_mode": "mt5_double_approval",
+        }
+    body = await _execute_mt5_filtered_order(order_payload)
     execute(
         """
         UPDATE mt5_live_approvals
@@ -11719,6 +12720,32 @@ async def _execute_mt5_filtered_order(payload: dict) -> dict:
     _assert_kill_switch_allows_execution()
     ts_decision = _now_utc()
     ts_intent = _now_utc()
+    payload_metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    live_target = str(payload_metadata.get("go_live_target") or "").strip().lower()
+    hardening_snapshot = None
+    if live_target == "live":
+        hardening_snapshot = _evaluate_go_live_hardening(
+            source=str((payload.get("order_intent") or {}).get("source") if isinstance(payload.get("order_intent"), dict) else payload_metadata.get("source") or "mission-control-ui").strip() or "mission-control-ui",
+            provider="mt5",
+            account_id=str(payload.get("account_id") or "").strip(),
+            symbol=str(payload.get("symbol") or ""),
+            side=str(payload.get("side") or "buy"),
+            requested_notional_usd=_to_float(payload.get("estimated_notional_usd"), 0.0),
+            confidence=_to_float(payload.get("confidence"), _to_float(payload_metadata.get("confidence"), 0.0)),
+            live_requested=True,
+            purpose="execute",
+            pre_trade_memory_gate=_extract_pre_trade_memory_gate(payload),
+            governance=_extract_trade_governance(payload),
+        )
+        if hardening_snapshot.get("status") != "approved":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "status": "blocked_by_go_live_hardening",
+                    "hardening": hardening_snapshot,
+                },
+            )
+
     risk_body = await _risk_check_mt5_order(payload)
     if risk_body.get("decision") != "accept":
         append_audit("mt5_order_rejected", {"risk": risk_body})
@@ -11795,6 +12822,10 @@ async def _execute_mt5_filtered_order(payload: dict) -> dict:
     bridge_payload["chosen_route"] = selected_route
     bridge_payload["expected_slippage_bps"] = routed_execution_result.get("expected_slippage_bps")
     bridge_payload["predictor"] = predictor_gate
+    if hardening_snapshot is not None:
+        bridge_payload.setdefault("metadata", {})
+        if isinstance(bridge_payload.get("metadata"), dict):
+            bridge_payload["metadata"]["go_live_hardening"] = hardening_snapshot
     async with httpx.AsyncClient(timeout=12.0) as client:
         response = await client.post(f"{MT5_BRIDGE_URL}/v1/orders/filter", json=bridge_payload)
         if response.status_code >= 400:
@@ -11882,7 +12913,7 @@ async def _execute_mt5_filtered_order(payload: dict) -> dict:
                 ts_broker_accept,
                 ts_fill_partial,
                 ts_fill_final,
-                json_dumps({"routing": routing, "bridge_result": result, "risk": risk_body, "router_execution": routed_execution_result, "predictor": predictor_gate, "rust_reality_gap": routed_execution_result.get("reality_gap_sample")}),
+                json_dumps({"routing": routing, "bridge_result": result, "risk": risk_body, "router_execution": routed_execution_result, "predictor": predictor_gate, "rust_reality_gap": routed_execution_result.get("reality_gap_sample"), "go_live_hardening": hardening_snapshot}),
             ),
         )
 
@@ -11890,11 +12921,16 @@ async def _execute_mt5_filtered_order(payload: dict) -> dict:
             "execution_telemetry_recorded",
             {
                 "telemetry_id": telemetry_id,
-                "decision_id": str(result.get("broker_ticket", "")),
-                "route": selected_route.get("venue", "mt5-default"),
-                "expected_slippage_bps": expected_slippage_bps,
-                "realized_slippage_bps": realized_slippage_bps,
-                "latency_e2e_ms": latency_e2e_ms,
+                **_execution_audit_summary(
+                    decision_id=str(result.get("broker_ticket", "")),
+                    route=str(selected_route.get("venue", "mt5-default")),
+                    reason=str(routing.get("reason", "")),
+                    expected_slippage_bps=expected_slippage_bps,
+                    realized_slippage_bps=realized_slippage_bps,
+                    latency_e2e_ms=latency_e2e_ms,
+                    requested_payload=payload,
+                    execution_result=result,
+                ),
             },
         )
         reality_gap_result = await _auto_ingest_reality_gap_for_decision(
@@ -11922,6 +12958,8 @@ async def _execute_mt5_filtered_order(payload: dict) -> dict:
             }
         result["predictor"] = predictor_gate
         result["reality_gap"] = reality_gap_result
+        if hardening_snapshot is not None:
+            result["go_live_hardening"] = hardening_snapshot
         synced_state = await _sync_mt5_account_state(str(payload.get("account_id", "")).strip())
         if synced_state:
             result["canonical_account_state"] = synced_state
@@ -13228,6 +14266,32 @@ async def _handle_signal_webhook(source: str, payload: dict, provided_secret: st
         resolved_preferred_venue = _preferred_execution_venue(provider, live_enabled=False)
 
     pre_trade_memory_gate = _extract_pre_trade_memory_gate(payload)
+    governance_snapshot = _extract_trade_governance(payload)
+    hardening_snapshot = None
+    if live_requested:
+        hardening_snapshot = _evaluate_go_live_hardening(
+            source=source,
+            provider=provider,
+            account_id=account_id,
+            symbol=symbol,
+            side=side,
+            requested_notional_usd=notional,
+            confidence=payload_confidence,
+            live_requested=True,
+            purpose="execute",
+            pre_trade_memory_gate=pre_trade_memory_gate,
+            governance=governance_snapshot,
+        )
+        if hardening_snapshot.get("status") != "approved":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "status": "blocked_by_go_live_hardening",
+                    "provider": provider,
+                    "account_id": account_id,
+                    "hardening": hardening_snapshot,
+                },
+            )
 
     execution_payload = {
         "decision_id": str(payload.get("decision_id") or f"{source}-{uuid4()}"),
@@ -13252,6 +14316,7 @@ async def _handle_signal_webhook(source: str, payload: dict, provided_secret: st
             "live_requested": live_requested,
             "position_side": position_side,
             "pre_trade_memory_gate": pre_trade_memory_gate,
+            "go_live_hardening": hardening_snapshot,
             "raw_payload": payload,
         },
     }
@@ -13280,9 +14345,10 @@ async def _handle_signal_webhook(source: str, payload: dict, provided_secret: st
             "position_side": position_side,
             "telemetry_id": telemetry_id,
             "pre_trade_memory_gate": routed_pre_trade_memory_gate,
+            "go_live_hardening": hardening_snapshot,
         },
     )
-    return {"status": "ok", "route": route, "telemetry_id": telemetry_id, "pre_trade_memory_gate": routed_pre_trade_memory_gate, "execution": routed}
+    return {"status": "ok", "route": route, "telemetry_id": telemetry_id, "pre_trade_memory_gate": routed_pre_trade_memory_gate, "go_live_hardening": hardening_snapshot, "execution": routed}
 
 
 @app.post("/v1/connectors/bingx/transfer")
@@ -13609,6 +14675,73 @@ async def bingx_transfer_and_smoke(payload: dict, auth: AuthContext = Depends(op
     }
 
 
+@app.post("/v1/live/orders/cancel")
+async def cancel_live_order(payload: dict, auth: AuthContext = Depends(operator_auth)) -> dict:
+    provider = str(payload.get("provider") or "bingx").strip().lower()
+    if provider != "bingx":
+        raise HTTPException(status_code=400, detail="unsupported live provider")
+
+    account_id = str(payload.get("account_id") or "").strip()
+    if not account_id:
+        raise HTTPException(status_code=400, detail="account_id is required")
+    _assert_account_visible(auth, account_id)
+
+    symbol = str(payload.get("symbol") or "").strip().upper().replace("/", "").replace("-", "")
+    if not symbol:
+        raise HTTPException(status_code=400, detail="symbol is required")
+    side = str(payload.get("side") or "buy").strip().lower()
+    if side not in {"buy", "sell"}:
+        raise HTTPException(status_code=400, detail="side must be buy or sell")
+
+    order_id = str(payload.get("order_id") or "").strip()
+    client_order_id = str(payload.get("client_order_id") or "").strip()
+    if not order_id and not client_order_id:
+        raise HTTPException(status_code=400, detail="order_id or client_order_id is required")
+
+    try:
+        linked_account, secret_payload = _bingx_secret_payload_for_account(account_id, require_trade=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    cancel_payload = {
+        "provider": provider,
+        "account_id": account_id,
+        "secret_payload": secret_payload,
+        "symbol": symbol,
+        "side": side,
+        "order_id": order_id,
+        "client_order_id": client_order_id,
+        "notional_usd": _to_float(payload.get("notional_usd"), 0.0),
+    }
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        response = await client.post(f"{BROKER_ADAPTER_URL}/v1/live/orders/cancel", json=cancel_payload)
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail=_flatten_downstream_error("live_cancel_failed", _http_error_detail(response)))
+    body = response.json()
+    cancel_result = body if isinstance(body, dict) else {"status": "unknown"}
+
+    append_audit(
+        "live_order_cancelled",
+        {
+            "provider": provider,
+            "account_id": account_id,
+            "symbol": symbol,
+            "side": side,
+            "order_id": order_id or None,
+            "client_order_id": client_order_id or None,
+            "status": cancel_result.get("status"),
+            "operator": auth.username,
+        },
+    )
+    return {
+        "status": "ok",
+        "provider": provider,
+        "account_id": account_id,
+        "linked_account": _connector_account_public_view(linked_account),
+        "cancel": cancel_result,
+    }
+
+
 @app.post("/v1/connectors/bingx/live-smoke")
 async def bingx_live_smoke(payload: dict, auth: AuthContext = Depends(operator_auth)) -> dict:
     account_id = str(payload.get("account_id") or "").strip()
@@ -13652,6 +14785,36 @@ async def bingx_live_smoke(payload: dict, auth: AuthContext = Depends(operator_a
                 "account_id": account_id,
                 "reasons": live_execution.get("reasons"),
                 "policy": live_execution.get("policy"),
+            },
+        )
+
+    hardening_snapshot = _evaluate_go_live_hardening(
+        source="bingx-live-smoke",
+        provider="bingx",
+        account_id=account_id,
+        symbol=symbol,
+        side=side,
+        requested_notional_usd=notional,
+        confidence=1.0,
+        live_requested=True,
+        purpose="smoke",
+        pre_trade_memory_gate={},
+        governance={
+            "approved": True,
+            "approver": auth.username,
+            "approval_id": f"bingx-smoke:{account_id}:{symbol}",
+            "approval_mode": "operator_confirmation_text",
+            "override": False,
+        },
+    )
+    if hardening_snapshot.get("status") != "approved":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "status": "blocked_by_go_live_hardening",
+                "provider": "bingx",
+                "account_id": account_id,
+                "hardening": hardening_snapshot,
             },
         )
 
@@ -13737,6 +14900,7 @@ async def bingx_live_smoke(payload: dict, auth: AuthContext = Depends(operator_a
             "limit_price": limit_price,
             "create_status": create_status,
             "cancel_status": cancel_result.get("status") if isinstance(cancel_result, dict) else None,
+            "go_live_hardening": hardening_snapshot,
             "operator": auth.username,
         },
     )
@@ -13755,6 +14919,7 @@ async def bingx_live_smoke(payload: dict, auth: AuthContext = Depends(operator_a
             "execution_venue": live_execution.get("execution_venue"),
         },
         "policy": live_execution.get("policy"),
+        "go_live_hardening": hardening_snapshot,
         "create": create_result,
         "cancel": cancel_result,
     }
@@ -13964,6 +15129,34 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
                     "account_id": live_execution.get("account_id"),
                 },
             )
+            hardening_snapshot = _evaluate_go_live_hardening(
+                source="approved-intent",
+                provider=str(live_execution.get("provider") or ""),
+                account_id=str(live_execution.get("account_id") or ""),
+                symbol=str(effective_intent_payload.get("instrument") or ""),
+                side=str(effective_intent_payload.get("side") or "buy"),
+                requested_notional_usd=_to_float(effective_intent_payload.get("target_notional_usd"), 0.0),
+                confidence=_clamp(_to_float(effective_intent_payload.get("confidence"), 0.0), 0.0, 1.0),
+                live_requested=True,
+                purpose="execute",
+                pre_trade_memory_gate=memory_pretrade if isinstance(memory_pretrade, dict) else {},
+                governance={
+                    "approved": True,
+                    "approver": "server-approved-intent",
+                    "approval_id": str(effective_intent_payload.get("intent_id") or "").strip(),
+                    "approval_mode": "intent_approval",
+                    "override": False,
+                },
+            )
+            if hardening_snapshot.get("status") != "approved":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "status": "blocked_by_go_live_hardening",
+                        "intent_id": effective_intent_payload.get("intent_id"),
+                        "hardening": hardening_snapshot,
+                    },
+                )
         execution_endpoint = f"{EXECUTION_ROUTER_URL}/v1/orders/routed"
         execution_body = {
             "decision_id": str(effective_intent_payload.get("intent_id") or uuid4()),
@@ -13993,6 +15186,7 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
                 "route_mode_override": applied_overrides.get("route_mode_override"),
                 "execution_style": applied_overrides.get("execution_style"),
                 "memory_v2_pretrade": memory_pretrade,
+                "go_live_hardening": hardening_snapshot,
             },
         }
     async with httpx.AsyncClient(timeout=10.0) as client:

@@ -31,6 +31,21 @@ export type GapRange = {
   missingSlots: number;
 };
 
+export type CandleAuditResult = {
+  /** True when at least one candle was built from raw trades (not OHLCV backfill). */
+  isTickTrue: boolean;
+  /** Fraction of candles [0,1] whose timestamp is a clean UTC multiple of tfMs. */
+  tfAlignmentScore: number;
+  /** True when every bar[i].o ≈ bar[i-1].c within a 0.01% tolerance. */
+  closeChainOk: boolean;
+  /** Fraction of candles [0,1] where high ≥ max(o,c) AND low ≤ min(o,c). */
+  wickConsistency: number;
+  /** Number of gaps detected in the series. */
+  gapCount: number;
+  /** Human-readable list of detected issues. */
+  issues: string[];
+};
+
 // ── Engine ────────────────────────────────────────────────────────────────────
 
 export class CandleEngineV5 {
@@ -301,6 +316,80 @@ export class CandleEngineV5 {
 
   getCandleCount(): number {
     return this.candles.size;
+  }
+
+  // ── Audit (institutional-grade candle consistency check) ──────────────────
+
+  /**
+   * Validates the candle series against institutional-grade criteria.
+   * Can be called with an external merged series (e.g. from mergeWithOhlcv)
+   * or defaults to the raw trade-built series.
+   */
+  audit(series?: NormalizedOhlcvBar[]): CandleAuditResult {
+    const s = series ?? this.getSeries();
+    const issues: string[] = [];
+
+    // 1. Tick-true flag
+    const isTickTrue = this.candles.size > 0;
+    if (!isTickTrue) {
+      issues.push("no-tick-data: series is OHLCV-only, not tick-reconstructed");
+    }
+
+    // 2. UTC alignment — every bar.t must be an exact multiple of tfMs
+    let alignedCount = 0;
+    for (const bar of s) {
+      const tsMs = new Date(bar.t).getTime();
+      if (tsMs % this.tfMs === 0) alignedCount++;
+    }
+    const tfAlignmentScore = s.length > 0 ? alignedCount / s.length : 1;
+    if (tfAlignmentScore < 1) {
+      const misaligned = s.length - alignedCount;
+      issues.push(`tf-misaligned: ${misaligned}/${s.length} bars not aligned to ${this.timeframe} UTC boundary`);
+    }
+
+    // 3. Close → Open chain (bar[i].o ≈ bar[i-1].c within 0.01%)
+    let closeChainOk = true;
+    if (s.length > 1) {
+      for (let i = 1; i < s.length; i++) {
+        const prev = s[i - 1];
+        const curr = s[i];
+        if (prev.c <= 0) continue;
+        const drift = Math.abs(curr.o - prev.c) / prev.c;
+        if (drift > 0.0001) {
+          closeChainOk = false;
+          issues.push(`close-chain-break at ${curr.t}: open=${curr.o} prev_close=${prev.c} drift=${(drift * 100).toFixed(4)}%`);
+          break; // report first occurrence only
+        }
+      }
+    }
+
+    // 4. Wick consistency — high ≥ max(o,c) AND low ≤ min(o,c)
+    let wickOkCount = 0;
+    for (const bar of s) {
+      const maxOC = Math.max(bar.o, bar.c);
+      const minOC = Math.min(bar.o, bar.c);
+      if (bar.h >= maxOC - 1e-9 && bar.l <= minOC + 1e-9) {
+        wickOkCount++;
+      } else {
+        issues.push(`wick-violation at ${bar.t}: o=${bar.o} h=${bar.h} l=${bar.l} c=${bar.c}`);
+      }
+    }
+    const wickConsistency = s.length > 0 ? wickOkCount / s.length : 1;
+
+    // 5. Gap count
+    const gaps = this.detectGaps(s);
+    if (gaps.length > 0) {
+      issues.push(`gaps: ${gaps.length} gap(s) detected (${gaps.reduce((acc, g) => acc + g.missingSlots, 0)} missing slots)`);
+    }
+
+    return {
+      isTickTrue,
+      tfAlignmentScore,
+      closeChainOk,
+      wickConsistency,
+      gapCount: gaps.length,
+      issues,
+    };
   }
 
   reset(): void {

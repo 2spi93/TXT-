@@ -52,6 +52,11 @@ export default function ChartPerceptualDebugPanel({ open, telemetry, gpuTelemetr
         </div>
 
         <div className="chart-perceptual-grid">
+          <div className="chart-perceptual-row chart-perceptual-row-range">
+            <span>Diagnosis</span>
+            <strong>{gpuTelemetry.diagnosis.primary[0] || "balanced_structure"}</strong>
+            <em>{gpuTelemetry.diagnosis.summary}</em>
+          </div>
           <div className="chart-perceptual-row">
             <span>Spacing</span>
             <strong>{formatNumber(gpuTelemetry.candleStepPx)}px obs</strong>
@@ -65,7 +70,7 @@ export default function ChartPerceptualDebugPanel({ open, telemetry, gpuTelemetr
           <div className="chart-perceptual-row">
             <span>Gap / bars</span>
             <strong>{formatNumber(gpuTelemetry.spacing.minGapPx)}px</strong>
-            <em>{gpuTelemetry.visibleBars} visible</em>
+            <em>{gpuTelemetry.visibleBars} visible · target {gpuTelemetry.spacing.targetVisibleBars}</em>
           </div>
           <div className="chart-perceptual-row">
             <span>Renderer</span>
@@ -125,9 +130,54 @@ export default function ChartPerceptualDebugPanel({ open, telemetry, gpuTelemetr
           <em>{formatNumber(telemetry.spacing.barSpacing)}px cible</em>
         </div>
         <div className="chart-perceptual-row">
+          <span>Snap / zone</span>
+          <strong>{formatNumber(telemetry.pixel.quantizedSpacingPx)}px</strong>
+          <em>{telemetry.pixel.spacingZone} · Δ {formatNumber(telemetry.pixel.snapDeltaPx, 2)}px</em>
+        </div>
+        <div className="chart-perceptual-row">
           <span>Body / gap</span>
           <strong>{formatNumber(telemetry.spacing.preferredBodyWidthPx)}px</strong>
           <em>{formatNumber(telemetry.spacing.minGapPx)}px</em>
+        </div>
+        <div className="chart-perceptual-row">
+          <span>Pixel geom</span>
+          <strong>{formatNumber(telemetry.pixel.preferredBodyWidthPx)}px body</strong>
+          <em>{formatNumber(telemetry.pixel.wickWidthPx)}px wick · {formatNumber(telemetry.pixel.pixelRatio, 2)}x DPR</em>
+        </div>
+        <div className="chart-perceptual-row">
+          <span>Weights</span>
+          <strong>tf {formatNumber(telemetry.perceptual.timeframeWeight, 2)} · dens {formatNumber(telemetry.perceptual.densityFactor, 2)}</strong>
+          <em>vol {formatNumber(telemetry.perceptual.volatilityFactor, 2)} · zoom {formatNumber(telemetry.perceptual.zoomFactor, 2)}</em>
+        </div>
+        <div className="chart-perceptual-row">
+          <span>Width model</span>
+          <strong>{formatNumber(telemetry.perceptual.baseBodyWidthPx)}px base</strong>
+          <em>{formatNumber(telemetry.perceptual.minBodyWidthPx)} → {formatNumber(telemetry.perceptual.maxBodyWidthPx)}px · ratio {formatNumber(telemetry.perceptual.bodyToSpacingRatio, 2)}</em>
+        </div>
+        <div className="chart-perceptual-row">
+          <span>Desk mode</span>
+          <strong>{telemetry.desk.mode}</strong>
+          <em>{telemetry.desk.authoritativeRenderer ? "V3 authoritative" : "native final bodies"} · conf {(telemetry.desk.confidence * 100).toFixed(0)}%</em>
+        </div>
+        <div className="chart-perceptual-row">
+          <span>Flow</span>
+          <strong>liq {formatNumber(telemetry.desk.liquidityScore, 2)} · exec {formatNumber(telemetry.desk.executionScore, 2)}</strong>
+          <em>heat {formatNumber(telemetry.desk.heatScore, 2)} · delta {formatNumber(telemetry.desk.deltaScore, 2)}</em>
+        </div>
+        <div className="chart-perceptual-row">
+          <span>Sim state</span>
+          <strong>{telemetry.simulation.stateLabel}</strong>
+          <em>{telemetry.simulation.shouldExecute ? `${telemetry.simulation.decisionAction} live` : "hold"} · conf {(telemetry.simulation.confidence * 100).toFixed(0)}%</em>
+        </div>
+        <div className="chart-perceptual-row">
+          <span>Sim exec</span>
+          <strong>fill {(telemetry.simulation.fillProbability * 100).toFixed(0)}%</strong>
+          <em>slip {formatNumber(telemetry.simulation.slippageBps, 1)}bps · lat {formatNumber(telemetry.simulation.latencyMs, 0)}ms</em>
+        </div>
+        <div className="chart-perceptual-row chart-perceptual-row-range">
+          <span>Sim cone</span>
+          <strong>{formatNumber(telemetry.simulation.coneBest, 2)} / {formatNumber(telemetry.simulation.coneExpected, 2)} / {formatNumber(telemetry.simulation.coneWorst, 2)}</strong>
+          <em>100 {formatNumber(telemetry.simulation.t100msPrice, 2)} · 250 {formatNumber(telemetry.simulation.t250msPrice, 2)} · 500 {formatNumber(telemetry.simulation.t500msPrice, 2)}</em>
         </div>
         <div className="chart-perceptual-row">
           <span>Visible bars</span>

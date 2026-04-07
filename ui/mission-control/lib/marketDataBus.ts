@@ -1,10 +1,11 @@
 type JsonMap = Record<string, unknown>;
 
 import { normalizeOhlcvRows, type NormalizedOhlcvBar } from "./ohlcvIntegrity";
-import { MarketDataEngineV5, type GapRange } from "./marketDataEngineV5";
+import { MarketDataEngineV5, type GapRange, type SyncedMarketFrame } from "./marketDataEngineV5";
 import type { DepthRow } from "./marketDataEngineV4";
 import { clearChartFrame, publishChartFrame, type LiveChartCandle } from "./chartFrameFeed";
 import { PriceFusionEngineV6, type RouteCandidate, type VenueQuote } from "./priceFusionEngineV6";
+import { OrderflowRuntimeEngine, type OrderflowRuntimeSnapshot } from "./orderflowRuntimeEngine";
 import { timeframeToMs } from "./ohlcvDataEngine";
 
 export type OhlcvBar = NormalizedOhlcvBar;
@@ -30,6 +31,7 @@ export type MarketDataBusSnapshot = {
   chartLoading: boolean;
   ohlcvStreamState: "offline" | "connecting" | "live";
   depthStreamState: "offline" | "connecting" | "live";
+  orderflowRuntime: OrderflowRuntimeSnapshot | null;
   kernelTelemetry: MarketDataBusKernelTelemetry;
   lastSyncAt: string | null;
 };
@@ -495,6 +497,7 @@ class MarketDataBus {
     chartLoading: false,
     ohlcvStreamState: "offline",
     depthStreamState: "offline",
+    orderflowRuntime: null,
     kernelTelemetry: {
       tickLatencyMs: 0,
       bufferBacklog: 0,
@@ -521,6 +524,7 @@ class MarketDataBus {
   private config: MarketDataBusConfig | null = null;
   // ── MarketDataEngine V5 : pipeline unifié (candles + microstructure + gaps) ──
   private engine: MarketDataEngineV5 | null = null;
+  private orderflowRuntimeEngine: OrderflowRuntimeEngine | null = null;
   private fusionEngine: PriceFusionEngineV6 | null = null;
   private pendingGaps: GapRange[] = [];
   private sideRefreshTimer: number | null = null;
@@ -611,6 +615,10 @@ class MarketDataBus {
     this.config = config;
     // Engine V5 : pipeline unifié (candles depuis trades + microstructure)
     this.engine = new MarketDataEngineV5(config.timeframe, config.instrument, config.venue);
+    this.orderflowRuntimeEngine = new OrderflowRuntimeEngine({
+      configKey: nextKey,
+      timeframe: config.timeframe,
+    });
     this.fusionEngine = new PriceFusionEngineV6();
     // Backfill callback : V5 nous notifie quand des gaps sont détectés
     this.engine.onGapDetected((startMs, endMs) => {
@@ -632,6 +640,7 @@ class MarketDataBus {
       chartLoading: true,
       ohlcvStreamState: "connecting",
       depthStreamState: "connecting",
+      orderflowRuntime: null,
       kernelTelemetry: {
         ...this.snapshot.kernelTelemetry,
         bufferBacklog: 0,
@@ -659,6 +668,7 @@ class MarketDataBus {
     this.disconnectSockets();
     this.config = null;
     this.engine = null;
+    this.orderflowRuntimeEngine = null;
     this.fusionEngine = null;
     this.pendingGaps = [];
     this.stopSyntheticHeartbeat();
@@ -676,6 +686,7 @@ class MarketDataBus {
       chartLoading: false,
       ohlcvStreamState: "offline",
       depthStreamState: "offline",
+      orderflowRuntime: null,
       kernelTelemetry: {
         ...this.snapshot.kernelTelemetry,
         bufferBacklog: 0,
@@ -887,6 +898,23 @@ class MarketDataBus {
     const fallbackDepth = busPayload.depth_snapshot && typeof busPayload.depth_snapshot === "object"
       ? busPayload.depth_snapshot as JsonMap
       : null;
+    if (fallbackDepth && this.orderflowRuntimeEngine) {
+      const depthPayload = (fallbackDepth.depth_payload as JsonMap | undefined) || fallbackDepth;
+      this.orderflowRuntimeEngine.ingestDepthSnapshot({
+        bids: MarketDataBus._toDepthRows(depthPayload.bids),
+        asks: MarketDataBus._toDepthRows(depthPayload.asks),
+        tsMs: typeof busPayload.as_of === "string" ? Date.parse(busPayload.as_of) : Date.now(),
+      });
+    }
+    if (this.orderflowRuntimeEngine && rawTrades.length > 0) {
+      this.orderflowRuntimeEngine.ingestTrades(rawTrades.map((trade) => ({
+        price: toNumber(trade.price ?? trade.p, 0),
+        size: toNumber(trade.size ?? trade.q ?? trade.qty, 0),
+        side: String(trade.side || (trade.m === true ? "sell" : "buy")).toLowerCase() === "sell" ? "sell" : "buy",
+        tsMs: tradeTimestampMs(trade),
+        source: String(trade.venue || config.venue || "market-bus-snapshot"),
+      })));
+    }
     const effectiveDepth = fallbackDepth
       ? (this.setVenueDepthSnapshot(config.venue, fallbackDepth) || fallbackDepth)
       : this.snapshot.marketDepth;
@@ -916,6 +944,13 @@ class MarketDataBus {
   }
 
   private emit(): void {
+    const nextOrderflowRuntime = this.orderflowRuntimeEngine ? this.orderflowRuntimeEngine.getSnapshot() : null;
+    if (this.snapshot.orderflowRuntime !== nextOrderflowRuntime) {
+      this.snapshot = {
+        ...this.snapshot,
+        orderflowRuntime: nextOrderflowRuntime,
+      };
+    }
     for (const listener of this.listeners) {
       listener(this.snapshot);
     }
@@ -1146,6 +1181,16 @@ class MarketDataBus {
 
     if (acceptedTrades.length === 0) {
       return;
+    }
+
+    if (this.orderflowRuntimeEngine) {
+      this.orderflowRuntimeEngine.ingestTrades(acceptedTrades.map((trade) => ({
+        price: toNumber(trade.raw_price ?? trade.price ?? trade.p, 0),
+        size: toNumber(trade.size ?? trade.q ?? trade.qty, 0),
+        side: String(trade.side || (trade.m === true ? "sell" : "buy")).toLowerCase() === "sell" ? "sell" : "buy",
+        tsMs: tradeTimestampMs(trade),
+        source: String(trade.venue || this.config?.venue || "live-trades"),
+      })));
     }
 
     this.engine.syncLatencyFromV4();
@@ -1878,6 +1923,14 @@ class MarketDataBus {
           const mergedDepth = this.setVenueDepthSnapshot(venue, payload);
           const effectiveDepth = mergedDepth || payload;
           this._feedDepthToV5(effectiveDepth);
+          if (this.orderflowRuntimeEngine) {
+            const depthPayload = (effectiveDepth.depth_payload as JsonMap | undefined) || effectiveDepth;
+            this.orderflowRuntimeEngine.ingestDepthSnapshot({
+              bids: MarketDataBus._toDepthRows(depthPayload.bids),
+              asks: MarketDataBus._toDepthRows(depthPayload.asks),
+              tsMs: Date.now(),
+            });
+          }
           const nextBars = this.publishEngineFrame(this.snapshot.ohlcvBars);
           this.snapshot = {
             ...this.snapshot,
@@ -1893,6 +1946,13 @@ class MarketDataBus {
           const mergedDepth = this.setVenueDepthSnapshot(venue, nextVenueDepth);
           const effectiveDepth = mergedDepth || nextVenueDepth;
           this._feedDepthToV5(effectiveDepth);
+          if (this.orderflowRuntimeEngine) {
+            this.orderflowRuntimeEngine.ingestDepthDelta({
+              bids: MarketDataBus._toDepthRows(payload.bids),
+              asks: MarketDataBus._toDepthRows(payload.asks),
+              tsMs: Date.now(),
+            });
+          }
           const nextBars = this.publishEngineFrame(this.snapshot.ohlcvBars);
           this.snapshot = {
             ...this.snapshot,
@@ -1993,6 +2053,17 @@ class MarketDataBus {
     this.connectDepthSocketForVenue(config.venue, false);
     this.connectAuxDepthSockets();
   }
+
+  getSyncedFrame(bidsRaw?: DepthRow[], asksRaw?: DepthRow[]): SyncedMarketFrame | null {
+    if (!this.engine) return null;
+    const effectiveDepth = (this.snapshot.marketDepth as JsonMap | null) || this.snapshot.orderbook;
+    const depthPayload = effectiveDepth && typeof effectiveDepth === "object"
+      ? ((effectiveDepth.depth_payload as JsonMap | undefined) || effectiveDepth)
+      : null;
+    const effectiveBids = bidsRaw ?? MarketDataBus._toDepthRows(depthPayload?.bids);
+    const effectiveAsks = asksRaw ?? MarketDataBus._toDepthRows(depthPayload?.asks);
+    return this.engine.getSyncedFrame(effectiveBids, effectiveAsks);
+  }
 }
 
 export function createMarketDataBus(): {
@@ -2003,6 +2074,7 @@ export function createMarketDataBus(): {
   ingestPriceTick: (price: number, tsMs?: number) => void;
   setSchedulerHint: (hint: MarketDataBusSchedulerHint) => void;
   setBenchmarkMode: (enabled: boolean, ticksPerSec?: number) => void;
+  getSyncedFrame: (bidsRaw?: DepthRow[], asksRaw?: DepthRow[]) => SyncedMarketFrame | null;
 } {
   const bus = new MarketDataBus();
   return {
@@ -2013,5 +2085,6 @@ export function createMarketDataBus(): {
     ingestPriceTick: (price, tsMs) => bus.ingestPriceTick(price, tsMs),
     setSchedulerHint: (hint) => bus.setSchedulerHint(hint),
     setBenchmarkMode: (enabled, ticksPerSec) => bus.setBenchmarkMode(enabled, ticksPerSec),
+    getSyncedFrame: (bidsRaw, asksRaw) => bus.getSyncedFrame(bidsRaw, asksRaw),
   };
 }

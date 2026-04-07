@@ -86,6 +86,27 @@ function safeNumber(value: unknown, fallback = 0): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
+function safeRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function safeRows(value: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+    : [];
+}
+
+function toneClass(value: string, positive: string, warning: string): string {
+  const normalized = value.trim().toUpperCase();
+  if (positive.split("|").includes(normalized)) {
+    return "good";
+  }
+  if (warning.split("|").includes(normalized)) {
+    return "warn";
+  }
+  return "subtle";
+}
+
 function formatCompactUsd(value: unknown): string {
   const amount = safeNumber(value, 0);
   return `${amount.toFixed(Math.abs(amount) >= 100 ? 0 : 2)} USD`;
@@ -139,6 +160,10 @@ const PANEL_HINTS: Record<string, { text: string; examples: string[] }> = {
   "Risk Compliance Timeline": {
     text: "Historique de conformite risque: ok/miss, ratio de miss, poll et seuils d'alerte locale.",
     examples: ["Si le ratio miss grimpe, le desk doit ralentir ou couper certaines executions.", "Le hard alert permet de declencher une vigilance locale plus stricte."],
+  },
+  "H24 Control Room": {
+    text: "Salle de controle live: watchdog, gouvernance, memory gate, recovery, audit et warfare core sur un seul panneau.",
+    examples: ["Si le watchdog passe en HALT, le bouton rouge doit etre considere comme prioritaire.", "Croiser health score, market state et audit trail avant toute promotion live."],
   },
 };
 
@@ -597,6 +622,137 @@ export function AlertsMonitoringPanel({
           <span className="subtle mini">{String(item.message || "").slice(0, 38)}</span>
         </div>
       ))}
+    </MonitoringPanelCard>
+  );
+}
+
+export function ControlRoomMonitoringPanel({
+  badge,
+  layoutEditMode,
+  onDetach,
+  liveOpsPayload,
+  emergencyStopBusy,
+  emergencyStopFeedback,
+  onEmergencyStop,
+  formatClock,
+}: {
+  badge: ReactNode;
+  layoutEditMode: boolean;
+  onDetach: () => void;
+  liveOpsPayload: Record<string, unknown> | null;
+  emergencyStopBusy: boolean;
+  emergencyStopFeedback: string | null;
+  onEmergencyStop: () => void;
+  formatClock: (value: string) => string;
+}) {
+  const snapshot = safeRecord(liveOpsPayload);
+  const watchdog = safeRecord(snapshot.watchdog_state);
+  const governance = safeRecord(snapshot.governance);
+  const recovery = safeRecord(snapshot.recovery);
+  const risk = safeRecord(snapshot.risk_snapshot);
+  const memoryGap = safeRecord(snapshot.memory_gap);
+  const warfare = safeRecord(snapshot.warfare_core);
+  const arbitrage = safeRecord(warfare.arbitrage);
+  const smartMoney = safeRecord(warfare.smart_money);
+  const spoof = safeRecord(warfare.spoof);
+  const marketState = safeRecord(warfare.market_state);
+  const domination = safeRecord(warfare.domination);
+  const auditTrail = safeRows(snapshot.audit_trail).slice(0, 3);
+  const riskTimeline = safeRows(snapshot.risk_timeline).slice(0, 3);
+  const exposureRows = safeRows(risk.exposure_by_symbol).slice(0, 3);
+  const venueRankings = safeRows(arbitrage.rankings).slice(0, 4);
+  const watchdogTriggers = Array.isArray(watchdog.triggers) ? watchdog.triggers.map((item) => String(item)).filter(Boolean).slice(0, 4) : [];
+  const healthScore = safeNumber(watchdog.health_score, 0);
+  const watchdogStatus = String(watchdog.status || "UNKNOWN");
+  const systemMode = String(governance.mode || "SAFE");
+  const recoveryMode = String(recovery.mode || "NOMINAL");
+  const memoryDecision = String(memoryGap.memory_decision || "OK");
+  const dominationState = String(domination.state || "WEAK");
+  const marketStateLabel = String(marketState.state || "CHOP");
+  const arbitrageExecutable = Boolean(arbitrage.executable);
+  const arbitrageEdge = safeNumber(arbitrage.netEdgeBps, 0);
+  const executableDepthUsd = safeNumber(arbitrage.maxExecutableUsd, 0);
+
+  return (
+    <MonitoringPanelCard title="H24 Control Room" badge={badge} layoutEditMode={layoutEditMode} onDetach={onDetach}>
+      {!liveOpsPayload ? <p className="subtle mini">Control room indisponible.</p> : null}
+      {liveOpsPayload ? (
+        <>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 8 }}>
+            <div style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid rgba(148, 163, 184, 0.18)", background: "rgba(15, 23, 42, 0.24)" }}>
+              <div className="subtle mini">Health score</div>
+              <div className={healthScore >= 80 ? "good" : healthScore >= 60 ? "subtle" : "warn"} style={{ fontSize: 18, fontWeight: 700 }}>{healthScore.toFixed(0)}%</div>
+              <div className={`subtle mini ${toneClass(watchdogStatus, "OK", "HALT|WARNING")}`}>watchdog {watchdogStatus}</div>
+            </div>
+            <div style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid rgba(148, 163, 184, 0.18)", background: "rgba(15, 23, 42, 0.24)" }}>
+              <div className="subtle mini">System lock</div>
+              <div className={toneClass(systemMode, "LIVE", "LOCKED")} style={{ fontSize: 18, fontWeight: 700 }}>{systemMode}</div>
+              <div className="subtle mini">{String(governance.backend_mode || "guarded_auto")} · {recoveryMode}</div>
+            </div>
+          </div>
+          <div className="mon-row"><span>Memory gate</span><span className={toneClass(memoryDecision, "OK", "BLOCKED|WATCH")}>{memoryDecision}</span></div>
+          <div className="mon-row"><span>Drawdown</span><span className={safeNumber(risk.dd_pct, 0) >= 2 ? "warn" : safeNumber(risk.dd_pct, 0) >= 1 ? "subtle" : "good"}>{safeNumber(risk.dd_pct, 0).toFixed(2)}% · {formatCompactUsd(risk.dd_usd)}</span></div>
+          <div className="mon-row"><span>Slippage / day use</span><span>{safeNumber(risk.avg_slippage_bps, 0).toFixed(2)}bps · {formatCompactUsd(risk.daily_used_usd)}</span></div>
+          <div className="mon-row"><span>Market state</span><span className={toneClass(marketStateLabel, "TREND", "TRAP|HIGH_VOL|DEAD")}>{marketStateLabel} · {(safeNumber(marketState.confidence, 0) * 100).toFixed(0)}%</span></div>
+          <div className="mon-row"><span>Warfare</span><span>{String(smartMoney.state || "INACTIVE")} / {String(spoof.state || "CLEAR")} / {dominationState}</span></div>
+          <div className="mon-row"><span>Arbitrage</span><span className={arbitrageExecutable && arbitrageEdge > 0 ? "good" : "subtle"}>{arbitrageExecutable ? `${String(arbitrage.buyVenue || "buy")} → ${String(arbitrage.sellVenue || "sell")} · +${arbitrageEdge.toFixed(2)}bps` : "standby"}</span></div>
+          <div className="mon-row"><span>Executable depth</span><span className={executableDepthUsd > 0 ? "good" : "subtle"}>{formatCompactUsd(executableDepthUsd)}</span></div>
+          {watchdogTriggers.length > 0 ? <div className="subtle mini" style={{ marginTop: 6 }}>Triggers: {watchdogTriggers.join(" · ")}</div> : null}
+          <div style={{ display: "flex", gap: 8, marginTop: 10, marginBottom: 8 }}>
+            <button type="button" className="chart-chip" onClick={onEmergencyStop} disabled={emergencyStopBusy} style={{ color: "#ffd5d5", borderColor: "rgba(248, 113, 113, 0.5)" }}>
+              {emergencyStopBusy ? "Emergency stop..." : "Emergency stop"}
+            </button>
+            <span className="subtle mini" style={{ alignSelf: "center" }}>
+              {String(recovery.active) === "true" ? "Recovery active" : "Recovery nominal"}
+            </span>
+          </div>
+          {emergencyStopFeedback ? <p className="subtle mini" style={{ marginTop: 0 }}>{emergencyStopFeedback}</p> : null}
+          <div style={{ marginTop: 10 }}>
+            <div className="subtle mini" style={{ marginBottom: 4 }}>Venue ladder</div>
+            {venueRankings.length === 0 ? <p className="subtle mini">Aucune venue classee.</p> : null}
+            {venueRankings.map((row, index) => (
+              <div key={`ops-venue-${index}`} className="mon-row">
+                <span>{String(row.venue || "venue").slice(0, 10)}</span>
+                <span className="subtle mini">{safeNumber(row.totalCostBps, 0).toFixed(2)}bps · {safeNumber(row.latencyMs, 0).toFixed(0)}ms</span>
+                <span className={Boolean(row.executable) ? "good" : "warn"}>{safeNumber(row.availableDepthUsd, 0).toFixed(0)} USD</span>
+              </div>
+            ))}
+          </div>
+          <div style={{ marginTop: 10 }}>
+            <div className="subtle mini" style={{ marginBottom: 4 }}>Exposure concentration</div>
+            {exposureRows.length === 0 ? <p className="subtle mini">Aucune exposition recente.</p> : null}
+            {exposureRows.map((row, index) => (
+              <div key={`ops-exposure-${index}`} className="mon-row">
+                <span>{String(row.symbol || "BOOK").slice(0, 10)}</span>
+                <span className="subtle mini">notional proxy</span>
+                <span>{formatCompactUsd(row.notionalUsd)}</span>
+              </div>
+            ))}
+          </div>
+          <div style={{ marginTop: 10 }}>
+            <div className="subtle mini" style={{ marginBottom: 4 }}>Audit trail</div>
+            {auditTrail.length === 0 ? <p className="subtle mini">Aucun audit recent.</p> : null}
+            {auditTrail.map((row, index) => (
+              <div key={`ops-audit-${index}`} className="mon-row">
+                <span>{String(row.at) ? formatClock(String(row.at)) : "--:--:--"}</span>
+                <span className="subtle mini">{String(row.route || row.decision || "n/a").slice(0, 20)}</span>
+                <span className={String(row.result || "").includes("BLOCK") ? "warn" : "good"}>{String(row.result || "OK").slice(0, 10)}</span>
+              </div>
+            ))}
+          </div>
+          <div style={{ marginTop: 10 }}>
+            <div className="subtle mini" style={{ marginBottom: 4 }}>Risk timeline</div>
+            {riskTimeline.length === 0 ? <p className="subtle mini">Aucun point risque recent.</p> : null}
+            {riskTimeline.map((row, index) => (
+              <div key={`ops-risk-${index}`} className="mon-row">
+                <span>{String(row.at) ? formatClock(String(row.at)) : "--:--:--"}</span>
+                <span className="subtle mini">{String(row.exposure_symbol || "BOOK").slice(0, 10)}</span>
+                <span className={safeNumber(row.dd_pct, 0) >= 2 ? "warn" : "subtle"}>{safeNumber(row.dd_pct, 0).toFixed(2)}%</span>
+              </div>
+            ))}
+          </div>
+        </>
+      ) : null}
     </MonitoringPanelCard>
   );
 }

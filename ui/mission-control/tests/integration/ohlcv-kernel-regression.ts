@@ -12,6 +12,26 @@ function findBar(engine: MarketDataEngineV5, timestamp: string) {
   return engine.getSeries().find((bar) => bar.t === timestamp) || null;
 }
 
+function projectBars(bars: Array<{ t: string; o: number; h: number; l: number; c: number; v: number; tf?: string }>) {
+  return bars.map((bar) => ({
+    t: bar.t,
+    o: bar.o,
+    h: bar.h,
+    l: bar.l,
+    c: bar.c,
+    v: bar.v,
+    tf: bar.tf,
+  }));
+}
+
+function assertProjectedSeriesEqual(
+  actual: Array<{ t: string; o: number; h: number; l: number; c: number; v: number; tf?: string }>,
+  expected: Array<{ t: string; o: number; h: number; l: number; c: number; v: number; tf?: string }>,
+  message: string,
+): void {
+  assert.deepEqual(projectBars(actual), projectBars(expected), message);
+}
+
 async function waitFor(predicate: () => boolean, timeoutMs: number, stepMs = 25): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -150,6 +170,121 @@ async function verifySyntheticHeartbeatOpensMicroTimeframeBar(): Promise<void> {
   }
 }
 
+function verifyReplayAndLiveProduceIdenticalSeries(): void {
+  const baseBarTime = "2026-03-30T11:59:00.000Z";
+  const baseBar = {
+    t: baseBarTime,
+    o: 100,
+    h: 100,
+    l: 99.5,
+    c: 100,
+    v: 10,
+    tf: "1m",
+    seq: iso(baseBarTime),
+  };
+
+  const trades = [
+    { price: 101, size: 2, side: "buy", tsMs: iso("2026-03-30T12:00:05.000Z") },
+    { price: 104, size: 1, side: "buy", tsMs: iso("2026-03-30T12:00:25.000Z") },
+    { price: 102, size: 3, side: "sell", tsMs: iso("2026-03-30T12:00:50.000Z") },
+    { price: 103, size: 2, side: "buy", tsMs: iso("2026-03-30T12:01:10.000Z") },
+    { price: 99, size: 1, side: "sell", tsMs: iso("2026-03-30T12:01:40.000Z") },
+    { price: 106, size: 4, side: "buy", tsMs: iso("2026-03-30T12:04:55.000Z") },
+  ];
+  const quoteTicks = [
+    { price: 105.5, tsMs: iso("2026-03-30T12:00:55.000Z") },
+    { price: 98.5, tsMs: iso("2026-03-30T12:01:45.000Z") },
+    { price: 107.25, tsMs: iso("2026-03-30T12:04:58.000Z") },
+  ];
+  const domBids: Array<[number, number]> = [[107.0, 5], [106.5, 3]];
+  const domAsks: Array<[number, number]> = [[107.5, 4], [108.0, 6]];
+
+  const replayEngine = new MarketDataEngineV5("1m", "SOLUSDT", "binance");
+  const liveEngine = new MarketDataEngineV5("1m", "SOLUSDT", "binance");
+
+  replayEngine.bootstrap({ ohlcvBars: [baseBar], trades });
+  liveEngine.bootstrap({ ohlcvBars: [baseBar] });
+  for (const trade of trades) {
+    liveEngine.ingestTrade(trade);
+  }
+
+  for (const tick of quoteTicks) {
+    replayEngine.ingestTick(tick.price, tick.tsMs, "binance");
+    liveEngine.ingestTick(tick.price, tick.tsMs, "binance");
+  }
+
+  replayEngine.ingestDepthSnapshot([...domBids], [...domAsks]);
+  liveEngine.ingestDepthSnapshot([...domBids], [...domAsks]);
+
+  assertProjectedSeriesEqual(
+    liveEngine.getSeries(),
+    replayEngine.getSeries(),
+    "replay and live pipelines must yield the exact same 1m merged series",
+  );
+  assertProjectedSeriesEqual(
+    liveEngine.getSeries("5m"),
+    replayEngine.getSeries("5m"),
+    "replay and live pipelines must yield the exact same 5m derived series",
+  );
+
+  const replayFrame = replayEngine.getSyncedFrame([...domBids], [...domAsks]);
+  const liveFrame = liveEngine.getSyncedFrame([...domBids], [...domAsks]);
+  assert.equal(liveFrame.slotIso, replayFrame.slotIso, "replay and live synced frames must anchor the same candle slot");
+  assert.equal(liveFrame.domDelta, replayFrame.domDelta, "replay and live synced frames must expose the same DOM delta");
+  assert.deepEqual(liveFrame.audit, replayFrame.audit, "replay and live synced frames must expose the same audit snapshot");
+}
+
+function verifyReconstructedFiveMinuteMatchesLiveFiveMinute(): void {
+  const trades = [
+    { price: 101, size: 2, side: "buy", tsMs: iso("2026-03-30T12:00:05.000Z") },
+    { price: 104, size: 1, side: "buy", tsMs: iso("2026-03-30T12:00:25.000Z") },
+    { price: 102, size: 3, side: "sell", tsMs: iso("2026-03-30T12:00:50.000Z") },
+    { price: 103, size: 2, side: "buy", tsMs: iso("2026-03-30T12:01:10.000Z") },
+    { price: 99, size: 1, side: "sell", tsMs: iso("2026-03-30T12:01:40.000Z") },
+    { price: 106, size: 4, side: "buy", tsMs: iso("2026-03-30T12:04:55.000Z") },
+  ];
+  const quoteTicks = [
+    { price: 105.5, tsMs: iso("2026-03-30T12:00:55.000Z") },
+    { price: 98.5, tsMs: iso("2026-03-30T12:01:45.000Z") },
+    { price: 107.25, tsMs: iso("2026-03-30T12:04:58.000Z") },
+  ];
+
+  const tickEngine = new MarketDataEngineV5("1m", "SOLUSDT", "binance");
+  tickEngine.bootstrap({ ohlcvBars: [], trades });
+  for (const tick of quoteTicks) {
+    tickEngine.ingestTick(tick.price, tick.tsMs, "binance");
+  }
+
+  const reconstructedFiveMinute = tickEngine.getSeries("5m");
+  const expectedLiveFiveMinute = {
+    t: "2026-03-30T12:00:00.000Z",
+    o: 101,
+    h: 107.25,
+    l: 98.5,
+    c: 107.25,
+    v: 13,
+    tf: "5m",
+    seq: 1,
+  };
+
+  assert.equal(reconstructedFiveMinute.length, 1, "the reconstructed 5m series should collapse into a single bar for the 5-minute window");
+  assertProjectedSeriesEqual(
+    reconstructedFiveMinute,
+    [expectedLiveFiveMinute],
+    "the reconstructed 5m candle must match the canonical candle built from the tick stream",
+  );
+
+  const liveFiveMinuteEngine = new MarketDataEngineV5("5m", "SOLUSDT", "binance");
+  liveFiveMinuteEngine.bootstrap({ ohlcvBars: [] });
+  liveFiveMinuteEngine.ingestWsBar(expectedLiveFiveMinute);
+
+  assertProjectedSeriesEqual(
+    reconstructedFiveMinute,
+    liveFiveMinuteEngine.getSeries("5m"),
+    "the 5m candle reconstructed from ticks must stay identical to the 5m live candle",
+  );
+}
+
 async function run(): Promise<void> {
   const engine = new MarketDataEngineV5("1m", "SOLUSDT", "binance");
   const baseBarTime = "2026-03-30T11:00:00.000Z";
@@ -218,9 +353,12 @@ async function run(): Promise<void> {
   assert.equal(swappedFiveMinute.length, fiveMinuteSeries.length, "timeframe-scoped back buffer should swap independently");
   assert.equal(swappedFiveMinute[0]?.tf, "5m", "timeframe-scoped frame should carry the selected timeframe");
 
+  verifyReplayAndLiveProduceIdenticalSeries();
+  verifyReconstructedFiveMinuteMatchesLiveFiveMinute();
+
   await verifySyntheticHeartbeatOpensMicroTimeframeBar();
 
-  console.log("PASS ohlcv-kernel regression: quote-only backfill/live fusion keeps candles mutable and heartbeat opens micro bars");
+  console.log("PASS ohlcv-kernel regression: quote-only fusion, replay/live parity, and 5m tick-vs-live parity all hold");
 }
 
 run().catch((error) => {
