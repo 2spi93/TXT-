@@ -14,8 +14,10 @@ import { MultiChartManager } from "../../lib/engine/gpu-chart/MultiChartManager"
 import type { PriceSignalBand } from "../../lib/engine/gpu-chart/PriceSignalLayer";
 import type { TradeBubblePoint } from "../../lib/engine/gpu-chart/TradeBubbleLayer";
 import type { OhlcBar } from "../../lib/engine/gpu-chart/sharedBuffer";
-import { subscribeChartFrame } from "../../lib/chartFrameFeed";
+import { publishChartFrameBatch, subscribeChartFrame, type LiveChartFrameMeta } from "../../lib/chartFrameFeed";
 import type { DomHistoryFrame } from "../../lib/domHistoryBuffer";
+import { GoldenFrameWorkerAdapter, type GoldenFrameWorkerEvent } from "../../lib/goldenFrameWorkerAdapter";
+import { timeframeToMs } from "../../lib/ohlcvDataEngine";
 
 type InstitutionalChartProps = Omit<ComponentProps<typeof InstitutionalChart>, "onPerceptualTelemetry">;
 
@@ -66,6 +68,7 @@ type Props = InstitutionalChartProps & {
   priceSignalBands?: PriceSignalBand[];
   isPreviewMode?: boolean;
   onPerceptualTelemetry?: (payload: GpuPerceptualTelemetry) => void;
+  onViewportFrameMetaChange?: (payload: Record<string, LiveChartFrameMeta>) => void;
 };
 
 type GpuMetrics = {
@@ -132,6 +135,219 @@ function timeframeSeconds(timeframe: string): number {
   }
 }
 
+
+function formatGpuHudPrice(value: number): string {
+  if (!Number.isFinite(value)) {
+    return "-";
+  }
+  if (Math.abs(value) >= 1000) {
+    return value.toLocaleString("en-US", { maximumFractionDigits: 2 });
+  }
+  if (Math.abs(value) >= 100) {
+    return value.toFixed(2);
+  }
+  return value.toFixed(4);
+}
+
+function formatGpuHudTime(epochSeconds: number, timeframe: string): string {
+  if (!Number.isFinite(epochSeconds)) {
+    return "--:--";
+  }
+  const date = new Date(epochSeconds * 1000);
+  const hours = String(date.getUTCHours()).padStart(2, "0");
+  const minutes = String(date.getUTCMinutes()).padStart(2, "0");
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(date.getUTCDate()).padStart(2, "0");
+  return timeframeSeconds(timeframe) >= 86_400 ? `${month}/${day}` : `${hours}:${minutes}`;
+}
+
+function resolveFeedCandleTimestampMs(candles: CandleLike[]): number | null {
+  const label = candles[candles.length - 1]?.label;
+  if (!label) {
+    return null;
+  }
+  const parsed = Date.parse(label);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeViewportFeedsForComparison(
+  primaryBars: OhlcBar[],
+  feeds: Array<{ id: string; symbol: string; bars: OhlcBar[] }>,
+): Array<{ id: string; symbol: string; bars: OhlcBar[] }> {
+  const filteredFeeds = feeds.filter((feed) => feed.bars.length > 1);
+  const masterTime = resolveMasterClockTime(primaryBars, filteredFeeds);
+  return filteredFeeds
+    .map((feed) => ({
+      ...feed,
+      bars: normalizeBarsForComparison(syncBarsToMasterClock(feed.bars, masterTime)),
+    }))
+    .filter((feed) => feed.bars.length > 1);
+}
+
+function drawGpuCanvasHud(
+  ctx: CanvasRenderingContext2D,
+  {
+    bars,
+    width,
+    height,
+    timeframe,
+    liveFrameMeta,
+    viewports,
+    viewportMetaMap,
+  }: {
+    bars: OhlcBar[];
+    width: number;
+    height: number;
+    timeframe: string;
+    liveFrameMeta: LiveChartFrameMeta | null;
+    viewports: Array<{ id: string; symbol?: string; x: number; y: number; width: number; height: number }>;
+    viewportMetaMap: Record<string, LiveChartFrameMeta>;
+  },
+): void {
+  ctx.clearRect(0, 0, width, height);
+  if (bars.length === 0 || width < 120 || height < 80) {
+    return;
+  }
+
+  const rightAxisWidth = 88;
+  const bottomAxisHeight = 26;
+  const leftPad = 8;
+  const topPad = 10;
+  const plotLeft = leftPad;
+  const plotTop = topPad;
+  const plotRight = Math.max(plotLeft + 24, width - rightAxisWidth);
+  const plotBottom = Math.max(plotTop + 24, height - bottomAxisHeight);
+  const plotWidth = plotRight - plotLeft;
+  const plotHeight = plotBottom - plotTop;
+  if (plotWidth <= 24 || plotHeight <= 24) {
+    return;
+  }
+
+  const minPrice = Math.min(...bars.map((bar) => bar.low));
+  const maxPrice = Math.max(...bars.map((bar) => bar.high));
+  const rawRange = Math.max(1e-6, maxPrice - minPrice);
+  const paddedRange = rawRange * 1.08;
+  const pad = (paddedRange - rawRange) * 0.5;
+  const domainMin = minPrice - pad;
+  const domainMax = maxPrice + pad;
+  const priceToY = (price: number) => {
+    const ratio = (domainMax - price) / Math.max(1e-6, domainMax - domainMin);
+    return plotTop + ratio * plotHeight;
+  };
+
+  const lastBar = bars[bars.length - 1];
+  const lastPrice = lastBar.close;
+  const priceLineY = Math.max(plotTop, Math.min(plotBottom, priceToY(lastPrice)));
+  const priceUp = lastBar.close >= lastBar.open;
+  const accent = priceUp ? "#00ffa3" : "#ff5d5d";
+  const accentSoft = priceUp ? "rgba(0,255,163,0.18)" : "rgba(255,93,93,0.18)";
+
+  ctx.save();
+  ctx.font = '11px ui-monospace, "SFMono-Regular", Menlo, monospace';
+  ctx.textBaseline = "middle";
+  ctx.lineWidth = 1;
+
+  const priceTicks = 5;
+  for (let index = 0; index < priceTicks; index += 1) {
+    const ratio = index / (priceTicks - 1);
+    const price = domainMax - ratio * (domainMax - domainMin);
+    const y = plotTop + ratio * plotHeight;
+    ctx.strokeStyle = index === Math.round((priceTicks - 1) / 2)
+      ? "rgba(126, 215, 255, 0.14)"
+      : "rgba(126, 215, 255, 0.08)";
+    ctx.beginPath();
+    ctx.moveTo(plotLeft, y + 0.5);
+    ctx.lineTo(plotRight, y + 0.5);
+    ctx.stroke();
+
+    ctx.fillStyle = "rgba(214, 228, 243, 0.74)";
+    ctx.fillText(formatGpuHudPrice(price), plotRight + 10, y);
+  }
+
+  const timeTicks = Math.min(4, Math.max(2, bars.length));
+  for (let index = 0; index < timeTicks; index += 1) {
+    const barIndex = timeTicks === 1 ? bars.length - 1 : Math.round((index * (bars.length - 1)) / (timeTicks - 1));
+    const bar = bars[Math.max(0, Math.min(bars.length - 1, barIndex))];
+    const x = plotLeft + (barIndex / Math.max(1, bars.length - 1)) * plotWidth;
+    ctx.strokeStyle = "rgba(126, 215, 255, 0.08)";
+    ctx.beginPath();
+    ctx.moveTo(x + 0.5, plotTop);
+    ctx.lineTo(x + 0.5, plotBottom);
+    ctx.stroke();
+
+    ctx.textAlign = index === 0 ? "left" : index === timeTicks - 1 ? "right" : "center";
+    ctx.fillStyle = "rgba(214, 228, 243, 0.7)";
+    ctx.fillText(formatGpuHudTime(bar.time, timeframe), x, plotBottom + 14);
+  }
+
+  ctx.strokeStyle = accent;
+  ctx.fillStyle = accentSoft;
+  ctx.beginPath();
+  ctx.moveTo(plotLeft, priceLineY + 0.5);
+  ctx.lineTo(plotRight, priceLineY + 0.5);
+  ctx.stroke();
+  ctx.fillRect(plotLeft, priceLineY - 9, plotRight - plotLeft, 18);
+
+  const badgeText = formatGpuHudPrice(lastPrice);
+  ctx.font = '12px ui-monospace, "SFMono-Regular", Menlo, monospace';
+  const badgeWidth = Math.ceil(ctx.measureText(badgeText).width) + 18;
+  const badgeHeight = 20;
+  const badgeX = plotRight + 6;
+  const badgeY = Math.max(plotTop, Math.min(plotBottom - badgeHeight, priceLineY - badgeHeight * 0.5));
+  ctx.fillStyle = accent;
+  ctx.beginPath();
+  ctx.roundRect(badgeX, badgeY, badgeWidth, badgeHeight, 8);
+  ctx.fill();
+  ctx.fillStyle = "#051018";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.fillText(badgeText, badgeX + 9, badgeY + badgeHeight * 0.5);
+
+  if (liveFrameMeta) {
+    const statusText = `${liveFrameMeta.syncStatus.toUpperCase()} ${Math.round(liveFrameMeta.confidence * 100)}%`;
+    ctx.font = '10px ui-monospace, "SFMono-Regular", Menlo, monospace';
+    const statusWidth = Math.ceil(ctx.measureText(statusText).width) + 14;
+    ctx.fillStyle = "rgba(6, 14, 24, 0.78)";
+    ctx.beginPath();
+    ctx.roundRect(plotLeft, plotTop, statusWidth, 18, 8);
+    ctx.fill();
+    ctx.fillStyle = "rgba(222, 235, 247, 0.88)";
+    ctx.textAlign = "left";
+    ctx.fillText(statusText, plotLeft + 7, plotTop + 9);
+  }
+
+  if (viewports.length > 1) {
+    ctx.font = '9px ui-monospace, "SFMono-Regular", Menlo, monospace';
+    for (const viewport of viewports) {
+      const meta = viewportMetaMap[viewport.id] || null;
+      if (!meta || viewport.width < 84 || viewport.height < 48) {
+        continue;
+      }
+      const top = Math.max(0, height - viewport.y - viewport.height);
+      const pillX = viewport.x + 6;
+      const pillY = top + 6;
+      const tone = meta.syncStatus === "atomic" && !meta.partial
+        ? { fill: "rgba(8, 22, 18, 0.86)", stroke: "rgba(0, 255, 163, 0.42)", text: "rgba(194, 255, 228, 0.94)" }
+        : meta.confidence >= 0.55
+          ? { fill: "rgba(29, 22, 8, 0.86)", stroke: "rgba(255, 209, 102, 0.42)", text: "rgba(255, 234, 180, 0.94)" }
+          : { fill: "rgba(28, 10, 10, 0.88)", stroke: "rgba(255, 116, 116, 0.42)", text: "rgba(255, 214, 214, 0.94)" };
+      const label = `${String(viewport.symbol || viewport.id).slice(0, 8)} ${meta.syncStatus === "atomic" && !meta.partial ? "AT" : meta.partial ? "PT" : "CO"} ${Math.round(meta.confidence * 100)}%`;
+      const skewLabel = meta.batchSkewMs != null ? ` ${meta.batchSkewMs}ms` : "";
+      const text = `${label}${skewLabel}`;
+      const pillWidth = Math.ceil(ctx.measureText(text).width) + 12;
+      ctx.fillStyle = tone.fill;
+      ctx.strokeStyle = tone.stroke;
+      ctx.beginPath();
+      ctx.roundRect(pillX, pillY, pillWidth, 16, 7);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = tone.text;
+      ctx.fillText(text, pillX + 6, pillY + 8);
+    }
+  }
+
+  ctx.restore();
+}
 function normalizeTimes(labels: string[], timeframe: string): number[] {
   const step = timeframeSeconds(timeframe);
   const fallbackStart = Math.floor(Date.now() / 1000) - Math.max(0, labels.length - 1) * step;
@@ -337,21 +553,34 @@ export default function GpuChartV4Surface({
   domHistory,
   tradeBubbles,
   priceSignalBands,
+  onViewportFrameMetaChange,
   ...rest
 }: Props) {
   const spanAuthorityMode = useMemo<SpanAuthorityMode>(() => resolveSpanAuthorityMode(), []);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const initCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const hostRef = useRef<HTMLDivElement | null>(null);
   const rafRef = useRef<number | null>(null);
   const managerRef = useRef<MultiChartManager | null>(null);
   const barsRef = useRef<OhlcBar[]>([]);
   const propCandlesRef = useRef(candles);
   const feedBarsRef = useRef<Array<{ id: string; symbol: string; bars: OhlcBar[] }>>([]);
+  const secondarySourceFeedsRef = useRef<Array<{ id: string; symbol: string; bars: OhlcBar[] }>>([]);
+  const secondaryBatchedFeedsRef = useRef<Array<{ id: string; symbol: string; bars: OhlcBar[] }>>([]);
+  const viewportLayoutRef = useRef<Array<{ id: string; symbol?: string; x: number; y: number; width: number; height: number }>>([]);
+  const viewportMetaRef = useRef<Record<string, LiveChartFrameMeta>>({});
+  const batchWorkerRef = useRef<GoldenFrameWorkerAdapter | null>(null);
+  const multiFeedSourceMapRef = useRef<Map<string, GpuViewportFeed>>(new Map());
+  const onViewportFrameMetaChangeRef = useRef(onViewportFrameMetaChange);
   const timeframeRef = useRef(timeframe);
   const visualProfileRef = useRef(visualProfile);
   const subscribedLiveFeedKeyRef = useRef<string | null>(null);
   const visualProfileConfig = useMemo(() => applyVisualProfile(visualProfile), [visualProfile]);
+  const effectiveSmoothingMs = useMemo(
+    () => (timeframeToMs(timeframe) <= 5_000 ? 0 : (Number.isFinite(smoothingMs) ? Math.max(0, smoothingMs) : 140)),
+    [smoothingMs, timeframe],
+  );
   const liveFrameSchedulerRef = useRef(createLatestFrameScheduler<CandleLike[]>({
     minFrameMs: visualProfileConfig.frame.minFrameMs,
     strictBucketAlignment: visualProfileConfig.perception.strictBucketAlignment,
@@ -360,6 +589,7 @@ export default function GpuChartV4Surface({
   const diagnosticsLoggedRef = useRef(false);
   const fpsSamplesRef = useRef<number[]>([]);
   const liveMetricsRef = useRef<GpuMetrics>({ fps: 0, drawCalls: 0, batchSize: 0, renderer: null, overlayIntervalMs: 250 });
+  const liveFrameMetaRef = useRef<LiveChartFrameMeta | null>(null);
   const cameraDatasetRef = useRef<{ timeframe: string; liveFeedKey: string | null; count: number }>({
     timeframe,
     liveFeedKey: liveFeedKey ?? null,
@@ -378,6 +608,7 @@ export default function GpuChartV4Surface({
   const [initPhase, setInitPhase] = useState<"canvas-init" | "webgl-live" | "fallback">("canvas-init");
   const [gpuMetrics, setGpuMetrics] = useState<GpuMetrics>({ fps: 0, drawCalls: 0, batchSize: 0, renderer: null, overlayIntervalMs: 250 });
   const [gpuRecoveryEpoch, setGpuRecoveryEpoch] = useState(0);
+  const [liveFrameMeta, setLiveFrameMeta] = useState<LiveChartFrameMeta | null>(null);
 
   const gpuBars = useMemo(() => toGpuBars(candles, timeframe, visualProfile), [candles, timeframe, visualProfile]);
   const gpuHeatmapLevels = useMemo(() => normalizeHeatmapLevels(heatmapLevels), [heatmapLevels]);
@@ -385,8 +616,8 @@ export default function GpuChartV4Surface({
   const gpuTradeBubbles = useMemo(() => normalizeTradeBubbles(tradeBubbles), [tradeBubbles]);
   const gpuPriceSignalBands = useMemo(() => normalizePriceSignalBands(priceSignalBands), [priceSignalBands]);
 
-  const feedBars = useMemo(() => {
-    const rawFeeds = multiSymbolFeeds
+  const secondarySourceFeeds = useMemo(() => {
+    return multiSymbolFeeds
       .filter((feed) => Array.isArray(feed.candles) && feed.candles.length > 1)
       .map((feed) => ({
         id: feed.id,
@@ -394,14 +625,12 @@ export default function GpuChartV4Surface({
         bars: toGpuBars(feed.candles, timeframe, visualProfile),
       }))
       .filter((feed) => feed.bars.length > 1);
-    const masterTime = resolveMasterClockTime(gpuBars, rawFeeds);
-    return rawFeeds
-      .map((feed) => ({
-        ...feed,
-        bars: normalizeBarsForComparison(syncBarsToMasterClock(feed.bars, masterTime)),
-      }))
-      .filter((feed) => feed.bars.length > 1);
-  }, [gpuBars, multiSymbolFeeds, timeframe, visualProfile]);
+  }, [multiSymbolFeeds, timeframe, visualProfile]);
+
+  const fallbackFeedBars = useMemo(
+    () => normalizeViewportFeedsForComparison(gpuBars, secondarySourceFeeds),
+    [gpuBars, secondarySourceFeeds],
+  );
 
   useEffect(() => {
     liveFrameSchedulerRef.current.configure({
@@ -410,22 +639,37 @@ export default function GpuChartV4Surface({
     });
   }, [visualProfileConfig]);
 
+  useEffect(() => {
+    onViewportFrameMetaChangeRef.current = onViewportFrameMetaChange;
+  }, [onViewportFrameMetaChange]);
+
   const targetGrid = useMemo<1 | 4 | 16>(() => {
     if (viewportGrid === 1 || viewportGrid === 4 || viewportGrid === 16) {
       return viewportGrid;
     }
-    if (feedBars.length >= 15) {
+    if (fallbackFeedBars.length >= 15) {
       return 16;
     }
-    if (feedBars.length >= 3) {
+    if (fallbackFeedBars.length >= 3) {
       return 4;
     }
     return 1;
-  }, [feedBars.length, viewportGrid]);
+  }, [fallbackFeedBars.length, viewportGrid]);
 
   useEffect(() => {
     barsRef.current = gpuBars;
   }, [gpuBars]);
+
+  useEffect(() => {
+    secondarySourceFeedsRef.current = secondarySourceFeeds;
+    multiFeedSourceMapRef.current = new Map(multiSymbolFeeds.map((feed) => [feed.id, feed]));
+    if (secondaryBatchedFeedsRef.current.length === 0) {
+      feedBarsRef.current = normalizeViewportFeedsForComparison(
+        barsRef.current.length > 0 ? barsRef.current : gpuBars,
+        secondarySourceFeeds,
+      );
+    }
+  }, [gpuBars, multiSymbolFeeds, secondarySourceFeeds]);
 
   useEffect(() => {
     const nextCount = gpuBars.length;
@@ -505,8 +749,20 @@ export default function GpuChartV4Surface({
       if (!isLiveFrameCompatibleWithProps(frame.candles, propCandlesRef.current, timeframeRef.current)) {
         return;
       }
+      liveFrameMetaRef.current = frame.meta;
+      viewportMetaRef.current = {
+        ...viewportMetaRef.current,
+        primary: frame.meta,
+      };
+      onViewportFrameMetaChangeRef.current?.({ ...viewportMetaRef.current });
+      setLiveFrameMeta(frame.meta);
       liveFrameSchedulerRef.current.schedule(frame.candles, (nextCandles) => {
-        barsRef.current = toGpuBars(nextCandles, timeframeRef.current, visualProfileRef.current);
+        const nextPrimaryBars = toGpuBars(nextCandles, timeframeRef.current, visualProfileRef.current);
+        barsRef.current = nextPrimaryBars;
+        feedBarsRef.current = normalizeViewportFeedsForComparison(
+          nextPrimaryBars,
+          secondaryBatchedFeedsRef.current.length > 0 ? secondaryBatchedFeedsRef.current : secondarySourceFeedsRef.current,
+        );
       });
     });
 
@@ -516,12 +772,102 @@ export default function GpuChartV4Surface({
       }
       unsubscribe();
       liveFrameSchedulerRef.current.cancel();
+      liveFrameMetaRef.current = null;
+      viewportMetaRef.current = Object.fromEntries(
+        Object.entries(viewportMetaRef.current).filter(([key]) => key !== "primary"),
+      );
+      onViewportFrameMetaChangeRef.current?.({ ...viewportMetaRef.current });
+      setLiveFrameMeta(null);
     };
   }, [liveFeedKey]);
 
   useEffect(() => {
-    feedBarsRef.current = feedBars;
-  }, [feedBars]);
+    feedBarsRef.current = normalizeViewportFeedsForComparison(
+      barsRef.current.length > 0 ? barsRef.current : gpuBars,
+      secondaryBatchedFeedsRef.current.length > 0 ? secondaryBatchedFeedsRef.current : secondarySourceFeeds,
+    );
+  }, [fallbackFeedBars, gpuBars, secondarySourceFeeds]);
+
+  useEffect(() => {
+    const worker = new GoldenFrameWorkerAdapter((event: GoldenFrameWorkerEvent) => {
+      if (event.type !== "publish-frame-batch") {
+        return;
+      }
+      const nextMeta: Record<string, LiveChartFrameMeta> = viewportMetaRef.current.primary
+        ? { primary: viewportMetaRef.current.primary }
+        : {};
+      const nextFeeds: Array<{ id: string; symbol: string; bars: OhlcBar[] }> = [];
+
+      for (const frame of event.batch.frames) {
+        const source = multiFeedSourceMapRef.current.get(frame.feedKey);
+        if (!source) {
+          continue;
+        }
+        nextMeta[frame.feedKey] = frame.meta;
+        nextFeeds.push({
+          id: source.id,
+          symbol: source.symbol,
+          bars: toGpuBars(frame.candles, timeframeRef.current, visualProfileRef.current),
+        });
+      }
+
+      publishChartFrameBatch(event.batch.batchKey, event.batch.frames.map((frame) => ({
+        feedKey: frame.feedKey,
+        candles: frame.candles,
+        meta: frame.meta,
+      })));
+
+      viewportMetaRef.current = nextMeta;
+      secondaryBatchedFeedsRef.current = nextFeeds;
+      feedBarsRef.current = normalizeViewportFeedsForComparison(
+        barsRef.current,
+        nextFeeds.length > 0 ? nextFeeds : secondarySourceFeedsRef.current,
+      );
+      onViewportFrameMetaChangeRef.current?.({ ...viewportMetaRef.current });
+    });
+
+    batchWorkerRef.current = worker;
+    return () => {
+      if (batchWorkerRef.current === worker) {
+        batchWorkerRef.current = null;
+      }
+      worker.terminate();
+    };
+  }, []);
+
+  useEffect(() => {
+    const worker = batchWorkerRef.current;
+    const sourceFeeds = multiSymbolFeeds.filter((feed) => Array.isArray(feed.candles) && feed.candles.length > 1);
+    if (sourceFeeds.length === 0) {
+      secondaryBatchedFeedsRef.current = [];
+      viewportMetaRef.current = viewportMetaRef.current.primary ? { primary: viewportMetaRef.current.primary } : {};
+      feedBarsRef.current = normalizeViewportFeedsForComparison(barsRef.current, secondarySourceFeedsRef.current);
+      onViewportFrameMetaChangeRef.current?.({ ...viewportMetaRef.current });
+      return;
+    }
+    if (!worker || !worker.isAvailable()) {
+      secondaryBatchedFeedsRef.current = [];
+      feedBarsRef.current = normalizeViewportFeedsForComparison(barsRef.current, secondarySourceFeedsRef.current);
+      return;
+    }
+    const dynamicBufferMs = liveFrameMetaRef.current?.dynamicBufferMs ?? 50;
+    const adaptiveGraceMs = Math.max(1, Math.round(dynamicBufferMs * 0.1));
+    worker.queueFrameBatch({
+      batchKey: `${timeframe}|${sourceFeeds.map((feed) => feed.id).join(",")}`,
+      frames: sourceFeeds.map((feed) => ({
+        feedKey: feed.id,
+        candles: feed.candles,
+        createdAt: Date.now(),
+        tradeTsMs: resolveFeedCandleTimestampMs(feed.candles),
+        depthTsMs: resolveFeedCandleTimestampMs(feed.candles),
+        depthSequence: null,
+        coalesced: false,
+        dynamicBufferMs,
+        adaptiveGraceMs,
+        backlog: 0,
+      })),
+    });
+  }, [multiSymbolFeeds, timeframe]);
 
   useEffect(() => {
     targetGridRef.current = targetGrid;
@@ -532,8 +878,8 @@ export default function GpuChartV4Surface({
     if (!manager) {
       return;
     }
-    manager.setLastBarSmoothingMs(Number.isFinite(smoothingMs) ? Math.max(0, smoothingMs) : 140);
-  }, [smoothingMs]);
+    manager.setLastBarSmoothingMs(effectiveSmoothingMs);
+  }, [effectiveSmoothingMs]);
 
   // ── Phase 1: draw a static 2D frame immediately so the panel is never blank ──
   useEffect(() => {
@@ -638,7 +984,7 @@ export default function GpuChartV4Surface({
       const gl = result.gl;
       const manager = new MultiChartManager(gl);
       managerRef.current = manager;
-      manager.setLastBarSmoothingMs(Number.isFinite(smoothingMs) ? Math.max(0, smoothingMs) : 140);
+      manager.setLastBarSmoothingMs(effectiveSmoothingMs);
       liveMetricsRef.current.renderer = result.renderer;
       liveMetricsRef.current.overlayIntervalMs = manager.getMetrics().overlayIntervalMs;
       setGpuReady(true);
@@ -734,23 +1080,57 @@ export default function GpuChartV4Surface({
         resizeGpuCanvas(canvas, gl, renderScale);
         const width = canvas.width;
         const height = canvas.height;
-        manager.setViewports(
-          buildViewports({
-            width,
-            height,
-            grid: targetGridRef.current,
-            primaryBars,
-            renderCandles: rest.mode !== "footprint",
-            primaryHeatmapLevels: gpuHeatmapLevels,
-            primaryDomHistory: gpuDomHistory,
-            primaryTradeBubbles: gpuTradeBubbles,
-            primaryPriceSignalBands: gpuPriceSignalBands,
-            heatIntensity,
-            heatmapDiscardThreshold,
-            feeds: feedBarsRef.current,
-          }),
-        );
+        const nextViewports = buildViewports({
+          width,
+          height,
+          grid: targetGridRef.current,
+          primarySymbol: rest.symbol,
+          primaryBars,
+          renderCandles: rest.mode !== "footprint",
+          primaryHeatmapLevels: gpuHeatmapLevels,
+          primaryDomHistory: gpuDomHistory,
+          primaryTradeBubbles: gpuTradeBubbles,
+          primaryPriceSignalBands: gpuPriceSignalBands,
+          heatIntensity,
+          heatmapDiscardThreshold,
+          feeds: feedBarsRef.current,
+        });
+        viewportLayoutRef.current = nextViewports.map((viewport) => ({
+          id: viewport.id,
+          symbol: viewport.symbol,
+          x: viewport.x,
+          y: viewport.y,
+          width: viewport.width,
+          height: viewport.height,
+        }));
+        manager.setViewports(nextViewports);
         manager.render(frameTs);
+
+        const overlayCanvas = overlayCanvasRef.current;
+        if (overlayCanvas) {
+          const overlayWidthCss = Math.max(1, host.clientWidth || canvas.clientWidth || 1);
+          const overlayHeightCss = Math.max(1, host.clientHeight || canvas.clientHeight || 1);
+          const overlayDpr = Math.max(1, window.devicePixelRatio || 1);
+          const overlayWidth = Math.max(1, Math.round(overlayWidthCss * overlayDpr));
+          const overlayHeight = Math.max(1, Math.round(overlayHeightCss * overlayDpr));
+          if (overlayCanvas.width !== overlayWidth || overlayCanvas.height !== overlayHeight) {
+            overlayCanvas.width = overlayWidth;
+            overlayCanvas.height = overlayHeight;
+          }
+          const overlayCtx = overlayCanvas.getContext("2d");
+          if (overlayCtx) {
+            overlayCtx.setTransform(overlayDpr, 0, 0, overlayDpr, 0, 0);
+            drawGpuCanvasHud(overlayCtx, {
+              bars: primaryBars,
+              width: overlayWidthCss,
+              height: overlayHeightCss,
+              timeframe,
+              liveFrameMeta: liveFrameMetaRef.current,
+              viewports: viewportLayoutRef.current,
+              viewportMetaMap: viewportMetaRef.current,
+            });
+          }
+        }
 
         const m = manager.getMetrics();
         liveMetricsRef.current.drawCalls = m.drawCalls;
@@ -826,13 +1206,34 @@ export default function GpuChartV4Surface({
             label: targetGridRef.current === 16 ? "4x4" : targetGridRef.current === 4 ? "2x2" : "1x1",
             viewportCount: Math.max(1, feedBarsRef.current.length + 1),
           },
+          sync: liveFrameMetaRef.current
+            ? {
+              status: liveFrameMetaRef.current.syncStatus,
+              confidence: liveFrameMetaRef.current.confidence,
+              partial: liveFrameMetaRef.current.partial,
+              coalesced: liveFrameMetaRef.current.coalesced,
+              stallAgeMs: liveFrameMetaRef.current.stallAgeMs,
+              dynamicBufferMs: liveFrameMetaRef.current.dynamicBufferMs,
+            }
+            : {
+              status: "unavailable",
+              confidence: null,
+              partial: false,
+              coalesced: false,
+              stallAgeMs: null,
+              dynamicBufferMs: null,
+            },
+          worker: {
+            batchActive: Boolean(batchWorkerRef.current?.isAvailable()),
+            mode: batchWorkerRef.current?.isAvailable() ? "worker" : "best-effort",
+          },
           spacing,
           performance: {
             fps: nextMetrics.fps,
             drawCalls: nextMetrics.drawCalls,
             batchSize: nextMetrics.batchSize,
             overlayIntervalMs: nextMetrics.overlayIntervalMs,
-            smoothingMs,
+            smoothingMs: effectiveSmoothingMs,
           },
           diagnosis,
           updatedAt: new Date().toISOString(),
@@ -856,7 +1257,7 @@ export default function GpuChartV4Surface({
       managerRef.current?.dispose();
       managerRef.current = null;
     };
-  }, [gpuDomHistory, gpuHeatmapLevels, gpuPriceSignalBands, gpuRecoveryEpoch, gpuTradeBubbles, heatIntensity, heatmapDiscardThreshold, onPerceptualTelemetry, rest.mode, rest.symbol, smoothingMs, timeframe]);
+  }, [effectiveSmoothingMs, gpuDomHistory, gpuHeatmapLevels, gpuPriceSignalBands, gpuRecoveryEpoch, gpuTradeBubbles, heatIntensity, heatmapDiscardThreshold, onPerceptualTelemetry, rest.mode, rest.symbol, timeframe]);
 
   // ── Input Engine: wheel zoom + left-drag pan + inertia ───────────────────
   useEffect(() => {
@@ -994,12 +1395,13 @@ export default function GpuChartV4Surface({
       <canvas ref={initCanvasRef} className="gpu-chart-v4-init-canvas" aria-hidden="true" />
       {/* WebGL2 live canvas — fades in once context is ready */}
       <canvas ref={canvasRef} className="gpu-chart-v4-canvas" aria-hidden="true" />
+      <canvas ref={overlayCanvasRef} className="gpu-chart-v4-overlay-canvas" aria-hidden="true" />
       {/* Status badge */}
       <div className={`gpu-chart-v4-status ${gpuReady ? "ready" : "fallback"}`}>
         <span className="gpu-chart-v4-kicker">Engine {engineMode.toUpperCase()}</span>
         <span>
           {gpuReady
-            ? `GPU renderer live \u2022 ${targetGrid === 16 ? "4x4" : targetGrid === 4 ? "2x2" : "1x1"} \u2022 feeds ${Math.max(1, feedBars.length + 1)}`
+            ? `GPU renderer live \u2022 ${targetGrid === 16 ? "4x4" : targetGrid === 4 ? "2x2" : "1x1"} \u2022 feeds ${Math.max(1, (secondaryBatchedFeedsRef.current.length > 0 ? secondaryBatchedFeedsRef.current.length : fallbackFeedBars.length) + 1)}${liveFrameMeta ? ` \u2022 ${liveFrameMeta.syncStatus.toUpperCase()} ${(liveFrameMeta.confidence * 100).toFixed(0)}%` : ""}`
             : initPhase === "canvas-init"
             ? "Initializing GPU\u2026"
             : initPhase === "fallback"
@@ -1266,6 +1668,7 @@ function buildViewports(input: {
   width: number;
   height: number;
   grid: 1 | 4 | 16;
+  primarySymbol: string;
   primaryBars: OhlcBar[];
   renderCandles: boolean;
   primaryHeatmapLevels: HeatmapLevelLike[];
@@ -1276,13 +1679,14 @@ function buildViewports(input: {
   heatmapDiscardThreshold: number;
   feeds: Array<{ id: string; symbol: string; bars: OhlcBar[] }>;
 }) {
-  const { width, height, grid, primaryBars, renderCandles, primaryHeatmapLevels, primaryDomHistory, primaryTradeBubbles, primaryPriceSignalBands, heatIntensity, heatmapDiscardThreshold, feeds } = input;
+  const { width, height, grid, primarySymbol, primaryBars, renderCandles, primaryHeatmapLevels, primaryDomHistory, primaryTradeBubbles, primaryPriceSignalBands, heatIntensity, heatmapDiscardThreshold, feeds } = input;
   const cells = grid === 16 ? 4 : grid === 4 ? 2 : 1;
   const cellWidth = Math.max(1, Math.floor(width / cells));
   const cellHeight = Math.max(1, Math.floor(height / cells));
 
   const viewports: Array<{
     id: string;
+    symbol?: string;
     x: number;
     y: number;
     width: number;
@@ -1321,6 +1725,7 @@ function buildViewports(input: {
 
       viewports.push({
         id: index === 0 ? "primary" : (feed?.id || `feed-${index}`),
+        symbol: index === 0 ? primarySymbol : (feed?.symbol || `feed-${index}`),
         x,
         y,
         width: w,

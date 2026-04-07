@@ -69,6 +69,18 @@ export class CandleEngineV5 {
     this.tfMs = timeframeToMs(timeframe);
   }
 
+  private isMicroTradeOnlyTimeframe(): boolean {
+    return this.tfMs <= 5_000;
+  }
+
+  private isQuoteSeedCandle(candle: NormalizedOhlcvBar | undefined): boolean {
+    if (!candle || candle.v > 0) {
+      return false;
+    }
+    const source = String(candle.source || "").toLowerCase();
+    return source.startsWith("quote-") || source === "quote-only-update";
+  }
+
   // ── Ingestion ──────────────────────────────────────────────────────────────
 
   /**
@@ -93,6 +105,20 @@ export class CandleEngineV5 {
         v: trade.size,
         tf: this.timeframe,
         seq: slotMs,
+        source: "trades",
+      };
+    } else if (this.isQuoteSeedCandle(existing)) {
+      candle = {
+        ...existing,
+        t: slotTs,
+        o: trade.price,
+        h: trade.price,
+        l: trade.price,
+        c: trade.price,
+        v: trade.size,
+        tf: existing.tf || this.timeframe,
+        seq: existing.seq,
+        source: "trades",
       };
     } else {
       candle = {
@@ -104,6 +130,7 @@ export class CandleEngineV5 {
         v: existing.v + trade.size,
         tf: existing.tf,
         seq: existing.seq,
+        source: "trades",
       };
     }
 
@@ -155,6 +182,10 @@ export class CandleEngineV5 {
       };
       this.candles.set(slotMs, candle);
       return true;
+    }
+
+    if (this.isMicroTradeOnlyTimeframe()) {
+      return false;
     }
 
     const nextHigh = Math.max(existing.h, price);
@@ -268,6 +299,21 @@ export class CandleEngineV5 {
       const existing = merged.get(bar.t);
       if (!existing) {
         merged.set(bar.t, bar);
+        continue;
+      }
+      if (this.isMicroTradeOnlyTimeframe() && bar.v > 0) {
+        merged.set(bar.t, {
+          ...existing,
+          o: bar.o,
+          h: bar.h,
+          l: bar.l,
+          c: bar.c,
+          v: Math.max(existing.v, bar.v),
+          tf: bar.tf || existing.tf,
+          venue: existing.venue || bar.venue,
+          instrument: existing.instrument || bar.instrument,
+          source: bar.source || "trades",
+        });
         continue;
       }
       const existingLow = existing.l > 0 ? existing.l : Math.min(existing.o, existing.c);

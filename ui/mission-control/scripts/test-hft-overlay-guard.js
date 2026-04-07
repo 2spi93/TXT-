@@ -13,7 +13,7 @@ function assertIncludes(source, snippet, label) {
 
 const priceSignalLayer = read("lib/engine/gpu-chart/PriceSignalLayer.ts");
 assertIncludes(priceSignalLayer, "export class PriceSignalLayer", "price signal GPU layer");
-assertIncludes(priceSignalLayer, 'kind: "execution-expected" | "execution-actual" | "slippage" | "wall" | "vacuum" | "trap"', "price signal kinds");
+assertIncludes(priceSignalLayer, 'kind: "execution-expected" | "execution-actual" | "slippage" | "wall" | "vacuum" | "trap" | "flow-sweep" | "flow-absorption" | "flow-exhaustion" | "flow-spoof" | "flow-memory" | "arb-buy" | "arb-sell"', "price signal kinds");
 assertIncludes(priceSignalLayer, "signals?: PriceSignalBand[]", "price signal input");
 
 const multiChartManager = read("lib/engine/gpu-chart/MultiChartManager.ts");
@@ -29,6 +29,8 @@ const terminalPage = read("app/terminal/page.tsx");
 assertIncludes(terminalPage, "buildExecutionOverlaySnapshot", "execution overlay snapshot builder");
 assertIncludes(terminalPage, "buildExecutionSlippageBands", "execution slippage band builder");
 assertIncludes(terminalPage, "buildLiquidityPredictionLevels", "liquidity prediction builder");
+assertIncludes(terminalPage, "buildFlowSignalBands", "flow signal band builder");
+assertIncludes(terminalPage, "buildArbitrageSignalBands", "arbitrage signal band builder");
 assertIncludes(terminalPage, "const chartPriceSignalBands = useMemo(() => buildPriceSignalBands", "chart price signal aggregation");
 assertIncludes(terminalPage, "priceSignalBands={chartRuntimeOrderflowEnabled ? chartPriceSignalBands : undefined}", "GPU page price signal forwarding");
 

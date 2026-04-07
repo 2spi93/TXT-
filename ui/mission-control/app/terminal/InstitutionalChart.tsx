@@ -19,11 +19,12 @@ import {
 import { createDirtyState } from "../../lib/dirtyFlags";
 import { createInteractionEngine } from "../../lib/chartInteraction";
 import { applyDynamicLod } from "../../lib/lodEngine";
+import { timeframeToMs } from "../../lib/ohlcvDataEngine";
 import { RenderScheduler } from "../../lib/renderScheduler";
 import { getDensityLevel, getDensityConfig, type DensityLevel } from "../../lib/densityEngine";
 import type { IndicatorSeriesData } from "../../lib/indicators/engine";
 import { heikinAshi, volumeProfile } from "../../lib/indicators/transforms";
-import { subscribeChartFrame, type LiveChartFrame } from "../../lib/chartFrameFeed";
+import { subscribeChartFrame, type LiveChartFrame, type LiveChartFrameMeta } from "../../lib/chartFrameFeed";
 import {
   type ChartPerceptualTelemetry,
   type PerceptualAutoscaleSnapshot,
@@ -225,6 +226,15 @@ type CandleSeriesPoint = {
   emphasis?: number;
   styleKey?: string;
   flow?: PerceptualCandleFlowState;
+};
+
+type GhostWickState = {
+  time: number;
+  high: number;
+  low: number;
+  color: string;
+  createdAt: number;
+  expiresAt: number;
 };
 
 type PerceptualRenderInput = CandleRenderPoint & {
@@ -1174,6 +1184,77 @@ function formatCompactPrice(value: number): string {
   return value.toFixed(4);
 }
 
+function drawCanvasLivePriceHud(
+  ctx: CanvasRenderingContext2D,
+  {
+    width,
+    candleSeries,
+    lastPrice,
+    lastOpen,
+    liveFrameMeta,
+  }: {
+    width: number;
+    candleSeries: ISeriesApi<"Candlestick">;
+    lastPrice: number;
+    lastOpen: number;
+    liveFrameMeta: LiveChartFrameMeta | null;
+  },
+): void {
+  if (!Number.isFinite(lastPrice)) {
+    return;
+  }
+
+  const y = candleSeries.priceToCoordinate(lastPrice);
+  if (y === null) {
+    return;
+  }
+
+  const priceUp = lastPrice >= lastOpen;
+  const accent = priceUp ? "#00ffa3" : "#ff5d5d";
+  const accentSoft = priceUp ? "rgba(0,255,163,0.16)" : "rgba(255,93,93,0.16)";
+  const label = formatCompactPrice(lastPrice);
+
+  ctx.save();
+  ctx.font = '12px ui-monospace, "SFMono-Regular", Menlo, monospace';
+  ctx.textBaseline = "middle";
+  ctx.textAlign = "left";
+  ctx.strokeStyle = accent;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, y + 0.5);
+  ctx.lineTo(Math.max(0, width - 92), y + 0.5);
+  ctx.stroke();
+
+  ctx.fillStyle = accentSoft;
+  ctx.fillRect(0, y - 9, Math.max(0, width - 92), 18);
+
+  const badgeWidth = Math.ceil(ctx.measureText(label).width) + 18;
+  const badgeHeight = 20;
+  const badgeX = Math.max(8, width - badgeWidth - 10);
+  const badgeY = y - badgeHeight * 0.5;
+  ctx.fillStyle = accent;
+  ctx.beginPath();
+  ctx.roundRect(badgeX, badgeY, badgeWidth, badgeHeight, 8);
+  ctx.fill();
+
+  ctx.fillStyle = "#051018";
+  ctx.fillText(label, badgeX + 9, badgeY + badgeHeight * 0.5);
+
+  if (liveFrameMeta) {
+    const status = `${liveFrameMeta.syncStatus.toUpperCase()} ${Math.round(liveFrameMeta.confidence * 100)}%`;
+    ctx.font = '10px ui-monospace, "SFMono-Regular", Menlo, monospace';
+    const pillWidth = Math.ceil(ctx.measureText(status).width) + 14;
+    ctx.fillStyle = "rgba(6, 14, 24, 0.78)";
+    ctx.beginPath();
+    ctx.roundRect(10, Math.max(8, badgeY - 26), pillWidth, 18, 8);
+    ctx.fill();
+    ctx.fillStyle = "rgba(222, 235, 247, 0.9)";
+    ctx.fillText(status, 17, Math.max(8, badgeY - 26) + 9);
+  }
+
+  ctx.restore();
+}
+
 function inferRenderPricePrecision(symbol: string, referencePrice: number): number {
   const assetClass = inferAssetContrastClass(symbol);
   const absPrice = Math.abs(referencePrice);
@@ -2095,6 +2176,7 @@ export default function InstitutionalChart({
     return inferRenderPricePrecision(symbol, referencePrice);
   }, [candles, symbol]);
   const motionTuning = useMemo(() => getChartMotionTuning(resolvedMotionPreset), [resolvedMotionPreset]);
+  const microTimeframeLock = useMemo(() => timeframeToMs(timeframe) <= 5_000, [timeframe]);
   const marketVolatility = useMemo(() => estimateRecentVolatility(candles), [candles]);
   const domImbalanceRatio = useMemo(() => resolveDomImbalanceRatio(domLevels), [domLevels]);
   const [autoStabilityMetrics, setAutoStabilityMetrics] = useState<AutoStabilityMetrics>({
@@ -2371,6 +2453,9 @@ export default function InstitutionalChart({
   const hasSeededSeriesRef = useRef(false);
   const liveFrameRef = useRef<LiveChartFrame | null>(null);
   const liveFrameRafRef = useRef<number | null>(null);
+  const liveFrameMetaRef = useRef<LiveChartFrameMeta | null>(null);
+  const liveFramePublishedAtRef = useRef(0);
+  const ghostWickRef = useRef<GhostWickState | null>(null);
   const liveFrameSchedulerRef = useRef(createLatestFrameScheduler<LiveChartFrame>({
     minFrameMs: resolvedVisualProfile.frame.minFrameMs,
     strictBucketAlignment: resolvedVisualProfile.perception.strictBucketAlignment,
@@ -2379,6 +2464,26 @@ export default function InstitutionalChart({
   const volatilityRef = useRef(marketVolatility);
   const customV3RendererEnabled = mode === "candles" && ENABLE_CUSTOM_V3_CANDLE_RENDERER;
   const nativeCandlesAuthoritative = mode === "candles" && !customV3RendererEnabled;
+  const customCandleCanvasActive = mode === "candles";
+
+  const captureGhostWick = useCallback((previous: CandleRenderPoint | null, next: CandleRenderPoint | null) => {
+    if (!isFiniteCandleRenderPoint(previous) || !isFiniteCandleRenderPoint(next) || previous.time !== next.time) {
+      return;
+    }
+    const wickChanged = Math.abs(previous.high - next.high) > 1e-6 || Math.abs(previous.low - next.low) > 1e-6;
+    if (!wickChanged) {
+      return;
+    }
+    const color = previous.wickColor || previous.borderColor || previous.color || resolvedVisualProfile.palette.crosshair;
+    ghostWickRef.current = {
+      time: previous.time,
+      high: previous.high,
+      low: previous.low,
+      color,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 180,
+    };
+  }, [resolvedVisualProfile.palette.crosshair]);
 
   const drawCustomV3CandleOverlay = useCallback(() => {
     const canvas = customCandleCanvasRef.current;
@@ -2406,7 +2511,7 @@ export default function InstitutionalChart({
 
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, width, height);
-    if (!customV3RendererEnabled || !chart || !candleSeries) {
+    if (!chart || !candleSeries) {
       return;
     }
 
@@ -2472,7 +2577,21 @@ export default function InstitutionalChart({
       return;
     }
 
+    const liveFrameMeta = liveFrameMetaRef.current;
+    const staleAgeMs = liveFramePublishedAtRef.current > 0 ? Math.max(0, Date.now() - liveFramePublishedAtRef.current) : 0;
+    const visualHeartbeatActive = staleAgeMs >= 2_500;
+
     const lastPrice = visible[visible.length - 1]?.close ?? Number(source[source.length - 1]?.close ?? 0);
+    if (!customV3RendererEnabled) {
+      drawCanvasLivePriceHud(ctx, {
+        width,
+        candleSeries,
+        lastPrice,
+        lastOpen: visible[visible.length - 1]?.open ?? lastPrice,
+        liveFrameMeta,
+      });
+      return;
+    }
     const visibleRange = Math.max(1e-6, maxVisiblePrice - minVisiblePrice);
     const averageRange = rangeCount > 0 ? rangeSum / rangeCount : visibleRange;
     const activeZoneHalfRange = clamp(
@@ -2617,6 +2736,13 @@ export default function InstitutionalChart({
         bodyAlpha = Math.max(bodyAlpha, 0.9);
       }
       bodyAlpha = clamp(bodyAlpha * (1 + priority.focusBoost * 0.4), priority.isLowRange ? 0.84 : 0.26, 1);
+      const liveFrameConfidence = entry.isLast ? liveFrameMeta?.confidence ?? 1 : 1;
+      if (entry.isLast && liveFrameConfidence < 0.8) {
+        const fadePenalty = liveFrameConfidence < 0.5 ? 0.58 : 0.82;
+        bodyAlpha *= fadePenalty;
+        wickAlpha *= fadePenalty;
+        capAlpha *= fadePenalty;
+      }
       const outlineAlpha = clamp((entry.isLast ? 0.3 : inActiveZone ? 0.24 : 0.2) + (priority.isLowRange ? 0.05 : 0), 0.2, 0.36);
 
       ctx.save();
@@ -2695,6 +2821,23 @@ export default function InstitutionalChart({
       ctx.strokeStyle = "rgba(244, 251, 255, 0.92)";
       ctx.lineWidth = 1;
       strokeDeskRoundRect(ctx, bodyLeft, bodyTop, bodyWidth, bodyHeight, radius);
+
+      if (entry.isLast && (liveFrameMeta?.partial || liveFrameConfidence < 0.5)) {
+        ctx.globalAlpha = clamp(0.26 + (1 - liveFrameMeta.confidence) * 0.44, 0.26, 0.72);
+        ctx.strokeStyle = "rgba(212, 221, 231, 0.96)";
+        ctx.lineWidth = 1.2;
+        ctx.setLineDash([3, 2]);
+        strokeDeskRoundRect(ctx, bodyLeft - 0.5, bodyTop - 0.5, bodyWidth + 1, bodyHeight + 1, radius);
+        ctx.setLineDash([]);
+      }
+
+      if (entry.isLast && visualHeartbeatActive) {
+        const beat = 0.5 + Math.sin(Date.now() / 280) * 0.5;
+        ctx.globalAlpha = 0.08 + beat * 0.1;
+        ctx.strokeStyle = withAlpha(resolvedVisualProfile.palette.crosshair, 0.9);
+        ctx.lineWidth = 1;
+        strokeDeskRoundRect(ctx, bodyLeft - 2, bodyTop - 2, bodyWidth + 4, bodyHeight + 4, Math.max(0, radius + 1));
+      }
 
       if (entry.isLast) {
         ctx.globalAlpha = 0.12;
@@ -2821,6 +2964,31 @@ export default function InstitutionalChart({
       }
       ctx.restore();
     }
+
+    const ghost = ghostWickRef.current;
+    const lastVisible = visible[visible.length - 1];
+    if (ghost && lastVisible && ghost.time === Number(lastVisible.isLast ? source[source.length - 1]?.time ?? ghost.time : ghost.time)) {
+      const now = Date.now();
+      if (ghost.expiresAt <= now) {
+        ghostWickRef.current = null;
+      } else {
+        const highY = candleSeries.priceToCoordinate(ghost.high);
+        const lowY = candleSeries.priceToCoordinate(ghost.low);
+        if (highY !== null && lowY !== null) {
+          const fade = 1 - (now - ghost.createdAt) / Math.max(1, ghost.expiresAt - ghost.createdAt);
+          const centerX = snapCssToDevicePixel(lastVisible.x);
+          ctx.save();
+          ctx.lineCap = "round";
+          ctx.strokeStyle = withAlpha(ghost.color, clamp(fade * 0.42, 0.08, 0.42));
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(centerX, snapCssToDevicePixel(Math.min(highY, lowY)));
+          ctx.lineTo(centerX, snapCssToDevicePixel(Math.max(highY, lowY)));
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+    }
   }, [customV3RendererEnabled, dynamicCandlePresentation.overlayWidthPx, perceptualDeskMode.coneAlpha, perceptualDeskMode.executionScore, perceptualDeskMode.heatAlpha, perceptualDeskMode.mode, resolvedVisualProfile, marketSimulation]);
 
   const scheduleCustomV3CandleOverlayDraw = useCallback(() => {
@@ -2853,6 +3021,22 @@ export default function InstitutionalChart({
   useEffect(() => {
     scheduleCustomV3CandleOverlayDraw();
   }, [chartViewportWidth, customV3RendererEnabled, densityLevel, scheduleCustomV3CandleOverlayDraw]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !customV3RendererEnabled) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      const ghostActive = Boolean(ghostWickRef.current && ghostWickRef.current.expiresAt > Date.now());
+      const heartbeatActive = liveFramePublishedAtRef.current > 0 && Date.now() - liveFramePublishedAtRef.current >= 2_500;
+      if (ghostActive || heartbeatActive) {
+        scheduleCustomV3CandleOverlayDraw();
+      }
+    }, 120);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [customV3RendererEnabled, scheduleCustomV3CandleOverlayDraw]);
 
   useEffect(() => {
     if (!schedulerRef.current) {
@@ -3003,12 +3187,32 @@ export default function InstitutionalChart({
           lastAppliedLiveFrameSignatureRef.current = frame.signature || pendingLiveFrameSignatureRef.current;
           return;
         }
+        captureGhostWick(lastCommittedCandleRef.current, lastPoint);
         if (!isFiniteCandleRenderPoint(lastPoint) || !safeSeriesUpdate(lastPoint)) {
           safeSetCandleData(candleData);
         }
         intraCandleCurrentRef.current = lastPoint;
         intraCandleTargetRef.current = lastPoint;
       } else {
+        const finalPointPreview = (candleData[candleData.length - 1] ?? null) as CandleSeriesPoint | null;
+        captureGhostWick(
+          lastCommittedCandleRef.current,
+          finalPointPreview
+            ? {
+              time: Number(finalPointPreview.time),
+              open: Number(finalPointPreview.open),
+              high: Number(finalPointPreview.high),
+              low: Number(finalPointPreview.low),
+              close: Number(finalPointPreview.close),
+              color: finalPointPreview.color,
+              borderColor: finalPointPreview.borderColor,
+              wickColor: finalPointPreview.wickColor,
+              wickType: finalPointPreview.wickType,
+              emphasis: finalPointPreview.emphasis,
+              styleKey: finalPointPreview.styleKey,
+            }
+            : null,
+        );
         safeSetCandleData(candleData);
         const finalPoint = (candleData[candleData.length - 1] ?? null) as CandleSeriesPoint | null;
         intraCandleCurrentRef.current = finalPoint
@@ -3042,6 +3246,8 @@ export default function InstitutionalChart({
           return;
         }
         liveFrameRef.current = latestFrame;
+        liveFrameMetaRef.current = latestFrame.meta;
+        liveFramePublishedAtRef.current = latestFrame.publishedAt;
         pendingLiveFrameSignatureRef.current = latestFrame.signature || "";
         if (liveFrameRafRef.current !== null) {
           return;
@@ -3058,10 +3264,12 @@ export default function InstitutionalChart({
         liveFrameRafRef.current = null;
       }
       liveFrameRef.current = null;
+      liveFrameMetaRef.current = null;
+      liveFramePublishedAtRef.current = 0;
       pendingLiveFrameSignatureRef.current = "";
       lastAppliedLiveFrameSignatureRef.current = "";
     };
-  }, [customV3RendererEnabled, liveFeedKey, mode, renderPricePrecision, scheduleCustomV3CandleOverlayDraw, timeframe, visualProfile]);
+  }, [captureGhostWick, customV3RendererEnabled, liveFeedKey, mode, renderPricePrecision, scheduleCustomV3CandleOverlayDraw, timeframe, visualProfile]);
 
   useEffect(() => {
     if (typeof window === "undefined" || isLiteMode || frozen) {
@@ -5618,8 +5826,16 @@ export default function InstitutionalChart({
         const previousPoint = intraCandleCurrentRef.current;
         try {
           if (isFiniteCandleRenderPoint(previousPoint) && previousPoint.time === lastPoint.time) {
-            intraCandleTargetRef.current = lastPoint;
-            startIntraCandleInterpolation();
+            if (microTimeframeLock) {
+              stopIntraCandleInterpolation();
+              safeSeriesUpdate(lastPoint, true);
+              hasSeededSeriesRef.current = true;
+              intraCandleCurrentRef.current = lastPoint;
+              intraCandleTargetRef.current = lastPoint;
+            } else {
+              intraCandleTargetRef.current = lastPoint;
+              startIntraCandleInterpolation();
+            }
           } else {
             stopIntraCandleInterpolation();
             safeSeriesUpdate(lastPoint, true);
@@ -6606,7 +6822,7 @@ export default function InstitutionalChart({
             aria-hidden="true"
           />
         ) : null}
-        <canvas ref={customCandleCanvasRef} className={`chart-custom-candle-canvas ${customV3RendererEnabled ? "is-active" : ""}`} aria-hidden="true" />
+        <canvas ref={customCandleCanvasRef} className={`chart-custom-candle-canvas ${customCandleCanvasActive ? "is-active" : ""}`} aria-hidden="true" />
         {activeCandleOverlay ? (
           <div
             className={`chart-active-candle-band ${activeCandleOverlay.source === "crosshair" ? "is-crosshair" : "is-live"}`}

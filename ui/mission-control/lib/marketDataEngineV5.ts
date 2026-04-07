@@ -32,7 +32,7 @@ import {
 } from "./marketDataEngineV4";
 import { CandleEngineV5, type TradeForCandle, type GapRange, type CandleAuditResult } from "./candleEngineV5";
 import type { NormalizedOhlcvBar } from "./ohlcvIntegrity";
-import { aggregateBarsToTimeframe, canDeriveTimeframe, normalizeTimeframe, SUPPORTED_TIMEFRAMES } from "./ohlcvDataEngine";
+import { aggregateBarsToTimeframe, canDeriveTimeframe, normalizeTimeframe, SUPPORTED_TIMEFRAMES, timeframeToMs } from "./ohlcvDataEngine";
 import { buildSyncedFrame, type SyncedMarketFrame } from "./syncedMarketFrame";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
@@ -136,6 +136,10 @@ export class MarketDataEngineV5 {
     if (timeframe === this.timeframe) {
       this.lastGaps = runtime.lastGaps;
     }
+  }
+
+  private isMicroTradeOnlyTimeframe(timeframe: string): boolean {
+    return timeframeToMs(normalizeTimeframe(timeframe)) <= 5_000;
   }
 
   private mergedSeriesFor(timeframe: string): NormalizedOhlcvBar[] {
@@ -301,7 +305,9 @@ export class MarketDataEngineV5 {
     this.v4.ingestTick(v4tick);
     let activeChanged = false;
     for (const [timeframe, runtime] of this.runtimes.entries()) {
-      const v3Changed = runtime.v3.ingestTick(price, tsMs);
+      const v3Changed = this.isMicroTradeOnlyTimeframe(timeframe)
+        ? false
+        : runtime.v3.ingestTick(price, tsMs);
       const tradeChanged = runtime.candleEngine.ingestPriceTick(price, tsMs);
       if (timeframe === this.timeframe) {
         activeChanged = v3Changed || tradeChanged;

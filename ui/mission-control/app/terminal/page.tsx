@@ -15,7 +15,11 @@ import {
   fetchBackendUserUiPreferences,
   readLocalUserUiPreferencesUpdatedAt,
   readLocalUserUiPreferences,
+  readStoredTerminalDeskViewMode,
+  readStoredTerminalChartBarMode,
   saveBackendUserUiPreferences,
+  setStoredTerminalChartBarMode,
+  setStoredTerminalDeskViewMode,
   setLocalUserUiPreferencesUpdatedAt,
   useChartHapticMode,
   useChartMotionPreset,
@@ -24,7 +28,7 @@ import {
   useChartSnapPriority,
   useUiMode,
 } from "../../lib/userUiPrefs";
-import type { ChartMotionPreset, ChartReleaseSendMode, ChartSnapPriority, UserUiPreferencesProfile } from "../../lib/userUiPrefs";
+import type { ChartMotionPreset, ChartReleaseSendMode, ChartSnapPriority, TerminalDeskViewModePreference, UserUiPreferencesProfile } from "../../lib/userUiPrefs";
 import {
   computeChartRoundMagnetStep,
   computeChartSnapThreshold,
@@ -198,11 +202,13 @@ import { buildDataset as buildMlDataset, buildMlFeatureVector } from "../../lib/
 import { PredictorEngineV8, type PredictorEngineV8TrainingStats } from "../../lib/predictorEngineV8";
 import { computeExitDecision } from "../../lib/profitOptimizer";
 import { buildVolatilityRegimeSnapshot, classifyStrategyAffinity } from "../../lib/volatilityRegimeAI";
+import { computeFlowIntelligence, type FlowEvent, type FlowIntelligenceSnapshot, type FlowLiquidityZone } from "../../lib/flowIntelligence";
 import type { PriceSignalBand } from "../../lib/engine/gpu-chart/PriceSignalLayer";
 import { riskGate } from "../../lib/riskAI";
 import { routeOrder } from "../../lib/smartRouter";
 import { SelfLearningSchedulerController, type ShadowSchedulerSnapshot } from "../../lib/selfLearningScheduler";
 import { createMarketDataBus, type MarketDataBusKernelTelemetry, type OhlcvBar } from "../../lib/marketDataBus";
+import { subscribeChartFrameBatch, type LiveChartFrameMeta } from "../../lib/chartFrameFeed";
 import { DomHistoryBuffer, type DomHistoryFrame } from "../../lib/domHistoryBuffer";
 import type { SyncedMarketFrame } from "../../lib/syncedMarketFrame";
 import type { OrderflowDomSnapshot as RuntimeOrderflowDomSnapshot, OrderflowFootprintSnapshot as RuntimeOrderflowFootprintSnapshot, OrderflowRuntimeSnapshot } from "../../lib/orderflowRuntimeEngine";
@@ -240,6 +246,19 @@ const DEFAULT_MARKET_BUS_KERNEL_TELEMETRY: MarketDataBusKernelTelemetry = {
   bufferBacklog: 0,
   drainedTicksPerFrame: 0,
   skippedFrames: 0,
+  renderedFrames: 0,
+  atomicFrames: 0,
+  partialFrames: 0,
+  coalescedFrames: 0,
+  stallFrames: 0,
+  partialFrameRate: 0,
+  frameSyncConfidence: 1,
+  frameSyncStatus: "atomic",
+  syncGapCount: 0,
+  sequenceQueueDepth: 0,
+  dynamicBufferMs: 50,
+  adaptiveGraceMs: 5,
+  maxFrameStallMs: 0,
   schedulerBudgetMs: 5,
   schedulerPullLimit: 320,
   cpuLoadHint: 1,
@@ -973,11 +992,21 @@ const TERMINAL_BOOKMAP_MODE_STORAGE_KEY = "txt.terminal.bookmap.mode";
 const TERMINAL_BOOKMAP_HEAT_INTENSITY_STORAGE_KEY = "txt.terminal.bookmap.heat-intensity";
 const TERMINAL_BOOKMAP_DISCARD_THRESHOLD_STORAGE_KEY = "txt.terminal.bookmap.discard-threshold";
 const TERMINAL_ML_ABSORPTION_MODE_STORAGE_KEY = "txt.terminal.ml-absorption.mode";
+const TERMINAL_CHART_ISOLATION_STORAGE_KEY = "txt.terminal.chart-isolation";
 const TERMINAL_ML_ABSORPTION_DEFAULT = process.env.NEXT_PUBLIC_TERMINAL_ML_ABSORPTION !== "0";
 const TERMINAL_ML_ABSORPTION_LIVE_DEFAULT = process.env.NEXT_PUBLIC_TERMINAL_ML_ABSORPTION_LIVE === "1";
 const DEFAULT_BOOKMAP_HEAT_INTENSITY = 1.2;
 const DEFAULT_BOOKMAP_DISCARD_THRESHOLD = 0.03;
+const BROWSER_LONG_TASK_WINDOW_MS = 30_000;
 type TerminalFocusDeckId = "micro" | "markets" | "monitoring" | "capital" | "metaRisk" | "correlation" | "calibration";
+type BrowserLongTaskTelemetry = {
+  supported: boolean;
+  recentCount: number;
+  maxDurationMs: number;
+  lastDurationMs: number;
+  lastAt: number | null;
+  pattern: "idle" | "wave" | "steady";
+};
 const TERMINAL_FOCUS_DECKS: Array<{ id: TerminalFocusDeckId; label: string }> = [
   { id: "micro", label: "Micro" },
   { id: "markets", label: "Markets" },
@@ -999,6 +1028,14 @@ const TERMINAL_FOCUS_DECK_THROTTLE_MS: Record<TerminalFocusDeckId, number> = {
 
 const DEBUG_TIME_SYNC = process.env.NEXT_PUBLIC_DEBUG_TIME_SYNC === "1";
 const TERMINAL_COMPUTE_PERF_STORAGE_KEY = "txt.terminal.compute-perf";
+const DEFAULT_BROWSER_LONG_TASK_TELEMETRY: BrowserLongTaskTelemetry = {
+  supported: true,
+  recentCount: 0,
+  maxDurationMs: 0,
+  lastDurationMs: 0,
+  lastAt: null,
+  pattern: "idle",
+};
 const MARKET_SNAPSHOT_CACHE_TTL_MS = 20_000;
 const CHART_ORDER_PRESETS: Record<Exclude<ChartOrderPreset, "custom">, { slPct: number; tpPct: number; notional: number; maxSpread: number }> = {
   scalp: { slPct: 0.003, tpPct: 0.006, notional: 10000, maxSpread: 10 },
@@ -1789,13 +1826,14 @@ function buildFocusedHeatmapLevels(input: {
   mode: ChartHeatmapMode;
   heatIntensity: number;
   discardThreshold: number;
+  liquidityZones?: FlowLiquidityZone[];
 }): DomLevel[] {
   if (!Array.isArray(input.levels) || input.levels.length === 0) {
     return [];
   }
 
   const heatIntensity = clamp(input.heatIntensity, 0.5, 3);
-  const discardThreshold = clamp(input.discardThreshold, 0.01, 0.2);
+  const discardThreshold = clamp(input.discardThreshold + (input.mode === "bookmap" ? 0.035 : 0.015), 0.03, 0.24);
   const sizes = input.levels.map((level) => Math.max(0, toNumber(level.size, 0))).filter((value) => value > 0);
   const maxSize = Math.max(1, ...sizes);
   const avgSize = sizes.length > 0 ? average(sizes) : maxSize;
@@ -1806,29 +1844,50 @@ function buildFocusedHeatmapLevels(input: {
       const baseIntensity = clamp(toNumber(level.intensity, 0), 0, 1.4);
       const normalizedVolume = clamp(Math.log(size + 1) / Math.max(1, Math.log(maxSize + 1)), 0, 1);
       const relativeSize = clamp(size / Math.max(avgSize, 1), 0.25, 6);
+      const liquidityMemoryBoost = (input.liquidityZones || []).reduce((best, zone) => {
+        const distanceBps = Math.abs(toNumber(zone.price, 0) - level.price) / Math.max(level.price, 0.0000001) * 10000;
+        if (distanceBps > 10) {
+          return best;
+        }
+        const proximity = clamp(1 - distanceBps / 10, 0, 1);
+        return Math.max(best, clamp(zone.strength * 0.72 + zone.persistence * 0.28, 0, 1) * proximity);
+      }, 0);
       const bookmapBoost = input.mode === "bookmap"
-        ? clamp(0.82 + Math.log(relativeSize + 1) * 0.72, 0.82, 2.4)
+        ? clamp(0.82 + Math.log(relativeSize + 1) * 0.72 + liquidityMemoryBoost * 0.48, 0.82, 2.8)
         : 1;
       const focusedIntensity = clamp(
-        (baseIntensity * 0.45 + normalizedVolume * 0.55) * heatIntensity * bookmapBoost,
+        (baseIntensity * 0.42 + normalizedVolume * 0.5 + liquidityMemoryBoost * 0.08) * heatIntensity * bookmapBoost,
         0,
         3,
       );
       const alpha = clamp(Math.log(size + 1) * heatIntensity / Math.max(1, Math.log(maxSize + 1)), 0, 1);
+      const priorityScore = clamp(
+        normalizedVolume * 0.5
+          + clamp(Math.log(relativeSize + 1) / Math.log(7), 0, 1) * 0.3
+          + clamp(baseIntensity / 1.4, 0, 1) * 0.14
+          + liquidityMemoryBoost * 0.06,
+        0,
+        1,
+      );
       return {
         ...level,
         size,
         intensity: focusedIntensity,
         __alpha: alpha,
-      } as DomLevel & { __alpha: number };
+        __priorityScore: priorityScore,
+      } as DomLevel & { __alpha: number; __priorityScore: number };
     })
     .filter((level) => level.__alpha >= discardThreshold)
     .sort((left, right) => {
-      const leftScore = left.intensity * 0.62 + Math.log1p(left.size) * 0.38;
-      const rightScore = right.intensity * 0.62 + Math.log1p(right.size) * 0.38;
+      const leftScore = left.__priorityScore * 0.64 + left.intensity * 0.22 + Math.log1p(left.size) * 0.14;
+      const rightScore = right.__priorityScore * 0.64 + right.intensity * 0.22 + Math.log1p(right.size) * 0.14;
       return rightScore - leftScore;
     })
-    .map(({ __alpha: _alpha, ...level }) => level)
+    .map((level, index) => ({
+      ...level,
+      intensity: clamp(level.intensity * (index < 3 ? 1.16 : 1) + (index < 3 ? 0.24 - index * 0.05 : 0), 0, 3),
+    }))
+    .map(({ __alpha: _alpha, __priorityScore: _priorityScore, ...level }) => level)
     .slice(0, input.mode === "bookmap" ? 16 : 20);
 }
 
@@ -2096,10 +2155,17 @@ function buildDomSnapshotSignature(snapshot: DOMSnapshot | null | undefined): st
 }
 
 type DeskRenderProfile = {
-  mode: "line" | "candles" | "footprint";
+  mode: "candles" | "footprint";
+  barMode: ChartBarConstructionMode;
   orderflowPriority: boolean;
   hybridPriority: boolean;
+  resolvedViewMode: Exclude<TerminalDeskViewModePreference, "auto">;
+  label: string;
+  description: string;
+  candlesContextOnly: boolean;
 };
+
+type ChartBarConstructionMode = "time" | "delta" | "event";
 
 type TradeBubbleVisual = {
   time: number;
@@ -2129,18 +2195,72 @@ type LiquidityPredictionLevel = {
   strength: number;
 };
 
-function resolveDeskRenderProfile(timeframe: string, requestedMode: "line" | "candles" | "footprint"): DeskRenderProfile {
-  if (requestedMode === "line") {
-    return { mode: "line", orderflowPriority: false, hybridPriority: false };
-  }
+type TerminalFlowInsight = {
+  label: string;
+  dominantSide: "buy" | "sell" | "neutral";
+  score: number;
+  liquidityBias: number;
+  eventKind: FlowEvent["kind"] | null;
+};
+
+type MicrostructureRenderCandle = RenderCandleLike & {
+  executionFootprint?: ExecutionFootprintSnapshot | null;
+  domSnapshot?: DOMSnapshot | null;
+};
+
+function resolveDeskRenderProfile(
+  timeframe: string,
+  requestedViewMode: TerminalDeskViewModePreference,
+  requestedBarMode: ChartBarConstructionMode,
+): DeskRenderProfile {
+  const buildProfile = (viewMode: Exclude<TerminalDeskViewModePreference, "auto">): DeskRenderProfile => {
+    if (viewMode === "flow") {
+      return {
+        mode: "footprint",
+        barMode: requestedBarMode === "time" ? "event" : requestedBarMode,
+        orderflowPriority: true,
+        hybridPriority: false,
+        resolvedViewMode: "flow",
+        label: "FLOW MODE",
+        description: "Orderflow dominant. Candles are suppressed in favor of DOM, tape, heatmap and execution flow.",
+        candlesContextOnly: false,
+      };
+    }
+    if (viewMode === "hybrid") {
+      return {
+        mode: "candles",
+        barMode: requestedBarMode === "time" ? "delta" : requestedBarMode,
+        orderflowPriority: false,
+        hybridPriority: true,
+        resolvedViewMode: "hybrid",
+        label: "HYBRID",
+        description: "Candles stay visible, but flow remains the confirmation layer.",
+        candlesContextOnly: false,
+      };
+    }
+    return {
+      mode: "candles",
+      barMode: "time",
+      orderflowPriority: false,
+      hybridPriority: false,
+      resolvedViewMode: "candle",
+      label: "CANDLE (CONTEXT ONLY)",
+      description: "Candles are context only, not primary signal.",
+      candlesContextOnly: true,
+    };
+  };
+
   const timeframeMs = Math.max(1_000, timeframeToMs(timeframe));
+  if (requestedViewMode === "flow" || requestedViewMode === "hybrid" || requestedViewMode === "candle") {
+    return buildProfile(requestedViewMode);
+  }
   if (timeframeMs <= 5_000) {
-    return { mode: "footprint", orderflowPriority: true, hybridPriority: false };
+    return buildProfile("flow");
   }
   if (timeframeMs <= 30_000) {
-    return { mode: requestedMode === "footprint" ? "footprint" : "candles", orderflowPriority: false, hybridPriority: true };
+    return buildProfile("hybrid");
   }
-  return { mode: requestedMode, orderflowPriority: false, hybridPriority: false };
+  return buildProfile("candle");
 }
 
 function parseFrameTimeMs(value: string | number | null | undefined, fallback = 0): number {
@@ -2220,6 +2340,142 @@ function buildTradeBubbleVisuals(input: {
     : [];
 
   return [...tapePoints, ...spoofPoints].slice(-160);
+}
+
+function mapFlowEventKindToBandKind(kind: FlowEvent["kind"]): PriceSignalBand["kind"] {
+  switch (kind) {
+    case "absorption":
+      return "flow-absorption";
+    case "exhaustion":
+      return "flow-exhaustion";
+    case "spoof":
+      return "flow-spoof";
+    case "breakout":
+    case "sweep":
+      return "flow-sweep";
+    case "reversion":
+      return "flow-memory";
+    default:
+      return "flow-memory";
+  }
+}
+
+function buildFlowSignalBands(input: {
+  snapshot: FlowIntelligenceSnapshot | null;
+}): PriceSignalBand[] {
+  if (!input.snapshot) {
+    return [];
+  }
+
+  const eventBands = input.snapshot.recentEvents.slice(0, 3).map((event, index) => ({
+    price: event.price,
+    strength: clamp(event.score * 0.82 + event.persistence * 0.18, 0.16, 1),
+    kind: mapFlowEventKindToBandKind(event.kind),
+    xStart: event.kind === "spoof"
+      ? -1
+      : event.side === "buy"
+        ? -1
+        : -0.18,
+    xEnd: event.kind === "spoof"
+      ? 1
+      : event.side === "buy"
+        ? 0.22
+        : 1,
+    thickness: clamp(0.0048 + event.score * 0.006 + index * 0.0004, 0.0048, 0.013),
+  } satisfies PriceSignalBand));
+
+  const liquidityBands = input.snapshot.liquidityZones.slice(0, 4).map((zone, index) => ({
+    price: zone.price,
+    strength: clamp(zone.strength * 0.76 + zone.persistence * 0.24, 0.14, 1),
+    kind: "flow-memory" as const,
+    xStart: zone.side === "bid" ? -1 : -0.12,
+    xEnd: zone.side === "bid" ? 0.16 : 1,
+    thickness: clamp(0.0035 + zone.persistence * 0.0038 - index * 0.00015, 0.0032, 0.0095),
+  }));
+
+  return [...eventBands, ...liquidityBands].slice(0, 8);
+}
+
+function buildArbitrageSignalBands(input: {
+  snapshot: {
+    executable: boolean;
+    buyPrice: number;
+    sellPrice: number;
+    opportunityScore: number;
+    netSpreadBps: number;
+  } | null;
+}): PriceSignalBand[] {
+  if (!input.snapshot?.executable || !(input.snapshot.buyPrice > 0) || !(input.snapshot.sellPrice > 0)) {
+    return [];
+  }
+  const strength = clamp(
+    input.snapshot.opportunityScore / 120 * 0.55 + Math.max(0, input.snapshot.netSpreadBps) / 12 * 0.45,
+    0.18,
+    1,
+  );
+  return [
+    {
+      price: input.snapshot.buyPrice,
+      strength,
+      kind: "arb-buy",
+      xStart: -1,
+      xEnd: 0.14,
+      thickness: 0.0065,
+    },
+    {
+      price: input.snapshot.sellPrice,
+      strength,
+      kind: "arb-sell",
+      xStart: -0.14,
+      xEnd: 1,
+      thickness: 0.0065,
+    },
+  ];
+}
+
+function buildFlowEventTradeBubbles(input: {
+  snapshot: FlowIntelligenceSnapshot | null;
+  fallbackTimeMs: number;
+  currentPrice: number;
+}): TradeBubbleVisual[] {
+  if (!input.snapshot) {
+    return [];
+  }
+  const baseTime = input.fallbackTimeMs > 0 ? input.fallbackTimeMs : Date.now();
+  return input.snapshot.recentEvents.slice(0, 2).map((event, index, array) => ({
+    time: baseTime - (array.length - index - 1) * 120,
+    price: event.price > 0 ? event.price : input.currentPrice,
+    volume: Math.max(8, Math.round(18 + event.score * 56 + event.persistence * 24)),
+    side: event.side,
+    intensity: clamp(event.score * 0.84 + event.persistence * 0.16, 0.25, 1),
+    kind: event.kind === "spoof" ? "spoof" : "trade",
+  }));
+}
+
+function summarizeFlowInsight(snapshot: FlowIntelligenceSnapshot | null): TerminalFlowInsight | null {
+  if (!snapshot) {
+    return null;
+  }
+  const activeEvent = snapshot.activeEvent;
+  const biasPct = Math.abs(snapshot.liquidityBias) * 100;
+  if (activeEvent) {
+    return {
+      label: `${activeEvent.label} · ${(activeEvent.score * 100).toFixed(0)}%`,
+      dominantSide: activeEvent.side,
+      score: snapshot.flowScore,
+      liquidityBias: snapshot.liquidityBias,
+      eventKind: activeEvent.kind,
+    };
+  }
+  return {
+    label: snapshot.dominantSide === "neutral"
+      ? `balanced flow · ${biasPct.toFixed(0)}% bias`
+      : `${snapshot.dominantSide} pressure · ${biasPct.toFixed(0)}% bias`,
+    dominantSide: snapshot.dominantSide,
+    score: snapshot.flowScore,
+    liquidityBias: snapshot.liquidityBias,
+    eventKind: null,
+  };
 }
 
 function resolveExecutionOverlaySide(payload: JsonMap, fallback: "buy" | "sell"): "buy" | "sell" {
@@ -2459,6 +2715,8 @@ function buildPriceSignalBands(input: {
   executionOverlay: ExecutionOverlaySnapshot | null;
   slippageBands: PriceSignalBand[];
   liquidityLevels: LiquidityPredictionLevel[];
+  flowBands?: PriceSignalBand[];
+  arbitrageBands?: PriceSignalBand[];
 }): PriceSignalBand[] {
   const bands: PriceSignalBand[] = [];
   if (input.executionOverlay) {
@@ -2483,6 +2741,8 @@ function buildPriceSignalBands(input: {
   }
 
   bands.push(...input.slippageBands);
+  bands.push(...(input.flowBands || []));
+  bands.push(...(input.arbitrageBands || []));
 
   input.liquidityLevels.forEach((level) => {
     bands.push({
@@ -3028,6 +3288,341 @@ function toTimeBucketKey(value: string | number, timeframe: string): string {
     return "";
   }
   return String(Math.floor(parsed / stepMs) * stepMs);
+}
+
+type RenderCandleLike = {
+  label: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+};
+
+function resolveDisplayCompressionBucketMs(timeframe: string, candleCount: number): number {
+  const timeframeMs = Math.max(1_000, timeframeSeconds(timeframe) * 1_000);
+  if (candleCount < 48) {
+    return timeframeMs;
+  }
+  if (timeframeMs <= 1_000) {
+    return timeframeMs * (candleCount >= 120 ? 5 : candleCount >= 72 ? 3 : 2);
+  }
+  if (timeframeMs <= 5_000) {
+    return timeframeMs * (candleCount >= 120 ? 3 : 2);
+  }
+  if (timeframeMs <= 10_000) {
+    return timeframeMs * (candleCount >= 120 ? 2 : 1);
+  }
+  return timeframeMs;
+}
+
+function aggregateDisplayCandles<T extends RenderCandleLike>(candles: T[], bucketMs: number): T[] {
+  if (!Array.isArray(candles) || candles.length < 3 || !(bucketMs > 0)) {
+    return candles;
+  }
+
+  const buckets = new Map<number, T[]>();
+  const orderedKeys: number[] = [];
+
+  candles.forEach((candle) => {
+    const parsed = parseTimestampLike(candle.label);
+    if (!parsed) {
+      return;
+    }
+    const bucketKey = Math.floor(parsed / bucketMs) * bucketMs;
+    if (!buckets.has(bucketKey)) {
+      buckets.set(bucketKey, []);
+      orderedKeys.push(bucketKey);
+    }
+    buckets.get(bucketKey)?.push(candle);
+  });
+
+  if (orderedKeys.length === 0 || orderedKeys.length >= candles.length) {
+    return candles;
+  }
+
+  return orderedKeys.map((bucketKey) => {
+    const rows = buckets.get(bucketKey) || [];
+    const first = rows[0];
+    const last = rows[rows.length - 1] || first;
+    const high = rows.reduce((max, row) => Math.max(max, Number(row.high)), Number(first.high));
+    const low = rows.reduce((min, row) => Math.min(min, Number(row.low)), Number(first.low));
+    const volume = rows.reduce((sum, row) => sum + Math.max(0, Number(row.volume)), 0);
+    return {
+      ...last,
+      label: last.label,
+      open: Number(first.open),
+      high,
+      low,
+      close: Number(last.close),
+      volume,
+    } as T;
+  });
+}
+
+type GridSyncBadgeState = {
+  chartCount: number;
+  chipTone: "default" | "active" | "warn" | "danger";
+  chipLabel: string;
+  detailLabel: string;
+  title: string;
+};
+
+type GlobalGridBatchState = {
+  batchKey: string;
+  publishedAt: number;
+  frameCount: number;
+  partialCount: number;
+  maxSkewMs: number;
+  minConfidence: number | null;
+};
+
+function quantile(values: number[], q: number): number {
+  if (values.length === 0) {
+    return 0;
+  }
+  const sorted = [...values].sort((left, right) => left - right);
+  const qq = clamp(q, 0, 1);
+  const position = (sorted.length - 1) * qq;
+  const lowerIndex = Math.floor(position);
+  const upperIndex = Math.ceil(position);
+  const weight = position - lowerIndex;
+  if (lowerIndex === upperIndex) {
+    return sorted[lowerIndex] || 0;
+  }
+  return (sorted[lowerIndex] || 0) * (1 - weight) + (sorted[upperIndex] || 0) * weight;
+}
+
+function extractCandleDelta(candle: MicrostructureRenderCandle): number {
+  const runtimeDelta = toNumber(candle.executionFootprint?.delta, Number.NaN);
+  if (Number.isFinite(runtimeDelta) && runtimeDelta !== 0) {
+    return runtimeDelta;
+  }
+  const direction = Math.sign(toNumber(candle.close, 0) - toNumber(candle.open, 0));
+  return direction * Math.max(1, toNumber(candle.volume, 0)) * 0.35;
+}
+
+function buildAggregatedMicrostructureCandle<T extends MicrostructureRenderCandle>(candles: T[]): T {
+  const first = candles[0];
+  const last = candles[candles.length - 1] || first;
+  const totalVolume = candles.reduce((sum, candle) => sum + Math.max(0, toNumber(candle.volume, 0)), 0);
+  const totalDelta = candles.reduce((sum, candle) => sum + extractCandleDelta(candle), 0);
+  const avgLiquidityScore = average(candles.map((candle) => toNumber(candle.executionFootprint?.liquidityScore ?? candle.domSnapshot?.liquidityScore, 0)).filter((value) => value > 0));
+  const absorption = candles.some((candle) => Boolean(candle.executionFootprint?.absorption));
+  const stackedImbalance = candles.some((candle) => Boolean(candle.executionFootprint?.stackedImbalance));
+  const exhaustion = candles.some((candle) => Boolean(candle.executionFootprint?.exhaustion));
+  const liquidityTrap = candles.some((candle) => Boolean(candle.executionFootprint?.liquidityTrap));
+  const mergedFootprint = last.executionFootprint
+    ? {
+      ...last.executionFootprint,
+      delta: totalDelta,
+      totalDelta,
+      imbalance: clamp(totalDelta / Math.max(1, totalVolume), -1, 1),
+      absorption,
+      stackedImbalance,
+      exhaustion,
+      liquidityTrap,
+      liquidityScore: avgLiquidityScore > 0 ? avgLiquidityScore : last.executionFootprint.liquidityScore,
+    }
+    : undefined;
+  return {
+    ...last,
+    label: last.label,
+    open: toNumber(first.open, toNumber(last.open, 0)),
+    high: candles.reduce((max, candle) => Math.max(max, toNumber(candle.high, 0)), toNumber(first.high, 0)),
+    low: candles.reduce((min, candle) => Math.min(min, toNumber(candle.low, toNumber(first.low, 0))), toNumber(first.low, 0)),
+    close: toNumber(last.close, toNumber(first.close, 0)),
+    volume: totalVolume,
+    executionFootprint: mergedFootprint,
+    domSnapshot: last.domSnapshot || first.domSnapshot,
+  } as T;
+}
+
+function buildDeltaEventDisplayCandles<T extends MicrostructureRenderCandle>(input: {
+  candles: T[];
+  mode: Exclude<ChartBarConstructionMode, "time">;
+  timeframe: string;
+}): T[] {
+  if (!Array.isArray(input.candles) || input.candles.length < 6) {
+    return input.candles;
+  }
+
+  const recentDeltas = input.candles
+    .map((candle) => Math.abs(extractCandleDelta(candle)))
+    .filter((value) => value > 0);
+  const recentVolumes = input.candles
+    .map((candle) => Math.max(0, toNumber(candle.volume, 0)))
+    .filter((value) => value > 0);
+  const deltaThreshold = Math.max(4, quantile(recentDeltas, 0.68), average(recentDeltas) * 1.15);
+  const eventThreshold = Math.max(0.85, quantile(recentDeltas, 0.52) / Math.max(10, average(recentVolumes) || 10) * 3.2);
+  const maxBucketSize = Math.max(3, input.mode === "event" ? Math.round(Math.max(3, timeframeSeconds(input.timeframe) / 2)) : Math.round(Math.max(4, timeframeSeconds(input.timeframe) / 1.5)));
+
+  const groups: T[][] = [];
+  let bucket: T[] = [];
+  let runningDelta = 0;
+  let runningEventScore = 0;
+
+  const flush = (): void => {
+    if (bucket.length === 0) {
+      return;
+    }
+    groups.push(bucket);
+    bucket = [];
+    runningDelta = 0;
+    runningEventScore = 0;
+  };
+
+  input.candles.forEach((candle) => {
+    const delta = extractCandleDelta(candle);
+    const footprint = candle.executionFootprint;
+    const eventScore = clamp(
+      Math.abs(delta) / Math.max(deltaThreshold, 1) * 0.42
+        + (footprint?.absorption ? 0.26 : 0)
+        + (footprint?.stackedImbalance ? 0.18 : 0)
+        + (footprint?.exhaustion ? 0.14 : 0)
+        + (footprint?.liquidityTrap ? 0.2 : 0)
+        + clamp(toNumber(footprint?.liquidityScore ?? candle.domSnapshot?.liquidityScore, 0), 0, 1) * 0.12,
+      0,
+      2,
+    );
+    bucket.push(candle);
+    runningDelta += delta;
+    runningEventScore += eventScore;
+
+    const shouldFlush = input.mode === "delta"
+      ? Math.abs(runningDelta) >= deltaThreshold || bucket.length >= maxBucketSize
+      : runningEventScore >= eventThreshold || bucket.length >= maxBucketSize;
+    if (shouldFlush) {
+      flush();
+    }
+  });
+  flush();
+
+  if (groups.length < 3 || groups.length >= input.candles.length) {
+    return input.candles;
+  }
+
+  return groups.map((group) => buildAggregatedMicrostructureCandle(group));
+}
+
+function buildLiquidityMemoryTrailFrames(input: {
+  zones: FlowLiquidityZone[];
+  baseTimeMs: number;
+  timeframe: string;
+  spoofRisk?: number;
+}): DomHistoryFrame[] {
+  if (!Array.isArray(input.zones) || input.zones.length === 0 || !(input.baseTimeMs > 0)) {
+    return [];
+  }
+  const stepMs = clamp(Math.floor(timeframeToMs(input.timeframe) / 2), 500, 8_000);
+  const trailDepth = timeframeToMs(input.timeframe) <= 5_000 ? 10 : timeframeToMs(input.timeframe) <= 60_000 ? 8 : 6;
+  const frames: DomHistoryFrame[] = [];
+
+  for (let frameIndex = 0; frameIndex < trailDepth; frameIndex += 1) {
+    const ageNorm = trailDepth <= 1 ? 0 : frameIndex / Math.max(1, trailDepth - 1);
+    const decay = Math.exp(-ageNorm * 2.35);
+    const levels = input.zones
+      .filter((zone) => zone.strength >= 0.24)
+      .map((zone) => ({
+        side: zone.side,
+        price: zone.price,
+        size: Math.max(6, zone.strength * 48 * decay + zone.persistence * 18),
+        intensity: clamp(zone.strength * (0.55 + zone.persistence * 0.3) * decay, 0.08, 1.4),
+      }))
+      .slice(0, 6);
+    if (levels.length === 0) {
+      continue;
+    }
+    frames.push({
+      time: input.baseTimeMs - (trailDepth - frameIndex - 1) * stepMs,
+      spoofingRisk: clamp(toNumber(input.spoofRisk, 0) * decay * 0.5, 0, 1),
+      levels,
+    });
+  }
+
+  return frames;
+}
+
+function mergeDomHistoryFrames(baseFrames: DomHistoryFrame[], trailFrames: DomHistoryFrame[], limit = 96): DomHistoryFrame[] {
+  if (trailFrames.length === 0) {
+    return baseFrames.slice(-limit);
+  }
+  const merged = new Map<number, DomHistoryFrame>();
+  [...baseFrames, ...trailFrames]
+    .sort((left, right) => left.time - right.time)
+    .forEach((frame) => {
+      const key = Math.round(frame.time);
+      const existing = merged.get(key);
+      if (!existing) {
+        merged.set(key, {
+          time: frame.time,
+          spoofingRisk: frame.spoofingRisk,
+          levels: [...frame.levels],
+        });
+        return;
+      }
+      existing.spoofingRisk = Math.max(toNumber(existing.spoofingRisk, 0), toNumber(frame.spoofingRisk, 0));
+      existing.levels = [...existing.levels, ...frame.levels]
+        .sort((left, right) => (Math.max(right.intensity, right.size) - Math.max(left.intensity, left.size)))
+        .slice(0, 20);
+      merged.set(key, existing);
+    });
+  return [...merged.values()].sort((left, right) => left.time - right.time).slice(-limit);
+}
+
+function buildMiniCandlesFromQuoteHistory(history: QuotePoint[], timeframe: string): RenderCandleLike[] {
+  if (!Array.isArray(history) || history.length < 4) {
+    return [];
+  }
+
+  const parsed = history
+    .map((point) => ({
+      ...point,
+      ts: parseTimestampLike(point.label),
+      value: Number(point.value),
+    }))
+    .filter((point): point is QuotePoint & { ts: number; value: number } => Number.isFinite(point.ts) && Number.isFinite(point.value) && point.value > 0);
+
+  if (parsed.length < 4) {
+    return [];
+  }
+
+  const firstTs = parsed[0]?.ts ?? 0;
+  const lastTs = parsed[parsed.length - 1]?.ts ?? firstTs;
+  const spanMs = Math.max(1, lastTs - firstTs);
+  const minimumBucketMs = Math.max(500, Math.floor(timeframeSeconds(timeframe) * 1_000 * 0.2));
+  const bucketMs = Math.max(minimumBucketMs, Math.floor(spanMs / 24));
+  const buckets = new Map<number, Array<QuotePoint & { ts: number; value: number }>>();
+  const orderedKeys: number[] = [];
+
+  parsed.forEach((point) => {
+    const bucketKey = Math.floor(point.ts / bucketMs) * bucketMs;
+    if (!buckets.has(bucketKey)) {
+      buckets.set(bucketKey, []);
+      orderedKeys.push(bucketKey);
+    }
+    buckets.get(bucketKey)?.push(point);
+  });
+
+  return orderedKeys.map((bucketKey) => {
+    const rows = buckets.get(bucketKey) || [];
+    const first = rows[0];
+    const last = rows[rows.length - 1] || first;
+    const high = rows.reduce((max, row) => Math.max(max, row.value), first.value);
+    const low = rows.reduce((min, row) => Math.min(min, row.value), first.value);
+    const volume = rows.reduce((sum, row, index) => {
+      const previous = rows[index - 1] || row;
+      return sum + Math.abs(row.value - previous.value);
+    }, 0);
+    return {
+      label: last.label,
+      open: first.value,
+      high,
+      low,
+      close: last.value,
+      volume: Math.max(1, volume * 1_000),
+    };
+  });
 }
 
 function incidentSeverityLabel(item: JsonMap): string {
@@ -3632,8 +4227,12 @@ export default function TradingTerminalPage() {
   const [emergencyStopFeedback, setEmergencyStopFeedback] = useState<string | null>(null);
   const [tradeResult, setTradeResult] = useState<JsonMap | null>(null);
   const [chartKernelPerf, setChartKernelPerf] = useState({ fps: 60, frameTimeMs: 16.7, cpuLoad: 1, workerLatencyMs: 0 });
+  const [chartIsolationMode, setChartIsolationMode] = useState(false);
+  const [browserLongTaskTelemetry, setBrowserLongTaskTelemetry] = useState<BrowserLongTaskTelemetry>(DEFAULT_BROWSER_LONG_TASK_TELEMETRY);
   const [chartPerceptualTelemetry, setChartPerceptualTelemetry] = useState<ChartPerceptualTelemetry | null>(null);
   const [gpuPerceptualTelemetry, setGpuPerceptualTelemetry] = useState<GpuPerceptualTelemetry | null>(null);
+  const [gpuViewportFrameMeta, setGpuViewportFrameMeta] = useState<Record<string, LiveChartFrameMeta>>({});
+  const [gpuGlobalGridBatch, setGpuGlobalGridBatch] = useState<GlobalGridBatchState | null>(null);
   const [chartPerceptualDebugOpen, setChartPerceptualDebugOpen] = useState(false);
   const [terminalComputePerfEnabled, setTerminalComputePerfEnabled] = useState(false);
   const [terminalComputePerfSummary, setTerminalComputePerfSummary] = useState<TerminalComputePerfEntry[]>([]);
@@ -3763,8 +4362,19 @@ export default function TradingTerminalPage() {
   const [notional, setNotional] = useState(15000);
   const [maxSpread, setMaxSpread] = useState(15);
   const [rationale, setRationale] = useState("Breakout confirme + risque controle");
-  const [chartMode, setChartMode] = useState<"line" | "candles" | "footprint">("candles");
+  const [chartBarConstructionMode, setChartBarConstructionMode] = useState<ChartBarConstructionMode>("time");
+  const [chartDeskViewMode, setChartDeskViewMode] = useState<TerminalDeskViewModePreference>("auto");
   const [chartTimeframe, setChartTimeframe] = useState("1m");
+  const chartMicroTimeframeLocked = timeframeToMs(chartTimeframe) <= 5_000;
+  const effectiveChartSmoothingMs: 0 | 80 | 140 | 220 = chartMicroTimeframeLocked ? 0 : chartSmoothingMs;
+  const deskRenderProfile = resolveDeskRenderProfile(chartTimeframe, chartDeskViewMode, chartBarConstructionMode);
+  const effectiveChartMode = deskRenderProfile.mode;
+  const effectiveChartBarConstructionMode = deskRenderProfile.barMode;
+  const chartRuntimeOrderflowPriority = deskRenderProfile.orderflowPriority;
+  const chartRuntimeHybridPriority = deskRenderProfile.hybridPriority;
+  const chartRuntimeOrderflowEnabled = deskRenderProfile.resolvedViewMode !== "candle";
+  const chartRuntimeUsesCandles = effectiveChartMode === "candles";
+  const chartRuntimeUsesFootprint = effectiveChartMode === "footprint";
   const [chartDataMode, setChartDataMode] = useState<TerminalDatasetMode>("live");
   const [chartDatasetProfile, setChartDatasetProfile] = useState("reference");
   const [chartLockedDatasetRuntime, setChartLockedDatasetRuntime] = useState<LockedDatasetRuntime | null>(null);
@@ -3992,6 +4602,7 @@ export default function TradingTerminalPage() {
   const backendPrefsReadyRef = useRef(false);
   const backendUpdatedAtRef = useRef<string | null>(null);
   const backendPrefsRef = useRef<Partial<UserUiPreferencesProfile> | null>(null);
+  const chartBarModeSyncedSymbolRef = useRef("");
   const termCoreGroupRef = useRef<ImperativePanelGroupHandle | null>(null);
   const layoutImportInputRef = useRef<HTMLInputElement | null>(null);
   const layoutDragRef = useRef<{ zone: DockZone; id: DockPanelId } | null>(null);
@@ -4116,6 +4727,8 @@ export default function TradingTerminalPage() {
     const persistedDatasetProfile = window.localStorage.getItem(TERMINAL_DATASET_PROFILE_STORAGE_KEY);
     const forcedPerfDebug = query.get("perfDebug");
     const persistedPerfDebug = window.localStorage.getItem(TERMINAL_COMPUTE_PERF_STORAGE_KEY);
+    const forcedChartIsolation = query.get("chartIsolation") || query.get("isolateChart");
+    const persistedChartIsolation = window.localStorage.getItem(TERMINAL_CHART_ISOLATION_STORAGE_KEY);
     const forcedSchedulerScenario = query.get("e2eScheduler");
     const webgl2 = isWebGL2Available();
     const allowAutomationOverride = Boolean(navigator.webdriver)
@@ -4124,6 +4737,12 @@ export default function TradingTerminalPage() {
       setTerminalV2Enabled(true);
     } else if (forced === "0" || persisted === "0") {
       setTerminalV2Enabled(false);
+    }
+
+    if (forcedChartIsolation === "1" || persistedChartIsolation === "1") {
+      setChartIsolationMode(true);
+    } else if (forcedChartIsolation === "0" || persistedChartIsolation === "0") {
+      setChartIsolationMode(false);
     }
 
     setSchedulerE2eScenario(
@@ -4219,6 +4838,75 @@ export default function TradingTerminalPage() {
     };
   }, [terminalComputePerfEnabled]);
 
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    if (typeof PerformanceObserver === "undefined" || !Array.isArray(PerformanceObserver.supportedEntryTypes) || !PerformanceObserver.supportedEntryTypes.includes("longtask")) {
+      setBrowserLongTaskTelemetry({
+        ...DEFAULT_BROWSER_LONG_TASK_TELEMETRY,
+        supported: false,
+      });
+      return;
+    }
+
+    const recentTasks: Array<{ at: number; duration: number }> = [];
+
+    const publishTelemetry = (now: number) => {
+      while (recentTasks.length > 0 && now - recentTasks[0].at > BROWSER_LONG_TASK_WINDOW_MS) {
+        recentTasks.shift();
+      }
+      const recentCount = recentTasks.length;
+      const recentFiveSecondCount = recentTasks.filter((task) => now - task.at <= 5_000).length;
+      const lastTask = recentTasks[recentTasks.length - 1] || null;
+      setBrowserLongTaskTelemetry({
+        supported: true,
+        recentCount,
+        maxDurationMs: recentTasks.reduce((max, task) => Math.max(max, task.duration), 0),
+        lastDurationMs: lastTask?.duration || 0,
+        lastAt: lastTask?.at || null,
+        pattern: recentCount <= 0
+          ? "idle"
+          : recentFiveSecondCount >= Math.max(2, Math.ceil(recentCount * 0.6))
+            ? "steady"
+            : "wave",
+      });
+    };
+
+    const observer = new PerformanceObserver((list) => {
+      const now = Date.now();
+      for (const entry of list.getEntries()) {
+        recentTasks.push({ at: now, duration: entry.duration });
+      }
+      publishTelemetry(now);
+    });
+
+    observer.observe({ entryTypes: ["longtask"] });
+    publishTelemetry(Date.now());
+    const heartbeat = window.setInterval(() => {
+      publishTelemetry(Date.now());
+    }, 5_000);
+
+    return () => {
+      observer.disconnect();
+      window.clearInterval(heartbeat);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.localStorage.setItem(TERMINAL_CHART_ISOLATION_STORAGE_KEY, chartIsolationMode ? "1" : "0");
+    if (!chartIsolationMode) {
+      return;
+    }
+    setTerminalDensityMode("focus");
+    setFocusDecks([]);
+    setFloatingPanels([]);
+    setTerminalV2Enabled(false);
+  }, [chartIsolationMode]);
+
   const toggleTerminalV2 = useCallback(() => {
     setTerminalV2Enabled((current) => {
       const next = !current;
@@ -4237,6 +4925,10 @@ export default function TradingTerminalPage() {
       }
       return next;
     });
+  }, []);
+
+  const toggleChartIsolationMode = useCallback(() => {
+    setChartIsolationMode((current) => !current);
   }, []);
 
   const setGpuViewportGridMode = useCallback((next: 1 | 4 | 16 | "auto") => {
@@ -4484,7 +5176,7 @@ export default function TradingTerminalPage() {
     if (
       authSessionRequired
       || authStatus !== "authenticated"
-      || chartMode !== "candles"
+      || effectiveChartMode !== "candles"
       || chartLoading
       || ohlcvBars.length > 0
       || quotes.length === 0
@@ -4517,7 +5209,7 @@ export default function TradingTerminalPage() {
     return () => {
       window.clearTimeout(timer);
     };
-  }, [authSessionRequired, authStatus, chartLoading, chartMode, chartTimeframe, ohlcvBars.length, quotes, selectedChartSymbol]);
+  }, [authSessionRequired, authStatus, chartLoading, chartTimeframe, effectiveChartMode, ohlcvBars.length, quotes, selectedChartSymbol]);
 
   const marketMetricsUniverseKey = useMemo(() => {
     return buildMarketMetricsUniverse(quotes, symbolFilter, marketFilter)
@@ -4862,6 +5554,10 @@ export default function TradingTerminalPage() {
   }, [autoExecutionMode]);
 
   useEffect(() => {
+    setChartDeskViewMode(readStoredTerminalDeskViewMode());
+  }, []);
+
+  useEffect(() => {
     let cancelled = false;
     void fetchBackendUserUiPreferences().then((payload) => {
       if (cancelled) {
@@ -4876,6 +5572,15 @@ export default function TradingTerminalPage() {
         backendPrefsRef.current = profile;
         applyLocalUserUiPreferences(profile);
         applyBackendTerminalProfile(profile);
+        setChartDeskViewMode(
+          profile.terminalDeskViewMode === "auto"
+            || profile.terminalDeskViewMode === "flow"
+            || profile.terminalDeskViewMode === "hybrid"
+            || profile.terminalDeskViewMode === "candle"
+            ? profile.terminalDeskViewMode
+            : readStoredTerminalDeskViewMode(),
+        );
+        setChartBarConstructionMode(readStoredTerminalChartBarMode(normalizeInstrument(selectedChartSymbol) || selectedChartSymbol || "BTCUSD"));
         if (profile.uiMode === "novice" || profile.uiMode === "expert") {
           setUiMode(profile.uiMode);
         }
@@ -4913,6 +5618,73 @@ export default function TradingTerminalPage() {
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accountId, layoutStorageKey, layoutWorkspaceStorageKey]);
+
+  useEffect(() => {
+    setStoredTerminalDeskViewMode(chartDeskViewMode);
+    if (!backendPrefsReadyRef.current) {
+      return;
+    }
+    const baseProfile = backendPrefsRef.current || {};
+    if (baseProfile.terminalDeskViewMode === chartDeskViewMode) {
+      return;
+    }
+    const nextProfile: UserUiPreferencesProfile = {
+      ...baseProfile,
+      ...readLocalUserUiPreferences(),
+      terminalDeskViewMode: chartDeskViewMode,
+    };
+    backendPrefsRef.current = nextProfile;
+    const clientUpdatedAt = new Date().toISOString();
+    void saveBackendUserUiPreferences(nextProfile, {
+      baseUpdatedAt: backendUpdatedAtRef.current,
+      clientUpdatedAt,
+    }).then((result) => {
+      if (result.ok) {
+        backendUpdatedAtRef.current = result.updatedAt;
+        if (result.updatedAt) {
+          setLocalUserUiPreferencesUpdatedAt(result.updatedAt);
+        }
+        return;
+      }
+      if (result.conflict && result.preferences) {
+        backendPrefsRef.current = result.preferences;
+        applyLocalUserUiPreferences(result.preferences);
+        if (
+          result.preferences.terminalDeskViewMode === "auto"
+          || result.preferences.terminalDeskViewMode === "flow"
+          || result.preferences.terminalDeskViewMode === "hybrid"
+          || result.preferences.terminalDeskViewMode === "candle"
+        ) {
+          setChartDeskViewMode(result.preferences.terminalDeskViewMode);
+        }
+        if (result.updatedAt) {
+          backendUpdatedAtRef.current = result.updatedAt;
+          setLocalUserUiPreferencesUpdatedAt(result.updatedAt);
+        }
+        return;
+      }
+      const fallbackLocalTs = readLocalUserUiPreferencesUpdatedAt() || clientUpdatedAt;
+      setLocalUserUiPreferencesUpdatedAt(fallbackLocalTs);
+    }).catch(() => {
+      const fallbackLocalTs = readLocalUserUiPreferencesUpdatedAt() || clientUpdatedAt;
+      setLocalUserUiPreferencesUpdatedAt(fallbackLocalTs);
+    });
+  }, [chartDeskViewMode]);
+
+  const selectedChartBarModeSymbolKey = useMemo(
+    () => normalizeInstrument(selectedChartSymbol) || String(selectedChartSymbol || "").trim().toUpperCase() || "BTCUSD",
+    [selectedChartSymbol],
+  );
+
+  useEffect(() => {
+    chartBarModeSyncedSymbolRef.current = "";
+    const nextMode = readStoredTerminalChartBarMode(selectedChartBarModeSymbolKey);
+    setChartBarConstructionMode((current) => (current === nextMode ? current : nextMode));
+  }, [selectedChartBarModeSymbolKey]);
+
+  useEffect(() => {
+    chartBarModeSyncedSymbolRef.current = selectedChartBarModeSymbolKey;
+  }, [chartBarConstructionMode, selectedChartBarModeSymbolKey]);
 
   useEffect(() => {
     if (!backendPrefsReadyRef.current) {
@@ -4974,6 +5746,60 @@ export default function TradingTerminalPage() {
       setLocalUserUiPreferencesUpdatedAt(fallbackLocalTs);
     });
   }, [accountId, chartHapticMode, chartLinkSymbolEnabled, chartLinkTimeframeEnabled, chartMotionPreset, chartReleaseSendMode, chartSnapEnabled, chartSnapPriority, floatingPanels, layoutCoreSplit, layoutLowerOrder, layoutMicroOrder, layoutMonitoringOrder, layoutPreset, layoutWorkspaceName, riskAlertMissThreshold, riskAlertWindow, riskHardAlertEnabled, riskHardAlertThresholdPct, riskTimelineRefreshSec, uiMode]);
+
+  useEffect(() => {
+    if (chartBarModeSyncedSymbolRef.current !== selectedChartBarModeSymbolKey) {
+      return;
+    }
+    setStoredTerminalChartBarMode(selectedChartBarModeSymbolKey, chartBarConstructionMode);
+    if (!backendPrefsReadyRef.current) {
+      return;
+    }
+    const baseProfile = backendPrefsRef.current || {};
+    const currentModes = (baseProfile.terminalChartBarModeBySymbol && typeof baseProfile.terminalChartBarModeBySymbol === "object")
+      ? baseProfile.terminalChartBarModeBySymbol
+      : {};
+    if (currentModes[selectedChartBarModeSymbolKey] === chartBarConstructionMode) {
+      return;
+    }
+    const nextProfile: UserUiPreferencesProfile = {
+      ...baseProfile,
+      ...readLocalUserUiPreferences(),
+      terminalChartBarModeBySymbol: {
+        ...currentModes,
+        [selectedChartBarModeSymbolKey]: chartBarConstructionMode,
+      },
+    };
+    backendPrefsRef.current = nextProfile;
+    const clientUpdatedAt = new Date().toISOString();
+    void saveBackendUserUiPreferences(nextProfile, {
+      baseUpdatedAt: backendUpdatedAtRef.current,
+      clientUpdatedAt,
+    }).then((result) => {
+      if (result.ok) {
+        backendUpdatedAtRef.current = result.updatedAt;
+        if (result.updatedAt) {
+          setLocalUserUiPreferencesUpdatedAt(result.updatedAt);
+        }
+        return;
+      }
+      if (result.conflict && result.preferences) {
+        backendPrefsRef.current = result.preferences;
+        applyLocalUserUiPreferences(result.preferences);
+        setChartBarConstructionMode(readStoredTerminalChartBarMode(selectedChartBarModeSymbolKey));
+        if (result.updatedAt) {
+          backendUpdatedAtRef.current = result.updatedAt;
+          setLocalUserUiPreferencesUpdatedAt(result.updatedAt);
+        }
+        return;
+      }
+      const fallbackLocalTs = readLocalUserUiPreferencesUpdatedAt() || clientUpdatedAt;
+      setLocalUserUiPreferencesUpdatedAt(fallbackLocalTs);
+    }).catch(() => {
+      const fallbackLocalTs = readLocalUserUiPreferencesUpdatedAt() || clientUpdatedAt;
+      setLocalUserUiPreferencesUpdatedAt(fallbackLocalTs);
+    });
+  }, [chartBarConstructionMode, selectedChartBarModeSymbolKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -5276,13 +6102,13 @@ export default function TradingTerminalPage() {
 
   const renderExtendedTerminalModules = terminalDensityMode === "full";
   const focusDeckSet = useMemo(() => new Set<TerminalFocusDeckId>(focusDecks), [focusDecks]);
-  const showMicroDeck = renderExtendedTerminalModules || focusDeckSet.has("micro");
-  const showMarketsDeck = renderExtendedTerminalModules || focusDeckSet.has("markets");
-  const showMonitoringDeck = renderExtendedTerminalModules || focusDeckSet.has("monitoring");
-  const showCapitalDeck = renderExtendedTerminalModules || focusDeckSet.has("capital");
-  const showMetaRiskDeck = renderExtendedTerminalModules || focusDeckSet.has("metaRisk");
-  const showCorrelationDeck = renderExtendedTerminalModules || focusDeckSet.has("correlation");
-  const showCalibrationDeck = renderExtendedTerminalModules || focusDeckSet.has("calibration");
+  const showMicroDeck = !chartIsolationMode && (renderExtendedTerminalModules || focusDeckSet.has("micro"));
+  const showMarketsDeck = !chartIsolationMode && (renderExtendedTerminalModules || focusDeckSet.has("markets"));
+  const showMonitoringDeck = !chartIsolationMode && (renderExtendedTerminalModules || focusDeckSet.has("monitoring"));
+  const showCapitalDeck = !chartIsolationMode && (renderExtendedTerminalModules || focusDeckSet.has("capital"));
+  const showMetaRiskDeck = !chartIsolationMode && (renderExtendedTerminalModules || focusDeckSet.has("metaRisk"));
+  const showCorrelationDeck = !chartIsolationMode && (renderExtendedTerminalModules || focusDeckSet.has("correlation"));
+  const showCalibrationDeck = !chartIsolationMode && (renderExtendedTerminalModules || focusDeckSet.has("calibration"));
   const chartSidecarMicroRealtimeEnabled = renderExtendedTerminalModules || focusDeckSet.has("micro");
   const sidecarProfileCards = CHART_SIDECAR_PROFILE_LAYOUTS[chartSidecarProfile].cards;
   const hasDomTapeSidecarConsumer = chartSidecarMicroRealtimeEnabled && sidecarProfileCards.includes("domTape");
@@ -5900,7 +6726,10 @@ export default function TradingTerminalPage() {
       const updated: QuoteHistoryMap = { ...current };
       const label = new Date().toISOString();
       for (const quote of nextQuotes) {
-        const quoteSymbol = instrumentLabel(quote);
+        const quoteSymbol = normalizeInstrument(String(quote.instrument || instrumentLabel(quote)));
+        if (!quoteSymbol) {
+          continue;
+        }
         const nextPoint = { label, value: toNumber(quote.last, 0) };
         const existing = updated[quoteSymbol] || [];
         updated[quoteSymbol] = [...existing, nextPoint].slice(-40);
@@ -6016,7 +6845,10 @@ export default function TradingTerminalPage() {
         const updated: QuoteHistoryMap = { ...current };
         const label = new Date().toISOString();
         for (const quote of nextQuotes) {
-          const quoteSymbol = instrumentLabel(quote);
+          const quoteSymbol = normalizeInstrument(String(quote.instrument || instrumentLabel(quote)));
+          if (!quoteSymbol) {
+            continue;
+          }
           const nextPoint = { label, value: toNumber(quote.last, 0) };
           const existing = updated[quoteSymbol] || [];
           updated[quoteSymbol] = [...existing, nextPoint].slice(-160);
@@ -6484,7 +7316,7 @@ export default function TradingTerminalPage() {
         }
         if (depthPayload && typeof depthPayload === "object") {
           setMarketDepth(depthPayload as JsonMap);
-          setDepthStreamState("live");
+          setDepthStreamState("connecting");
         }
       } catch {
         chartRestFallbackKeyRef.current = "";
@@ -7552,6 +8384,11 @@ export default function TradingTerminalPage() {
       await submitChartOrder(confirmAck);
       return;
     }
+    if (chartLowFlowEdgeBlocked) {
+      setError(chartLowFlowEdgeMessage);
+      pushChartSendHistory("blocked-loss");
+      return;
+    }
     if (!decision.shouldExecute) {
       setError(`V7 blocked: ${decision.reasons.join(", ") || "net edge unavailable"}`);
       pushChartSendHistory("blocked-loss");
@@ -7583,8 +8420,12 @@ export default function TradingTerminalPage() {
     }
 
     const arbBaseNotional = autoExecutionMode === "full-auto" ? autoSizingV3.finalNotional : notional;
-    const arbNotional = applyRiskAiLiveSizing(Math.max(250, arbBaseNotional * liveExecutionSizeMultiplier));
-    const maxLegSpread = Math.max(2, Math.min(maxSpread, Math.ceil(opportunity.expectedNetEdgeBps + opportunity.expectedSlippageBps + 2)));
+    const arbRiskSizedNotional = applyRiskAiLiveSizing(Math.max(250, arbBaseNotional * liveExecutionSizeMultiplier));
+    const arbNotional = Math.max(25, Math.min(opportunity.targetNotionalUsd || arbRiskSizedNotional, arbRiskSizedNotional));
+    const maxLegSpread = Math.max(
+      2,
+      Math.min(maxSpread, Math.ceil(opportunity.expectedNetEdgeBps + opportunity.expectedSlippageBps + (opportunity.shouldReprice ? 4 : 2))),
+    );
     const baseMetadata: JsonMap = {
       ui_feature: "v7-arb-execution",
       route_mode: decision.routeMode,
@@ -7592,6 +8433,12 @@ export default function TradingTerminalPage() {
       expected_slippage_bps: Number(opportunity.expectedSlippageBps.toFixed(3)),
       latency_cost_bps: Number(opportunity.latencyCostBps.toFixed(3)),
       confidence: Number(opportunity.confidence.toFixed(3)),
+      target_notional_usd: Number(arbNotional.toFixed(2)),
+      arb_average_queue_position: Number(opportunity.averageQueuePosition.toFixed(3)),
+      arb_should_reprice: opportunity.shouldReprice,
+      arb_latency_prediction: opportunity.latencyPrediction,
+      arb_execution_policy: opportunity.executionPolicy,
+      arb_execution_plan: opportunity.splitPlan,
       predictor_governor_mode: backendBrainGovernorMode,
       predictor_strategy_mode: backendBrainStrategyMode,
       adaptive_size_multiplier: Number(adaptiveV7Snapshot.strategy.sizeMultiplier.toFixed(3)),
@@ -7681,7 +8528,14 @@ export default function TradingTerminalPage() {
         enabled: true,
         buy_venue: opportunity.buyVenue,
         sell_venue: opportunity.sellVenue,
+        split_plan: opportunity.splitPlan,
       },
+      latency_predictor: opportunity.latencyPrediction,
+      queue_estimator: {
+        average_queue_position: Number(opportunity.averageQueuePosition.toFixed(3)),
+        should_reprice: opportunity.shouldReprice,
+      },
+      execution_rl: opportunity.executionPolicy,
       predictor_execution_adjustments: {
         governor_mode: backendBrainGovernorMode,
         size_multiplier: backendBrainGovernorSizeMultiplier,
@@ -7767,6 +8621,11 @@ export default function TradingTerminalPage() {
         hedged: result.hedged,
         buy: result.buy.payload || { error: result.buy.error, venue: result.buy.venue },
         sell: result.sell.payload || { error: result.sell.error, venue: result.sell.venue },
+        executed_notional_usd: result.executedNotionalUsd,
+        slice_count: result.sliceCount,
+        latency_prediction: result.latencyPrediction,
+        execution_policy: result.executionPolicy,
+        execution_plan: result.plan,
         expected_net_edge_bps: opportunity.expectedNetEdgeBps,
         expected_slippage_bps: opportunity.expectedSlippageBps,
       });
@@ -7790,7 +8649,7 @@ export default function TradingTerminalPage() {
       ? routingScore.candidates as JsonMap[]
       : [];
     const decision = executionEngineV7Ref.current.buildDecision({
-      arbitrage: (routingScore?.arbitrage as JsonMap | undefined) || null,
+      arbitrage: effectiveArbitragePayload,
       routingCandidates,
       bestRoute: (routingScore?.best as JsonMap | undefined) || null,
       backupRoute: (routingScore?.backup as JsonMap | undefined) || null,
@@ -7968,6 +8827,11 @@ export default function TradingTerminalPage() {
   async function submitChartOrder(confirmAck = false): Promise<void> {
     if (backendBrainGovernorBlocked) {
       setError(`Brain governor blocked: ${backendBrainGovernorReasons.join(", ") || "execution disabled"}`);
+      pushChartSendHistory("blocked-loss");
+      return;
+    }
+    if (chartLowFlowEdgeBlocked) {
+      setError(chartLowFlowEdgeMessage);
       pushChartSendHistory("blocked-loss");
       return;
     }
@@ -8477,24 +9341,6 @@ export default function TradingTerminalPage() {
   // V5 trades-first: les quotes live n'altèrent plus les candles canoniques.
   // Elles servent à la microstructure / latence, tandis que les candles viennent
   // du flux trades snapshot/backfill reconstruit côté moteur.
-  useEffect(() => {
-    const liveQuote = quotes.find((q) => instrumentLabel(q) === selectedChartSymbol);
-    const tickPrice = liveQuote
-      ? toNumber(
-          (liveQuote as Record<string, unknown>).last
-            ?? (liveQuote as Record<string, unknown>).mid
-            ?? (liveQuote as Record<string, unknown>).ask,
-          0,
-        )
-      : 0;
-    if (tickPrice > 0) {
-      const updatedAt = typeof (liveQuote as Record<string, unknown>)?.updated_at === "string"
-        ? Date.parse((liveQuote as Record<string, unknown>).updated_at as string)
-        : undefined;
-      marketDataBusRef.current?.ingestPriceTick(tickPrice, updatedAt);
-    }
-  }, [quotes, selectedChartSymbol]);
-
   const localOhlcvAnalysis = useMemo(
     () => measureTerminalCompute("localOhlcvAnalysis", terminalComputePerfEnabled, () => analyzeOhlcvRows(ohlcvBars, {
       instrument: selectedChartInstrument,
@@ -8670,6 +9516,7 @@ export default function TradingTerminalPage() {
       };
     });
   }, [chartSeriesForAnchors, marketMicro, multiAnchorVwap, predictorOrderbookSignals, reconstructedOrderflowSnapshot, terminalComputePerfEnabled]);
+  const hasLiveOrderflowRuntime = depthStreamState === "live" && marketOrderflowRuntime?.syncStatus === "live";
   const executionFootprintSnapshot = useMemo(() => measureTerminalCompute("executionFootprintSnapshot", terminalComputePerfEnabled, () => {
     const runtimeFootprint = marketOrderflowRuntime?.footprint || null;
     if (runtimeFootprint) {
@@ -8689,18 +9536,15 @@ export default function TradingTerminalPage() {
     });
   }), [marketOrderflowRuntime, predictorOrderbookSignals.orderbookAsks, predictorOrderbookSignals.orderbookBids, predictorOrderflowSnapshot, renderableOhlcvBars, terminalComputePerfEnabled]);
   const domSnapshot = useMemo(() => measureTerminalCompute("domSnapshot", terminalComputePerfEnabled, () => {
+    if (!hasLiveOrderflowRuntime) {
+      return null;
+    }
     const runtimeDom = marketOrderflowRuntime?.dom || null;
     if (runtimeDom) {
       return convertRuntimeDomSnapshot(runtimeDom);
     }
-    return buildDomSnapshot({
-      orderbookBids: predictorOrderbookSignals.orderbookBids,
-      orderbookAsks: predictorOrderbookSignals.orderbookAsks,
-      liquidityScore: predictorOrderflowSnapshot.liquidityEngine.liquidityEngineScore,
-      spoofingRisk: Math.abs(predictorOrderflowSnapshot.spoofingScore),
-      timestamp: renderableOhlcvBars.length > 0 ? String(renderableOhlcvBars[renderableOhlcvBars.length - 1]?.t || "") : null,
-    });
-  }), [marketOrderflowRuntime, predictorOrderbookSignals.orderbookAsks, predictorOrderbookSignals.orderbookBids, predictorOrderflowSnapshot.liquidityEngine.liquidityEngineScore, renderableOhlcvBars, terminalComputePerfEnabled]);
+    return null;
+  }), [hasLiveOrderflowRuntime, marketOrderflowRuntime, terminalComputePerfEnabled]);
   useEffect(() => {
     if (typeof window === "undefined") {
       return;
@@ -8712,13 +9556,6 @@ export default function TradingTerminalPage() {
     runtimeWindow.__MC_EXECUTION_FOOTPRINT__ = executionFootprintSnapshot;
     runtimeWindow.__MC_DOM_SNAPSHOT__ = domSnapshot;
   }, [domSnapshot, executionFootprintSnapshot]);
-  const deskRenderProfile = useMemo(() => resolveDeskRenderProfile(chartTimeframe, chartMode), [chartMode, chartTimeframe]);
-  const effectiveChartMode = deskRenderProfile.mode;
-  const chartRuntimeOrderflowPriority = deskRenderProfile.orderflowPriority;
-  const chartRuntimeHybridPriority = deskRenderProfile.hybridPriority;
-  const chartRuntimeOrderflowEnabled = effectiveChartMode !== "line";
-  const chartRuntimeUsesCandles = effectiveChartMode === "candles";
-  const chartRuntimeUsesFootprint = effectiveChartMode === "footprint";
   const effectiveChartHeatmapMode = chartRuntimeOrderflowPriority || chartRuntimeHybridPriority ? "bookmap" : chartHeatmapMode;
   const terminalFeatureFlags = useMemo<TerminalFeatureFlags>(() => ({
     DOM_GPU: chartEngineMode === "v4",
@@ -8921,47 +9758,10 @@ export default function TradingTerminalPage() {
     latestQuote,
     toNumber(renderableOhlcvBars[renderableOhlcvBars.length - 1]?.c, 100),
   );
-  const fallbackChartCandles = !hasRenderableCandles
-    ? (() => {
-      // Generate 80 plausible 1-minute preview bars so the chart looks sensible
-      // while market data is loading / offline. Uses a seeded pseudo-random walk
-      // so the shape is stable across renders rather than jumping on every tick.
-      const BARS = 80;
-      const INTERVAL_MS = 60_000;
-      const base = previewAnchorPrice > 0 ? previewAnchorPrice : 100;
-      const now = Math.floor(Date.now() / INTERVAL_MS) * INTERVAL_MS;
-      const bars: Array<{ label: string; open: number; high: number; low: number; close: number; volume: number }> = [];
-      let price = base;
-      // Deterministic LCG seeded on the day so shape is stable for a session
-      let seed = Math.floor(now / 86_400_000) % 65536;
-      const rand = () => {
-        seed = (seed * 1664525 + 1013904223) & 0xffffffff;
-        return (seed >>> 0) / 0xffffffff;
-      };
-      for (let i = BARS - 1; i >= 0; i--) {
-        const t = now - i * INTERVAL_MS;
-        const drift = (rand() - 0.5) * 0.003;
-        const open = price;
-        const close = open * (1 + drift);
-        const wickPad = Math.max(open * 0.00018, Math.abs(close - open) * 0.25 + open * 0.00004);
-        const high = Math.max(open, close) + wickPad;
-        const low = Math.min(open, close) - wickPad;
-        price = close;
-        bars.push({
-          label: new Date(t).toISOString(),
-          open: +open.toFixed(5),
-          high: +high.toFixed(5),
-          low: +low.toFixed(5),
-          close: +close.toFixed(5),
-          volume: Math.round(50 + rand() * 200),
-        });
-      }
-      return bars;
-    })()
-    : [];
+  const fallbackChartCandles: Array<{ label: string; open: number; high: number; low: number; close: number; volume: number }> = [];
   const chartCandles = ohlcvCandles;
-  const chartDisplayCandles = hasRenderableCandles ? chartCandles : fallbackChartCandles;
-  const chartPreviewModeActive = !hasRenderableCandles && chartDisplayCandles.length > 0;
+  const chartDisplayCandles = chartCandles;
+  const chartPreviewModeActive = false;
   const chartPreviewBannerActive = chartPreviewModeActive || (!chartAuthBlocked && chartDisplayCandles.length > 0 && localOhlcvAnalysis.signal !== "OHLCV_RENDERABLE");
   const chartPerceptionEnabled = hasRenderableCandles && !chartPreviewModeActive;
   const chartMaskActive = (chartRenderBlocked || (chartAuthBlocked && !hasRenderableCandles)) && !chartPreviewModeActive;
@@ -8971,8 +9771,41 @@ export default function TradingTerminalPage() {
     if (!chartPerceptionEnabled) {
       setChartPerceptualTelemetry(null);
       setGpuPerceptualTelemetry(null);
+      setGpuViewportFrameMeta({});
+      setGpuGlobalGridBatch(null);
     }
   }, [chartPerceptionEnabled]);
+
+  useEffect(() => {
+    setGpuViewportFrameMeta({});
+    setGpuGlobalGridBatch(null);
+  }, [chartEngineMode, chartTimeframe, selectedChartInstrument, selectedChartVenue]);
+
+  useEffect(() => {
+    if (!chartPerceptionEnabled || chartEngineMode !== "v4") {
+      setGpuGlobalGridBatch(null);
+      return;
+    }
+    const unsubscribe = subscribeChartFrameBatch((batch) => {
+      const frameCount = batch.frames.length;
+      const partialCount = batch.frames.filter((frame) => frame.meta.partial || frame.meta.syncStatus !== "atomic").length;
+      const maxSkewMs = frameCount > 0
+        ? Math.max(...batch.frames.map((frame) => Math.max(0, Number(frame.meta.batchSkewMs || 0))))
+        : 0;
+      const minConfidence = frameCount > 0
+        ? Math.min(...batch.frames.map((frame) => Math.max(0, Math.min(1, Number(frame.meta.confidence || 0)))))
+        : null;
+      setGpuGlobalGridBatch({
+        batchKey: batch.batchKey,
+        publishedAt: batch.publishedAt,
+        frameCount,
+        partialCount,
+        maxSkewMs,
+        minConfidence,
+      });
+    });
+    return unsubscribe;
+  }, [chartEngineMode, chartPerceptionEnabled]);
 
   // ── Memoized indicator computation (PERF) ──────────────────────────────────
   // Hash-based memoization: only recompute if bars or active indicators actually change
@@ -9023,13 +9856,13 @@ export default function TradingTerminalPage() {
     };
     }, [barHash, activeIndicatorKey, activeIndicators]);
   const selectedQuoteRows = quotes.filter((quote) => instrumentLabel(quote) === selectedChartSymbol);
-  const chartValues = chartMode === "candles"
+  const chartValues = chartRuntimeUsesCandles
     ? chartCandles.flatMap((candle) => [candle.low, candle.high]).filter((value) => Number.isFinite(value) && value > 0)
     : chartSeries.map((point) => point.value);
-  const chartFirstValue = chartMode === "candles"
+  const chartFirstValue = chartRuntimeUsesCandles
     ? (chartCandles[0]?.close ?? 0)
     : (chartSeries[0]?.value ?? 0);
-  const chartLastValue = chartMode === "candles"
+  const chartLastValue = chartRuntimeUsesCandles
     ? (chartCandles[chartCandles.length - 1]?.close ?? chartFirstValue)
     : (chartSeries[chartSeries.length - 1]?.value ?? chartFirstValue);
   const chartMin = chartValues.length > 0 ? Math.min(...chartValues) : 0;
@@ -9052,7 +9885,7 @@ export default function TradingTerminalPage() {
     const chartSpan = Math.max(chartMax - chartMin, chartSeriesAnchorPrice * 0.0012);
     return chartLiveAnchorPrice < chartMin - chartSpan * 0.35 || chartLiveAnchorPrice > chartMax + chartSpan * 0.35;
   })();
-  const chartShouldLockAnchorToSeries = chartMode === "candles"
+  const chartShouldLockAnchorToSeries = chartRuntimeUsesCandles
     && hasRenderableCandles
     && (chartBarsHardFail || chartAnchorOutOfRange);
   const chartAnchorPrice = chartShouldLockAnchorToSeries
@@ -9295,6 +10128,11 @@ export default function TradingTerminalPage() {
 
   const approveAllAndSend = async (): Promise<void> => {
     if (!marketDecisionV1.suggestedBracket) {
+      return;
+    }
+    if (chartLowFlowEdgeBlocked) {
+      setError(chartLowFlowEdgeMessage);
+      pushChartSendHistory("blocked-loss");
       return;
     }
     setShowDecisionSecondary(false);
@@ -11005,7 +11843,7 @@ export default function TradingTerminalPage() {
       ||
       authSessionRequired
       || authStatus !== "authenticated"
-      || chartMode !== "candles"
+      || effectiveChartMode !== "candles"
       || chartLoading
       || quotes.length === 0
       || classifyInstrument(selectedChartSymbol) !== "crypto"
@@ -11055,8 +11893,8 @@ export default function TradingTerminalPage() {
     authStatus,
     chartDataMode,
     chartLoading,
-    chartMode,
     chartTimeframe,
+    effectiveChartMode,
     localOhlcvAnalysis.signal,
     quotes,
     selectedChartInstrument,
@@ -11140,7 +11978,7 @@ export default function TradingTerminalPage() {
       chartPriceDigits,
       chartSnapEnabled,
       chartRoundMagnetStep,
-      chartMode,
+      chartMode: effectiveChartMode,
       chartCandles,
       showVwap,
       dayVwap,
@@ -11373,11 +12211,7 @@ export default function TradingTerminalPage() {
       footprintByTimeKey: nextFootprintByTimeKey,
     };
   }, [chartSeries, chartSignalComputationEnabled, chartTimeframe, hasRenderableCandles, marketDepth, nativeTrades, orderbook, renderableOhlcvBars]);
-  const displayDepthStreamState: "offline" | "connecting" | "live" = depthStreamState === "live"
-    || marketDepth !== null
-    || orderbook !== null
-    ? "live"
-    : depthStreamState;
+  const displayDepthStreamState: "offline" | "connecting" | "live" = depthStreamState;
   const depthPayload = (marketDepth?.depth_payload as JsonMap | undefined) || {};
   const depthEventTime = toNumber(depthPayload.event_time, 0);
   const depthSnapshotAt = String(marketDepth?.snapshot_at || "");
@@ -11753,10 +12587,10 @@ export default function TradingTerminalPage() {
     : buildReplayFootprintRowsFromSnapshot(replayFrame?.footprintSnapshot);
   const activeDomLevels = replayState.enabled
     ? replayDomLevels
-    : (chartHeavyFeaturesEnabled ? domDisplayLevels : []);
+    : (chartHeavyFeaturesEnabled && hasLiveOrderflowRuntime ? domDisplayLevels : []);
   const activeHeatmapLevels = replayState.enabled
     ? replayHeatmapLevels
-    : (chartHeavyFeaturesEnabled ? heatmapLevels : []);
+    : (chartHeavyFeaturesEnabled && hasLiveOrderflowRuntime ? heatmapLevels : []);
   const activeFootprintRows = replayState.enabled
     ? replayFootprintRows
     : (chartHeavyFeaturesEnabled ? footprintRows.slice(0, 8) : []);
@@ -11849,6 +12683,41 @@ export default function TradingTerminalPage() {
       ? [{ time, spoofingRisk: activeDomSnapshot.spoofingRisk, levels }]
       : [];
   }, [activeDomSnapshot, liveDomHistory, replayFrames, replayMaxIndex, replayState.cursorIndex, replayState.enabled, syncedFrame?.ts]);
+  const flowFallbackTimeMs = parseFrameTimeMs(activeDomSnapshot?.timestamp, syncedFrame?.ts ?? 0);
+  const flowIntelligenceSnapshot = useMemo(() => {
+    if (!chartRuntimeOrderflowEnabled) {
+      return null;
+    }
+    return computeFlowIntelligence({
+      tape: activeTape.map((trade) => ({
+        time: parseFrameTimeMs(trade.timeKey, parseFrameTimeMs(trade.label, flowFallbackTimeMs)),
+        price: toNumber(trade.price, 0),
+        delta: toNumber(trade.delta, 0),
+        side: trade.side,
+        volume: Math.max(0, toNumber(trade.volume, Math.abs(toNumber(trade.delta, 0)))),
+      })),
+      domLevels: activeDomLevels.map((level) => ({
+        side: level.side,
+        price: toNumber(level.price, 0),
+        size: Math.max(0, toNumber(level.size, 0)),
+        intensity: clamp(toNumber(level.intensity, 0), 0, 3),
+      })),
+      domHistory: activeDomHistory.map((frame) => ({
+        time: frame.time,
+        spoofingRisk: frame.spoofingRisk,
+        levels: frame.levels.map((level) => ({
+          side: level.side,
+          price: toNumber(level.price, 0),
+          size: Math.max(0, toNumber(level.size, 0)),
+          intensity: clamp(toNumber(level.intensity, 0), 0, 3),
+        })),
+      })),
+      currentPrice: activePrice > 0 ? activePrice : chartLastValue,
+      timeframeMs: timeframeToMs(chartTimeframe),
+      fallbackTimeMs: flowFallbackTimeMs,
+      spoofRisk: activeDomSnapshot?.spoofingRisk ?? predictorOrderflowSnapshot.spoofingScore,
+    });
+  }, [activeDomHistory, activeDomLevels, activeDomSnapshot?.spoofingRisk, activePrice, activeTape, chartLastValue, chartRuntimeOrderflowEnabled, chartTimeframe, flowFallbackTimeMs, predictorOrderflowSnapshot.spoofingScore]);
   const activeTradeBubbles = useMemo(() => {
     if (!chartRuntimeOrderflowEnabled) {
       return [] as TradeBubbleVisual[];
@@ -11872,13 +12741,31 @@ export default function TradingTerminalPage() {
       timeframe: chartTimeframe,
     });
   }, [activeDomSnapshot, activeTape, chartRuntimeOrderflowEnabled, chartTimeframe, replayFrames, replayMaxIndex, replayState.cursorIndex, replayState.enabled, syncedFrame?.ts]);
+  const chartTradeBubbles = useMemo(() => {
+    return [...activeTradeBubbles, ...buildFlowEventTradeBubbles({
+      snapshot: flowIntelligenceSnapshot,
+      fallbackTimeMs: flowFallbackTimeMs,
+      currentPrice: activePrice > 0 ? activePrice : chartLastValue,
+    })].slice(-180);
+  }, [activePrice, activeTradeBubbles, chartLastValue, flowFallbackTimeMs, flowIntelligenceSnapshot]);
+  const chartDomHistoryWithMemoryTrail = useMemo(() => {
+    const trailFrames = buildLiquidityMemoryTrailFrames({
+      zones: flowIntelligenceSnapshot?.liquidityZones || [],
+      baseTimeMs: flowFallbackTimeMs > 0 ? flowFallbackTimeMs : Date.now(),
+      timeframe: chartTimeframe,
+      spoofRisk: flowIntelligenceSnapshot?.spoofRisk,
+    });
+    return mergeDomHistoryFrames(activeDomHistory, trailFrames, 96);
+  }, [activeDomHistory, chartTimeframe, flowFallbackTimeMs, flowIntelligenceSnapshot?.liquidityZones, flowIntelligenceSnapshot?.spoofRisk]);
   const activeAbsorptionMlScore = activeExecutionFootprint?.mlAbsorptionScore ?? 0;
   const focusedHeatmapLevels = useMemo(() => buildFocusedHeatmapLevels({
     levels: activeHeatmapLevels,
     mode: effectiveChartHeatmapMode,
     heatIntensity: bookmapHeatIntensity,
     discardThreshold: bookmapDiscardThreshold,
-  }), [activeHeatmapLevels, bookmapDiscardThreshold, bookmapHeatIntensity, effectiveChartHeatmapMode]);
+    liquidityZones: flowIntelligenceSnapshot?.liquidityZones,
+  }), [activeHeatmapLevels, bookmapDiscardThreshold, bookmapHeatIntensity, effectiveChartHeatmapMode, flowIntelligenceSnapshot?.liquidityZones]);
+  const terminalFlowInsight = useMemo(() => summarizeFlowInsight(flowIntelligenceSnapshot), [flowIntelligenceSnapshot]);
   const mlAbsorptionBridge = useMemo(() => buildMlAbsorptionBridge({
     mode: mlAbsorptionRuntimeMode,
     footprint: activeExecutionFootprint,
@@ -11924,19 +12811,30 @@ export default function TradingTerminalPage() {
       domSnapshot: dom,
     };
   }), [chartCandles, chartTimeframe, domSnapshotByTimeKey, executionFootprintSnapshot, footprintSnapshotByTimeKey]);
-  const chartDisplayCandlesWithMicrostructure = useMemo(() => chartDisplayCandles.map((candle) => {
-    const timeKey = toTimeBucketKey(candle.label, chartTimeframe);
-    const executionFootprint = footprintSnapshotByTimeKey.get(timeKey) || null;
-    const dom = domSnapshotByTimeKey.get(timeKey) || null;
-    if (!executionFootprint && !dom) {
-      return candle;
+  const chartDisplayCandlesWithMicrostructure = useMemo(() => {
+    const enriched = chartDisplayCandles.map((candle) => {
+      const timeKey = toTimeBucketKey(candle.label, chartTimeframe);
+      const executionFootprint = footprintSnapshotByTimeKey.get(timeKey) || null;
+      const dom = domSnapshotByTimeKey.get(timeKey) || null;
+      if (!executionFootprint && !dom) {
+        return candle;
+      }
+      return {
+        ...candle,
+        executionFootprint,
+        domSnapshot: dom,
+      };
+    });
+    if (effectiveChartBarConstructionMode === "delta" || effectiveChartBarConstructionMode === "event") {
+      return buildDeltaEventDisplayCandles({
+        candles: enriched,
+        mode: effectiveChartBarConstructionMode,
+        timeframe: chartTimeframe,
+      });
     }
-    return {
-      ...candle,
-      executionFootprint,
-      domSnapshot: dom,
-    };
-  }), [chartDisplayCandles, chartTimeframe, domSnapshotByTimeKey, footprintSnapshotByTimeKey]);
+    const compressionBucketMs = replayState.enabled ? timeframeSeconds(chartTimeframe) * 1000 : resolveDisplayCompressionBucketMs(chartTimeframe, enriched.length);
+    return aggregateDisplayCandles(enriched, compressionBucketMs);
+  }, [chartDisplayCandles, chartTimeframe, domSnapshotByTimeKey, effectiveChartBarConstructionMode, footprintSnapshotByTimeKey, replayState.enabled]);
   var marketSignalV1 = useMemo<MarketSignalSnapshot>(() => {
     if (!chartSignalComputationEnabled) {
       return {
@@ -13294,6 +14192,35 @@ export default function TradingTerminalPage() {
   }, [avgLatency, backendPredictorSnapshot, marketBusKernelTelemetry.tickLatencyMs, routeCandidateByVenue, selectedQuoteRows]);
   const aggregatedMultiVenueBook = useMemo(() => aggregateOrderbooks(multiVenueOrderbooks), [multiVenueOrderbooks]);
   const multiVenueArbitrageSnapshot = useMemo(() => detectArbitrage(multiVenueOrderbooks), [multiVenueOrderbooks]);
+  const effectiveArbitragePayload = useMemo<JsonMap | null>(() => {
+    const backendPayload = (routingScore?.arbitrage as JsonMap | undefined) || null;
+    const localPayload = multiVenueArbitrageSnapshot.executable
+      ? {
+        opportunity: multiVenueArbitrageSnapshot.opportunity,
+        buy: multiVenueArbitrageSnapshot.buy,
+        sell: multiVenueArbitrageSnapshot.sell,
+        net_spread: multiVenueArbitrageSnapshot.net_spread,
+        gross_spread_bps: multiVenueArbitrageSnapshot.grossSpreadBps,
+        latency_gap_ms: multiVenueArbitrageSnapshot.latencyGapMs,
+        opportunity_score: multiVenueArbitrageSnapshot.opportunityScore,
+        max_executable_usd: multiVenueArbitrageSnapshot.maxExecutableUsd,
+        buy_price: multiVenueArbitrageSnapshot.buyPrice,
+        sell_price: multiVenueArbitrageSnapshot.sellPrice,
+        rankings: multiVenueArbitrageSnapshot.rankings,
+        opportunities: multiVenueArbitrageSnapshot.opportunities,
+        execution_plan: multiVenueArbitrageSnapshot.executionPlan,
+      } satisfies JsonMap
+      : null;
+    if (!backendPayload) {
+      return localPayload;
+    }
+    if (!localPayload) {
+      return backendPayload;
+    }
+    return toNumber(localPayload.net_spread, 0) >= toNumber(backendPayload.net_spread, 0)
+      ? localPayload
+      : backendPayload;
+  }, [multiVenueArbitrageSnapshot, routingScore?.arbitrage]);
   const smartRoutingPlan = useMemo(() => routeOrder({
     side: side === "sell" ? "sell" : "buy",
     notionalUsd: Math.max(25, autoExecutionMode === "full-auto" ? aiAdjustedAutoNotionalUsd : applyRiskAiLiveSizing(notional)),
@@ -14062,7 +14989,7 @@ export default function TradingTerminalPage() {
     0.1,
     1.5,
   );
-  const arbPayload = (routingScore?.arbitrage as JsonMap | undefined) || null;
+  const arbPayload = effectiveArbitragePayload;
   const arbOpportunity = Boolean(arbPayload?.opportunity ?? marketMicro?.arbitrage_opportunity);
   const arbNetSpread = toNumber(arbPayload?.net_spread ?? marketMicro?.arbitrage_net_spread, 0);
   const arbBuyVenue = String(arbPayload?.buy ?? marketMicro?.arbitrage_buy_venue ?? "").replace("-public", "").replace("paper-", "");
@@ -14186,8 +15113,21 @@ export default function TradingTerminalPage() {
       : "neutral";
   const v8ChipTone = effectiveV8ShouldExecute ? (v8Prediction.confidence === "high" ? "good" : "warn") : effectiveV8DataReliable ? "neutral" : "warn";
   const benchmarkChipTone = kernelBenchmarkRate > 0 ? "warn" : "neutral";
-  const kernelTelemetryLabel = `KERN ${marketBusKernelTelemetry.tickLatencyMs.toFixed(1)}ms q${marketBusKernelTelemetry.bufferBacklog} d${marketBusKernelTelemetry.drainedTicksPerFrame} sk${marketBusKernelTelemetry.skippedFrames}`;
-  const schedulerLabel = `SCHED ${marketBusKernelTelemetry.schedulerBudgetMs.toFixed(1)}ms/${marketBusKernelTelemetry.schedulerPullLimit}`;
+  const kernelTelemetryLabel = `KERN ${marketBusKernelTelemetry.tickLatencyMs.toFixed(1)}ms q${marketBusKernelTelemetry.bufferBacklog} d${marketBusKernelTelemetry.drainedTicksPerFrame} sk${marketBusKernelTelemetry.skippedFrames} c${marketBusKernelTelemetry.coalescedFrames} sg${marketBusKernelTelemetry.syncGapCount}`;
+  const schedulerLabel = `SCHED ${marketBusKernelTelemetry.schedulerBudgetMs.toFixed(1)}ms/${marketBusKernelTelemetry.schedulerPullLimit} jb${marketBusKernelTelemetry.dynamicBufferMs} ag${marketBusKernelTelemetry.adaptiveGraceMs} sq${marketBusKernelTelemetry.sequenceQueueDepth}`;
+  const longTaskAgeMs = browserLongTaskTelemetry.lastAt ? Math.max(0, Date.now() - browserLongTaskTelemetry.lastAt) : -1;
+  const longTaskLabel = !browserLongTaskTelemetry.supported
+    ? "LT unsupported"
+    : browserLongTaskTelemetry.recentCount <= 0
+      ? "LT idle"
+      : `LT ${browserLongTaskTelemetry.pattern} ${browserLongTaskTelemetry.recentCount}/30s max${browserLongTaskTelemetry.maxDurationMs.toFixed(0)}ms age ${longTaskAgeMs >= 0 ? formatFreshness(longTaskAgeMs) : "n/a"}`;
+  const longTaskTone: "good" | "warn" | "neutral" = !browserLongTaskTelemetry.supported
+    ? "neutral"
+    : browserLongTaskTelemetry.recentCount <= 0
+      ? "good"
+      : browserLongTaskTelemetry.maxDurationMs >= 100 || browserLongTaskTelemetry.pattern === "steady"
+        ? "warn"
+        : "neutral";
   const candleProbeAgeMs = marketBusKernelTelemetry.lastCandleUpdateAt
     ? Math.max(0, Date.now() - Date.parse(marketBusKernelTelemetry.lastCandleUpdateAt))
     : -1;
@@ -14199,7 +15139,7 @@ export default function TradingTerminalPage() {
       : candleProbeAgeMs <= 60_000
         ? "warn"
         : "bad";
-  const candleProbeLabel = `CANDLE t${marketBusKernelTelemetry.receivedTicks} u${marketBusKernelTelemetry.candleUpdates} hb${marketBusKernelTelemetry.syntheticHeartbeatOpens} age ${candleLastUpdateAgeLabel}`;
+  const candleProbeLabel = `CANDLE t${marketBusKernelTelemetry.receivedTicks} u${marketBusKernelTelemetry.candleUpdates} hb${marketBusKernelTelemetry.syntheticHeartbeatOpens} ${marketBusKernelTelemetry.frameSyncStatus} ${(marketBusKernelTelemetry.frameSyncConfidence * 100).toFixed(0)}% age ${candleLastUpdateAgeLabel}`;
   const candleAudit = syncedFrame?.audit ?? null;
   const candleAuditTone: "good" | "warn" | "bad" | "neutral" = !candleAudit
     ? "neutral"
@@ -14290,6 +15230,9 @@ export default function TradingTerminalPage() {
     reasonLabel: backendPredictorReasonsLabel || backendBrainReason,
   };
   const chartExecutionSignals = useMemo<PerceptualExecutionSignal[]>(() => {
+    if (!replayState.enabled && !hasLiveOrderflowRuntime) {
+      return [];
+    }
     type ExecutionBucketAccumulator = {
       fillProbability: number;
       slippageBps: number;
@@ -14465,6 +15408,7 @@ export default function TradingTerminalPage() {
     effectiveV8Probability,
     executionTelemetry,
     filteredOutcomes,
+    hasLiveOrderflowRuntime,
     liveTimeKey,
     omsLifecycleSummary.acceptedCount,
     omsLifecycleSummary.blockedCount,
@@ -14472,6 +15416,7 @@ export default function TradingTerminalPage() {
     omsLifecycleSummary.partialCount,
     omsLifecycleSummary.pendingApprovals,
     preferredRouteScore,
+    replayState.enabled,
     selectedChartSymbol,
   ]);
   const activeChartExecutionSignal = useMemo(() => {
@@ -14481,7 +15426,7 @@ export default function TradingTerminalPage() {
       || null;
   }, [activeTimeKey, chartExecutionSignals, liveTimeKey]);
   const chartMarketSimulation = useMemo<MarketSimulation | null>(() => {
-    if (effectiveChartMode === "line") {
+    if (!chartRuntimeOrderflowEnabled) {
       return null;
     }
 
@@ -14639,11 +15584,19 @@ export default function TradingTerminalPage() {
     domSnapshot: activeDomSnapshot,
     currentPrice: activePrice > 0 ? activePrice : chartLastValue,
   }), [activeDomSnapshot, activeHeatmapLevels, activePrice, chartLastValue, chartMarketSimulation, liquidityAiSnapshot]);
+  const chartFlowSignalBands = useMemo(() => buildFlowSignalBands({
+    snapshot: flowIntelligenceSnapshot,
+  }), [flowIntelligenceSnapshot]);
+  const chartArbitrageSignalBands = useMemo(() => buildArbitrageSignalBands({
+    snapshot: multiVenueArbitrageSnapshot,
+  }), [multiVenueArbitrageSnapshot]);
   const chartPriceSignalBands = useMemo(() => buildPriceSignalBands({
     executionOverlay: chartExecutionOverlay,
     slippageBands: chartExecutionSlippageBands,
     liquidityLevels: chartLiquidityPredictionLevels,
-  }), [chartExecutionOverlay, chartExecutionSlippageBands, chartLiquidityPredictionLevels]);
+    flowBands: chartFlowSignalBands,
+    arbitrageBands: chartArbitrageSignalBands,
+  }), [chartArbitrageSignalBands, chartExecutionOverlay, chartExecutionSlippageBands, chartFlowSignalBands, chartLiquidityPredictionLevels]);
   const v6StateLabel = chartMarketSimulation
     ? chartMarketSimulation.stateLabel.replace(/_/g, " ").toUpperCase()
     : "STBY";
@@ -17033,7 +17986,7 @@ export default function TradingTerminalPage() {
     .filter((quote, index, rows) => rows.findIndex((candidate) => instrumentLabel(candidate) === instrumentLabel(quote)) === index)
     .slice(0, 7)
     .map((quote) => {
-      const symbol = instrumentLabel(quote);
+      const symbol = normalizeInstrument(String(quote.instrument || instrumentLabel(quote)));
       const metrics = marketMetricsBySymbol[symbol];
       const history = quoteHistory[symbol] || [];
       const first = history[0]?.value ?? toNumber(quote.last, 0);
@@ -17062,7 +18015,7 @@ export default function TradingTerminalPage() {
     .filter((quote, index, rows) => rows.findIndex((candidate) => instrumentLabel(candidate) === instrumentLabel(quote)) === index)
     .slice(0, 16)
     .map((quote) => {
-      const symbol = instrumentLabel(quote);
+      const symbol = normalizeInstrument(String(quote.instrument || instrumentLabel(quote)));
       const history = quoteHistory[symbol] || [];
       const first = history[0]?.value ?? toNumber(quote.last, 0);
       const last = history[history.length - 1]?.value ?? toNumber(quote.last, 0);
@@ -17079,23 +18032,7 @@ export default function TradingTerminalPage() {
   const gpuMultiSymbolFeeds = useMemo(() => (
     gpuMatrixRows.map((row) => {
       const history = quoteHistory[row.symbol] || [];
-      const candles = history.length >= 4
-        ? history.map((point, index) => {
-            const prev = history[index - 1] || point;
-            const open = Number(prev.value);
-            const close = Number(point.value);
-            const high = Math.max(open, close) * 1.0006;
-            const low = Math.min(open, close) * 0.9994;
-            return {
-              label: point.label,
-              open,
-              high,
-              low,
-              close,
-              volume: Math.abs(close - open) * 1000 + 1,
-            };
-          })
-        : [];
+      const candles = buildMiniCandlesFromQuoteHistory(history, chartTimeframe);
       return {
         id: `${row.symbol}-${row.venue}`,
         symbol: row.symbol,
@@ -17103,7 +18040,7 @@ export default function TradingTerminalPage() {
       };
     })
     .filter((feed) => feed.candles.length >= 4)
-  ), [gpuMatrixRows, quoteHistory]);
+  ), [chartTimeframe, gpuMatrixRows, quoteHistory]);
   const activeGpuMultiSymbolFeeds = renderExtendedTerminalModules ? gpuMultiSymbolFeeds : [];
   const {
     marketBusHealth,
@@ -17130,10 +18067,202 @@ export default function TradingTerminalPage() {
   } = deriveTerminalMarketHealth({
     marketBusMeta,
     marketBusLastSyncAt,
-    chartMode,
+    chartMode: effectiveChartMode,
     chartVisualMode,
     publicBrowserHost: isGtixPublicBrowserHost(),
   });
+  const expectedGpuGlobalBatchKey = useMemo(
+    () => `${chartTimeframe}|${activeGpuMultiSymbolFeeds.map((feed) => feed.id).join(",")}`,
+    [activeGpuMultiSymbolFeeds, chartTimeframe],
+  );
+  const activeGpuGlobalGridBatch = useMemo(() => {
+    if (!gpuGlobalGridBatch || chartEngineMode !== "v4") {
+      return null;
+    }
+    return gpuGlobalGridBatch.batchKey === expectedGpuGlobalBatchKey ? gpuGlobalGridBatch : null;
+  }, [chartEngineMode, expectedGpuGlobalBatchKey, gpuGlobalGridBatch]);
+  const gridSyncBadge = useMemo<GridSyncBadgeState>(() => {
+    const secondaryFeedCount = activeGpuMultiSymbolFeeds.length;
+    const autoViewportCount = secondaryFeedCount >= 15 ? 16 : secondaryFeedCount >= 3 ? 4 : 1;
+    const requestedViewportCount = gpuViewportGrid === "auto" ? autoViewportCount : gpuViewportGrid;
+    const viewportCount = chartEngineMode === "v4"
+      ? Math.max(1, gpuPerceptualTelemetry?.grid.viewportCount ?? requestedViewportCount)
+      : 1;
+    const expectedViewportIds = ["primary", ...activeGpuMultiSymbolFeeds.slice(0, Math.max(0, viewportCount - 1)).map((feed) => feed.id)];
+    const viewportMetaEntries = expectedViewportIds
+      .map((id) => gpuViewportFrameMeta[id])
+      .filter((meta): meta is LiveChartFrameMeta => Boolean(meta));
+
+    const primaryLabel = chartDisplayCandlesWithMicrostructure[chartDisplayCandlesWithMicrostructure.length - 1]?.label || "";
+    const primaryTs = parseTimestampLike(primaryLabel);
+    const candidateTimestamps = [primaryTs]
+      .concat(activeGpuMultiSymbolFeeds.map((feed) => parseTimestampLike(feed.candles[feed.candles.length - 1]?.label || "")))
+      .filter((value): value is number => Number.isFinite(value));
+    const scopedTimestamps = candidateTimestamps.slice(0, viewportCount);
+    const timeframeMs = Math.max(1_000, timeframeSeconds(chartTimeframe) * 1_000);
+    const maxSkewMs = scopedTimestamps.length >= 2
+      ? Math.max(...scopedTimestamps) - Math.min(...scopedTimestamps)
+      : 0;
+    const primarySync = gpuPerceptualTelemetry?.sync;
+    const confidencePct = primarySync?.confidence != null ? Math.round(primarySync.confidence * 100) : null;
+    const syncLabel = primarySync?.status === "unavailable" || !primarySync?.status ? "no-meta" : primarySync.status;
+    const stallLabel = primarySync?.stallAgeMs != null ? `${primarySync.stallAgeMs}ms` : "n/a";
+    const metaCoverage = Math.min(viewportCount, viewportMetaEntries.length);
+    const metaSkewMs = viewportMetaEntries.length > 0
+      ? Math.max(...viewportMetaEntries.map((meta) => Math.max(0, Number(meta.batchSkewMs || 0))))
+      : maxSkewMs;
+    const minMetaConfidence = viewportMetaEntries.length > 0
+      ? Math.min(...viewportMetaEntries.map((meta) => meta.confidence))
+      : (primarySync?.confidence ?? null);
+    const metaConfidencePct = minMetaConfidence != null ? Math.round(minMetaConfidence * 100) : null;
+    const metaPartialCount = viewportMetaEntries.filter((meta) => meta.partial || meta.syncStatus !== "atomic").length;
+    const hasViewportMetaCoverage = metaCoverage > 0 && chartEngineMode === "v4";
+    const globalBatchCoverage = activeGpuGlobalGridBatch
+      ? Math.min(viewportCount, activeGpuGlobalGridBatch.frameCount + 1)
+      : 0;
+    const hasGlobalBatchCoverage = chartEngineMode === "v4" && globalBatchCoverage > 0;
+    const globalBatchPartialCount = activeGpuGlobalGridBatch
+      ? activeGpuGlobalGridBatch.partialCount + (primarySync?.status && primarySync.status !== "atomic" ? 1 : 0)
+      : metaPartialCount;
+    const globalBatchConfidence = activeGpuGlobalGridBatch
+      ? Math.min(primarySync?.confidence ?? 1, activeGpuGlobalGridBatch.minConfidence ?? 1)
+      : (primarySync?.confidence ?? 0);
+
+    if (viewportCount <= 1) {
+      return {
+        chartCount: 1,
+        chipTone: chartEngineMode === "v4" && (viewportMetaEntries[0]?.syncStatus === "atomic" || primarySync?.status === "atomic") ? "active" : "default",
+        chipLabel: "1 Chart",
+        detailLabel: metaConfidencePct != null ? `SYNC ${syncLabel.toUpperCase()} ${metaConfidencePct}%` : primarySync?.confidence != null ? `SYNC ${syncLabel.toUpperCase()} ${confidencePct}%` : "SYNC SINGLE",
+        title: metaConfidencePct != null
+          ? `Single viewport · primary sync ${syncLabel} · confidence ${metaConfidencePct}% · stall ${stallLabel}`
+          : primarySync?.confidence != null
+            ? `Single viewport · primary sync ${syncLabel} · confidence ${confidencePct}% · stall ${stallLabel}`
+          : "Single viewport render",
+      };
+    }
+
+    const viewportCoverage = hasViewportMetaCoverage
+      ? metaCoverage
+      : hasGlobalBatchCoverage
+        ? globalBatchCoverage
+        : Math.min(viewportCount, scopedTimestamps.length);
+    const missingViewports = Math.max(0, viewportCount - viewportCoverage);
+    const atomicSkewBudgetMs = Math.max(250, Math.floor(timeframeMs * 0.25));
+    const partialSkewBudgetMs = Math.max(750, timeframeMs);
+    const effectiveSkewMs = hasViewportMetaCoverage
+      ? metaSkewMs
+      : hasGlobalBatchCoverage
+        ? (activeGpuGlobalGridBatch?.maxSkewMs ?? maxSkewMs)
+        : maxSkewMs;
+    const effectiveConfidence = hasViewportMetaCoverage
+      ? (minMetaConfidence ?? primarySync?.confidence ?? 0)
+      : hasGlobalBatchCoverage
+        ? globalBatchConfidence
+        : (primarySync?.confidence ?? 0);
+    const effectiveConfidencePct = hasViewportMetaCoverage
+      ? metaConfidencePct
+      : hasGlobalBatchCoverage
+        ? Math.round(globalBatchConfidence * 100)
+        : confidencePct;
+    const effectivePartialCount = hasViewportMetaCoverage ? metaPartialCount : globalBatchPartialCount;
+
+    let chipTone: GridSyncBadgeState["chipTone"] = "default";
+    let detailLabel = `GRID ${viewportCoverage}/${viewportCount}`;
+
+    if (missingViewports > 0) {
+      chipTone = "warn";
+      detailLabel = `GRID PARTIAL ${viewportCoverage}/${viewportCount}`;
+    } else if (chartEngineMode === "v4" && effectivePartialCount === 0 && effectiveConfidence >= 0.82 && effectiveSkewMs <= atomicSkewBudgetMs) {
+      chipTone = "active";
+      detailLabel = `GRID ATOMIC ${effectiveConfidencePct ?? 100}%`;
+    } else if (effectiveSkewMs <= partialSkewBudgetMs && effectiveConfidence >= 0.55) {
+      chipTone = "warn";
+      detailLabel = `GRID PARTIAL ${effectiveConfidencePct ?? Math.round(((partialSkewBudgetMs - effectiveSkewMs) / partialSkewBudgetMs) * 100)}%`;
+    } else {
+      chipTone = "danger";
+      detailLabel = `GRID DRIFT ${Math.round(effectiveSkewMs / 1000)}s`;
+    }
+
+    return {
+      chartCount: viewportCount,
+      chipTone,
+      chipLabel: `${viewportCount} Charts`,
+      detailLabel,
+      title: [
+        `${viewportCount} viewport(s)`,
+        `coverage ${viewportCoverage}/${viewportCount}`,
+        `skew ${effectiveSkewMs}ms`,
+        `timeframe ${chartTimeframe}`,
+        `primary sync ${syncLabel}`,
+        effectiveConfidencePct != null ? `confidence ${effectiveConfidencePct}%` : "confidence n/a",
+        `stall ${stallLabel}`,
+        hasViewportMetaCoverage ? `viewport-meta ${metaCoverage}/${viewportCount}` : "viewport-meta fallback",
+        activeGpuGlobalGridBatch ? `global-batch ${globalBatchCoverage}/${viewportCount} skew ${activeGpuGlobalGridBatch.maxSkewMs}ms` : "global-batch n/a",
+        `bus ${marketBusSyncLabel}`,
+      ].join(" · "),
+    };
+  }, [
+    activeGpuMultiSymbolFeeds,
+    activeGpuGlobalGridBatch,
+    chartDisplayCandlesWithMicrostructure,
+    chartEngineMode,
+    chartTimeframe,
+    gpuPerceptualTelemetry,
+    gpuViewportFrameMeta,
+    gpuViewportGrid,
+    marketBusSyncLabel,
+  ]);
+  const workerBadge = useMemo(() => {
+    const workerMeta = marketBusMeta?.worker && typeof marketBusMeta.worker === "object"
+      ? marketBusMeta.worker as JsonMap
+      : null;
+    const primaryWorkerActive = chartDataMode === "live"
+      && !authSessionRequired
+      && Boolean(workerMeta?.active);
+    const primaryWorkerMode = workerMeta?.mode === "worker" ? "worker" : "best-effort";
+    const expectsBatchWorker = chartEngineMode === "v4" && activeGpuMultiSymbolFeeds.length > 0;
+    const batchWorkerMode = gpuPerceptualTelemetry?.worker.mode === "worker" ? "worker" : "best-effort";
+    const batchFreshWindowMs = Math.max(1_500, Math.min(10_000, timeframeToMs(chartTimeframe)));
+    const batchWorkerActive = expectsBatchWorker
+      && Boolean(gpuPerceptualTelemetry?.worker.batchActive)
+      && Boolean(activeGpuGlobalGridBatch)
+      && (Date.now() - activeGpuGlobalGridBatch.publishedAt) <= batchFreshWindowMs;
+
+    let chipTone: GridSyncBadgeState["chipTone"] = "default";
+    if (chartDataMode === "live" && !authSessionRequired) {
+      if (primaryWorkerActive && primaryWorkerMode === "worker" && (!expectsBatchWorker || (batchWorkerActive && batchWorkerMode === "worker"))) {
+        chipTone = "active";
+      } else if (primaryWorkerActive || batchWorkerActive || primaryWorkerMode === "worker" || batchWorkerMode === "worker") {
+        chipTone = "warn";
+      } else {
+        chipTone = "danger";
+      }
+    }
+
+    return {
+      chipTone,
+      label: "W",
+      title: [
+        `primary ${primaryWorkerMode}${primaryWorkerActive ? " active" : " idle"}`,
+        expectsBatchWorker
+          ? `batch ${batchWorkerMode}${batchWorkerActive ? " active" : " idle"}`
+          : "batch n/a",
+        activeGpuGlobalGridBatch
+          ? `global batch ${activeGpuGlobalGridBatch.frameCount} feed(s) @ ${new Date(activeGpuGlobalGridBatch.publishedAt).toISOString()}`
+          : "global batch idle",
+      ].join(" · "),
+    };
+  }, [
+    activeGpuGlobalGridBatch,
+    activeGpuMultiSymbolFeeds.length,
+    authSessionRequired,
+    chartDataMode,
+    chartEngineMode,
+    chartTimeframe,
+    gpuPerceptualTelemetry,
+    marketBusMeta,
+  ]);
   const localTerminalCapturePayload = useMemo(
     () => (localTerminalCaptureClientId ? buildLocalTerminalRuntimeCapture({
       clientId: localTerminalCaptureClientId,
@@ -17144,7 +18273,7 @@ export default function TradingTerminalPage() {
       instrument: selectedChartInstrument,
       venue: selectedChartVenue,
       timeframe: chartTimeframe,
-      chartMode,
+      chartMode: effectiveChartMode,
       chartVisualMode,
       feedLabel: localOhlcvFeedLabel,
       localFeedSignal: localOhlcvAnalysis.signal,
@@ -17233,10 +18362,10 @@ export default function TradingTerminalPage() {
       chartCompactAlertLabel,
       chartEngineMode,
       chartFlowAlertText,
-      chartMode,
       chartPerceptualTelemetry,
       chartTimeframe,
       chartVisualMode,
+      effectiveChartMode,
       depthFreshnessState,
       displayDepthStreamState,
       gpuPerceptualTelemetry,
@@ -17487,6 +18616,11 @@ export default function TradingTerminalPage() {
   };
 
   const handleChartHudSubmit = () => {
+    if (chartLowFlowEdgeBlocked) {
+      setError(chartLowFlowEdgeMessage);
+      pushChartSendHistory("blocked-loss");
+      return;
+    }
     if (chartEffectiveSendMode === "confirm-required" && !chartHudConfirmArmed) {
       setError("Confirmation requise: armez d’abord l’envoi.");
       return;
@@ -17701,7 +18835,24 @@ export default function TradingTerminalPage() {
     : chartVisualMode === "clean"
       ? "forced clean"
       : `auto ${chartVisualPresetLabel}`;
-  const chartSidecarVisible = layoutScreenProfile !== "sm";
+  const chartDeskModeLabel = chartDeskViewMode === "auto"
+    ? `AUTO (LOCKED BY SYSTEM) -> ${deskRenderProfile.label}`
+    : deskRenderProfile.label;
+  const chartDeskModeDescription = `${deskRenderProfile.description} Bars ${effectiveChartBarConstructionMode.toUpperCase()}.`;
+  const chartDeskModeLocked = chartDeskViewMode === "auto";
+  const chartFlowScore = clamp(toNumber(flowIntelligenceSnapshot?.flowScore, 0), 0, 1);
+  const chartFrameSyncConfidence = clamp(toNumber(marketBusKernelTelemetry.frameSyncConfidence, 1), 0, 1);
+  const chartFrameConfidenceLow = chartFrameSyncConfidence < 0.5;
+  const chartFrameConfidenceBlocked = chartFrameSyncConfidence < 0.3;
+  const chartFlowConfidenceLow = (chartRuntimeOrderflowEnabled && flowIntelligenceSnapshot !== null && chartFlowScore < 0.56) || chartFrameConfidenceLow;
+  const chartLowFlowEdgeBlocked = (chartRuntimeOrderflowEnabled && flowIntelligenceSnapshot !== null && chartFlowScore < 0.2) || chartFrameConfidenceBlocked;
+  const chartLowFlowEdgeMessage = chartFrameConfidenceBlocked
+    ? `FRAME CONFIDENCE ${(chartFrameSyncConfidence * 100).toFixed(0)}% < 30%. Execution blocked.`
+    : `LOW FLOW EDGE: flow ${(chartFlowScore * 100).toFixed(0)}% < 20%. Execution blocked.`;
+  const chartFlowConfidenceLabel = chartRuntimeOrderflowEnabled
+    ? `Flow ${(chartFlowScore * 100).toFixed(0)}% · Frame ${(chartFrameSyncConfidence * 100).toFixed(0)}%`
+    : `Frame ${(chartFrameSyncConfidence * 100).toFixed(0)}%`;
+  const chartSidecarVisible = layoutScreenProfile !== "sm" && !chartIsolationMode;
   const chartSidecarDomRows = activeDomLevels.slice(0, 6);
   const chartSidecarTapeRows = activeTape.slice(0, 6);
   const chartSidecarFootprintRows = activeFootprintRows.slice(0, 5);
@@ -17738,7 +18889,9 @@ export default function TradingTerminalPage() {
 
     const approveAllAndSendLabel = chartEffectiveSendMode === "confirm-required" && !chartHudConfirmArmed
       ? "Approve + Arm Send"
-      : "Approve All + Send";
+      : chartLowFlowEdgeBlocked
+        ? "LOW FLOW EDGE"
+        : "Approve All + Send";
 
     if (id === "policy") {
       return (
@@ -17757,7 +18910,7 @@ export default function TradingTerminalPage() {
           pills={[
             { text: `preset ${chartVisualPresetLabel}` },
             { text: `perf ${chartPerfMode}` },
-            { text: `mode ${chartMode}` },
+            { text: `view ${chartDeskViewMode}` },
             { text: `ind ${activeIndicators.length}` },
             { text: `snap ${marketDecisionV1.executionPlan.snapPriority}` },
             { text: `plan ${marketDecisionV1.executionPlan.preset}` },
@@ -17945,6 +19098,7 @@ export default function TradingTerminalPage() {
           void approveAllAndSend();
         }}
         approveAllAndSendLabel={approveAllAndSendLabel}
+        approveAllAndSendDisabled={chartLowFlowEdgeBlocked}
         showCriticalActions={marketDecisionV1.criticalConfirmed}
         previewOpen={chartOrderPreviewOpen}
         onTogglePreview={() => setChartOrderPreviewOpen((value) => !value)}
@@ -18754,13 +19908,30 @@ export default function TradingTerminalPage() {
               <span className="eyebrow" style={{ marginRight: 8 }}>Chart premium</span>
               <span className="chart-symbol-badge">{selectedChartSymbol}</span>
               <span className="chart-inline-timeframe">{chartTimeframe}</span>
+              <span
+                className={`chart-chip ${gridSyncBadge.chipTone === "active" ? "active" : gridSyncBadge.chipTone === "warn" ? "chart-chip-warn" : gridSyncBadge.chipTone === "danger" ? "chart-chip-danger" : ""}`}
+                title={gridSyncBadge.title}
+              >
+                {gridSyncBadge.chipLabel}
+              </span>
+              <span
+                className={`chart-chip ${gridSyncBadge.chipTone === "active" ? "active" : gridSyncBadge.chipTone === "warn" ? "chart-chip-warn" : gridSyncBadge.chipTone === "danger" ? "chart-chip-danger" : ""}`}
+                title={gridSyncBadge.title}
+              >
+                {gridSyncBadge.detailLabel}
+              </span>
+              <span
+                className={`chart-chip ${workerBadge.chipTone === "active" ? "active" : workerBadge.chipTone === "warn" ? "chart-chip-warn" : workerBadge.chipTone === "danger" ? "chart-chip-danger" : ""}`}
+                title={workerBadge.title}
+              >
+                {workerBadge.label}
+              </span>
               {signalAlertBadgeCount > 0 ? (
                 <button type="button" className={`chart-signal-badge chart-signal-badge-${marketDecisionV1.biasDirection}`} onClick={() => setSignalAlertBadgeCount(0)}>
                   Signal {signalAlertBadgeCount}
                 </button>
               ) : null}
               <span className={`chart-change-pill ${chartChange >= 0 ? "bull" : "bear"}`}>{chartChange >= 0 ? "+" : ""}{chartChangePct.toFixed(2)}%</span>
-              <span className={`chart-price-live ${chartChange >= 0 ? "bull" : "bear"}`}>{String(latestQuote?.last || "–")}</span>
             </div>
             <div className="chart-toolbar-right">
               <select value={selectedChartSymbol} onChange={(event) => setActiveChartSymbol(event.target.value)} className="chart-symbol-selector" aria-label="Symbol selector">
@@ -18769,7 +19940,6 @@ export default function TradingTerminalPage() {
                   return <option key={`sel-${symbolValue}`} value={symbolValue}>{symbolValue}</option>;
                 })}
               </select>
-              <span className="chart-chip active">1 Chart</span>
               {(["assisted", "semi-auto", "full-auto"] as const).map((mode) => (
                 <button
                   key={`top-mode-${mode}`}
@@ -18826,6 +19996,14 @@ export default function TradingTerminalPage() {
                     : "CPU warming"}
                 </span>
               ) : null}
+              <button
+                type="button"
+                className={`chart-chip ${chartIsolationMode ? "active" : ""}`}
+                onClick={toggleChartIsolationMode}
+                title="Masque les panneaux lourds autour du chart pour diagnostiquer la contention du Main Thread"
+              >
+                ISO {chartIsolationMode ? "ON" : "OFF"}
+              </button>
               {(["auto", "clean", "full"] as const).map((mode) => (
                 <button
                   key={`visual-${mode}`}
@@ -18837,21 +20015,31 @@ export default function TradingTerminalPage() {
                   {mode === "auto" ? "View:A" : mode === "clean" ? "View:C" : "View:F"}
                 </button>
               ))}
-              {(["line", "candles", "footprint"] as const).map((m) => (
+              {([
+                ["auto", "AUTO"],
+                ["flow", "FLOW"],
+                ["hybrid", "HYBRID"],
+                ["candle", "CANDLE"],
+              ] as const).map(([mode, label]) => (
                 <button
-                  key={m}
+                  key={`desk-${mode}`}
                   type="button"
-                  className={`chart-chip ${chartMode === m ? "active" : ""}`}
-                  onClick={() => {
-                    setChartMode(m);
-                    if (m === "candles" && isGtixPublicBrowserHost() && chartVisualMode !== "full") {
-                      setChartVisualMode("clean");
-                    }
-                  }}
+                  className={`chart-chip ${chartDeskViewMode === mode ? "active" : ""}`}
+                  title={mode === "auto"
+                    ? "System resolves FLOW, HYBRID or CANDLE from timeframe"
+                    : mode === "flow"
+                      ? "Force flow-first rendering and suppress candles"
+                      : mode === "hybrid"
+                        ? "Keep candles visible with flow confirmation"
+                        : "Force context-only candles"}
+                  onClick={() => setChartDeskViewMode(mode)}
                 >
-                  {m === "line" ? "L" : m === "candles" ? "C" : "FP"}
+                  {label}
                 </button>
               ))}
+              <span className="chart-chip active" title="Desk-grade bar mode is forced by the resolved render mode">Bars:{effectiveChartBarConstructionMode.toUpperCase()}</span>
+              {chartDeskModeLocked ? <span className="chart-chip active" title="System owns the render policy while AUTO is selected">AUTO LOCK</span> : null}
+              {chartLowFlowEdgeBlocked ? <span className="chart-chip chart-chip-warn" title={chartLowFlowEdgeMessage}>LOW FLOW EDGE</span> : null}
               {CHART_TIMEFRAME_SELECTOR_PRIMARY.map((tf) => (
                 <button key={tf} type="button" className={`chart-chip ${chartTimeframe === tf ? "active" : ""}`} aria-pressed={chartTimeframe === tf} onClick={() => setActiveChartTimeframe(tf)}>{tf}</button>
               ))}
@@ -18923,6 +20111,11 @@ export default function TradingTerminalPage() {
           <div className={`chart-meta-strip ${marketSignalV1.focusMode ? "signal-focus" : ""}`}>
             <span className="chart-overlay-chip chart-overlay-chip-emphasis">{selectedChartSymbol}</span>
             <span className="chart-overlay-chip">{chartTimeframe}</span>
+            <span className={`chart-overlay-chip ${deskRenderProfile.resolvedViewMode === "flow" ? "chart-overlay-chip-good" : deskRenderProfile.resolvedViewMode === "candle" ? "chart-overlay-chip-warn" : ""}`}>{chartDeskModeLabel}</span>
+            <span className={`chart-overlay-chip ${chartFlowConfidenceLow ? "chart-overlay-chip-warn" : chartRuntimeOrderflowEnabled ? "chart-overlay-chip-good" : ""}`}>{chartFlowConfidenceLabel}</span>
+            {chartLowFlowEdgeBlocked ? <span className="chart-overlay-chip chart-overlay-chip-warn">LOW FLOW EDGE</span> : null}
+            <span className="chart-overlay-chip">Bars {effectiveChartBarConstructionMode.toUpperCase()}</span>
+            {deskRenderProfile.candlesContextOnly ? <span className="chart-overlay-chip">Candles = context only, not signal</span> : null}
             <span className={`chart-overlay-chip ${localOhlcvAnalysis.signal === "OHLCV_RENDERABLE" ? "chart-overlay-chip-good" : "chart-overlay-chip-warn"}`}>Feed {selectedChartInstrument} @ {selectedChartVenue}</span>
             <span className={`chart-overlay-chip ${localOhlcvAnalysis.signal === "OHLCV_RENDERABLE" ? "chart-overlay-chip-good" : "chart-overlay-chip-warn"}`}>OHLCV {localOhlcvAnalysis.signal === "OHLCV_RENDERABLE" ? "RENDERABLE" : localOhlcvAnalysis.signal === "OHLCV_PARTIAL" ? "PARTIAL" : "UNUSABLE"}</span>
             <span className={`chart-overlay-chip chart-overlay-chip-signal chart-overlay-chip-signal-${marketSignalV1.dominantDirection}`}>{marketSignalV1.headline}</span>
@@ -18981,9 +20174,12 @@ export default function TradingTerminalPage() {
             <span className={`replay-badge ${effectiveChartHeatmapMode === "bookmap" ? "replay-badge-hot" : "replay-badge-muted"}`}>
               {effectiveChartHeatmapMode === "bookmap" ? "BOOKMAP" : "NORMAL"}
             </span>
-            <span className={`replay-badge ${chartRuntimeOrderflowPriority ? "replay-badge-hot" : chartRuntimeHybridPriority ? "replay-badge-muted" : "replay-badge-muted"}`}>
-              {chartRuntimeOrderflowPriority ? "AUTO OFLOW" : chartRuntimeHybridPriority ? "AUTO HYBRID" : `MODE ${effectiveChartMode.toUpperCase()}`}
+            <span className={`replay-badge ${deskRenderProfile.resolvedViewMode === "flow" ? "replay-badge-hot" : "replay-badge-muted"}`}>
+              {chartDeskModeLabel}
             </span>
+            {deskRenderProfile.candlesContextOnly ? <span className="replay-badge replay-badge-muted">Candles = context only</span> : null}
+            {chartRuntimeOrderflowEnabled ? <span className={`replay-badge ${chartFlowConfidenceLow ? "replay-badge-warn" : "replay-badge-muted"}`}>{chartFlowConfidenceLabel}</span> : null}
+            {chartLowFlowEdgeBlocked ? <span className="replay-badge replay-badge-warn">LOW FLOW EDGE</span> : null}
             <span className={`replay-badge ${mlAbsorptionTone === "good" ? "replay-badge-hot" : "replay-badge-muted"}`} title={mlAbsorptionBridge.reasons.join(" · ") || "ml absorption idle"}>
               {mlAbsorptionRuntimeMode.toUpperCase()} {(mlAbsorptionBridge.score * 100).toFixed(0)}%
             </span>
@@ -19101,18 +20297,19 @@ export default function TradingTerminalPage() {
             <button type="button" className={`chart-chip ${gpuViewportGrid === 16 ? "active" : ""}`} onClick={() => setGpuViewportGridMode(16)}>
               Grid 4x4
             </button>
-            <button type="button" className={`chart-chip ${chartSmoothingMs === 0 ? "active" : ""}`} onClick={() => setChartSmoothingMode(0)}>
+            <button type="button" className={`chart-chip ${effectiveChartSmoothingMs === 0 ? "active" : ""}`} onClick={() => setChartSmoothingMode(0)}>
               Smooth OFF
             </button>
-            <button type="button" className={`chart-chip ${chartSmoothingMs === 80 ? "active" : ""}`} onClick={() => setChartSmoothingMode(80)}>
+            <button type="button" className={`chart-chip ${effectiveChartSmoothingMs === 80 ? "active" : ""}`} onClick={() => setChartSmoothingMode(80)} disabled={chartMicroTimeframeLocked} title={chartMicroTimeframeLocked ? "Micro timeframes run with smoothing locked off" : undefined}>
               Smooth 80ms
             </button>
-            <button type="button" className={`chart-chip ${chartSmoothingMs === 140 ? "active" : ""}`} onClick={() => setChartSmoothingMode(140)}>
+            <button type="button" className={`chart-chip ${effectiveChartSmoothingMs === 140 ? "active" : ""}`} onClick={() => setChartSmoothingMode(140)} disabled={chartMicroTimeframeLocked} title={chartMicroTimeframeLocked ? "Micro timeframes run with smoothing locked off" : undefined}>
               Smooth 140ms
             </button>
-            <button type="button" className={`chart-chip ${chartSmoothingMs === 220 ? "active" : ""}`} onClick={() => setChartSmoothingMode(220)}>
+            <button type="button" className={`chart-chip ${effectiveChartSmoothingMs === 220 ? "active" : ""}`} onClick={() => setChartSmoothingMode(220)} disabled={chartMicroTimeframeLocked} title={chartMicroTimeframeLocked ? "Micro timeframes run with smoothing locked off" : undefined}>
               Smooth 220ms
             </button>
+            {chartMicroTimeframeLocked ? <span className="chart-overlay-chip">MICRO LOCK: smoothing 0ms</span> : null}
             <button type="button" className={`chart-chip ${kernelBenchmarkRate > 0 ? "active" : ""}`} onClick={cycleKernelBenchmark}>
               {benchmarkLabel}
             </button>
@@ -19184,11 +20381,17 @@ export default function TradingTerminalPage() {
               routeScorePct={toNumber((preferredRoute as JsonMap | null)?.score, NaN)}
               depthState={displayDepthStreamState}
               renderMode={effectiveChartMode}
+              deskModeLabel={chartDeskModeLabel}
+              deskModeLocked={chartDeskModeLocked}
+              effectiveBarMode={effectiveChartBarConstructionMode}
+              lowFlowEdgeBlocked={chartLowFlowEdgeBlocked}
+              flowConfidenceLabel={chartFlowConfidenceLabel}
               domLevels={chartRuntimeOrderflowEnabled ? activeDomLevels : []}
               heatmapLevels={chartRuntimeOrderflowEnabled ? focusedHeatmapLevels : []}
-              domHistory={activeDomHistory}
-              tradeBubbles={activeTradeBubbles}
+              domHistory={chartDomHistoryWithMemoryTrail}
+              tradeBubbles={chartTradeBubbles}
               priceSignalBands={chartRuntimeOrderflowEnabled ? chartPriceSignalBands : []}
+              flowInsight={terminalFlowInsight}
               footprintRows={chartRuntimeUsesCandles ? footprintRows : chartRuntimeUsesFootprint ? activeFootprintRows : undefined}
               executionSignals={chartRuntimeOrderflowEnabled && chartPerceptionEnabled ? chartExecutionSignals : undefined}
               marketSimulation={chartRuntimeOrderflowEnabled && chartPerceptionEnabled ? chartMarketSimulation : null}
@@ -19231,7 +20434,7 @@ export default function TradingTerminalPage() {
               aiExplanation={overlayDecisionRationale || marketSignalV1.signals[0]?.detail || "No contextual explanation available."}
               indicatorSeries={indicatorSeriesForChart}
               chartEngineMode={chartEngineMode}
-              chartSmoothingMs={chartSmoothingMs}
+              chartSmoothingMs={effectiveChartSmoothingMs}
               onChartPerceptualTelemetry={chartPerceptionEnabled ? setChartPerceptualTelemetry : undefined}
               onGpuPerceptualTelemetry={chartPerceptionEnabled ? setGpuPerceptualTelemetry : undefined}
             />
@@ -19265,6 +20468,13 @@ export default function TradingTerminalPage() {
                 <button type="button" className={`chart-tool-btn ${chartVisualMode === "full" ? "active" : ""}`} onClick={() => setChartVisualMode("full")}>FULL</button>
               </div>
               <div className="chart-tools-visual-note">{chartVisualPolicyLabel}</div>
+              <div className="chart-tools-visual-group" role="group" aria-label="Desk render mode">
+                <button type="button" className={`chart-tool-btn ${chartDeskViewMode === "auto" ? "active" : ""}`} onClick={() => setChartDeskViewMode("auto")}>AUTO</button>
+                <button type="button" className={`chart-tool-btn ${chartDeskViewMode === "flow" ? "active" : ""}`} onClick={() => setChartDeskViewMode("flow")}>FLOW</button>
+                <button type="button" className={`chart-tool-btn ${chartDeskViewMode === "hybrid" ? "active" : ""}`} onClick={() => setChartDeskViewMode("hybrid")}>HYBRID</button>
+                <button type="button" className={`chart-tool-btn ${chartDeskViewMode === "candle" ? "active" : ""}`} onClick={() => setChartDeskViewMode("candle")}>CANDLE</button>
+              </div>
+              <div className="chart-tools-visual-note">{chartDeskModeDescription}</div>
               <button type="button" className={`chart-tool-btn ${showVwap ? "active" : ""}`} onClick={() => setShowVwap((v) => !v)}>VWAP</button>
               <button type="button" className={`chart-tool-btn ${showFvgOb ? "active" : ""}`} onClick={() => setShowFvgOb((v) => !v)}>FVG/OB</button>
               <button type="button" className={`chart-tool-btn ${showLiquidity ? "active" : ""}`} onClick={() => setShowLiquidity((v) => !v)}>LIQ</button>
@@ -19279,7 +20489,7 @@ export default function TradingTerminalPage() {
                 <span className="chart-preset-reminder-value">{chartMotionPreset}</span>
               </Link>
             </aside>
-            <div className={`chart-stage-wrap chart-stage-wrap-premium chart-stage-wrap-${chartMotionClass} ${chartOverlayCompactMode ? "chart-stage-wrap-compact-overlays" : ""} ${chartActiveSnapLine ? "is-execution-focus" : ""} ${marketSignalV1.focusMode ? "is-signal-focus" : ""} ${chartMaskActive ? "is-chart-invalid" : ""}`} ref={chartStageRef}>
+            <div className={`chart-stage-wrap chart-stage-wrap-premium chart-stage-wrap-${chartMotionClass} ${chartOverlayCompactMode ? "chart-stage-wrap-compact-overlays" : ""} ${chartActiveSnapLine ? "is-execution-focus" : ""} ${marketSignalV1.focusMode ? "is-signal-focus" : ""} ${chartMaskActive ? "is-chart-invalid" : ""} ${chartFlowConfidenceLow ? "is-flow-confidence-low" : ""}`} ref={chartStageRef}>
               {chartOverlayCompactMode ? (
                 <div className="chart-flow-banner chart-flow-banner-compact" aria-live="polite">
                   <span className={`chart-flow-pill tone-${marketBusHealthTone}`}>BUS {marketBusHealthStatus.toUpperCase()}</span>
@@ -19290,6 +20500,8 @@ export default function TradingTerminalPage() {
                   <span className={`chart-flow-pill tone-${arbChipTone}`}>ARB {arbOpportunity ? `${arbBuyVenue || "?"}→${arbSellVenue || "?"} ${arbNetSpread.toFixed(2)}` : "NONE"}</span>
                   <span className={`chart-flow-pill tone-${kernelChipTone}`}>{kernelTelemetryLabel}</span>
                   <span className={`chart-flow-pill tone-${schedulerChipTone}`}>{schedulerLabel}</span>
+                  <span className={`chart-flow-pill tone-${longTaskTone}`}>{longTaskLabel}</span>
+                  {chartIsolationMode ? <span className="chart-flow-pill tone-neutral">ISOLATED CHART</span> : null}
                   <span className={`chart-flow-pill tone-${candleProbeTone}`}>{candleProbeLabel}</span>
                   <span className={`chart-flow-pill tone-${candleAuditTone}`}>{candleAuditLabel}</span>
                   <span className={`chart-flow-pill tone-${v8ChipTone}`}>{v8Label}</span>
@@ -19333,6 +20545,8 @@ export default function TradingTerminalPage() {
                   <span className={`chart-flow-pill tone-${arbChipTone}`}>ARB {arbOpportunity ? `${arbBuyVenue || "?"}→${arbSellVenue || "?"} net ${arbNetSpread.toFixed(2)}` : "NONE"}</span>
                   <span className={`chart-flow-pill tone-${kernelChipTone}`}>{kernelTelemetryLabel}</span>
                   <span className={`chart-flow-pill tone-${schedulerChipTone}`}>{schedulerLabel}</span>
+                  <span className={`chart-flow-pill tone-${longTaskTone}`}>{longTaskLabel}</span>
+                  {chartIsolationMode ? <span className="chart-flow-pill tone-neutral">ISOLATED CHART</span> : null}
                   <span className={`chart-flow-pill tone-${candleProbeTone}`}>{candleProbeLabel}</span>
                   <span className={`chart-flow-pill tone-${candleAuditTone}`}>{candleAuditLabel}</span>
                   <span className={`chart-flow-pill tone-${v8ChipTone}`}>{v8Label}</span>
@@ -19386,7 +20600,7 @@ export default function TradingTerminalPage() {
               {chartLoading ? <div className="chart-loader">Switching symbol…</div> : null}
               {chartEngineMode === "v4" ? (
                 <GpuChartV4Surface
-                  key={`${selectedChartInstrument}|${selectedChartVenue}|${chartTimeframe}|v4|${chartMode}`}
+                  key={`${selectedChartInstrument}|${selectedChartVenue}|${chartTimeframe}|v4|${effectiveChartMode}|${effectiveChartBarConstructionMode}`}
                   className={`chart-stage-premium ${chartActiveSnapLine ? "execution-focus" : ""} ${marketSignalV1.focusMode ? "signal-focus" : ""}`}
                   symbol={selectedChartSymbol}
                   timeframe={chartTimeframe}
@@ -19400,8 +20614,8 @@ export default function TradingTerminalPage() {
                   liquidityZones={activeLiquidityZones}
                   domLevels={chartRuntimeOrderflowEnabled ? activeDomLevels : undefined}
                   heatmapLevels={chartRuntimeOrderflowEnabled ? focusedHeatmapLevels : undefined}
-                  domHistory={chartRuntimeOrderflowEnabled ? activeDomHistory : undefined}
-                  tradeBubbles={chartRuntimeOrderflowEnabled ? activeTradeBubbles : undefined}
+                  domHistory={chartRuntimeOrderflowEnabled ? chartDomHistoryWithMemoryTrail : undefined}
+                  tradeBubbles={chartRuntimeOrderflowEnabled ? chartTradeBubbles : undefined}
                   priceSignalBands={chartRuntimeOrderflowEnabled ? chartPriceSignalBands : undefined}
                   dayVwap={showVwap ? dayVwap : 0}
                   weekVwap={showVwap ? weekVwap : 0}
@@ -19413,15 +20627,16 @@ export default function TradingTerminalPage() {
                   onCrosshairMove={(payload) => setCrosshair(payload)}
                   engineMode="v4"
                   viewportGrid={gpuViewportGrid}
-                  smoothingMs={chartSmoothingMs}
+                  smoothingMs={effectiveChartSmoothingMs}
                   heatIntensity={bookmapHeatIntensity}
                   heatmapDiscardThreshold={bookmapDiscardThreshold}
                   multiSymbolFeeds={activeGpuMultiSymbolFeeds}
                   onPerceptualTelemetry={chartPerceptionEnabled ? setGpuPerceptualTelemetry : undefined}
+                  onViewportFrameMetaChange={chartPerceptionEnabled ? setGpuViewportFrameMeta : undefined}
                 />
               ) : (
                 <InstitutionalChart
-                  key={`${selectedChartInstrument}|${selectedChartVenue}|${chartTimeframe}|v3|${chartMode}`}
+                  key={`${selectedChartInstrument}|${selectedChartVenue}|${chartTimeframe}|v3|${effectiveChartMode}|${effectiveChartBarConstructionMode}`}
                   className={`chart-stage-premium ${chartActiveSnapLine ? "execution-focus" : ""} ${marketSignalV1.focusMode ? "signal-focus" : ""}`}
                   symbol={selectedChartSymbol}
                   timeframe={chartTimeframe}
@@ -19434,8 +20649,8 @@ export default function TradingTerminalPage() {
                   liquidityZones={activeLiquidityZones}
                   domLevels={chartRuntimeOrderflowEnabled ? activeDomLevels : undefined}
                   heatmapLevels={chartRuntimeOrderflowEnabled ? focusedHeatmapLevels : undefined}
-                  domHistory={chartRuntimeOrderflowEnabled ? activeDomHistory : undefined}
-                  tradeBubbles={chartRuntimeOrderflowEnabled ? activeTradeBubbles : undefined}
+                  domHistory={chartRuntimeOrderflowEnabled ? chartDomHistoryWithMemoryTrail : undefined}
+                  tradeBubbles={chartRuntimeOrderflowEnabled ? chartTradeBubbles : undefined}
                   priceSignalBands={chartRuntimeOrderflowEnabled ? chartPriceSignalBands : undefined}
                   dayVwap={showVwap ? dayVwap : 0}
                   weekVwap={showVwap ? weekVwap : 0}
@@ -19585,6 +20800,9 @@ export default function TradingTerminalPage() {
                         {chartRiskTargetMiss && (
                           <div className="chart-order-release-note chart-order-release-note-warn">Auto confirm-required force tant que le gain cible n’est pas atteint.</div>
                         )}
+                        {chartLowFlowEdgeBlocked && (
+                          <div className="chart-order-release-note chart-order-release-note-warn">{chartLowFlowEdgeMessage}</div>
+                        )}
                         <div className="chart-order-release-actions">
                           {chartEffectiveSendMode === "confirm-required" ? (
                             <button
@@ -19600,7 +20818,7 @@ export default function TradingTerminalPage() {
                           <button
                             type="button"
                             className="chart-chip chart-buy-btn"
-                            disabled={chartEffectiveSendMode === "confirm-required" && !chartReleaseTicket.armed}
+                            disabled={chartLowFlowEdgeBlocked || (chartEffectiveSendMode === "confirm-required" && !chartReleaseTicket.armed)}
                             onClick={() => {
                               setChartReleaseValidationPulse(true);
                               setChartReleaseTicket(null);
@@ -19815,6 +21033,8 @@ export default function TradingTerminalPage() {
           </div> : null}
         </PanelShell>
           </Panel>
+          {!chartIsolationMode ? (
+          <>
           <PanelResizeHandle
           className="term-core-resize-handle"
           role="separator"
@@ -19972,6 +21192,11 @@ export default function TradingTerminalPage() {
                     ? `${multiVenueArbitrageSnapshot.buyVenue} → ${multiVenueArbitrageSnapshot.sellVenue} · ${multiVenueArbitrageSnapshot.netSpreadBps.toFixed(2)}bps`
                     : "aucun edge net"}
                 </strong>
+                <div className="subtle mini" style={{ marginTop: 2 }}>
+                  {multiVenueArbitrageSnapshot.executionPlan
+                    ? `${multiVenueArbitrageSnapshot.executionPlan.slices.length} slice(s) · $${multiVenueArbitrageSnapshot.executionPlan.totalNotionalUsd.toFixed(0)} exécutable`
+                    : "plan depth-aware indisponible"}
+                </div>
               </div>
               <div>
                 <div className="subtle mini">Coverage / venues</div>
@@ -20341,6 +21566,8 @@ export default function TradingTerminalPage() {
           </div>
         </PanelShell>
           </Panel>
+          </>
+          ) : null}
         </PanelGroup>
       </section>
 
@@ -20521,6 +21748,7 @@ export default function TradingTerminalPage() {
       ) : null}
 
       {/* ═══════════════ LOWER: BLOTTER + BROKERS ══════════════ */}
+      {!chartIsolationMode ? (
       <section
         className={`term-lower${layoutDropPreview?.zone === "lower" ? " is-drop-zone-active" : ""}`}
         onDragOver={(event) => {
@@ -20628,6 +21856,7 @@ export default function TradingTerminalPage() {
         </PanelShell>
         </div>
       </section>
+      ) : null}
 
       {showMonitoringDeck ? (
       <>

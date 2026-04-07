@@ -3,7 +3,7 @@ import { createArrayBuffer, createProgram } from "./glUtils";
 export type PriceSignalBand = {
   price: number;
   strength: number;
-  kind: "execution-expected" | "execution-actual" | "slippage" | "wall" | "vacuum" | "trap";
+  kind: "execution-expected" | "execution-actual" | "slippage" | "wall" | "vacuum" | "trap" | "flow-sweep" | "flow-absorption" | "flow-exhaustion" | "flow-spoof" | "flow-memory" | "arb-buy" | "arb-sell";
   xStart?: number;
   xEnd?: number;
   thickness?: number;
@@ -58,7 +58,28 @@ vec3 resolveTone(float kind) {
   if (kind < 4.5) {
     return vec3(1.0, 0.55, 0.18);
   }
-  return vec3(0.90, 0.34, 0.96);
+  if (kind < 5.5) {
+    return vec3(0.90, 0.34, 0.96);
+  }
+  if (kind < 6.5) {
+    return vec3(1.0, 0.36, 0.22);
+  }
+  if (kind < 7.5) {
+    return vec3(0.18, 0.92, 0.74);
+  }
+  if (kind < 8.5) {
+    return vec3(1.0, 0.82, 0.24);
+  }
+  if (kind < 9.5) {
+    return vec3(1.0, 0.92, 0.38);
+  }
+  if (kind < 10.5) {
+    return vec3(0.82, 0.94, 1.0);
+  }
+  if (kind < 11.5) {
+    return vec3(0.22, 0.96, 0.56);
+  }
+  return vec3(1.0, 0.34, 0.24);
 }
 
 void main() {
@@ -88,6 +109,20 @@ function kindToFloat(kind: PriceSignalBand["kind"]): number {
       return 4;
     case "trap":
       return 5;
+    case "flow-sweep":
+      return 6;
+    case "flow-absorption":
+      return 7;
+    case "flow-exhaustion":
+      return 8;
+    case "flow-spoof":
+      return 9;
+    case "flow-memory":
+      return 10;
+    case "arb-buy":
+      return 11;
+    case "arb-sell":
+      return 12;
     default:
       return 0;
   }

@@ -24,6 +24,7 @@
     "test:perceptual-candle-engine-guard": "node scripts/test-perceptual-candle-engine-guard.js",
     "test:gpu-orderflow-desk-guard": "node scripts/test-gpu-orderflow-desk-guard.js",
     "test:hft-overlay-guard": "node scripts/test-hft-overlay-guard.js",
+    "test:golden-frame-stress": "sh scripts/test-golden-frame-stress.sh",
     "test:terminal-v4-visual-smoke": "sh scripts/run_terminal_failsafe_visual_smoke_v4.sh",
     "test:terminal-v4-canonical-multi-tf": "sh scripts/run_terminal_v4_canonical_multi_tf.sh",
     "test:xscale-viewport-guard": "node scripts/test-xscale-viewport-guard.js",

@@ -43,7 +43,7 @@ async function waitFor(predicate: () => boolean, timeoutMs: number, stepMs = 25)
   throw new Error(`Condition not met within ${timeoutMs}ms`);
 }
 
-async function verifySyntheticHeartbeatOpensMicroTimeframeBar(): Promise<void> {
+async function verifyStrictIntegrityModeSkipsSyntheticHeartbeat(): Promise<void> {
   const baseTs = Math.floor((Date.now() - 3_000) / 1_000) * 1_000;
   const baseIso = new Date(baseTs).toISOString();
   const globalWithWindow = globalThis as Record<string, unknown>;
@@ -151,17 +151,12 @@ async function verifySyntheticHeartbeatOpensMicroTimeframeBar(): Promise<void> {
 
     const initialBarCount = latestBars.length;
     const previousClose = latestBars[latestBars.length - 1]?.c;
-    assert.equal(previousClose, 100, "snapshot bootstrap should seed the last close used by the heartbeat");
+    assert.equal(previousClose, 100, "snapshot bootstrap should seed the last close used by strict integrity mode");
 
-    await waitFor(() => latestBars.length > initialBarCount, 2_500, 50);
+    await new Promise((resolve) => setTimeout(resolve, 1_250));
 
-    const heartbeatBar = latestBars[latestBars.length - 1];
-    assert.ok(heartbeatBar, "synthetic heartbeat should publish a new micro-timeframe bar");
-    assert.equal(heartbeatBar.o, 100, "heartbeat-opened bar should inherit the previous close as open");
-    assert.ok(heartbeatBar.h >= 100, "heartbeat-opened bar should preserve or widen the high when depth wicks are applied");
-    assert.ok(heartbeatBar.l <= 100, "heartbeat-opened bar should preserve or widen the low when depth wicks are applied");
-    assert.equal(heartbeatBar.c, 100, "heartbeat-opened bar should keep the synthetic price as close");
-    assert.equal(heartbeatBar.v, 0, "heartbeat-opened bar should remain zero-volume without trades");
+    assert.equal(latestBars.length, initialBarCount, "strict integrity mode must not publish synthetic heartbeat bars on micro timeframes");
+    assert.equal(latestBars[latestBars.length - 1]?.t, baseIso, "strict integrity mode should keep the snapshot bar as the latest slot without synthetic heartbeat");
   } finally {
     unsubscribe();
     bus.disconnect();
@@ -285,6 +280,96 @@ function verifyReconstructedFiveMinuteMatchesLiveFiveMinute(): void {
   );
 }
 
+function verifyMicroQuotesDoNotRewriteTradeBodies(): void {
+  const engine = new MarketDataEngineV5("1s", "SOLUSDT", "binance");
+  engine.bootstrap({ ohlcvBars: [] });
+
+  engine.ingestTrade({ price: 100, size: 1.2, side: "buy", tsMs: iso("2026-03-30T11:00:00.120Z") });
+  assert.equal(
+    engine.ingestTick(100.8, iso("2026-03-30T11:00:00.420Z"), "binance"),
+    false,
+    "micro quote should not mutate a trade-built candle",
+  );
+
+  const currentBar = findBar(engine, "2026-03-30T11:00:00.000Z");
+  assert.ok(currentBar, "expected micro candle after first trade");
+  assert.equal(currentBar?.o, 100, "micro trade-built candle should keep the first trade as open");
+  assert.equal(currentBar?.h, 100, "micro trade-built candle should not inherit quote highs");
+  assert.equal(currentBar?.l, 100, "micro trade-built candle should not inherit quote lows");
+  assert.equal(currentBar?.c, 100, "micro trade-built candle close should remain trade-only");
+  assert.equal(currentBar?.v, 1.2, "micro trade-built candle should keep trade volume only");
+}
+
+function verifyFirstTradeResetsQuoteSeedOnMicroTimeframe(): void {
+  const seedBarTime = "2026-03-30T11:00:00.000Z";
+  const engine = new MarketDataEngineV5("1s", "SOLUSDT", "binance");
+
+  engine.bootstrap({
+    ohlcvBars: [
+      {
+        t: seedBarTime,
+        o: 100,
+        h: 100,
+        l: 100,
+        c: 100,
+        v: 4,
+        tf: "1s",
+        seq: iso(seedBarTime),
+      },
+    ],
+  });
+
+  assert.equal(
+    engine.ingestTick(100, iso("2026-03-30T11:00:01.040Z"), "binance"),
+    true,
+    "cross-slot micro quote should still open a placeholder bar",
+  );
+  engine.ingestTrade({ price: 101.25, size: 2, side: "buy", tsMs: iso("2026-03-30T11:00:01.180Z") });
+  assert.equal(
+    engine.ingestTick(99.5, iso("2026-03-30T11:00:01.600Z"), "binance"),
+    false,
+    "subsequent micro quotes should not rewrite the trade-confirmed body",
+  );
+
+  const nextBar = findBar(engine, "2026-03-30T11:00:01.000Z");
+  assert.ok(nextBar, "expected placeholder slot to become a trade-confirmed candle");
+  assert.equal(nextBar?.o, 101.25, "first trade must replace the quote-seeded open on micro timeframe");
+  assert.equal(nextBar?.h, 101.25, "first trade must replace quote-seeded highs on micro timeframe");
+  assert.equal(nextBar?.l, 101.25, "first trade must replace quote-seeded lows on micro timeframe");
+  assert.equal(nextBar?.c, 101.25, "micro candle close should stay trade-only after the first trade");
+  assert.equal(nextBar?.v, 2, "micro candle should accumulate the first trade volume");
+}
+
+function verifyMicroTradesOverrideBackfillBody(): void {
+  const slotTime = "2026-03-30T11:00:00.000Z";
+  const engine = new MarketDataEngineV5("1s", "SOLUSDT", "binance");
+
+  engine.bootstrap({
+    ohlcvBars: [
+      {
+        t: slotTime,
+        o: 100,
+        h: 105,
+        l: 95,
+        c: 104,
+        v: 12,
+        tf: "1s",
+        seq: iso(slotTime),
+      },
+    ],
+  });
+
+  engine.ingestTrade({ price: 101, size: 1.5, side: "buy", tsMs: iso("2026-03-30T11:00:00.250Z") });
+
+  const bar = findBar(engine, slotTime);
+  assert.ok(bar, "expected micro bar after trade reconstruction over backfill");
+  assert.equal(bar?.o, 101, "micro reconstructed open must come from the first trade, not stale backfill");
+  assert.equal(bar?.h, 101, "micro reconstructed high must stay trade-only");
+  assert.equal(bar?.l, 101, "micro reconstructed low must stay trade-only");
+  assert.equal(bar?.c, 101, "micro reconstructed close must stay trade-only");
+  assert.equal(bar?.v, 12, "merged volume may keep the richer backfill volume for telemetry");
+}
+
 async function run(): Promise<void> {
   const engine = new MarketDataEngineV5("1m", "SOLUSDT", "binance");
   const baseBarTime = "2026-03-30T11:00:00.000Z";
@@ -355,10 +440,13 @@ async function run(): Promise<void> {
 
   verifyReplayAndLiveProduceIdenticalSeries();
   verifyReconstructedFiveMinuteMatchesLiveFiveMinute();
+  verifyMicroQuotesDoNotRewriteTradeBodies();
+  verifyFirstTradeResetsQuoteSeedOnMicroTimeframe();
+  verifyMicroTradesOverrideBackfillBody();
 
-  await verifySyntheticHeartbeatOpensMicroTimeframeBar();
+  await verifyStrictIntegrityModeSkipsSyntheticHeartbeat();
 
-  console.log("PASS ohlcv-kernel regression: quote-only fusion, replay/live parity, and 5m tick-vs-live parity all hold");
+  console.log("PASS ohlcv-kernel regression: quote-only fusion, replay/live parity, strict micro integrity, and 5m tick-vs-live parity all hold");
 }
 
 run().catch((error) => {

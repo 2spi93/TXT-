@@ -9,6 +9,7 @@ import type { PerceptualExecutionSignal } from "./chartPerceptualEngine";
 import type { MarketSimulation } from "./marketSimulationEngine";
 import type { PriceSignalBand } from "../../lib/engine/gpu-chart/PriceSignalLayer";
 import { DEFAULT_MIN_RENDERABLE_BARS } from "../../lib/ohlcvIntegrity";
+import { timeframeToMs } from "../../lib/ohlcvDataEngine";
 import { computePredictionV5, type PredictionV5 } from "../../lib/predictionEngineV5";
 
 const TERMINAL_V2_TIMEFRAME_SELECTOR_PRIMARY = ["1s", "5s", "10s", "30s", "1m", "5m", "15m"] as const;
@@ -39,6 +40,14 @@ type RiskJournalEntry = {
   strategy: string;
   action: string;
   detail: string;
+};
+
+type FlowInsight = {
+  label: string;
+  dominantSide: "buy" | "sell" | "neutral";
+  score: number;
+  liquidityBias: number;
+  eventKind: string | null;
 };
 
 const MIN_RENDER_CANDLES = DEFAULT_MIN_RENDERABLE_BARS;
@@ -102,6 +111,11 @@ type Props = {
   routeScorePct: number | null;
   depthState: "offline" | "connecting" | "live";
   renderMode?: "line" | "candles" | "footprint";
+  deskModeLabel: string;
+  deskModeLocked: boolean;
+  effectiveBarMode: "time" | "delta" | "event";
+  lowFlowEdgeBlocked: boolean;
+  flowConfidenceLabel: string;
   domLevels: DomLevel[];
   heatmapLevels: DomLevel[];
   domHistory?: DomHistoryFrame[];
@@ -140,6 +154,7 @@ type Props = {
   aiScenario: string;
   aiConfidencePct: number;
   aiExplanation: string;
+  flowInsight?: FlowInsight | null;
   indicatorSeries?: IndicatorSeries[];
   chartEngineMode?: ChartEngineMode;
   gpuViewportGrid?: GpuViewportGrid;
@@ -192,6 +207,31 @@ function buildSparklinePath(values: number[], width: number, height: number): st
     .join(" ");
 }
 
+function parseHistoryLabelMs(label: string): number | null {
+  const parsed = Date.parse(label);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function timeframeMs(timeframe: string): number {
+  const match = String(timeframe || "").trim().match(/^(\d+)([smhdwM])$/);
+  if (!match) {
+    return 60_000;
+  }
+  const value = Number(match[1]);
+  if (!Number.isFinite(value) || value <= 0) {
+    return 60_000;
+  }
+  switch (match[2]) {
+    case "s": return value * 1_000;
+    case "m": return value * 60_000;
+    case "h": return value * 3_600_000;
+    case "d": return value * 86_400_000;
+    case "w": return value * 604_800_000;
+    case "M": return value * 2_592_000_000;
+    default: return 60_000;
+  }
+}
+
 export default function TerminalChartV2(props: Props) {
   const {
     enabled,
@@ -215,6 +255,11 @@ export default function TerminalChartV2(props: Props) {
     routeScorePct,
     depthState,
     renderMode = "candles",
+    deskModeLabel,
+    deskModeLocked,
+    effectiveBarMode,
+    lowFlowEdgeBlocked,
+    flowConfidenceLabel,
     domLevels,
     heatmapLevels,
     domHistory,
@@ -253,6 +298,7 @@ export default function TerminalChartV2(props: Props) {
     aiScenario,
     aiConfidencePct,
     aiExplanation,
+    flowInsight,
     indicatorSeries: indicatorSeriesProp = [],
     chartEngineMode = "v3",
     gpuViewportGrid = "auto",
@@ -263,6 +309,10 @@ export default function TerminalChartV2(props: Props) {
 
   const analyticsCandlesInput = props.analyticsCandles ?? props.candles;
   const isPreviewMode = Boolean(props.isPreviewMode);
+  const effectiveChartSmoothingMs: ChartSmoothingMs = useMemo(
+    () => (timeframeToMs(timeframe) <= 5_000 ? 0 : chartSmoothingMs),
+    [chartSmoothingMs, timeframe],
+  );
 
   const [intent, setIntent] = useState<V2Intent>("observe");
   const [crosshairText, setCrosshairText] = useState("--");
@@ -382,11 +432,28 @@ export default function TerminalChartV2(props: Props) {
     return { bids, asks, imbalance, spoofCount, icebergCount };
   }, [domLevels]);
 
+  const dominantDomLevelKeys = useMemo(() => {
+    return new Set(
+      [...domLevels]
+        .sort((left, right) => (right.size * Math.max(0.2, right.intensity)) - (left.size * Math.max(0.2, left.intensity)))
+        .slice(0, 3)
+        .map((level) => `${level.side}:${level.price.toFixed(4)}`),
+    );
+  }, [domLevels]);
+
   const heatmapTop = useMemo(() => {
     return [...heatmapLevels]
-      .sort((left, right) => right.intensity - left.intensity)
+      .sort((left, right) => (right.intensity * 0.58 + Math.log1p(Math.max(0, right.size)) * 0.42) - (left.intensity * 0.58 + Math.log1p(Math.max(0, left.size)) * 0.42))
       .slice(0, 8);
   }, [heatmapLevels]);
+
+  const dominantHeatmapKeys = useMemo(() => {
+    return new Set(
+      heatmapTop
+        .slice(0, 3)
+        .map((level) => `${level.side}:${level.price.toFixed(4)}`),
+    );
+  }, [heatmapTop]);
 
   // ── Prediction Engine V5 ────────────────────────────────────────────────────
   const predictionV5 = useMemo((): PredictionV5 => {
@@ -441,7 +508,7 @@ export default function TerminalChartV2(props: Props) {
       symbol: row.symbol,
       candles: buildCandlesFromHistory(quoteHistory[row.symbol] || [], row.price),
     }));
-  }, [multiChartRows, quoteHistory]);
+  }, [multiChartRows, quoteHistory, timeframe]);
 
   const recentCandleAnchors = useMemo(() => {
     return analyticsEligibleCandles.slice(-6).map((candle) => ({
@@ -685,6 +752,10 @@ export default function TerminalChartV2(props: Props) {
 
         <button type="button" className="chart-chip" onClick={onZoomIn}>Zoom +</button>
         <button type="button" className="chart-chip" onClick={onZoomOut}>Zoom &minus;</button>
+        <span className="chart-chip active">{deskModeLabel}</span>
+        <span className="chart-chip active">Bars {effectiveBarMode.toUpperCase()}</span>
+        {deskModeLocked ? <span className="chart-chip active">AUTO LOCK</span> : null}
+        {lowFlowEdgeBlocked ? <span className="chart-chip chart-chip-warn">LOW FLOW EDGE</span> : null}
 
         {intent === "execute" ? (
           <>
@@ -696,12 +767,12 @@ export default function TerminalChartV2(props: Props) {
         ) : null}
 
         <span className="terminal-v2-sep" />
-        <span className="terminal-v2-intent-label">{intent === "observe" ? "perception layer" : intent === "analyze" ? "structure analysis" : "execution mode"}</span>
+        <span className="terminal-v2-intent-label">{lowFlowEdgeBlocked ? `${flowConfidenceLabel} · execution blocked` : intent === "observe" ? "perception layer" : intent === "analyze" ? "structure analysis" : "execution mode"}</span>
       </div>
 
       {/* ─── ROW 2: CHART CORE + AI HUD ─── */}
       <div className="terminal-v2-core">
-        <div className={`terminal-v2-chart-col${aiConfidencePct >= 70 ? " chart-focus-mode" : ""}`}>
+        <div className={`terminal-v2-chart-col${aiConfidencePct >= 70 ? " chart-focus-mode" : ""}${lowFlowEdgeBlocked ? " is-flow-confidence-low" : ""}`}>
           {loading ? <div className="chart-loader">Switching symbol…</div> : null}
           {chartEngineMode === "v4" ? (
             <GpuChartV4Surface
@@ -730,7 +801,7 @@ export default function TerminalChartV2(props: Props) {
               candleTransform="none"
               engineMode="v4"
               viewportGrid={gpuViewportGrid}
-              smoothingMs={chartSmoothingMs}
+              smoothingMs={effectiveChartSmoothingMs}
               multiSymbolFeeds={gpuViewportFeeds}
               onCrosshairMove={handleCrosshairMove}
               onPerceptualTelemetry={analyticsReady ? onGpuPerceptualTelemetry : undefined}
@@ -845,6 +916,14 @@ export default function TerminalChartV2(props: Props) {
                 ? `fill ${(marketSimulation.execution.fillProb * 100).toFixed(0)}% · slip ${marketSimulation.execution.slippage.toFixed(1)}bps · lat ${marketSimulation.execution.latency.toFixed(0)}ms`
                 : "no execution preview"}
             </span>
+            {flowInsight ? (
+              <div className={`terminal-v2-flow-chip ${flowInsight.dominantSide}`}>
+                <strong>Flow</strong>
+                <span>{flowInsight.label}</span>
+                <span>{(flowInsight.score * 100).toFixed(0)}% · bias {(Math.abs(flowInsight.liquidityBias) * 100).toFixed(0)}%</span>
+              </div>
+            ) : null}
+            {lowFlowEdgeBlocked ? <div className="terminal-v2-alert">LOW FLOW EDGE · execution blocked</div> : null}
             <p className="terminal-v2-ai-copy">
               {marketSimulation
                 ? `100ms ${marketSimulation.t100ms.price.toFixed(2)} · 250ms ${marketSimulation.t250ms.price.toFixed(2)} · 500ms ${marketSimulation.t500ms.price.toFixed(2)} · cone ${marketSimulation.cone.best.toFixed(2)} / ${marketSimulation.cone.expected.toFixed(2)} / ${marketSimulation.cone.worst.toFixed(2)}`
@@ -935,9 +1014,10 @@ export default function TerminalChartV2(props: Props) {
             <label className="terminal-v2-input-chip">Target<input type="number" value={targetGainUsd} onChange={(event) => onSetTargetGainUsd(Math.max(10, Number(event.target.value || 0)))} /></label>
           </div>
           <div className="terminal-v2-inline-actions">
-            <button type="button" className="chart-chip" onClick={() => { onAutoReduce(); void appendRiskAction("auto-reduce", "Reduced by guardrail", { ratioMiss: riskMissRatioPct }); }}>Reduce</button>
-            <button type="button" className="chart-chip chart-sell-btn" onClick={() => { onAutoClose(); void appendRiskAction("auto-close", "Closed and armed kill-switch", { ratioMiss: riskMissRatioPct }); }}>Close</button>
+            <button type="button" className="chart-chip" disabled={lowFlowEdgeBlocked} onClick={() => { onAutoReduce(); void appendRiskAction("auto-reduce", "Reduced by guardrail", { ratioMiss: riskMissRatioPct }); }}>Reduce</button>
+            <button type="button" className="chart-chip chart-sell-btn" disabled={lowFlowEdgeBlocked} onClick={() => { onAutoClose(); void appendRiskAction("auto-close", "Closed and armed kill-switch", { ratioMiss: riskMissRatioPct }); }}>Close</button>
           </div>
+          {lowFlowEdgeBlocked ? <span className="terminal-v2-alert">LOW FLOW EDGE</span> : null}
           {riskLossExceeded ? <span className="terminal-v2-alert">Loss exceeded</span> : null}
           {riskTargetMiss ? <span className="terminal-v2-alert">Target miss</span> : null}
         </div>
@@ -952,27 +1032,31 @@ export default function TerminalChartV2(props: Props) {
           <div className="terminal-v2-ladder">
             {[...domStats.asks.slice(0, 4), ...domStats.bids.slice(0, 4)]
               .sort((left, right) => right.price - left.price)
-              .map((level, index) => (
-                <div key={`${level.side}-${level.price}-${index}`} className={`terminal-v2-ladder-row ${level.side}`}>
+              .map((level, index) => {
+                const key = `${level.side}:${level.price.toFixed(4)}`;
+                return (
+                <div key={`${level.side}-${level.price}-${index}`} className={`terminal-v2-ladder-row ${level.side} ${dominantDomLevelKeys.has(key) ? "dominant" : ""}`}>
                   <span>{level.price.toFixed(2)}</span>
                   <span>{level.size.toFixed(0)}</span>
                   <span>{(level.intensity * 100).toFixed(0)}%</span>
                   <button type="button" className="chart-chip" onClick={() => onDomEntryFromLevel(level.price, level.side)}>E</button>
                   <button type="button" className="chart-chip" onClick={() => onDomExitFromLevel(level.price, level.side)}>X</button>
                 </div>
-              ))}
+              );})}
           </div>
         </div>
 
         <div className="terminal-v2-exec-card terminal-v2-exec-card-heatmap">
           <span className="terminal-v2-card-kicker">Heatmap</span>
           <div className="terminal-v2-heatmap">
-            {heatmapTop.slice(0, 6).map((level, index) => (
-              <div key={`${level.side}-${level.price}-${index}`} className="terminal-v2-heatmap-row">
+            {heatmapTop.slice(0, 6).map((level, index) => {
+              const key = `${level.side}:${level.price.toFixed(4)}`;
+              return (
+              <div key={`${level.side}-${level.price}-${index}`} className={`terminal-v2-heatmap-row ${dominantHeatmapKeys.has(key) ? "dominant" : ""}`}>
                 <span>{level.price.toFixed(1)}</span>
                 <div className="terminal-v2-meter"><div className="terminal-v2-meter-fill" style={{ width: `${Math.max(4, level.intensity * 100)}%` }} /></div>
               </div>
-            ))}
+            );})}
           </div>
         </div>
       </div>
@@ -995,8 +1079,8 @@ export default function TerminalChartV2(props: Props) {
         </div>
         <div className={`terminal-v2-multi-grid terminal-v2-multi-grid-${multiSlots}`}>
           {multiRows.map((row) => {
-            const history = quoteHistory[row.symbol] || [];
-            const values = history.slice(-48).map((point) => point.value);
+            const miniCandles = buildCandlesFromHistory(quoteHistory[row.symbol] || [], row.price);
+            const values = miniCandles.slice(-24).map((point) => point.close);
             const path = buildSparklinePath(values, 96, 24);
             return (
               <button
@@ -1114,15 +1198,19 @@ function buildCandlesFromHistory(
     const prev = history[index - 1] || point;
     const open = Number(prev.value);
     const close = Number(point.value);
-    const high = Math.max(open, close) * 1.0006;
-    const low = Math.min(open, close) * 0.9994;
+    const localWindow = history
+      .slice(Math.max(0, index - 3), index + 1)
+      .map((item) => Number(item.value))
+      .filter((value) => Number.isFinite(value) && value > 0);
+    const high = Math.max(open, close, ...(localWindow.length > 0 ? localWindow : [open, close]));
+    const low = Math.min(open, close, ...(localWindow.length > 0 ? localWindow : [open, close]));
     candles.push({
       label: point.label,
       open,
       high,
       low,
       close,
-      volume: Math.abs(close - open) * 1000 + 1,
+      volume: Math.max(1, Math.abs(close - open) * 1000),
     });
   }
   return candles;

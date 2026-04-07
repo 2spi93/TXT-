@@ -42,8 +42,9 @@ assertIncludes(terminalPage, "buildReplayDomHistoryFrames", "replay DOM history 
 assertIncludes(terminalPage, "buildTradeBubbleVisuals", "trade bubble builder");
 assertIncludes(terminalPage, "domHistoryBufferRef", "live DOM history buffer ref");
 assertIncludes(terminalPage, "renderMode={effectiveChartMode}", "terminal V2 render mode forwarding");
-assertIncludes(terminalPage, "domHistory={chartRuntimeOrderflowEnabled ? activeDomHistory : undefined}", "GPU orderflow DOM history forwarding");
-assertIncludes(terminalPage, "tradeBubbles={chartRuntimeOrderflowEnabled ? activeTradeBubbles : undefined}", "GPU orderflow trade bubble forwarding");
+assertIncludes(terminalPage, "chartDomHistoryWithMemoryTrail", "GPU liquidity memory trail history");
+assertIncludes(terminalPage, "domHistory={chartRuntimeOrderflowEnabled ? chartDomHistoryWithMemoryTrail : undefined}", "GPU orderflow DOM history forwarding");
+assertIncludes(terminalPage, "tradeBubbles={chartRuntimeOrderflowEnabled ? chartTradeBubbles : undefined}", "GPU orderflow trade bubble forwarding");
 
 const terminalV2 = read("app/terminal/TerminalChartV2.tsx");
 assertIncludes(terminalV2, "renderMode?: \"line\" | \"candles\" | \"footprint\"", "terminal V2 render mode prop");

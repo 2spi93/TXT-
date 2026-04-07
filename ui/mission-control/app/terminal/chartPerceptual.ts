@@ -136,6 +136,18 @@ export type GpuPerceptualTelemetry = {
     label: string;
     viewportCount: number;
   };
+  sync: {
+    status: "atomic" | "loose-sync" | "coalesced" | "unavailable";
+    confidence: number | null;
+    partial: boolean;
+    coalesced: boolean;
+    stallAgeMs: number | null;
+    dynamicBufferMs: number | null;
+  };
+  worker: {
+    batchActive: boolean;
+    mode: "worker" | "best-effort";
+  };
   spacing: {
     pixelSnapping: boolean;
     denseMode: DenseLegibilityMode;

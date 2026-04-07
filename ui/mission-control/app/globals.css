@@ -1314,6 +1314,23 @@ html[data-ui-mode="novice"] .decision-overlay-panel {
   border-color: rgba(103, 232, 165, 0.35);
 }
 
+.chart-chip.chart-chip-warn {
+  background: linear-gradient(135deg, rgba(255, 209, 102, 0.18), rgba(255, 125, 125, 0.14));
+  border-color: rgba(255, 209, 102, 0.34);
+  color: #ffe7a6;
+}
+
+.chart-chip.chart-chip-danger {
+  background: linear-gradient(135deg, rgba(255, 116, 116, 0.18), rgba(255, 74, 74, 0.2));
+  border-color: rgba(255, 122, 122, 0.4);
+  color: #ffd0d0;
+}
+
+.chart-chip:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+}
+
 .chart-chip:focus-visible {
   outline: none;
   border-color: rgba(126, 215, 255, 0.82);
@@ -2603,6 +2620,11 @@ html[data-ui-mode="novice"] .decision-overlay-panel {
   box-shadow: inset 0 0 0 1px rgba(103,232,165,0.28), 0 0 22px rgba(103,232,165,0.12);
   color: #baffd9;
 }
+.replay-badge-warn {
+  background: linear-gradient(180deg, rgba(255, 209, 102, 0.22), rgba(255, 209, 102, 0.06));
+  box-shadow: inset 0 0 0 1px rgba(255,209,102,0.28), 0 0 22px rgba(255,209,102,0.12);
+  color: #ffe8aa;
+}
 .replay-frame-index {
   font-size: 10px;
   color: var(--fg);
@@ -3023,6 +3045,26 @@ html[data-ui-mode="novice"] .decision-overlay-panel {
   transition: border-color 160ms ease, box-shadow 160ms ease, background-color 200ms ease;
 }
 
+.chart-stage-wrap.is-flow-confidence-low {
+  border-color: rgba(255, 209, 102, 0.28);
+  box-shadow: inset 0 0 0 1px rgba(255, 209, 102, 0.08);
+}
+
+.chart-stage-wrap.is-flow-confidence-low .chart-stage-premium,
+.chart-stage-wrap.is-flow-confidence-low .chart-flow-banner,
+.chart-stage-wrap.is-flow-confidence-low .chart-trading-overlay,
+.chart-stage-wrap.is-flow-confidence-low .chart-order-hud {
+  opacity: 0.72;
+}
+
+.chart-stage-wrap.is-flow-confidence-low::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, rgba(255, 209, 102, 0.06), rgba(255, 209, 102, 0.02));
+  pointer-events: none;
+}
+
 .chart-sidecar-stack {
   width: 216px;
   min-width: 196px;
@@ -3146,6 +3188,21 @@ html[data-ui-mode="novice"] .decision-overlay-panel {
   z-index: 1;
   overflow: hidden;
   border-left: 1px solid rgba(126, 215, 255, 0.1);
+}
+
+.terminal-v2-chart-col.is-flow-confidence-low .terminal-v2-chart,
+.terminal-v2-chart-col.is-flow-confidence-low .chart-stage-premium,
+.terminal-v2-chart-col.is-flow-confidence-low .chart-canvas-host {
+  opacity: 0.72;
+}
+
+.terminal-v2-chart-col.is-flow-confidence-low::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, rgba(255, 209, 102, 0.06), rgba(255, 209, 102, 0.02));
+  pointer-events: none;
+  z-index: 2;
 }
 
 .terminal-v2-chart {
@@ -3519,6 +3576,11 @@ html[data-ui-mode="novice"] .decision-overlay-panel {
   color: #ff9e9e;
 }
 
+.terminal-v2-ladder-row.dominant {
+  background: linear-gradient(90deg, rgba(126, 215, 255, 0.12), rgba(126, 215, 255, 0.02));
+  box-shadow: inset 0 0 0 1px rgba(126, 215, 255, 0.16);
+}
+
 .terminal-v2-heatmap {
   display: grid;
   gap: 3px;
@@ -3530,6 +3592,41 @@ html[data-ui-mode="novice"] .decision-overlay-panel {
   gap: 6px;
   align-items: center;
   font-size: 10px;
+}
+
+.terminal-v2-heatmap-row.dominant {
+  background: linear-gradient(90deg, rgba(255, 214, 102, 0.14), rgba(255, 214, 102, 0.02));
+  border-radius: 4px;
+  padding: 2px 4px;
+}
+
+.terminal-v2-flow-chip {
+  display: grid;
+  gap: 2px;
+  margin-top: 4px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  font-size: 10px;
+  line-height: 1.35;
+  font-variant-numeric: tabular-nums;
+}
+
+.terminal-v2-flow-chip.buy {
+  background: linear-gradient(135deg, rgba(38, 112, 88, 0.46), rgba(17, 29, 36, 0.9));
+  box-shadow: inset 0 0 0 1px rgba(126, 245, 186, 0.2);
+  color: rgba(214, 255, 232, 0.96);
+}
+
+.terminal-v2-flow-chip.sell {
+  background: linear-gradient(135deg, rgba(132, 51, 51, 0.44), rgba(22, 17, 20, 0.92));
+  box-shadow: inset 0 0 0 1px rgba(255, 158, 158, 0.22);
+  color: rgba(255, 225, 225, 0.96);
+}
+
+.terminal-v2-flow-chip.neutral {
+  background: linear-gradient(135deg, rgba(54, 73, 92, 0.34), rgba(12, 20, 32, 0.9));
+  box-shadow: inset 0 0 0 1px rgba(182, 212, 232, 0.18);
+  color: rgba(226, 240, 249, 0.94);
 }
 
 .terminal-v2-ai-copy {
@@ -6880,6 +6977,17 @@ a[href*="tradingview"] {
   transition: opacity 0.28s ease;
 }
 
+.gpu-chart-v4-overlay-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 2;
+  opacity: 0;
+  transition: opacity 0.28s ease;
+}
+
 /* Init canvas: 2D static frame shown before WebGL2 is live */
 .gpu-chart-v4-init-canvas {
   position: absolute;
@@ -6897,6 +7005,9 @@ a[href*="tradingview"] {
   opacity: 0;
 }
 [data-phase="webgl-live"] .gpu-chart-v4-canvas {
+  opacity: 1;
+}
+[data-phase="webgl-live"] .gpu-chart-v4-overlay-canvas {
   opacity: 1;
 }
 

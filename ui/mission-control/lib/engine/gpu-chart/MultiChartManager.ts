@@ -10,6 +10,7 @@ import type { DomHistoryFrame } from "../../domHistoryBuffer";
 
 export type ChartViewport = {
   id: string;
+  symbol?: string;
   x: number;
   y: number;
   width: number;

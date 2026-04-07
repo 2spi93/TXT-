@@ -201,7 +201,8 @@ export class HeatmapHistoryLayer {
       const halfWidthTime = Math.max(0.5, Math.min(defaultStep * 1.35, Math.max(frame.time - previousTime, nextTime - frame.time) * 0.48));
       const centerX = (((frame.time - minTime) / timeSpan) * 2) - 1;
       const halfWidth = Math.min(0.22, Math.max(0.004, (halfWidthTime / timeSpan) * 2));
-      const spoof = Math.max(0, Math.min(1, Number(frame.spoofingRisk) || 0));
+      const ageFade = Math.max(0.18, Math.min(1, ((frame.time - minTime) / timeSpan) * 0.82 + 0.18));
+      const spoof = Math.max(0, Math.min(1, (Number(frame.spoofingRisk) || 0) * ageFade));
       const levels = (frame.levels || [])
         .filter((level) => Number.isFinite(level.price) && level.price >= minPrice && level.price <= maxPrice && Number(level.size) > 0)
         .sort((left, right) => Math.max(right.intensity || 0, right.size || 0) - Math.max(left.intensity || 0, left.size || 0))
@@ -212,7 +213,7 @@ export class HeatmapHistoryLayer {
         const base = cursor * INSTANCE_STRIDE_FLOATS;
         const centerY = (((level.price - minPrice) / priceSpan) * 2) - 1;
         const halfHeight = Math.min(0.06, Math.max(0.004, ((Math.max(priceSpan / 180, priceSpan * 0.008) * (0.82 + (level.intensity || 0) * 0.55)) / priceSpan) * 2));
-        const volume = Math.max(0, Number(level.size) || 0);
+        const volume = Math.max(0, Number(level.size) || 0) * ageFade;
         this.instanceData[base + 0] = centerX;
         this.instanceData[base + 1] = halfWidth;
         this.instanceData[base + 2] = centerY;
