@@ -3,11 +3,28 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import time
 from datetime import datetime, timezone
 from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, HTTPException
+
+from apps.execution_router.optimizer_v3 import (
+    apply_order_management_to_live_context,
+    build_execution_optimizer_snapshot,
+    execution_optimizer_allows_trade,
+)
+from apps.execution_router.optimizer_v4 import (
+    adaptive_slippage_guard,
+    calibrate_execution_desk_profile,
+    compute_live_fill_score,
+    decide_order_lifecycle,
+    detect_liquidity_trap,
+    detect_spoof_signal,
+    initialize_queue_tracker,
+    update_queue_tracker,
+)
 
 from shared.db import ensure_schema, execute, fetch_all, fetch_one, json_dumps
 from shared.models import ExecutionRequest, OrderResult
@@ -19,6 +36,10 @@ POSITIONS: dict[str, float] = {}
 MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "http://127.0.0.1:8003")
 BROKER_ADAPTER_URL = os.getenv("BROKER_ADAPTER_URL", "http://127.0.0.1:8004")
 VENUE_STABILITY: dict[str, dict[str, object]] = {}
+EXECUTION_OPTIMIZER_PROFILE_CACHE: dict[str, object] = {"expires_at": 0.0, "profiles": {}, "updated_at": None}
+ACTIVE_EXECUTION_ORDERS: dict[str, dict[str, object]] = {}
+ACTIVE_EXECUTION_ORDER_TASKS: dict[str, asyncio.Task] = {}
+RECENT_EXECUTION_OPTIMIZER_EVENTS: list[dict[str, object]] = []
 
 VENUE_EXECUTION_PROFILES: dict[str, dict[str, object]] = {
     "binance": {
@@ -28,6 +49,14 @@ VENUE_EXECUTION_PROFILES: dict[str, dict[str, object]] = {
         "latency_base_ms": 16,
         "latency_jitter_ms": 4,
         "partial_fill_bias": 0.1,
+    },
+    "bybit": {
+        "matching_rule": "price-time",
+        "queue_priority_bias": 0.82,
+        "hidden_liquidity_ratio": 0.12,
+        "latency_base_ms": 17,
+        "latency_jitter_ms": 5,
+        "partial_fill_bias": 0.12,
     },
     "okx": {
         "matching_rule": "price-time",
@@ -71,6 +100,21 @@ VENUE_EXECUTION_PROFILES: dict[str, dict[str, object]] = {
     },
 }
 
+VENUE_PREFERENCE_ALIASES: dict[str, str] = {
+    "binance": "binance-public",
+    "binance-public": "binance-public",
+    "bybit": "bybit-public",
+    "bybit-public": "bybit-public",
+    "coinbase": "coinbase-public",
+    "coinbase-public": "coinbase-public",
+    "okx": "okx-public",
+    "okx-public": "okx-public",
+    "bingx": "bingx-public",
+    "bingx-public": "bingx-public",
+    "bitget": "bitget-public",
+    "bitget-public": "bitget-public",
+}
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -78,6 +122,21 @@ def _now_iso() -> str:
 
 def _normalize_symbol(symbol: str) -> str:
     return symbol.replace("-PERP", "").replace("/", "").replace("-", "").upper()
+
+
+def _normalize_market_venue_name(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    return VENUE_PREFERENCE_ALIASES.get(normalized, normalized)
+
+
+def _venue_matches_preference(candidate_venue: object, preferred_venue: object) -> bool:
+    candidate = _normalize_market_venue_name(candidate_venue)
+    preferred = _normalize_market_venue_name(preferred_venue)
+    if not candidate or not preferred:
+        return False
+    if candidate == preferred:
+        return True
+    return candidate.startswith(preferred) or preferred.startswith(candidate)
 
 
 def _market_symbol(symbol: str) -> str:
@@ -108,13 +167,335 @@ def _as_list(value: object) -> list[dict[str, object]]:
     return [item for item in value if isinstance(item, dict)]
 
 
+def _append_execution_optimizer_event(event: dict[str, object]) -> None:
+    RECENT_EXECUTION_OPTIMIZER_EVENTS.insert(0, event)
+    del RECENT_EXECUTION_OPTIMIZER_EVENTS[80:]
+
+
+def _compact_persisted_execution_optimizer_order(row: dict[str, object]) -> dict[str, object]:
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    if isinstance(payload, dict) and payload:
+        return payload
+    return {
+        "decision_id": row.get("decision_id"),
+        "order_id": row.get("order_id"),
+        "symbol": row.get("instrument"),
+        "side": row.get("side"),
+        "market_venue": row.get("market_venue"),
+        "broker_provider": row.get("broker_provider"),
+        "status": row.get("status"),
+        "remaining_notional_usd": round(_to_float(row.get("remaining_notional_usd"), 0.0), 6),
+        "queue_edge": round(_to_float(row.get("queue_edge"), 0.0), 6),
+        "predicted_fill_probability": round(_to_float(row.get("predicted_fill_probability"), 0.0), 6),
+        "fill_score": round(_to_float(row.get("fill_score"), 0.0), 6),
+        "spoof_detected": bool(row.get("spoof_detected")),
+        "lifecycle_action": row.get("lifecycle_action"),
+        "lifecycle_reason": row.get("lifecycle_reason"),
+        "desk_profile": row.get("desk_profile") if isinstance(row.get("desk_profile"), dict) else {},
+        "updated_at": row.get("updated_at"),
+        "history": row.get("history") if isinstance(row.get("history"), list) else [],
+    }
+
+
+def _persist_execution_optimizer_active_order(state: dict[str, object]) -> None:
+    latest_snapshot = state.get("latest_snapshot") if isinstance(state.get("latest_snapshot"), dict) else {}
+    latest_v4 = state.get("latest_v4") if isinstance(state.get("latest_v4"), dict) else {}
+    latest_lifecycle = latest_v4.get("lifecycle") if isinstance(latest_v4.get("lifecycle"), dict) else {}
+    compact_payload = _compact_execution_optimizer_live_order(state)
+    execute(
+        """
+        INSERT INTO execution_optimizer_active_orders (
+          decision_id,
+          order_id,
+          account_id,
+          broker_provider,
+          market_venue,
+          instrument,
+          side,
+          status,
+          active,
+          requested_notional_usd,
+          filled_notional_usd,
+          remaining_notional_usd,
+          lifecycle_action,
+          lifecycle_reason,
+          queue_edge,
+          predicted_fill_probability,
+          fill_score,
+          spoof_detected,
+          desk_profile,
+          latest_snapshot,
+          latest_v4,
+          history,
+          payload,
+          updated_at,
+          finalized_at
+        ) VALUES (
+          %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+          %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, NOW(), %s
+        )
+        ON CONFLICT (decision_id) DO UPDATE SET
+          order_id = EXCLUDED.order_id,
+          account_id = EXCLUDED.account_id,
+          broker_provider = EXCLUDED.broker_provider,
+          market_venue = EXCLUDED.market_venue,
+          instrument = EXCLUDED.instrument,
+          side = EXCLUDED.side,
+          status = EXCLUDED.status,
+          active = EXCLUDED.active,
+          requested_notional_usd = EXCLUDED.requested_notional_usd,
+          filled_notional_usd = EXCLUDED.filled_notional_usd,
+          remaining_notional_usd = EXCLUDED.remaining_notional_usd,
+          lifecycle_action = EXCLUDED.lifecycle_action,
+          lifecycle_reason = EXCLUDED.lifecycle_reason,
+          queue_edge = EXCLUDED.queue_edge,
+          predicted_fill_probability = EXCLUDED.predicted_fill_probability,
+          fill_score = EXCLUDED.fill_score,
+          spoof_detected = EXCLUDED.spoof_detected,
+          desk_profile = EXCLUDED.desk_profile,
+          latest_snapshot = EXCLUDED.latest_snapshot,
+          latest_v4 = EXCLUDED.latest_v4,
+          history = EXCLUDED.history,
+          payload = EXCLUDED.payload,
+          updated_at = NOW(),
+          finalized_at = EXCLUDED.finalized_at
+        """,
+        (
+            str(state.get("decision_id") or ""),
+            str(state.get("order_id") or "") or None,
+            str(state.get("account_id") or "") or None,
+            str(state.get("broker_provider") or "unknown"),
+            str(state.get("market_venue") or "unknown"),
+            str(state.get("symbol") or "unknown"),
+            str(state.get("side") or "buy"),
+            str(state.get("status") or "unknown"),
+            bool(state.get("active", False)),
+            _to_float(state.get("requested_notional_usd"), 0.0),
+            _to_float(state.get("filled_notional_usd"), 0.0),
+            _to_float(state.get("remaining_notional_usd"), 0.0),
+            str(latest_lifecycle.get("action") or "") or None,
+            str(latest_lifecycle.get("reason") or "") or None,
+            _to_float(compact_payload.get("queue_edge"), 0.0),
+            _to_float(compact_payload.get("predicted_fill_probability"), 0.0),
+            _to_float(compact_payload.get("fill_score"), 0.0),
+            bool(compact_payload.get("spoof_detected")),
+            json_dumps(state.get("desk_profile") if isinstance(state.get("desk_profile"), dict) else {}),
+            json_dumps(latest_snapshot),
+            json_dumps(latest_v4),
+            json_dumps(state.get("history") if isinstance(state.get("history"), list) else []),
+            json_dumps(compact_payload),
+            datetime.now(timezone.utc) if not bool(state.get("active", False)) else None,
+        ),
+    )
+
+
+def _persist_execution_optimizer_event(
+    state: dict[str, object],
+    *,
+    event_type: str,
+    cycle_index: int | None = None,
+    action: str | None = None,
+    reason: str | None = None,
+    payload_extra: dict[str, object] | None = None,
+) -> None:
+    compact_payload = _compact_execution_optimizer_live_order(state)
+    latest_snapshot = state.get("latest_snapshot") if isinstance(state.get("latest_snapshot"), dict) else {}
+    latest_v4 = state.get("latest_v4") if isinstance(state.get("latest_v4"), dict) else {}
+    latest_lifecycle = latest_v4.get("lifecycle") if isinstance(latest_v4.get("lifecycle"), dict) else {}
+    payload = dict(compact_payload)
+    payload["event_type"] = event_type
+    if cycle_index is not None:
+        payload["cycle_index"] = cycle_index
+    if payload_extra:
+        payload.update(payload_extra)
+    execute(
+        """
+        INSERT INTO execution_optimizer_lifecycle_events (
+          decision_id,
+          order_id,
+          account_id,
+          broker_provider,
+          market_venue,
+          instrument,
+          side,
+          cycle_index,
+          event_type,
+          action,
+          reason,
+          status,
+          queue_edge,
+          predicted_fill_probability,
+          fill_score,
+          expected_slippage_bps,
+          spoof_detected,
+          payload
+        ) VALUES (
+          %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+        )
+        """,
+        (
+            str(state.get("decision_id") or ""),
+            str(state.get("order_id") or "") or None,
+            str(state.get("account_id") or "") or None,
+            str(state.get("broker_provider") or "unknown"),
+            str(state.get("market_venue") or "unknown"),
+            str(state.get("symbol") or "unknown"),
+            str(state.get("side") or "buy"),
+            cycle_index,
+            event_type,
+            action or str(latest_lifecycle.get("action") or "") or None,
+            reason or str(latest_lifecycle.get("reason") or "") or None,
+            str(state.get("status") or "unknown"),
+            _to_float(compact_payload.get("queue_edge"), 0.0),
+            _to_float(compact_payload.get("predicted_fill_probability"), 0.0),
+            _to_float(compact_payload.get("fill_score"), 0.0),
+            _to_float(latest_snapshot.get("expected_slippage_bps"), 0.0),
+            bool(compact_payload.get("spoof_detected")),
+            json_dumps(payload),
+        ),
+    )
+    event_summary = dict(payload)
+    event_summary["updated_at"] = state.get("updated_at")
+    _append_execution_optimizer_event(event_summary)
+
+
+def _load_persisted_active_execution_orders(limit: int = 20) -> list[dict[str, object]]:
+    rows = fetch_all(
+        """
+        SELECT *
+        FROM execution_optimizer_active_orders
+        WHERE active = TRUE
+        ORDER BY updated_at DESC
+        LIMIT %s
+        """,
+        (max(1, limit),),
+    )
+    return [_compact_persisted_execution_optimizer_order(row) for row in rows if isinstance(row, dict)]
+
+
+def _load_recent_execution_optimizer_events(limit: int = 20) -> list[dict[str, object]]:
+    rows = fetch_all(
+        """
+        SELECT payload, created_at
+        FROM execution_optimizer_lifecycle_events
+        ORDER BY created_at DESC, id DESC
+        LIMIT %s
+        """,
+        (max(1, limit),),
+    )
+    events: list[dict[str, object]] = []
+    for row in rows:
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        if not isinstance(payload, dict):
+            continue
+        event = dict(payload)
+        event.setdefault("updated_at", row.get("created_at"))
+        events.append(event)
+    return events
+
+
+def _provider_supports_native_amend(provider: str, current_order: dict[str, object], lifecycle: dict[str, object]) -> bool:
+    normalized_provider = str(provider or "").strip().lower()
+    order_type = str(current_order.get("order_type") or "").strip().upper()
+    target_order_type = str(lifecycle.get("target_order_type") or "").strip().upper()
+    return normalized_provider == "bybit" and order_type == "LIMIT" and target_order_type == "LIMIT"
+
+
+def _live_order_open(status: object) -> bool:
+    normalized = str(status or "").strip().lower()
+    return normalized in {"open", "partially_filled"}
+
+
+def _load_execution_optimizer_profiles(force: bool = False) -> dict[str, dict[str, object]]:
+    now = time.time()
+    cached_profiles = EXECUTION_OPTIMIZER_PROFILE_CACHE.get("profiles")
+    if not force and now < _to_float(EXECUTION_OPTIMIZER_PROFILE_CACHE.get("expires_at"), 0.0) and isinstance(cached_profiles, dict):
+        return cached_profiles  # type: ignore[return-value]
+
+    rows = fetch_all(
+        """
+                WITH fill_stats AS (
+                    SELECT
+                        venue,
+                        COUNT(*) AS fill_count,
+                        AVG(COALESCE(slippage_bps, 0.0)) AS avg_slippage_bps,
+                        AVG(COALESCE(fill_latency_ms, 0.0)) AS avg_fill_latency_ms,
+                        AVG(COALESCE(NULLIF(payload->>'fill_quality_score', '')::double precision, GREATEST(0.0, 100.0 - COALESCE(slippage_bps, 0.0) * 2.0))) AS avg_fill_quality_score,
+                        MAX(filled_at) AS last_fill_at
+                    FROM execution_fill_events
+                    WHERE filled_at >= NOW() - INTERVAL '7 days'
+                    GROUP BY venue
+                ),
+                lifecycle_stats AS (
+                    SELECT
+                        market_venue AS venue,
+                        COALESCE(AVG(CASE WHEN event_type = 'cycle_evaluation' AND action = 'replace' THEN 1.0 ELSE 0.0 END)
+                            FILTER (WHERE event_type = 'cycle_evaluation'), 0.0) AS replace_rate,
+                        COALESCE(
+                            COUNT(*) FILTER (WHERE event_type = 'order_amend')::double precision /
+                            NULLIF(COUNT(*) FILTER (WHERE event_type IN ('order_amend', 'order_cancel_replace', 'cycle_evaluation')), 0),
+                            0.0
+                        ) AS amend_rate,
+                        COALESCE(AVG(CASE WHEN event_type = 'cycle_evaluation' AND action = 'cancel' THEN 1.0 ELSE 0.0 END)
+                            FILTER (WHERE event_type = 'cycle_evaluation'), 0.0) AS cancel_rate
+                    FROM execution_optimizer_lifecycle_events
+                    WHERE created_at >= NOW() - INTERVAL '7 days'
+                    GROUP BY market_venue
+                )
+                SELECT
+                    COALESCE(fill_stats.venue, lifecycle_stats.venue) AS venue,
+                    COALESCE(fill_stats.fill_count, 0) AS fill_count,
+                    COALESCE(fill_stats.avg_slippage_bps, 0.0) AS avg_slippage_bps,
+                    COALESCE(fill_stats.avg_fill_latency_ms, 0.0) AS avg_fill_latency_ms,
+                    COALESCE(fill_stats.avg_fill_quality_score, 0.0) AS avg_fill_quality_score,
+                    fill_stats.last_fill_at AS last_fill_at,
+                    COALESCE(lifecycle_stats.replace_rate, 0.0) AS replace_rate,
+                    COALESCE(lifecycle_stats.amend_rate, 0.0) AS amend_rate,
+                    COALESCE(lifecycle_stats.cancel_rate, 0.0) AS cancel_rate
+                FROM fill_stats
+                FULL OUTER JOIN lifecycle_stats ON lifecycle_stats.venue = fill_stats.venue
+                ORDER BY COALESCE(fill_stats.venue, lifecycle_stats.venue)
+        """
+    )
+    profiles: dict[str, dict[str, object]] = {}
+    for row in rows:
+        venue = str(row.get("venue") or "unknown")
+        profiles[venue] = calibrate_execution_desk_profile(venue, row)
+    EXECUTION_OPTIMIZER_PROFILE_CACHE.update(
+        {
+            "expires_at": now + 20.0,
+            "profiles": profiles,
+            "updated_at": _now_iso(),
+        }
+    )
+    return profiles
+
+
+def _execution_optimizer_profile_for_venue(venue: str) -> dict[str, object]:
+    profiles = _load_execution_optimizer_profiles()
+    normalized = str(venue or "").strip().lower()
+    exact = profiles.get(normalized)
+    if isinstance(exact, dict):
+        return exact
+    prefixed = next((profile for key, profile in profiles.items() if normalized and key.startswith(normalized)), None)
+    if isinstance(prefixed, dict):
+        return prefixed
+    return calibrate_execution_desk_profile(normalized or "unknown", {})
+
+
+def _remaining_notional_usd(order_payload: dict[str, object]) -> float:
+    requested = max(0.0, _to_float(order_payload.get("requested_notional_usd"), 0.0))
+    filled = max(0.0, _to_float(order_payload.get("filled_notional_usd"), 0.0))
+    return max(0.0, requested - filled)
+
+
 def _live_execution_context(payload: dict[str, object]) -> dict[str, object]:
     live = _as_dict(payload.get("live_execution"))
     metadata = _as_dict(payload.get("metadata"))
     provider = str(live.get("provider") or metadata.get("provider") or "").strip().lower()
     account_id = str(live.get("account_id") or metadata.get("account_id") or "").strip()
     secret_payload = live.get("secret_payload") if isinstance(live.get("secret_payload"), dict) else None
-    enabled = bool(live.get("enabled")) and provider == "bingx" and bool(account_id) and isinstance(secret_payload, dict)
+    enabled = bool(live.get("enabled")) and provider in {"bingx", "bybit"} and bool(account_id) and isinstance(secret_payload, dict)
     return {
         "enabled": enabled,
         "provider": provider,
@@ -128,6 +509,23 @@ def _live_execution_context(payload: dict[str, object]) -> dict[str, object]:
         "quantity": _to_float(live.get("quantity") or payload.get("quantity"), 0.0),
         "notional_usd": _to_float(live.get("notional_usd") or payload.get("estimated_notional_usd"), 0.0),
         "client_order_id": str(live.get("client_order_id") or payload.get("client_order_id") or "").strip(),
+    }
+
+
+def _compact_execution_optimizer_candidate(candidate: dict[str, object], snapshot: dict[str, object]) -> dict[str, object]:
+    queue = snapshot.get("queue") if isinstance(snapshot.get("queue"), dict) else {}
+    guard = snapshot.get("slippage_guard") if isinstance(snapshot.get("slippage_guard"), dict) else {}
+    order_management = snapshot.get("order_management") if isinstance(snapshot.get("order_management"), dict) else {}
+    return {
+        "venue": str(candidate.get("venue") or "unknown"),
+        "spread_bps": round(_to_float(candidate.get("spread_bps"), 0.0), 6),
+        "available_depth_usd": round(_to_float(candidate.get("available_depth_usd"), 0.0), 6),
+        "predicted_fill_probability": round(_to_float(snapshot.get("predicted_fill_probability"), 0.0), 6),
+        "expected_slippage_bps": round(_to_float(snapshot.get("expected_slippage_bps"), 0.0), 6),
+        "queue_edge": round(_to_float(queue.get("queue_edge"), 0.0), 6),
+        "slippage_guard": guard,
+        "order_management": order_management,
+        "desk_profile": snapshot.get("desk_profile") if isinstance(snapshot.get("desk_profile"), dict) else {},
     }
 
 
@@ -165,6 +563,165 @@ async def _execute_live_order(payload: dict[str, object], live_context: dict[str
     return body
 
 
+async def _query_live_order_status(live_context: dict[str, object], payload: dict[str, object], order_payload: dict[str, object]) -> dict[str, object]:
+    request_payload: dict[str, object] = {
+        "provider": str(live_context.get("provider") or ""),
+        "account_id": str(live_context.get("account_id") or ""),
+        "secret_payload": live_context.get("secret_payload"),
+        "symbol": str(payload.get("symbol") or ""),
+        "side": str(payload.get("side") or "buy"),
+        "order_id": order_payload.get("order_id"),
+        "client_order_id": order_payload.get("client_order_id"),
+        "notional_usd": _to_float(order_payload.get("requested_notional_usd"), _to_float(live_context.get("notional_usd"), 0.0)),
+    }
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.post(f"{BROKER_ADAPTER_URL}/v1/live/orders/status", json=request_payload)
+    if response.status_code >= 400:
+        detail: object
+        try:
+            detail = response.json()
+        except ValueError:
+            detail = response.text[:500]
+        raise HTTPException(status_code=502 if response.status_code >= 500 else response.status_code, detail=detail)
+    body = response.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=502, detail="broker-adapter returned invalid order status payload")
+    return body
+
+
+async def _cancel_live_order(live_context: dict[str, object], payload: dict[str, object], order_payload: dict[str, object]) -> dict[str, object]:
+    request_payload: dict[str, object] = {
+        "provider": str(live_context.get("provider") or ""),
+        "account_id": str(live_context.get("account_id") or ""),
+        "secret_payload": live_context.get("secret_payload"),
+        "symbol": str(payload.get("symbol") or ""),
+        "side": str(payload.get("side") or "buy"),
+        "order_id": order_payload.get("order_id"),
+        "client_order_id": order_payload.get("client_order_id"),
+        "notional_usd": _to_float(order_payload.get("requested_notional_usd"), _to_float(live_context.get("notional_usd"), 0.0)),
+    }
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.post(f"{BROKER_ADAPTER_URL}/v1/live/orders/cancel", json=request_payload)
+    if response.status_code >= 400:
+        detail: object
+        try:
+            detail = response.json()
+        except ValueError:
+            detail = response.text[:500]
+        raise HTTPException(status_code=502 if response.status_code >= 500 else response.status_code, detail=detail)
+    body = response.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=502, detail="broker-adapter returned invalid cancel payload")
+    return body
+
+
+async def _amend_live_order(
+    live_context: dict[str, object],
+    payload: dict[str, object],
+    order_payload: dict[str, object],
+    *,
+    target_price: float,
+    target_quantity: float = 0.0,
+) -> dict[str, object]:
+    request_payload: dict[str, object] = {
+        "provider": str(live_context.get("provider") or ""),
+        "account_id": str(live_context.get("account_id") or ""),
+        "secret_payload": live_context.get("secret_payload"),
+        "symbol": str(payload.get("symbol") or ""),
+        "side": str(payload.get("side") or "buy"),
+        "order_id": order_payload.get("order_id"),
+        "client_order_id": order_payload.get("client_order_id"),
+        "notional_usd": _to_float(order_payload.get("requested_notional_usd"), _to_float(live_context.get("notional_usd"), 0.0)),
+        "price": target_price,
+    }
+    if target_quantity > 0:
+        request_payload["quantity"] = target_quantity
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.post(f"{BROKER_ADAPTER_URL}/v1/live/orders/amend", json=request_payload)
+    if response.status_code >= 400:
+        detail: object
+        try:
+            detail = response.json()
+        except ValueError:
+            detail = response.text[:500]
+        raise HTTPException(status_code=502 if response.status_code >= 500 else response.status_code, detail=detail)
+    body = response.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=502, detail="broker-adapter returned invalid amend payload")
+    return body
+
+
+async def _candidate_for_market_venue(symbol: str, market_venue: str, infra_context: dict[str, object]) -> dict[str, object]:
+    candidates = await _build_route_candidates(symbol, infra_context=infra_context)
+    normalized_venue = str(market_venue or "").strip().lower()
+    exact = next((candidate for candidate in candidates if str(candidate.get("venue") or "").strip().lower() == normalized_venue), None)
+    if isinstance(exact, dict):
+        return exact
+    startswith = next((candidate for candidate in candidates if normalized_venue and str(candidate.get("venue") or "").strip().lower().startswith(normalized_venue)), None)
+    if isinstance(startswith, dict):
+        return startswith
+    return candidates[0] if candidates else {}
+
+
+def _compact_execution_optimizer_live_order(state: dict[str, object]) -> dict[str, object]:
+    latest_snapshot = state.get("latest_snapshot") if isinstance(state.get("latest_snapshot"), dict) else {}
+    latest_v4 = state.get("latest_v4") if isinstance(state.get("latest_v4"), dict) else {}
+    latest_guard = latest_v4.get("guard") if isinstance(latest_v4.get("guard"), dict) else {}
+    latest_spoof = latest_v4.get("spoof") if isinstance(latest_v4.get("spoof"), dict) else {}
+    latest_lifecycle = latest_v4.get("lifecycle") if isinstance(latest_v4.get("lifecycle"), dict) else {}
+    queue = latest_snapshot.get("queue") if isinstance(latest_snapshot.get("queue"), dict) else {}
+    queue_tracker = latest_v4.get("queue_tracker") if isinstance(latest_v4.get("queue_tracker"), dict) else {}
+    fill_state = latest_v4.get("fill") if isinstance(latest_v4.get("fill"), dict) else {}
+    candidate_metrics = latest_v4.get("candidate_metrics") if isinstance(latest_v4.get("candidate_metrics"), dict) else {}
+    return {
+        "decision_id": state.get("decision_id"),
+        "order_id": state.get("order_id"),
+        "symbol": state.get("symbol"),
+        "side": state.get("side"),
+        "market_venue": state.get("market_venue"),
+        "broker_provider": state.get("broker_provider"),
+        "status": state.get("status"),
+        "remaining_notional_usd": round(_to_float(state.get("remaining_notional_usd"), 0.0), 6),
+        "queue_edge": round(_to_float(queue.get("queue_edge"), 0.0), 6),
+        "queue_position_usd": round(_to_float(queue_tracker.get("queue_position_usd"), 0.0), 6),
+        "queue_rank_estimate": round(_to_float(fill_state.get("queue_rank_estimate"), _to_float(queue_tracker.get("queue_rank_estimate"), 0.0)), 6),
+        "predicted_fill_probability": round(_to_float(fill_state.get("effective_fill_probability"), _to_float(latest_snapshot.get("predicted_fill_probability"), 0.0)), 6),
+        "fill_score": round(_to_float(fill_state.get("fill_score"), 0.0), 6),
+        "aggressiveness": round(_to_float(fill_state.get("aggressiveness"), 0.0), 6),
+        "dominance_score": round(_to_float(fill_state.get("dominance_score"), 0.0), 6),
+        "time_in_queue_ms": round(_to_float(fill_state.get("time_in_queue_ms"), _to_float(queue_tracker.get("time_in_queue_ms"), 0.0)), 6),
+        "time_to_fill_estimate_ms": round(_to_float(fill_state.get("time_to_fill_estimate_ms"), 0.0), 6) if fill_state.get("time_to_fill_estimate_ms") is not None else None,
+        "adverse_selection_score": round(_to_float(fill_state.get("adverse_selection_score"), 0.0), 6),
+        "liquidity_decay_rate": round(_to_float(fill_state.get("liquidity_decay_rate"), _to_float(queue_tracker.get("liquidity_decay_rate"), 0.0)), 6),
+        "latency_ms": round(_to_float(candidate_metrics.get("latency_ms"), 0.0), 6),
+        "freshness_ms": round(_to_float(candidate_metrics.get("freshness_ms"), 0.0), 6),
+        "guard_reasons": latest_guard.get("reasons") or [],
+        "spoof_detected": bool(latest_spoof.get("spoof_detected")),
+        "liquidity_trap_detected": bool(fill_state.get("liquidity_trap_detected")),
+        "should_move_ahead": bool(fill_state.get("should_move_ahead")),
+        "lifecycle_action": latest_lifecycle.get("action"),
+        "lifecycle_reason": latest_lifecycle.get("reason"),
+        "timing": latest_lifecycle.get("timing"),
+        "desk_profile": state.get("desk_profile") if isinstance(state.get("desk_profile"), dict) else {},
+        "updated_at": state.get("updated_at"),
+        "history": state.get("history") if isinstance(state.get("history"), list) else [],
+    }
+
+
+def _update_active_execution_order(decision_id: str, state: dict[str, object]) -> None:
+    ACTIVE_EXECUTION_ORDERS[decision_id] = state
+    _persist_execution_optimizer_active_order(state)
+
+
+def _finalize_active_execution_order(decision_id: str, state: dict[str, object]) -> None:
+    state["updated_at"] = _now_iso()
+    state["active"] = False
+    _persist_execution_optimizer_active_order(state)
+    _persist_execution_optimizer_event(state, event_type="loop_finalized")
+    ACTIVE_EXECUTION_ORDERS.pop(decision_id, None)
+    ACTIVE_EXECUTION_ORDER_TASKS.pop(decision_id, None)
+
+
 def _resolve_execution_delay_ms(payload: dict[str, object] | None = None) -> int:
     source = payload if isinstance(payload, dict) else {}
     metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
@@ -180,6 +737,227 @@ def _resolve_execution_delay_ms(payload: dict[str, object] | None = None) -> int
         except Exception:
             continue
     return 0
+
+
+async def _run_execution_optimizer_live_loop(
+    *,
+    payload: dict[str, object],
+    live_context: dict[str, object],
+    broker_order: dict[str, object],
+    selected_candidate: dict[str, object],
+    route_preferences: dict[str, object],
+    decision_id: str,
+) -> None:
+    market_venue = str(selected_candidate.get("venue") or live_context.get("provider") or "unknown")
+    broker_provider = str(live_context.get("provider") or broker_order.get("venue") or "unknown")
+    desk_profile = _execution_optimizer_profile_for_venue(market_venue)
+    latest_snapshot = build_execution_optimizer_snapshot(
+        selected_candidate,
+        str(payload.get("side") or "buy"),
+        _remaining_notional_usd(broker_order),
+        str(route_preferences.get("execution_style") or "default"),
+        str(live_context.get("order_type") or "LIMIT"),
+        _to_float(live_context.get("price"), 0.0),
+        desk_profile=desk_profile,
+    )
+    queue_tracker = initialize_queue_tracker(selected_candidate, latest_snapshot.get("queue") if isinstance(latest_snapshot.get("queue"), dict) else {})
+    state: dict[str, object] = {
+        "active": True,
+        "decision_id": decision_id,
+        "order_id": broker_order.get("order_id"),
+        "account_id": live_context.get("account_id"),
+        "symbol": payload.get("symbol"),
+        "side": payload.get("side"),
+        "market_venue": market_venue,
+        "broker_provider": broker_provider,
+        "status": broker_order.get("status"),
+        "requested_notional_usd": _to_float(broker_order.get("requested_notional_usd"), _to_float(live_context.get("notional_usd"), 0.0)),
+        "filled_notional_usd": _to_float(broker_order.get("filled_notional_usd"), 0.0),
+        "remaining_notional_usd": _remaining_notional_usd(broker_order),
+        "desk_profile": desk_profile,
+        "history": [],
+        "latest_snapshot": latest_snapshot,
+        "latest_v4": {},
+        "updated_at": _now_iso(),
+    }
+    _update_active_execution_order(decision_id, state)
+    _persist_execution_optimizer_event(state, event_type="loop_started", action="monitor")
+
+    current_order = dict(broker_order)
+    previous_candidate = selected_candidate
+    last_cycle_started = time.perf_counter()
+    max_cycles = max(1, int(_to_float(desk_profile.get("max_lifecycle_cycles"), 6.0)))
+    loop_interval_seconds = max(0.25, _to_float(desk_profile.get("loop_interval_ms"), 900.0) / 1000.0)
+
+    try:
+        for cycle in range(1, max_cycles + 1):
+            await asyncio.sleep(loop_interval_seconds)
+            current_order = await _query_live_order_status(live_context, payload, current_order)
+            state["status"] = current_order.get("status")
+            state["filled_notional_usd"] = _to_float(current_order.get("filled_notional_usd"), _to_float(state.get("filled_notional_usd"), 0.0))
+            state["remaining_notional_usd"] = _remaining_notional_usd(current_order)
+            if not _live_order_open(current_order.get("status")) or _to_float(state.get("remaining_notional_usd"), 0.0) <= 1.0:
+                _persist_execution_optimizer_event(state, event_type="order_closed", cycle_index=cycle, action="closed")
+                _finalize_active_execution_order(decision_id, state)
+                return
+
+            current_candidate = await _candidate_for_market_venue(str(payload.get("symbol") or ""), market_venue, _resolve_infra_context(payload))
+            loop_elapsed_ms = max(1.0, (time.perf_counter() - last_cycle_started) * 1000.0)
+            last_cycle_started = time.perf_counter()
+            queue_tracker = update_queue_tracker(queue_tracker, previous_candidate, current_candidate, str(payload.get("side") or "buy"), loop_elapsed_ms)
+            latest_snapshot = build_execution_optimizer_snapshot(
+                current_candidate,
+                str(payload.get("side") or "buy"),
+                _to_float(state.get("remaining_notional_usd"), 0.0),
+                str(route_preferences.get("execution_style") or "default"),
+                str(current_order.get("order_type") or live_context.get("order_type") or "LIMIT"),
+                _to_float(current_order.get("limit_price"), _to_float(live_context.get("price"), 0.0)),
+                desk_profile=desk_profile,
+            )
+            spoof_signal = detect_spoof_signal(previous_candidate, current_candidate, str(payload.get("side") or "buy"), desk_profile, loop_elapsed_ms)
+            live_fill = compute_live_fill_score(queue_tracker, current_candidate, desk_profile)
+            liquidity_signal = detect_liquidity_trap(current_candidate, live_fill, desk_profile)
+            live_signal = {**live_fill, **liquidity_signal}
+            v4_guard = adaptive_slippage_guard(current_candidate, desk_profile, _to_float(live_signal.get("fill_score"), 0.0), spoof_signal, liquidity_signal)
+            lifecycle = decide_order_lifecycle(
+                current_candidate,
+                queue_tracker,
+                live_signal,
+                spoof_signal,
+                v4_guard,
+                {
+                    "side": payload.get("side"),
+                    "status": current_order.get("status"),
+                    "order_type": current_order.get("order_type") or live_context.get("order_type") or "LIMIT",
+                    "price": current_order.get("limit_price") or current_order.get("avg_fill_price") or live_context.get("price"),
+                },
+                desk_profile,
+            )
+            previous_candidate = current_candidate
+            state["latest_snapshot"] = latest_snapshot
+            state["latest_v4"] = {
+                "queue_tracker": queue_tracker,
+                "fill": live_signal,
+                "spoof": spoof_signal,
+                "guard": v4_guard,
+                "candidate_metrics": {
+                    "latency_ms": _to_float(current_candidate.get("latency_ms"), 0.0),
+                    "freshness_ms": _to_float(current_candidate.get("freshness_ms"), 0.0),
+                    "spread_bps": _to_float(current_candidate.get("spread_bps"), 0.0),
+                    "available_depth_usd": _to_float(current_candidate.get("available_depth_usd"), 0.0),
+                    "depth_imbalance": _to_float(current_candidate.get("depth_imbalance"), 0.0),
+                    "volume_imbalance": _to_float(current_candidate.get("volume_imbalance"), 0.0),
+                    "best_bid": _to_float(current_candidate.get("best_bid"), 0.0),
+                    "best_ask": _to_float(current_candidate.get("best_ask"), 0.0),
+                    "queue_rank_estimate": _to_float(live_signal.get("queue_rank_estimate"), 0.0),
+                    "aggressiveness": _to_float(live_signal.get("aggressiveness"), 0.0),
+                    "dominance_score": _to_float(live_signal.get("dominance_score"), 0.0),
+                    "adverse_selection_score": _to_float(live_signal.get("adverse_selection_score"), 0.0),
+                    "liquidity_decay_rate": _to_float(live_signal.get("liquidity_decay_rate"), 0.0),
+                },
+                "lifecycle": lifecycle,
+            }
+            state["updated_at"] = _now_iso()
+            history = state.get("history") if isinstance(state.get("history"), list) else []
+            history.insert(
+                0,
+                {
+                    "cycle": cycle,
+                    "at": state["updated_at"],
+                    "latency_ms": _to_float(current_candidate.get("latency_ms"), 0.0),
+                    "freshness_ms": _to_float(current_candidate.get("freshness_ms"), 0.0),
+                    "spread_bps": _to_float(current_candidate.get("spread_bps"), 0.0),
+                    "available_depth_usd": _to_float(current_candidate.get("available_depth_usd"), 0.0),
+                    "fill_score": live_signal.get("fill_score"),
+                    "confidence": live_signal.get("confidence"),
+                    "entry_boost": live_signal.get("entry_boost"),
+                    "predicted_fill_probability": live_signal.get("effective_fill_probability"),
+                    "queue_position_usd": queue_tracker.get("queue_position_usd"),
+                    "queue_rank_estimate": live_signal.get("queue_rank_estimate"),
+                    "time_in_queue_ms": live_signal.get("time_in_queue_ms"),
+                    "time_to_fill_estimate_ms": live_signal.get("time_to_fill_estimate_ms"),
+                    "aggressiveness": live_signal.get("aggressiveness"),
+                    "dominance_score": live_signal.get("dominance_score"),
+                    "adverse_selection_score": live_signal.get("adverse_selection_score"),
+                    "liquidity_decay_rate": live_signal.get("liquidity_decay_rate"),
+                    "guard_reasons": v4_guard.get("reasons"),
+                    "spoof_detected": spoof_signal.get("spoof_detected"),
+                    "liquidity_trap_detected": live_signal.get("liquidity_trap_detected"),
+                    "action": lifecycle.get("action"),
+                    "reason": lifecycle.get("reason"),
+                },
+            )
+            del history[12:]
+            state["history"] = history
+            _update_active_execution_order(decision_id, state)
+            _persist_execution_optimizer_event(state, event_type="cycle_evaluation", cycle_index=cycle)
+
+            action = str(lifecycle.get("action") or "keep")
+            if action == "keep":
+                continue
+
+            target_price = _to_float(lifecycle.get("target_price"), 0.0)
+            if action == "replace" and target_price > 0 and _provider_supports_native_amend(str(live_context.get("provider") or ""), current_order, lifecycle):
+                amended_order = await _amend_live_order(live_context, payload, current_order, target_price=target_price)
+                current_order = amended_order
+                state["order_id"] = current_order.get("order_id")
+                state["status"] = current_order.get("status")
+                state["filled_notional_usd"] = _to_float(current_order.get("filled_notional_usd"), _to_float(state.get("filled_notional_usd"), 0.0))
+                state["remaining_notional_usd"] = _remaining_notional_usd(current_order)
+                state["latest_v4"] = {
+                    **(state.get("latest_v4") if isinstance(state.get("latest_v4"), dict) else {}),
+                    "lifecycle": {**lifecycle, "action": "amend", "reason": "native_limit_amend"},
+                }
+                state["updated_at"] = _now_iso()
+                _update_active_execution_order(decision_id, state)
+                _persist_execution_optimizer_event(state, event_type="order_amend", cycle_index=cycle, action="amend", reason="native_limit_amend")
+                if not _live_order_open(current_order.get("status")):
+                    _finalize_active_execution_order(decision_id, state)
+                    return
+                continue
+
+            current_order = await _cancel_live_order(live_context, payload, current_order)
+            if action == "cancel":
+                state["status"] = current_order.get("status") or "cancelled"
+                _persist_execution_optimizer_event(state, event_type="order_cancelled", cycle_index=cycle, action="cancel")
+                _finalize_active_execution_order(decision_id, state)
+                return
+
+            next_live_context = dict(live_context)
+            notional_scale = _clamp(_to_float(lifecycle.get("target_notional_scale"), 1.0), 0.2, 1.0)
+            next_live_context["notional_usd"] = _to_float(state.get("remaining_notional_usd"), 0.0) * notional_scale
+            next_live_context["client_order_id"] = f"txt-{decision_id[:18]}-v4-{cycle}"[:40]
+            target_order_type = str(lifecycle.get("target_order_type") or "LIMIT").strip().upper() or "LIMIT"
+            next_live_context["order_type"] = target_order_type
+            if target_order_type == "LIMIT" and target_price > 0:
+                next_live_context["price"] = target_price
+            else:
+                next_live_context.pop("price", None)
+
+            replacement = await _execute_live_order(payload, next_live_context, f"{decision_id}-v4-{cycle}")
+            current_order = replacement
+            live_context = next_live_context
+            state["order_id"] = current_order.get("order_id")
+            state["status"] = current_order.get("status")
+            state["filled_notional_usd"] = _to_float(current_order.get("filled_notional_usd"), _to_float(state.get("filled_notional_usd"), 0.0))
+            state["remaining_notional_usd"] = _remaining_notional_usd(current_order)
+            state["updated_at"] = _now_iso()
+            _update_active_execution_order(decision_id, state)
+            _persist_execution_optimizer_event(state, event_type="order_cancel_replace", cycle_index=cycle, action=action)
+            if not _live_order_open(current_order.get("status")):
+                _finalize_active_execution_order(decision_id, state)
+                return
+    except Exception as exc:
+        state["status"] = "lifecycle_error"
+        state["updated_at"] = _now_iso()
+        state["error"] = str(exc)[:400]
+        _persist_execution_optimizer_event(state, event_type="loop_error", reason=str(exc)[:200])
+        _finalize_active_execution_order(decision_id, state)
+        return
+
+    state["status"] = current_order.get("status") or "timeout"
+    _persist_execution_optimizer_event(state, event_type="loop_timeout", action="timeout")
+    _finalize_active_execution_order(decision_id, state)
 
 
 def _normalize_route_mode_override(value: object) -> str:
@@ -210,7 +988,7 @@ def _resolve_route_preferences(payload: dict[str, object] | None = None) -> dict
     for candidate in (source.get("preferred_venue"), metadata.get("preferred_venue"), order_intent.get("preferred_venue")):
         value = str(candidate or "").strip()
         if value:
-            preferred_venue = value
+            preferred_venue = _normalize_market_venue_name(value)
             break
 
     route_mode_override = ""
@@ -343,7 +1121,7 @@ def _route_selection_score(
         )
 
     if preferred_venue:
-        if str(candidate.get("venue") or "") == preferred_venue:
+        if _venue_matches_preference(candidate.get("venue"), preferred_venue):
             score += 0.4 if execution_style == "primary_only" else 0.16
         elif execution_style == "primary_only":
             score -= 0.3
@@ -357,6 +1135,21 @@ def _route_selection_score(
         score *= 0.78
 
     return score
+
+
+def _rank_route_candidates(
+    candidates: list[dict[str, object]],
+    side: str,
+    preferences: dict[str, object],
+) -> list[dict[str, object]]:
+    best_bid = max((_to_float(candidate.get("best_bid"), 0.0) for candidate in candidates), default=0.0)
+    asks = [_to_float(candidate.get("best_ask"), 0.0) for candidate in candidates if _to_float(candidate.get("best_ask"), 0.0) > 0]
+    best_ask = min(asks) if asks else 0.0
+    return sorted(
+        candidates,
+        key=lambda candidate: _route_selection_score(candidate, side, preferences, best_bid=best_bid, best_ask=best_ask),
+        reverse=True,
+    )
 
 
 def _select_route_candidates(
@@ -373,7 +1166,7 @@ def _select_route_candidates(
     execution_style = _normalize_execution_style(preferences.get("execution_style"))
 
     if preferred_venue and execution_style == "primary_only":
-        selected = next((candidate for candidate in candidates if str(candidate.get("venue") or "") == preferred_venue), candidates[0])
+        selected = next((candidate for candidate in candidates if _venue_matches_preference(candidate.get("venue"), preferred_venue)), candidates[0])
         backup = next((candidate for candidate in candidates if candidate.get("venue") != selected.get("venue")), None)
         return selected, backup, "preferred_venue_primary_only", {
             "preferred_venue": preferred_venue,
@@ -383,7 +1176,7 @@ def _select_route_candidates(
         }
 
     if preferred_venue and execution_style == "default" and route_mode_override in {"", "bestSingleVenue"}:
-        selected = next((candidate for candidate in candidates if str(candidate.get("venue") or "") == preferred_venue), candidates[0])
+        selected = next((candidate for candidate in candidates if _venue_matches_preference(candidate.get("venue"), preferred_venue)), candidates[0])
         backup = next((candidate for candidate in candidates if candidate.get("venue") != selected.get("venue")), None)
         return selected, backup, "preferred_venue_override", {
             "preferred_venue": preferred_venue,
@@ -392,14 +1185,7 @@ def _select_route_candidates(
             "ranked_venues": [str(candidate.get("venue") or "") for candidate in candidates[:5]],
         }
 
-    best_bid = max((_to_float(candidate.get("best_bid"), 0.0) for candidate in candidates), default=0.0)
-    asks = [_to_float(candidate.get("best_ask"), 0.0) for candidate in candidates if _to_float(candidate.get("best_ask"), 0.0) > 0]
-    best_ask = min(asks) if asks else 0.0
-    ranked = sorted(
-        candidates,
-        key=lambda candidate: _route_selection_score(candidate, side, preferences, best_bid=best_bid, best_ask=best_ask),
-        reverse=True,
-    )
+    ranked = _rank_route_candidates(candidates, side, preferences)
     selected = ranked[0]
     backup = next((candidate for candidate in ranked if candidate.get("venue") != selected.get("venue")), None)
 
@@ -744,14 +1530,26 @@ async def _build_route_candidates(symbol: str, infra_context: dict[str, object] 
             ],
             return_exceptions=True,
         )
+        micro_responses = await asyncio.gather(
+            *[
+                client.get(
+                    f"{MARKET_DATA_URL}/v1/market/microstructure",
+                    params={"venue": str(quote.get("venue", "unknown")), "instrument": market_symbol, "lookback_minutes": 30},
+                )
+                for quote in matching_quotes
+            ],
+            return_exceptions=True,
+        )
 
         candidates: list[dict] = []
-        for quote, depth_response in zip(matching_quotes, depth_responses):
+        for quote, depth_response, micro_response in zip(matching_quotes, depth_responses, micro_responses):
             venue = str(quote.get("venue", "unknown"))
             venue_profile = _venue_execution_profile(venue)
             spread_bps = _to_float(quote.get("spread_bps"), 9999.0)
             depth_ok = not isinstance(depth_response, Exception) and depth_response.status_code < 400
             depth_payload = depth_response.json() if depth_ok else {}
+            micro_ok = not isinstance(micro_response, Exception) and micro_response.status_code < 400
+            micro_payload = micro_response.json() if micro_ok else {}
             book = (depth_payload or {}).get("depth_payload", {})
             bid_depth_usd, ask_depth_usd = _aggregate_depth(book)
             available_depth_usd = min(bid_depth_usd, ask_depth_usd) if bid_depth_usd > 0 and ask_depth_usd > 0 else max(bid_depth_usd, ask_depth_usd)
@@ -760,8 +1558,16 @@ async def _build_route_candidates(symbol: str, infra_context: dict[str, object] 
             depth_confidence = 1.0 if depth_levels >= 4 else 0.45 if depth_levels >= 1 else 0.05
             quote_age_ms = _timestamp_age_ms(quote.get("updated_at"))
             depth_age_ms = _timestamp_age_ms(depth_payload.get("snapshot_at"))
+            if depth_ok and depth_levels >= 4 and depth_age_ms <= 5000:
+                quote_age_ms = min(quote_age_ms, depth_age_ms) if quote_age_ms > 0 else depth_age_ms
             freshness_ms = max(quote_age_ms, depth_age_ms, 0)
             latency_ms = max(15.0, min(2000.0, 20.0 + freshness_ms * 0.15))
+            reference_price = _to_float((micro_payload or {}).get("mark_price"), mid)
+            tape_acceleration = _to_float((micro_payload or {}).get("tape_acceleration"), 0.0)
+            incoming_flow_usd_per_min = tape_acceleration * max(reference_price, 0.0)
+            depth_imbalance = _to_float((micro_payload or {}).get("depth_imbalance"), 0.0)
+            volume_imbalance = _to_float((micro_payload or {}).get("volume_imbalance"), 0.0)
+            trade_count = int(_to_float((micro_payload or {}).get("trade_count"), 0.0))
             liquidity_score = _clamp(math.log10(max(10.0, available_depth_usd)) / 6.0, 0.0, 1.0) if available_depth_usd > 0 else depth_confidence * 0.1
             queue_priority_risk = _clamp(
                 (1.0 - _to_float(venue_profile.get("queue_priority_bias"), 0.8)) * 0.45
@@ -832,6 +1638,13 @@ async def _build_route_candidates(symbol: str, infra_context: dict[str, object] 
                     "freshness_ms": freshness_ms,
                     "quote_age_ms": quote_age_ms,
                     "depth_age_ms": depth_age_ms,
+                    "queue_priority_bias": _to_float(venue_profile.get("queue_priority_bias"), 0.8),
+                    "incoming_flow_usd_per_min": incoming_flow_usd_per_min,
+                    "tape_acceleration": tape_acceleration,
+                    "depth_imbalance": depth_imbalance,
+                    "volume_imbalance": volume_imbalance,
+                    "trade_count": trade_count,
+                    "mark_price": reference_price,
                     "liquidity": liquidity_score,
                     "fill_probability": fill_probability,
                     "raw_score": raw_score,
@@ -846,6 +1659,7 @@ async def _build_route_candidates(symbol: str, infra_context: dict[str, object] 
                     "stability_flags": stability.get("stability_flags") or [],
                     "consecutive_failures": int(stability.get("consecutive_failures", 0)),
                     "source": "v6-price-fusion-stability-infra",
+                    "microstructure": micro_payload if isinstance(micro_payload, dict) else {},
                     "depth_payload": book,
                 }
             )
@@ -891,6 +1705,25 @@ def _build_route_context(candidates: list[dict]) -> dict:
         "backup": backup,
         "reason": route_reason,
     }
+
+
+async def _fetch_market_venue_telemetry() -> dict[str, dict[str, object]]:
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{MARKET_DATA_URL}/v1/market/venues/telemetry")
+        if response.status_code >= 400:
+            return {}
+        payload = response.json()
+        venues = payload.get("venues") if isinstance(payload, dict) else None
+        if not isinstance(venues, list):
+            return {}
+        return {
+            str(item.get("venue") or "unknown"): item
+            for item in venues
+            if isinstance(item, dict)
+        }
+    except Exception:
+        return {}
 
 
 def _simulate_fills(
@@ -1013,6 +1846,75 @@ async def health() -> dict:
     }
 
 
+@app.get("/v1/routes/venues/telemetry")
+async def route_venue_telemetry(lookback_minutes: int = 120) -> dict:
+    window_minutes = max(5, min(1440, int(lookback_minutes)))
+    market_venues = await _fetch_market_venue_telemetry()
+    execution_rows = fetch_all(
+        """
+        SELECT
+          venue,
+          COUNT(*) AS fill_count,
+          COUNT(DISTINCT instrument) AS instrument_count,
+          AVG(COALESCE(slippage_bps, 0.0)) AS avg_slippage_bps,
+          AVG(COALESCE(fill_latency_ms, 0)) AS avg_fill_latency_ms,
+          AVG(COALESCE(NULLIF(payload->>'fill_quality_score', '')::double precision, GREATEST(0.0, 100.0 - COALESCE(slippage_bps, 0.0) * 2.0))) AS avg_fill_quality_score,
+          MAX(filled_at) AS last_fill_at
+        FROM execution_fill_events
+        WHERE filled_at >= NOW() - (%s || ' minutes')::interval
+        GROUP BY venue
+        ORDER BY venue
+        """,
+        (window_minutes,),
+    )
+    execution_by_venue = {
+        str(row.get("venue") or "unknown"): row
+        for row in execution_rows
+    }
+    all_venues = sorted(set(market_venues.keys()) | set(execution_by_venue.keys()) | set(VENUE_STABILITY.keys()))
+    return {
+        "status": "ok",
+        "lookback_minutes": window_minutes,
+        "venues": [
+            {
+                "venue": venue,
+                "market": market_venues.get(venue),
+                "execution": (
+                    {
+                        "fill_count": int(execution_by_venue[venue].get("fill_count") or 0),
+                        "instrument_count": int(execution_by_venue[venue].get("instrument_count") or 0),
+                        "avg_slippage_bps": round(_to_float(execution_by_venue[venue].get("avg_slippage_bps"), 0.0), 3),
+                        "avg_fill_latency_ms": round(_to_float(execution_by_venue[venue].get("avg_fill_latency_ms"), 0.0), 1),
+                        "avg_fill_quality_score": round(_to_float(execution_by_venue[venue].get("avg_fill_quality_score"), 0.0), 2),
+                        "last_fill_at": execution_by_venue[venue].get("last_fill_at"),
+                    }
+                    if venue in execution_by_venue
+                    else None
+                ),
+                "stability": VENUE_STABILITY.get(venue),
+                "profile": _venue_execution_profile(venue),
+            }
+            for venue in all_venues
+        ],
+        "updated_at": _now_iso(),
+    }
+
+
+@app.get("/v1/execution-optimizer/live-state")
+async def execution_optimizer_live_state() -> dict:
+    profiles = _load_execution_optimizer_profiles()
+    persisted_active_orders = _load_persisted_active_execution_orders(limit=20)
+    persisted_recent_events = _load_recent_execution_optimizer_events(limit=20)
+    return {
+        "status": "ok",
+        "updated_at": _now_iso(),
+        "profiles_updated_at": EXECUTION_OPTIMIZER_PROFILE_CACHE.get("updated_at"),
+        "profiles": profiles,
+        "active_orders": persisted_active_orders,
+        "recent_events": persisted_recent_events,
+    }
+
+
 @app.get("/v1/routes/score")
 async def route_score(symbol: str, infra_health: float | None = None, network_regime: str | None = None) -> dict:
     resolved_infra = _resolve_infra_context(
@@ -1061,6 +1963,7 @@ async def place_routed_order(payload: dict) -> dict:
     failure_attribution = _build_route_failure_attribution(candidates, context, resolved_infra)
     route_preferences = _resolve_route_preferences(payload)
     pre_trade_memory_gate = _extract_pre_trade_memory_gate(payload)
+    ranked_candidates = _rank_route_candidates(candidates, side, route_preferences)
     selected, backup, route_reason, route_selection = _select_route_candidates(
         candidates,
         side,
@@ -1070,17 +1973,95 @@ async def place_routed_order(payload: dict) -> dict:
 
     decision_id = str(payload.get("decision_id") or f"route-{uuid4()}")
     live_context = _live_execution_context(payload)
+    evaluated_candidates = [
+        {
+            "candidate": candidate,
+            "snapshot": build_execution_optimizer_snapshot(
+                candidate,
+                side,
+                notional,
+                str(route_preferences.get("execution_style") or "default"),
+                str(live_context.get("order_type") or "MARKET"),
+                _to_float(live_context.get("price"), 0.0),
+                desk_profile=_execution_optimizer_profile_for_venue(str(candidate.get("venue") or "unknown")),
+            ),
+        }
+        for candidate in ranked_candidates
+    ]
+    selected_entry = next(
+        (
+            entry
+            for entry in evaluated_candidates
+            if str(entry["candidate"].get("venue") or "") == str(selected.get("venue") or "")
+        ),
+        None,
+    )
+    if selected_entry is None or not execution_optimizer_allows_trade(selected_entry["snapshot"]):
+        selected_entry = next((entry for entry in evaluated_candidates if execution_optimizer_allows_trade(entry["snapshot"])), None)
+        if selected_entry is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "status": "execution_optimizer_v3_blocked",
+                    "decision_id": decision_id,
+                    "symbol": symbol,
+                    "side": side,
+                    "requested_notional_usd": notional,
+                    "selected_venue": str(selected.get("venue") or ""),
+                    "execution_style": str(route_preferences.get("execution_style") or "default"),
+                    "candidates": [
+                        _compact_execution_optimizer_candidate(entry["candidate"], entry["snapshot"])
+                        for entry in evaluated_candidates[:5]
+                    ],
+                },
+            )
+        if str(selected.get("venue") or "") != str(selected_entry["candidate"].get("venue") or ""):
+            route_reason = f"execution_optimizer_v3_fallback_{route_reason}"
+        selected = selected_entry["candidate"]
+    selected_optimizer_v3 = selected_entry["snapshot"] if isinstance(selected_entry, dict) else {}
+    backup_entry = next(
+        (
+            entry
+            for entry in evaluated_candidates
+            if str(entry["candidate"].get("venue") or "") != str(selected.get("venue") or "")
+            and execution_optimizer_allows_trade(entry["snapshot"])
+        ),
+        None,
+    )
+    if backup_entry is not None:
+        backup = backup_entry["candidate"]
+    backup_optimizer_v3 = backup_entry["snapshot"] if isinstance(backup_entry, dict) else {}
+    route_selection["execution_optimizer_v3"] = {
+        "selected_venue": str(selected.get("venue") or "unknown"),
+        "fallback_used": str(selected.get("venue") or "") != str((context.get("best") or {}).get("venue") or ""),
+        "evaluated": [
+            _compact_execution_optimizer_candidate(entry["candidate"], entry["snapshot"])
+            for entry in evaluated_candidates[:5]
+        ],
+    }
+    effective_live_context = apply_order_management_to_live_context(live_context, selected_optimizer_v3) if bool(live_context.get("enabled")) else live_context
     if execution_delay_ms > 0:
         await asyncio.sleep(execution_delay_ms / 1000.0)
 
     broker_order: dict[str, object] | None = None
     if bool(live_context.get("enabled")):
-        broker_order = await _execute_live_order(payload, live_context, decision_id)
+        broker_order = await _execute_live_order(payload, effective_live_context, decision_id)
         fills = _as_list(broker_order.get("fills"))
         avg_fill_price = _to_float(broker_order.get("avg_fill_price"), 0.0)
         filled_notional = _to_float(broker_order.get("filled_notional_usd"), 0.0)
         order_status = str(broker_order.get("status") or "unknown")
-        actual_venue = str(broker_order.get("venue") or live_context.get("provider") or selected.get("venue") or "unknown")
+        actual_venue = str(broker_order.get("venue") or effective_live_context.get("provider") or selected.get("venue") or "unknown")
+        if _live_order_open(order_status):
+            ACTIVE_EXECUTION_ORDER_TASKS[decision_id] = asyncio.create_task(
+                _run_execution_optimizer_live_loop(
+                    payload=payload,
+                    live_context=effective_live_context,
+                    broker_order=broker_order,
+                    selected_candidate=selected,
+                    route_preferences=route_preferences,
+                    decision_id=decision_id,
+                )
+            )
     else:
         fills, avg_fill_price = _simulate_fills(
             decision_id=decision_id,
@@ -1097,7 +2078,7 @@ async def place_routed_order(payload: dict) -> dict:
 
     spread_bps = _to_float(selected.get("spread_bps"), 0.0)
     reference_price = _to_float(selected.get("best_ask" if side == "buy" else "best_bid"), avg_fill_price)
-    expected_slippage_bps = max(0.2, spread_bps * 0.7)
+    expected_slippage_bps = max(0.2, _to_float(selected_optimizer_v3.get("expected_slippage_bps"), 0.0), spread_bps * 0.7)
     realized_slippage_bps = abs(avg_fill_price - reference_price) / max(reference_price, 1e-9) * 10000 if avg_fill_price > 0 and reference_price > 0 else 0.0
     fill_quality_score = max(0.0, 100.0 - spread_bps * 1.6 - realized_slippage_bps * 2.0)
 
@@ -1140,15 +2121,25 @@ async def place_routed_order(payload: dict) -> dict:
             "pre_trade_memory_gate": pre_trade_memory_gate,
             "live_execution": {
                 "enabled": bool(live_context.get("enabled")),
-                "provider": live_context.get("provider"),
-                "account_id": live_context.get("account_id"),
-                "position_side": live_context.get("position_side"),
+                "provider": effective_live_context.get("provider"),
+                "account_id": effective_live_context.get("account_id"),
+                "position_side": effective_live_context.get("position_side"),
+                "order_type": effective_live_context.get("order_type"),
+                "price": effective_live_context.get("price"),
             },
             "route": {
                 "chosen": str(selected.get("venue") or actual_venue),
                 "backup": str(backup.get("venue") or "") if isinstance(backup, dict) else "",
                 "reason": route_reason,
             },
+            "execution_optimizer_v3": {
+                "selected": selected_optimizer_v3,
+                "backup": backup_optimizer_v3,
+                "profile": selected_optimizer_v3.get("desk_profile") if isinstance(selected_optimizer_v3.get("desk_profile"), dict) else {},
+            },
+            "expected_slippage_bps": expected_slippage_bps,
+            "realized_slippage_bps": realized_slippage_bps,
+            "fill_quality_score": fill_quality_score,
         }
         execute(
             """
@@ -1210,9 +2201,16 @@ async def place_routed_order(payload: dict) -> dict:
         "fills": fills,
         "live_execution": {
             "enabled": bool(live_context.get("enabled")),
-            "provider": live_context.get("provider"),
-            "account_id": live_context.get("account_id"),
-            "position_side": live_context.get("position_side"),
+            "provider": effective_live_context.get("provider"),
+            "account_id": effective_live_context.get("account_id"),
+            "position_side": effective_live_context.get("position_side"),
+            "order_type": effective_live_context.get("order_type"),
+            "price": effective_live_context.get("price"),
+        },
+        "execution_optimizer_v3": {
+            "selected": selected_optimizer_v3,
+            "backup": backup_optimizer_v3,
+            "profile": selected_optimizer_v3.get("desk_profile") if isinstance(selected_optimizer_v3.get("desk_profile"), dict) else {},
         },
         "pre_trade_memory_gate": pre_trade_memory_gate,
         "broker_order": broker_order,
