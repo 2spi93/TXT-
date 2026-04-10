@@ -1,6 +1,7 @@
 import Link from "next/link";
 
 import TxtMiniGuide from "../../components/ui/TxtMiniGuide";
+import TxtWorkspaceHelper from "../../components/ui/TxtWorkspaceHelper";
 
 const TOPICS = [
   "Comprendre les bougies",
@@ -27,6 +28,8 @@ export default function LearnPage() {
           terms={["dom", "footprint", "vwap"]}
         />
       </section>
+
+      <TxtWorkspaceHelper />
 
       <section className="grid" style={{ gridTemplateColumns: "repeat(3, minmax(0, 1fr))" }}>
         {TOPICS.map((topic) => (

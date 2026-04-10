@@ -2,6 +2,9 @@
 
 import { useEffect, useState } from "react";
 
+import HelpHint from "../../../components/HelpHint";
+import TxtMiniGuide from "../../../components/ui/TxtMiniGuide";
+
 type JsonMap = Record<string, unknown>;
 
 type RuntimeStatus = {
@@ -252,12 +255,18 @@ export default function KairosShadowClient() {
       <section className="panel" style={{ padding: 18, display: "grid", gap: 12 }}>
         <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "start", flexWrap: "wrap" }}>
           <div style={{ display: "grid", gap: 6 }}>
-            <span className="eyebrow">Kairos Shadow Runtime</span>
+            <span className="eyebrow">Kairos Shadow Runtime <HelpHint text="Cette page montre ce que Kairos aurait voulu faire, sans envoyer de vrai ordre." examples={["Tu peux voir si le moteur voulait acheter, vendre ou ne rien faire.", "Tu peux aussi comparer la decision, le filtre memoire et le resultat du test rapide."]} /></span>
             <h1 style={{ margin: 0 }}>Cycles shadow et recommandations mémoire</h1>
             <p className="subtle" style={{ margin: 0, maxWidth: 880 }}>
               Cette vue lit le journal SQL du premier loop Kairos shadow. Aucun ordre réel n’est envoyé ici: la page affiche les cycles,
               les décisions, le verdict predictor, et la recommandation Memory V2 appliquée ou non.
             </p>
+            <TxtMiniGuide
+              title="Guide Kairos"
+              what="Une lecture simple de ce que Kairos aurait fait en mode observation."
+              why="Verifier le comportement du moteur avant d'autoriser un usage plus sensible."
+              example="Regarde une decision recente, puis compare le sens choisi, le filtre memoire et les raisons du blocage ou du passage."
+            />
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <button type="button" className="btn" onClick={() => void runAction("/api/ai/kairos/shadow/start")} disabled={acting}>

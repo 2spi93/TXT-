@@ -9,7 +9,7 @@ type HelpHintProps = {
   label?: string;
 };
 
-export default function HelpHint({ text, examples = [], label = "A quoi sert ce bloc ?" }: HelpHintProps) {
+export default function HelpHint({ text, examples = [], label = "Pour lire ce bloc" }: HelpHintProps) {
   const [uiMode] = useUiMode();
 
   return (
@@ -19,7 +19,7 @@ export default function HelpHint({ text, examples = [], label = "A quoi sert ce 
         label,
         simple: text,
         example: examples.join(" "),
-        whyItMatters: "Utilise ce repère pour interpréter le bloc sans dérouler toute la logique métier.",
+        whyItMatters: "Lis cette aide pour comprendre rapidement ce que montre le bloc et ce qu'il faut regarder.",
       }}
     />
   );
