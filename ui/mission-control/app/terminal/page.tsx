@@ -166,6 +166,7 @@ import {
 import { isWebGL2Available } from "../../lib/engine/gpu-chart/context";
 import {
   ControlRoomMonitoringPanel,
+  ExecutionAiV6ObservabilityPanel,
   ExecutionOptimizerMonitoringPanel,
   AlertsDockPanel,
   BlotterDockPanel,
@@ -4188,6 +4189,7 @@ export default function TradingTerminalPage() {
   const [externalKillSwitchPayload, setExternalKillSwitchPayload] = useState<JsonMap | null>(null);
   const [liveOpsPayload, setLiveOpsPayload] = useState<JsonMap | null>(null);
   const [executionOptimizerLivePayload, setExecutionOptimizerLivePayload] = useState<JsonMap | null>(null);
+  const [executionAiV6Payload, setExecutionAiV6Payload] = useState<JsonMap | null>(null);
   const [marketVenueTelemetryPayload, setMarketVenueTelemetryPayload] = useState<JsonMap | null>(null);
   const [routeVenueTelemetryPayload, setRouteVenueTelemetryPayload] = useState<JsonMap | null>(null);
   const [incidents, setIncidents] = useState<JsonMap[]>([]);
@@ -6742,13 +6744,16 @@ export default function TradingTerminalPage() {
       }
     };
 
-    const [snapshotPayload, readinessPayload, aiPayload, overviewPayload, liveOpsResponsePayload, executionOptimizerLiveResponsePayload, marketVenueTelemetryResponsePayload, routeVenueTelemetryResponsePayload, incidentPayload, pendingPayload, outcomePayload, mt5Payload, quotesPayload, positionsPayload, balancePayload, performanceSummaryPayload, performanceAttributionPayload, accountsPayload, connectorAccountsPayload, investorReportsPayload] = await Promise.all([
+    const [snapshotPayload, readinessPayload, aiPayload, overviewPayload, liveOpsResponsePayload, executionOptimizerLiveResponsePayload, executionAiV6ResponsePayload, marketVenueTelemetryResponsePayload, routeVenueTelemetryResponsePayload, incidentPayload, pendingPayload, outcomePayload, mt5Payload, quotesPayload, positionsPayload, balancePayload, performanceSummaryPayload, performanceAttributionPayload, accountsPayload, connectorAccountsPayload, investorReportsPayload] = await Promise.all([
       fetchMaybeUnauthorized("/api/connectors/status"),
       fetchMaybeUnauthorized("/api/live-readiness/overview"),
       fetchMaybeUnauthorized("/api/ai/health"),
       fetchMaybeUnauthorized("/api/dashboard/overview"),
       fetchMaybeUnauthorized("/api/system/live-ops"),
       fetchMaybeUnauthorized("/api/execution/optimizer/live-state", {
+        headers: buildRoutingRequestHeaders("ui", selectedChartSymbol),
+      }).catch(() => null),
+      fetchMaybeUnauthorized("/api/execution/ai/v6/state", {
         headers: buildRoutingRequestHeaders("ui", selectedChartSymbol),
       }).catch(() => null),
       fetchMaybeUnauthorized("/api/market/venues/telemetry").catch(() => null),
@@ -6786,6 +6791,7 @@ export default function TradingTerminalPage() {
     setOverview(overviewPayload && typeof overviewPayload === "object" ? (overviewPayload as JsonMap) : null);
     setLiveOpsPayload(liveOpsResponsePayload && typeof liveOpsResponsePayload === "object" ? (liveOpsResponsePayload as JsonMap) : null);
     setExecutionOptimizerLivePayload(executionOptimizerLiveResponsePayload && typeof executionOptimizerLiveResponsePayload === "object" ? (executionOptimizerLiveResponsePayload as JsonMap) : null);
+    setExecutionAiV6Payload(executionAiV6ResponsePayload && typeof executionAiV6ResponsePayload === "object" ? (executionAiV6ResponsePayload as JsonMap) : null);
     setMarketVenueTelemetryPayload(marketVenueTelemetryResponsePayload && typeof marketVenueTelemetryResponsePayload === "object" ? (marketVenueTelemetryResponsePayload as JsonMap) : null);
     setRouteVenueTelemetryPayload(routeVenueTelemetryResponsePayload && typeof routeVenueTelemetryResponsePayload === "object" ? (routeVenueTelemetryResponsePayload as JsonMap) : null);
     const incidentItems = incidentPayload && typeof incidentPayload === "object"
@@ -9114,7 +9120,35 @@ export default function TradingTerminalPage() {
     type: String(item.code || item.type || "live_ops"),
     message: String(item.message || item.detail || item.code || "live ops alert"),
   }));
-  const operatorAlerts = [...liveOpsAlerts, ...alerts];
+  const executionAiV6AlertEnvelope = executionAiV6Payload && typeof executionAiV6Payload === "object"
+    ? executionAiV6Payload
+    : routingScore?.execution_ai_v6 && typeof routingScore.execution_ai_v6 === "object"
+      ? routingScore.execution_ai_v6 as JsonMap
+      : null;
+  const executionAiV6AlertSnapshot = asJsonMap(executionAiV6AlertEnvelope?.snapshot);
+  const executionAiV6AlertGuardrails = asJsonMap(executionAiV6AlertSnapshot.guardrails);
+  const executionAiV6FreezeReasons = asJsonArray(executionAiV6AlertGuardrails.freeze_reasons)
+    .map((item) => String(item).trim())
+    .filter(Boolean);
+  const executionAiV6Alerts = [
+    typeof executionAiV6AlertGuardrails.persistence_available === "boolean" && !executionAiV6AlertGuardrails.persistence_available
+      ? {
+        level: "critical",
+        type: "execution_ai_v6_db",
+        message: String(executionAiV6AlertGuardrails.last_persist_error || "Execution AI V6 persistence degraded"),
+      }
+      : null,
+    Boolean(executionAiV6AlertGuardrails.learning_frozen) || executionAiV6FreezeReasons.length > 0
+      ? {
+        level: "warn",
+        type: "execution_ai_v6_guardrails",
+        message: executionAiV6FreezeReasons.length > 0
+          ? `Learning frozen: ${executionAiV6FreezeReasons.slice(0, 2).join(" · ")}`
+          : "Execution AI V6 learning frozen",
+      }
+      : null,
+  ].filter(Boolean) as Array<{ level: string; type: string; message: string }>;
+  const operatorAlerts = [...executionAiV6Alerts, ...liveOpsAlerts, ...alerts];
   const snapshotLinkedAccounts = (snapshot?.linked_accounts as JsonMap[] | undefined) || [];
   const providerRows = (((aiHealth?.providers as JsonMap | undefined)?.providers as JsonMap[] | undefined) || []).slice(0, 8);
   const drift = (readiness?.drift as JsonMap | undefined) || {};
@@ -14327,6 +14361,9 @@ export default function TradingTerminalPage() {
   }), [aggregatedMultiVenueBook, aiAdjustedAutoNotionalUsd, autoExecutionMode, notional, side]);
   const preferredRoute = (routingScore?.best as JsonMap | undefined) || routeCandidates[0] || null;
   const backupRoute = (routingScore?.backup as JsonMap | undefined) || routeCandidates[1] || null;
+  const executionAiV6StandaloneSnapshot = executionAiV6Payload?.snapshot && typeof executionAiV6Payload.snapshot === "object"
+    ? executionAiV6Payload.snapshot as JsonMap
+    : null;
   const routingExecutionAiV6 = routingScore?.execution_ai_v6 && typeof routingScore.execution_ai_v6 === "object"
     ? routingScore.execution_ai_v6 as JsonMap
     : null;
@@ -14338,7 +14375,7 @@ export default function TradingTerminalPage() {
     : null;
   const routingExecutionAiV6Snapshot = routingExecutionAiV6?.snapshot && typeof routingExecutionAiV6.snapshot === "object"
     ? routingExecutionAiV6.snapshot as JsonMap
-    : null;
+    : executionAiV6StandaloneSnapshot;
   const routingExecutionAiV6Guardrails = routingExecutionAiV6Decision?.guardrails && typeof routingExecutionAiV6Decision.guardrails === "object"
     ? routingExecutionAiV6Decision.guardrails as JsonMap
     : routingExecutionAiV6Snapshot?.guardrails && typeof routingExecutionAiV6Snapshot.guardrails === "object"
@@ -19660,9 +19697,11 @@ export default function TradingTerminalPage() {
       case "brokers":
         return <BrokersDockPanel providerRows={providerRows} balances={balances} positions={positions} instrumentLabel={instrumentLabel} omsLifecycle={omsLifecycleSummary} portfolioOverlay={portfolioOverlaySummary} aiBridge={aiBridgeSummary} />;
       case "controlroom":
-        return <ControlRoomMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} liveOpsPayload={liveOpsPayload} emergencyStopBusy={emergencyStopBusy} emergencyStopFeedback={emergencyStopFeedback} onEmergencyStop={() => { void triggerEmergencyStop(); }} formatClock={formatClock} />;
+        return <ControlRoomMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} liveOpsPayload={liveOpsPayload} executionAiV6Payload={executionAiV6Payload} emergencyStopBusy={emergencyStopBusy} emergencyStopFeedback={emergencyStopFeedback} onEmergencyStop={() => { void triggerEmergencyStop(); }} formatClock={formatClock} />;
       case "optimizer":
         return <ExecutionOptimizerMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} payload={executionOptimizerLivePayload} routingPayload={routingScore} formatClock={formatClock} />;
+      case "v6observability":
+        return <ExecutionAiV6ObservabilityPanel badge={null} layoutEditMode={false} onDetach={() => {}} payload={executionAiV6Payload} formatClock={formatClock} />;
       case "venues":
         return <VenueTelemetryMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} marketPayload={marketVenueTelemetryPayload} routePayload={routeVenueTelemetryPayload} formatClock={formatClock} />;
       case "alerts":
@@ -22335,6 +22374,7 @@ export default function TradingTerminalPage() {
               layoutEditMode={layoutEditMode}
               onDetach={() => detachPanel("controlroom", "monitoring")}
               liveOpsPayload={liveOpsPayload}
+              executionAiV6Payload={executionAiV6Payload}
               emergencyStopBusy={emergencyStopBusy}
               emergencyStopFeedback={emergencyStopFeedback}
               onEmergencyStop={() => { void triggerEmergencyStop(); }}
@@ -22356,6 +22396,23 @@ export default function TradingTerminalPage() {
               onDetach={() => detachPanel("optimizer", "monitoring")}
               payload={executionOptimizerLivePayload}
               routingPayload={routingScore}
+              formatClock={formatClock}
+            />
+            </div>
+            <div
+              className={`layout-draggable-card${layoutEditMode ? " is-edit" : ""}${layoutDropPreview?.zone === "monitoring" && layoutDropPreview.targetId === "v6observability" ? " is-drop-target" : ""}`}
+              draggable={layoutEditMode}
+              onDragStart={() => { layoutDragRef.current = { zone: "monitoring", id: "v6observability" }; setLayoutDropPreview({ zone: "monitoring", targetId: "v6observability", mode: "panel" }); }}
+              onDragEnd={() => { layoutDragRef.current = null; setLayoutDropPreview(null); }}
+              onDragOver={(event) => { if (layoutEditMode) { event.preventDefault(); setLayoutDropPreview({ zone: "monitoring", targetId: "v6observability", mode: "panel" }); } }}
+              onDrop={() => handleLayoutDrop("monitoring", "v6observability")}
+              style={{ order: monitoringOrderById.v6observability ?? 1, display: floatingPanels.some((fp) => fp.id === "v6observability") ? "none" : undefined }}
+            >
+            <ExecutionAiV6ObservabilityPanel
+              badge={publicOpsPanelBadge}
+              layoutEditMode={layoutEditMode}
+              onDetach={() => detachPanel("v6observability", "monitoring")}
+              payload={executionAiV6Payload}
               formatClock={formatClock}
             />
             </div>

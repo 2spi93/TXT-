@@ -90,6 +90,8 @@ type AiBridgeSummary = {
   reasonLabel: string;
 };
 
+type ExecutionAiV6PanelPayload = Record<string, unknown>;
+
 function safeNumber(value: unknown, fallback = 0): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
@@ -321,6 +323,10 @@ const PANEL_HINTS: Record<string, { text: string; examples: string[] }> = {
   "H24 Control Room": {
     text: "Salle de controle live: watchdog, gouvernance, memory gate, recovery, audit et warfare core sur un seul panneau.",
     examples: ["Si le watchdog passe en HALT, le bouton rouge doit etre considere comme prioritaire.", "Croiser health score, market state et audit trail avant toute promotion live."],
+  },
+  "Execution AI V6.1": {
+    text: "Observabilite du moteur d'execution V6: persistence DB, guardrails, top actions apprises et episodes recents.",
+    examples: ["Si la DB passe en degrade, l'alerte doit etre visible meme sans routing score actif.", "Les top actions et freeze reasons montrent si le moteur apprend encore ou s'est auto-protege."],
   },
   "Venue Telemetry": {
     text: "Rassemble la sante feed et execution par venue: fraicheur quotes/depth/trades, spread, slippage, fill quality et contraintes de route.",
@@ -798,6 +804,7 @@ export function ControlRoomMonitoringPanel({
   layoutEditMode,
   onDetach,
   liveOpsPayload,
+  executionAiV6Payload,
   emergencyStopBusy,
   emergencyStopFeedback,
   onEmergencyStop,
@@ -807,6 +814,7 @@ export function ControlRoomMonitoringPanel({
   layoutEditMode: boolean;
   onDetach: () => void;
   liveOpsPayload: Record<string, unknown> | null;
+  executionAiV6Payload?: ExecutionAiV6PanelPayload | null;
   emergencyStopBusy: boolean;
   emergencyStopFeedback: string | null;
   onEmergencyStop: () => void;
@@ -828,7 +836,13 @@ export function ControlRoomMonitoringPanel({
   const riskTimeline = safeRows(snapshot.risk_timeline).slice(0, 3);
   const exposureRows = safeRows(risk.exposure_by_symbol).slice(0, 3);
   const venueRankings = safeRows(arbitrage.rankings).slice(0, 4);
+  const executionAiV6Envelope = safeRecord(executionAiV6Payload);
+  const executionAiV6Snapshot = safeRecord(executionAiV6Envelope.snapshot);
+  const executionAiV6Guardrails = safeRecord(executionAiV6Snapshot.guardrails);
   const watchdogTriggers = Array.isArray(watchdog.triggers) ? watchdog.triggers.map((item) => String(item)).filter(Boolean).slice(0, 4) : [];
+  const executionAiV6FreezeReasons = Array.isArray(executionAiV6Guardrails.freeze_reasons)
+    ? executionAiV6Guardrails.freeze_reasons.map((item) => String(item)).filter(Boolean).slice(0, 3)
+    : [];
   const healthScore = safeNumber(watchdog.health_score, 0);
   const watchdogStatus = String(watchdog.status || "UNKNOWN");
   const systemMode = String(governance.mode || "SAFE");
@@ -839,6 +853,9 @@ export function ControlRoomMonitoringPanel({
   const arbitrageExecutable = Boolean(arbitrage.executable);
   const arbitrageEdge = safeNumber(arbitrage.netEdgeBps, 0);
   const executableDepthUsd = safeNumber(arbitrage.maxExecutableUsd, 0);
+  const executionAiV6PersistenceAvailable = typeof executionAiV6Guardrails.persistence_available === "boolean"
+    ? Boolean(executionAiV6Guardrails.persistence_available)
+    : true;
 
   return (
     <MonitoringPanelCard title="H24 Control Room" badge={badge} layoutEditMode={layoutEditMode} onDetach={onDetach}>
@@ -862,9 +879,13 @@ export function ControlRoomMonitoringPanel({
           <div className="mon-row"><span>Slippage / day use</span><span>{safeNumber(risk.avg_slippage_bps, 0).toFixed(2)}bps · {formatCompactUsd(risk.daily_used_usd)}</span></div>
           <div className="mon-row"><span>Market state</span><span className={toneClass(marketStateLabel, "TREND", "TRAP|HIGH_VOL|DEAD")}>{marketStateLabel} · {(safeNumber(marketState.confidence, 0) * 100).toFixed(0)}%</span></div>
           <div className="mon-row"><span>Warfare</span><span>{String(smartMoney.state || "INACTIVE")} / {String(spoof.state || "CLEAR")} / {dominationState}</span></div>
+          <div className="mon-row"><span>Execution AI V6</span><span className={executionAiV6PersistenceAvailable ? "good" : "warn"}>{executionAiV6PersistenceAvailable ? "DB online" : "DB degraded"}</span></div>
+          <div className="mon-row"><span>V6 guardrails</span><span className={Boolean(executionAiV6Guardrails.learning_frozen) ? "warn" : "good"}>{Boolean(executionAiV6Guardrails.learning_frozen) ? "frozen" : "active"} · {safeNumber(executionAiV6Snapshot.context_count, 0).toFixed(0)} ctx</span></div>
           <div className="mon-row"><span>Arbitrage</span><span className={arbitrageExecutable && arbitrageEdge > 0 ? "good" : "subtle"}>{arbitrageExecutable ? `${String(arbitrage.buyVenue || "buy")} → ${String(arbitrage.sellVenue || "sell")} · +${arbitrageEdge.toFixed(2)}bps` : "standby"}</span></div>
           <div className="mon-row"><span>Executable depth</span><span className={executableDepthUsd > 0 ? "good" : "subtle"}>{formatCompactUsd(executableDepthUsd)}</span></div>
           {watchdogTriggers.length > 0 ? <div className="subtle mini" style={{ marginTop: 6 }}>Triggers: {watchdogTriggers.join(" · ")}</div> : null}
+          {executionAiV6FreezeReasons.length > 0 ? <div className="subtle mini warn" style={{ marginTop: 6 }}>V6 freeze: {executionAiV6FreezeReasons.join(" · ")}</div> : null}
+          {!executionAiV6PersistenceAvailable && String(executionAiV6Guardrails.last_persist_error || "") ? <div className="subtle mini warn" style={{ marginTop: 4 }}>V6 DB: {String(executionAiV6Guardrails.last_persist_error || "")}</div> : null}
           <div style={{ display: "flex", gap: 8, marginTop: 10, marginBottom: 8 }}>
             <button type="button" className="chart-chip" onClick={onEmergencyStop} disabled={emergencyStopBusy} style={{ color: "#ffd5d5", borderColor: "rgba(248, 113, 113, 0.5)" }}>
               {emergencyStopBusy ? "Emergency stop..." : "Emergency stop"}
@@ -915,6 +936,92 @@ export function ControlRoomMonitoringPanel({
                 <span>{String(row.at) ? formatClock(String(row.at)) : "--:--:--"}</span>
                 <span className="subtle mini">{String(row.exposure_symbol || "BOOK").slice(0, 10)}</span>
                 <span className={safeNumber(row.dd_pct, 0) >= 2 ? "warn" : "subtle"}>{safeNumber(row.dd_pct, 0).toFixed(2)}%</span>
+              </div>
+            ))}
+          </div>
+        </>
+      ) : null}
+    </MonitoringPanelCard>
+  );
+}
+
+export function ExecutionAiV6ObservabilityPanel({
+  badge,
+  layoutEditMode,
+  onDetach,
+  payload,
+  formatClock,
+}: {
+  badge: ReactNode;
+  layoutEditMode: boolean;
+  onDetach: () => void;
+  payload: ExecutionAiV6PanelPayload | null;
+  formatClock: (value: string) => string;
+}) {
+  const envelope = safeRecord(payload);
+  const snapshot = safeRecord(envelope.snapshot);
+  const guardrails = safeRecord(snapshot.guardrails);
+  const topActions = safeRows(snapshot.top_actions).slice(0, 5);
+  const recentEpisodes = safeRows(snapshot.recent_episodes).slice(0, 6);
+  const freezeReasons = Array.isArray(guardrails.freeze_reasons)
+    ? guardrails.freeze_reasons.map((item) => String(item)).filter(Boolean).slice(0, 4)
+    : [];
+  const persistenceAvailable = typeof guardrails.persistence_available === "boolean"
+    ? Boolean(guardrails.persistence_available)
+    : true;
+
+  return (
+    <MonitoringPanelCard title="Execution AI V6.1" badge={badge} layoutEditMode={layoutEditMode} onDetach={onDetach}>
+      {!payload ? <p className="subtle mini">Observabilite V6 indisponible.</p> : null}
+      {payload ? (
+        <>
+          <div className="venue-telemetry-summary">
+            <span className={`venue-telemetry-pill ${persistenceAvailable ? "" : "warn"}`}>{persistenceAvailable ? "db online" : "db degraded"}</span>
+            <span className="venue-telemetry-pill">ctx {safeNumber(snapshot.context_count, 0).toFixed(0)}</span>
+            <span className="venue-telemetry-pill">ema {safeNumber(guardrails.reward_ema, 0).toFixed(2)}</span>
+            <span className="venue-telemetry-pill">dd {safeNumber(guardrails.reward_drawdown, 0).toFixed(2)}</span>
+          </div>
+          <div className="optimizer-live-grid">
+            <div className={`venue-telemetry-item ${persistenceAvailable ? "subtle" : "warn"}`}>
+              <div className="venue-telemetry-head">
+                <span className="venue-telemetry-venue">Persistence</span>
+                <span className={`venue-telemetry-state ${persistenceAvailable ? "subtle" : "warn"}`}>{persistenceAvailable ? "online" : "degraded"}</span>
+              </div>
+              <div className="mon-row"><span>Loaded</span><span>{Boolean(guardrails.loaded) ? formatCompactClock(guardrails.loaded_at, formatClock) : "cold"}</span></div>
+              <div className="mon-row"><span>Vol / streak</span><span>{safeNumber(guardrails.reward_volatility, 0).toFixed(2)} · {safeNumber(guardrails.negative_streak, 0).toFixed(0)} neg</span></div>
+              {!persistenceAvailable && String(guardrails.last_persist_error || "") ? <div className="warn mini gtix-ellipsis">{String(guardrails.last_persist_error || "")}</div> : null}
+            </div>
+            <div className={`venue-telemetry-item ${Boolean(guardrails.learning_frozen) ? "warn" : "good"}`}>
+              <div className="venue-telemetry-head">
+                <span className="venue-telemetry-venue">Guardrails</span>
+                <span className={`venue-telemetry-state ${Boolean(guardrails.learning_frozen) ? "warn" : "good"}`}>{Boolean(guardrails.learning_frozen) ? "frozen" : "active"}</span>
+              </div>
+              <div className="mon-row"><span>EMA / drawdown</span><span>{safeNumber(guardrails.reward_ema, 0).toFixed(2)} · {safeNumber(guardrails.reward_drawdown, 0).toFixed(2)}</span></div>
+              <div className="optimizer-live-reasons">
+                {freezeReasons.length === 0 ? <span className="optimizer-live-chip good">no freeze</span> : null}
+                {freezeReasons.map((reason) => <span key={reason} className="optimizer-live-chip warn">{reason}</span>)}
+              </div>
+            </div>
+          </div>
+          <div className="optimizer-live-section">
+            <div className="subtle mini">Top actions</div>
+            {topActions.length === 0 ? <p className="subtle mini">Aucune action apprise.</p> : null}
+            {topActions.map((row) => (
+              <div key={`v6-action-${String(row.action || "hold")}`} className="mon-row">
+                <span>{String(row.action || "hold")}</span>
+                <span className="subtle mini">reward {safeNumber(row.avg_reward, 0).toFixed(2)} · win {(safeNumber(row.win_rate, 0) * 100).toFixed(0)}%</span>
+                <span>{safeNumber(row.sample_count, 0).toFixed(0)} ep</span>
+              </div>
+            ))}
+          </div>
+          <div className="optimizer-live-section">
+            <div className="subtle mini">Recent episodes</div>
+            {recentEpisodes.length === 0 ? <p className="subtle mini">Aucun episode recent.</p> : null}
+            {recentEpisodes.map((row, index) => (
+              <div key={`v6-episode-row-${index}`} className="mon-row">
+                <span>{String(row.timestamp || "") ? formatCompactClock(row.timestamp, formatClock) : "--:--:--"}</span>
+                <span className="subtle mini">{String(row.action || "hold")}</span>
+                <span className={safeNumber(row.reward, 0) >= 0 ? "good" : "warn"}>{safeNumber(row.reward, 0).toFixed(2)}</span>
               </div>
             ))}
           </div>
