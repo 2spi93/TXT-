@@ -1521,6 +1521,56 @@ type RenderUpdateCounts = {
   overlay: number;
 };
 
+type ContinuityMode = "idle" | "series-and-overlay" | "overlay-only";
+
+type LiveRenderContinuityStats = {
+  liveFrames: number;
+  renderedFrames: number;
+  partialFrames: number;
+  coalescedFrames: number;
+  looseSyncFrames: number;
+  rafOverwrites: number;
+  duplicateFrameSkips: number;
+  throttleDeferrals: number;
+  conflatedUpdates: number;
+  partialUpdates: number;
+  fullRedraws: number;
+  updateFallbackRedraws: number;
+  recoveryClears: number;
+  overlayContinuityStarts: number;
+  overlayContinuityFrames: number;
+  overlayContinuitySettles: number;
+  jumpEvents: number;
+  latestJumpPx: number;
+  peakJumpPx: number;
+  continuityMode: ContinuityMode;
+};
+
+function createLiveRenderContinuityStats(): LiveRenderContinuityStats {
+  return {
+    liveFrames: 0,
+    renderedFrames: 0,
+    partialFrames: 0,
+    coalescedFrames: 0,
+    looseSyncFrames: 0,
+    rafOverwrites: 0,
+    duplicateFrameSkips: 0,
+    throttleDeferrals: 0,
+    conflatedUpdates: 0,
+    partialUpdates: 0,
+    fullRedraws: 0,
+    updateFallbackRedraws: 0,
+    recoveryClears: 0,
+    overlayContinuityStarts: 0,
+    overlayContinuityFrames: 0,
+    overlayContinuitySettles: 0,
+    jumpEvents: 0,
+    latestJumpPx: 0,
+    peakJumpPx: 0,
+    continuityMode: "idle",
+  };
+}
+
 type VolumeProfileOverlayRow = {
   key: string;
   top: number;
@@ -2460,9 +2510,11 @@ export default function InstitutionalChart({
     minFrameMs: resolvedVisualProfile.frame.minFrameMs,
     strictBucketAlignment: resolvedVisualProfile.perception.strictBucketAlignment,
   }));
+  const liveRenderContinuityRef = useRef<LiveRenderContinuityStats>(createLiveRenderContinuityStats());
+  const intraCandleContinuityModeRef = useRef<ContinuityMode>("idle");
   const lastCommittedCandleRef = useRef<CandleRenderPoint | null>(null);
   const volatilityRef = useRef(marketVolatility);
-  const customV3RendererEnabled = mode === "candles" && ENABLE_CUSTOM_V3_CANDLE_RENDERER;
+  const customV3RendererEnabled = mode === "candles" && (perceptualDeskMode.authoritativeRenderer || ENABLE_CUSTOM_V3_CANDLE_RENDERER);
   const nativeCandlesAuthoritative = mode === "candles" && !customV3RendererEnabled;
   const customCandleCanvasActive = mode === "candles";
 
@@ -2484,6 +2536,36 @@ export default function InstitutionalChart({
       expiresAt: Date.now() + 180,
     };
   }, [resolvedVisualProfile.palette.crosshair]);
+
+  const trackRenderJump = useCallback((previous: CandleRenderPoint | null, next: CandleRenderPoint | null) => {
+    if (!previous || !next || previous.time !== next.time) {
+      return;
+    }
+    const candleSeries = candleSeriesRef.current;
+    if (!candleSeries) {
+      return;
+    }
+    const ranges = [
+      [previous.open, next.open],
+      [previous.high, next.high],
+      [previous.low, next.low],
+      [previous.close, next.close],
+    ] as const;
+    let jumpPx = 0;
+    for (const [fromPrice, toPrice] of ranges) {
+      const fromY = candleSeries.priceToCoordinate(fromPrice);
+      const toY = candleSeries.priceToCoordinate(toPrice);
+      if (fromY === null || toY === null) {
+        continue;
+      }
+      jumpPx = Math.max(jumpPx, Math.abs(toY - fromY));
+    }
+    liveRenderContinuityRef.current.latestJumpPx = jumpPx;
+    liveRenderContinuityRef.current.peakJumpPx = Math.max(liveRenderContinuityRef.current.peakJumpPx, jumpPx);
+    if (jumpPx >= 1.5) {
+      liveRenderContinuityRef.current.jumpEvents += 1;
+    }
+  }, []);
 
   const drawCustomV3CandleOverlay = useCallback(() => {
     const canvas = customCandleCanvasRef.current;
@@ -3004,6 +3086,97 @@ export default function InstitutionalChart({
     });
   }, [drawCustomV3CandleOverlay]);
 
+  const armOverlayOnlyContinuity = useCallback((previous: CandleRenderPoint | null, target: CandleRenderPoint | null) => {
+    if (!customV3RendererEnabled || !previous || !target || previous.time !== target.time) {
+      intraCandleCurrentRef.current = target;
+      intraCandleTargetRef.current = target;
+      intraCandleContinuityModeRef.current = "idle";
+      liveRenderContinuityRef.current.continuityMode = "idle";
+      scheduleCustomV3CandleOverlayDraw();
+      return;
+    }
+
+    if (intraCandleRafRef.current) {
+      window.cancelAnimationFrame(intraCandleRafRef.current);
+      intraCandleRafRef.current = null;
+    }
+
+    intraCandleFrameTsRef.current = 0;
+    intraCandleCurrentRef.current = normalizeRenderPoint(previous);
+    intraCandleTargetRef.current = normalizeRenderPoint(target);
+    intraCandleContinuityModeRef.current = "overlay-only";
+    liveRenderContinuityRef.current.continuityMode = "overlay-only";
+    liveRenderContinuityRef.current.overlayContinuityStarts += 1;
+    trackRenderJump(previous, target);
+
+    const animate = (frameTs: number) => {
+      const current = intraCandleCurrentRef.current;
+      const nextTarget = intraCandleTargetRef.current;
+      if (!current || !nextTarget || !customV3RendererEnabled) {
+        intraCandleRafRef.current = null;
+        intraCandleFrameTsRef.current = 0;
+        intraCandleContinuityModeRef.current = "idle";
+        liveRenderContinuityRef.current.continuityMode = "idle";
+        return;
+      }
+
+      const frameDeltaMs = intraCandleFrameTsRef.current > 0 ? frameTs - intraCandleFrameTsRef.current : 16.7;
+      intraCandleFrameTsRef.current = frameTs;
+      const frameScale = clamp(frameDeltaMs / 16.7, 0.65, 1.9);
+      const spread = Math.max(
+        Math.abs(nextTarget.open - current.open),
+        Math.abs(nextTarget.high - current.high),
+        Math.abs(nextTarget.low - current.low),
+        Math.abs(nextTarget.close - current.close),
+      );
+      const alphaBase = clamp(0.2 + spread * 0.01, 0.18, 0.6);
+      const alpha = 1 - Math.pow(1 - alphaBase, frameScale);
+
+      const next: CandleRenderPoint = {
+        time: nextTarget.time,
+        open: current.open + (nextTarget.open - current.open) * alpha,
+        high: current.high + (nextTarget.high - current.high) * alpha,
+        low: current.low + (nextTarget.low - current.low) * alpha,
+        close: current.close + (nextTarget.close - current.close) * alpha,
+        timeKey: nextTarget.timeKey ?? current.timeKey,
+        color: nextTarget.color ?? current.color,
+        borderColor: nextTarget.borderColor ?? current.borderColor,
+        wickColor: nextTarget.wickColor ?? current.wickColor,
+        wickType: nextTarget.wickType ?? current.wickType,
+        emphasis: nextTarget.emphasis ?? current.emphasis,
+        styleKey: nextTarget.styleKey ?? current.styleKey,
+        flow: nextTarget.flow ?? current.flow,
+      };
+      next.high = Math.max(next.high, next.open, next.close);
+      next.low = Math.min(next.low, next.open, next.close);
+      intraCandleCurrentRef.current = next;
+      liveRenderContinuityRef.current.overlayContinuityFrames += 1;
+      scheduleCustomV3CandleOverlayDraw();
+
+      const settled = Math.max(
+        Math.abs(next.open - nextTarget.open),
+        Math.abs(next.high - nextTarget.high),
+        Math.abs(next.low - nextTarget.low),
+        Math.abs(next.close - nextTarget.close),
+      ) < 1e-4;
+
+      if (settled) {
+        intraCandleRafRef.current = null;
+        intraCandleFrameTsRef.current = 0;
+        intraCandleCurrentRef.current = nextTarget;
+        intraCandleContinuityModeRef.current = "idle";
+        liveRenderContinuityRef.current.continuityMode = "idle";
+        liveRenderContinuityRef.current.overlayContinuitySettles += 1;
+        scheduleCustomV3CandleOverlayDraw();
+        return;
+      }
+
+      intraCandleRafRef.current = window.requestAnimationFrame(animate);
+    };
+
+    intraCandleRafRef.current = window.requestAnimationFrame(animate);
+  }, [customV3RendererEnabled, mode, scheduleCustomV3CandleOverlayDraw, trackRenderJump]);
+
   const overlayStorageKey = `${OVERLAY_OFFSET_STORAGE_PREFIX}.${symbol}.${timeframe}`;
   const domLockStorageKey = `${DOM_LOCK_STORAGE_PREFIX}.${symbol}.${timeframe}`;
 
@@ -3080,13 +3253,16 @@ export default function InstitutionalChart({
         return;
       }
       if (frame.signature && frame.signature === lastAppliedLiveFrameSignatureRef.current) {
+        liveRenderContinuityRef.current.duplicateFrameSkips += 1;
         return;
       }
       const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
       if (nowMs - lastSeriesUpdateTsRef.current < CANDLE_UPDATE_INTERVAL_MS) {
+        liveRenderContinuityRef.current.throttleDeferrals += 1;
         liveFrameRafRef.current = window.requestAnimationFrame(flushLiveFrame);
         return;
       }
+      liveRenderContinuityRef.current.renderedFrames += 1;
 
       const candleData = applyPerceptualRenderPipeline(
         sanitizeLiveFeedCandles(frame.candles, timeframe, renderPricePrecision).map((bar) => ({
@@ -3114,6 +3290,7 @@ export default function InstitutionalChart({
       }
 
       const safeSetCandleData = (source: CandleSeriesPoint[]) => {
+        liveRenderContinuityRef.current.fullRedraws += 1;
         try {
           candleSeries.setData((customV3RendererEnabled ? source.map((point) => hideNativeCandlePoint(point)) : source) as any);
           lastSeriesUpdateTsRef.current = typeof performance !== "undefined" ? performance.now() : Date.now();
@@ -3134,6 +3311,7 @@ export default function InstitutionalChart({
             })
             : null;
         } catch {
+          liveRenderContinuityRef.current.recoveryClears += 1;
           candleSeries.setData([] as any);
           lastSeriesUpdateTsRef.current = typeof performance !== "undefined" ? performance.now() : Date.now();
           lastCommittedCandleRef.current = null;
@@ -3180,6 +3358,7 @@ export default function InstitutionalChart({
           volatility: volatilityRef.current,
           visualProfile,
         })) {
+          liveRenderContinuityRef.current.conflatedUpdates += 1;
           hasSeededSeriesRef.current = true;
           prevCandlesRef.current = candleData as any;
           prevCandleLengthRef.current = candleData.length;
@@ -3187,12 +3366,19 @@ export default function InstitutionalChart({
           lastAppliedLiveFrameSignatureRef.current = frame.signature || pendingLiveFrameSignatureRef.current;
           return;
         }
+        liveRenderContinuityRef.current.partialUpdates += 1;
         captureGhostWick(lastCommittedCandleRef.current, lastPoint);
+        trackRenderJump(lastCommittedCandleRef.current, lastPoint);
+        const priorVisualPoint = intraCandleCurrentRef.current ?? lastCommittedCandleRef.current;
         if (!isFiniteCandleRenderPoint(lastPoint) || !safeSeriesUpdate(lastPoint)) {
+          liveRenderContinuityRef.current.updateFallbackRedraws += 1;
           safeSetCandleData(candleData);
+        } else if (microTimeframeLock && customV3RendererEnabled) {
+          armOverlayOnlyContinuity(priorVisualPoint, lastPoint);
+        } else {
+          intraCandleCurrentRef.current = lastPoint;
+          intraCandleTargetRef.current = lastPoint;
         }
-        intraCandleCurrentRef.current = lastPoint;
-        intraCandleTargetRef.current = lastPoint;
       } else {
         const finalPointPreview = (candleData[candleData.length - 1] ?? null) as CandleSeriesPoint | null;
         captureGhostWick(
@@ -3241,8 +3427,19 @@ export default function InstitutionalChart({
     };
 
     const unsubscribe = subscribeChartFrame(liveFeedKey, (frame) => {
+      liveRenderContinuityRef.current.liveFrames += 1;
+      if (frame.meta.partial) {
+        liveRenderContinuityRef.current.partialFrames += 1;
+      }
+      if (frame.meta.coalesced) {
+        liveRenderContinuityRef.current.coalescedFrames += 1;
+      }
+      if (frame.meta.syncStatus === "loose-sync") {
+        liveRenderContinuityRef.current.looseSyncFrames += 1;
+      }
       liveFrameSchedulerRef.current.schedule(frame, (latestFrame) => {
         if (latestFrame.signature && latestFrame.signature === pendingLiveFrameSignatureRef.current) {
+          liveRenderContinuityRef.current.duplicateFrameSkips += 1;
           return;
         }
         liveFrameRef.current = latestFrame;
@@ -3250,6 +3447,7 @@ export default function InstitutionalChart({
         liveFramePublishedAtRef.current = latestFrame.publishedAt;
         pendingLiveFrameSignatureRef.current = latestFrame.signature || "";
         if (liveFrameRafRef.current !== null) {
+          liveRenderContinuityRef.current.rafOverwrites += 1;
           return;
         }
         liveFrameRafRef.current = window.requestAnimationFrame(flushLiveFrame);
@@ -3655,6 +3853,8 @@ export default function InstitutionalChart({
     visibleBarsRef.current = 0;
     lastPriceDriftPxRef.current = 0;
     peakPriceDriftPxRef.current = 0;
+    liveRenderContinuityRef.current = createLiveRenderContinuityStats();
+    intraCandleContinuityModeRef.current = "idle";
   }, [mode, symbol, timeframe]);
 
   useEffect(() => {
@@ -3672,6 +3872,7 @@ export default function InstitutionalChart({
     }
 
     const publish = () => {
+      const schedulerDiagnostics = liveFrameSchedulerRef.current.getDiagnostics();
       const activeAutoscaleSnapshot = mode === "line"
         ? areaAutoscaleSnapshotRef.current
         : candleAutoscaleSnapshotRef.current;
@@ -3765,6 +3966,31 @@ export default function InstitutionalChart({
           frameTimeMs: framePerf.frameTimeMs,
           cpuLoad: framePerf.cpuLoad,
           workerLatencyMs,
+        },
+        continuity: {
+          liveFrames: liveRenderContinuityRef.current.liveFrames,
+          renderedFrames: liveRenderContinuityRef.current.renderedFrames,
+          partialFrames: liveRenderContinuityRef.current.partialFrames,
+          coalescedFrames: liveRenderContinuityRef.current.coalescedFrames,
+          looseSyncFrames: liveRenderContinuityRef.current.looseSyncFrames,
+          schedulerOverwrites: schedulerDiagnostics.overwrittenPendingCount,
+          schedulerDeferrals: schedulerDiagnostics.minFrameDeferralCount,
+          rafOverwrites: liveRenderContinuityRef.current.rafOverwrites,
+          duplicateFrameSkips: liveRenderContinuityRef.current.duplicateFrameSkips,
+          throttleDeferrals: liveRenderContinuityRef.current.throttleDeferrals,
+          conflatedUpdates: liveRenderContinuityRef.current.conflatedUpdates,
+          partialUpdates: liveRenderContinuityRef.current.partialUpdates,
+          fullRedraws: liveRenderContinuityRef.current.fullRedraws,
+          updateFallbackRedraws: liveRenderContinuityRef.current.updateFallbackRedraws,
+          recoveryClears: liveRenderContinuityRef.current.recoveryClears,
+          overlayContinuityStarts: liveRenderContinuityRef.current.overlayContinuityStarts,
+          overlayContinuityFrames: liveRenderContinuityRef.current.overlayContinuityFrames,
+          overlayContinuitySettles: liveRenderContinuityRef.current.overlayContinuitySettles,
+          lostIntermediateFrames: schedulerDiagnostics.overwrittenPendingCount + liveRenderContinuityRef.current.rafOverwrites + liveRenderContinuityRef.current.conflatedUpdates,
+          jumpEvents: liveRenderContinuityRef.current.jumpEvents,
+          latestJumpPx: liveRenderContinuityRef.current.latestJumpPx,
+          peakJumpPx: liveRenderContinuityRef.current.peakJumpPx,
+          continuityMode: liveRenderContinuityRef.current.continuityMode,
         },
         updatedAt: new Date().toISOString(),
       };
@@ -5585,11 +5811,14 @@ export default function InstitutionalChart({
         intraCandleRafRef.current = null;
       }
       intraCandleFrameTsRef.current = 0;
+      intraCandleContinuityModeRef.current = "idle";
+      liveRenderContinuityRef.current.continuityMode = "idle";
     };
 
     const safeSeriesUpdate = (next: CandleRenderPoint, force = false): boolean => {
       const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
       if (!force && nowMs - lastSeriesUpdateTsRef.current < CANDLE_UPDATE_INTERVAL_MS) {
+        liveRenderContinuityRef.current.throttleDeferrals += 1;
         return false;
       }
       try {
@@ -5607,6 +5836,9 @@ export default function InstitutionalChart({
         return;
       }
 
+      intraCandleContinuityModeRef.current = "series-and-overlay";
+      liveRenderContinuityRef.current.continuityMode = "series-and-overlay";
+
       const chartGeneration = chartGenerationRef.current;
 
       const animate = (frameTs: number) => {
@@ -5616,16 +5848,22 @@ export default function InstitutionalChart({
         if (!target || !current || !series || mode === "line") {
           intraCandleRafRef.current = null;
           intraCandleFrameTsRef.current = 0;
+          intraCandleContinuityModeRef.current = "idle";
+          liveRenderContinuityRef.current.continuityMode = "idle";
           return;
         }
         if (!isFiniteCandleRenderPoint(target) || !isFiniteCandleRenderPoint(current)) {
           intraCandleRafRef.current = null;
           intraCandleFrameTsRef.current = 0;
+          intraCandleContinuityModeRef.current = "idle";
+          liveRenderContinuityRef.current.continuityMode = "idle";
           return;
         }
         if (chartGenerationRef.current !== chartGeneration || series !== candleSeriesRef.current) {
           intraCandleRafRef.current = null;
           intraCandleFrameTsRef.current = 0;
+          intraCandleContinuityModeRef.current = "idle";
+          liveRenderContinuityRef.current.continuityMode = "idle";
           return;
         }
 
@@ -5668,6 +5906,7 @@ export default function InstitutionalChart({
         const committed = safeSeriesUpdate(next, false);
         if (!committed) {
           intraCandleCurrentRef.current = next;
+          scheduleCustomV3CandleOverlayDraw();
           intraCandleRafRef.current = window.requestAnimationFrame(animate);
           return;
         }
@@ -5679,6 +5918,7 @@ export default function InstitutionalChart({
         }
 
         intraCandleCurrentRef.current = next;
+        scheduleCustomV3CandleOverlayDraw();
         const settled = Math.max(
           Math.abs(next.open - target.open),
           Math.abs(next.high - target.high),
@@ -5690,6 +5930,9 @@ export default function InstitutionalChart({
           intraCandleRafRef.current = null;
           intraCandleFrameTsRef.current = 0;
           intraCandleCurrentRef.current = target;
+          intraCandleContinuityModeRef.current = "idle";
+          liveRenderContinuityRef.current.continuityMode = "idle";
+          scheduleCustomV3CandleOverlayDraw();
           return;
         }
 
@@ -5732,6 +5975,7 @@ export default function InstitutionalChart({
         prevTime = time;
       }
 
+      liveRenderContinuityRef.current.fullRedraws += 1;
       try {
         candleSeries.setData((customV3RendererEnabled ? sanitized.map((point) => hideNativeCandlePoint(point)) : sanitized) as any);
         lastSeriesUpdateTsRef.current = typeof performance !== "undefined" ? performance.now() : Date.now();
@@ -5755,6 +5999,7 @@ export default function InstitutionalChart({
           : null;
       } catch {
         // Last-resort fallback: clear malformed frame instead of crashing render loop.
+        liveRenderContinuityRef.current.recoveryClears += 1;
         candleSeries.setData([] as any);
         lastSeriesUpdateTsRef.current = typeof performance !== "undefined" ? performance.now() : Date.now();
         lastCommittedCandleRef.current = null;
@@ -5816,6 +6061,7 @@ export default function InstitutionalChart({
           volatility: marketVolatility,
           visualProfile,
         })) {
+          liveRenderContinuityRef.current.conflatedUpdates += 1;
           prevCandlesRef.current = candleData as any;
           prevAreaDataRef.current = areaData;
           renderUpdateCountsRef.current.candle += 1;
@@ -5823,28 +6069,44 @@ export default function InstitutionalChart({
           intraCandleTargetRef.current = lastPoint;
           return;
         }
+        liveRenderContinuityRef.current.partialUpdates += 1;
+        trackRenderJump(lastCommittedCandleRef.current, lastPoint);
         const previousPoint = intraCandleCurrentRef.current;
         try {
           if (isFiniteCandleRenderPoint(previousPoint) && previousPoint.time === lastPoint.time) {
             if (microTimeframeLock) {
               stopIntraCandleInterpolation();
-              safeSeriesUpdate(lastPoint, true);
+              if (!safeSeriesUpdate(lastPoint, true)) {
+                liveRenderContinuityRef.current.updateFallbackRedraws += 1;
+                safeSetCandleData(candleData as any);
+                intraCandleCurrentRef.current = lastPoint;
+                intraCandleTargetRef.current = lastPoint;
+                hasSeededSeriesRef.current = true;
+                return;
+              }
               hasSeededSeriesRef.current = true;
-              intraCandleCurrentRef.current = lastPoint;
-              intraCandleTargetRef.current = lastPoint;
+              armOverlayOnlyContinuity(previousPoint, lastPoint);
             } else {
               intraCandleTargetRef.current = lastPoint;
               startIntraCandleInterpolation();
             }
           } else {
             stopIntraCandleInterpolation();
-            safeSeriesUpdate(lastPoint, true);
+            if (!safeSeriesUpdate(lastPoint, true)) {
+              liveRenderContinuityRef.current.updateFallbackRedraws += 1;
+              safeSetCandleData(candleData as any);
+              intraCandleCurrentRef.current = lastPoint;
+              intraCandleTargetRef.current = lastPoint;
+              hasSeededSeriesRef.current = true;
+              return;
+            }
             hasSeededSeriesRef.current = true;
             intraCandleCurrentRef.current = lastPoint;
             intraCandleTargetRef.current = lastPoint;
           }
         } catch {
           stopIntraCandleInterpolation();
+          liveRenderContinuityRef.current.updateFallbackRedraws += 1;
           safeSetCandleData(candleData as any);
           hasSeededSeriesRef.current = true;
           intraCandleCurrentRef.current = lastPoint;

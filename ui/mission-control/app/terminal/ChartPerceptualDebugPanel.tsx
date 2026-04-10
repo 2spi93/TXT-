@@ -83,6 +83,26 @@ export default function ChartPerceptualDebugPanel({ open, telemetry, gpuTelemetr
             <em>DC {gpuTelemetry.performance.drawCalls} · batch {gpuTelemetry.performance.batchSize}</em>
           </div>
           <div className="chart-perceptual-row">
+            <span>Live sync</span>
+            <strong>{gpuTelemetry.continuity.renderedFrames}/{gpuTelemetry.continuity.liveFrames}</strong>
+            <em>{gpuTelemetry.sync.status} · partial {gpuTelemetry.continuity.partialFrames} · coal {gpuTelemetry.continuity.coalescedFrames}</em>
+          </div>
+          <div className="chart-perceptual-row">
+            <span>Lost states</span>
+            <strong>{gpuTelemetry.continuity.lostIntermediateFrames}</strong>
+            <em>ow {gpuTelemetry.continuity.schedulerOverwrites} · def {gpuTelemetry.continuity.schedulerDeferrals} · loose {gpuTelemetry.continuity.looseSyncFrames}</em>
+          </div>
+          <div className="chart-perceptual-row">
+            <span>Jump / mode</span>
+            <strong>{formatNumber(gpuTelemetry.continuity.peakJumpPx)}px peak</strong>
+            <em>{gpuTelemetry.continuity.continuityMode} · evt {gpuTelemetry.continuity.jumpEvents}</em>
+          </div>
+          <div className="chart-perceptual-row">
+            <span>Fallback redraw</span>
+            <strong>{gpuTelemetry.continuity.updateFallbackRedraws}</strong>
+            <em>GPU path keeps setData fallback at 0</em>
+          </div>
+          <div className="chart-perceptual-row">
             <span>Overlay / smooth</span>
             <strong>{gpuTelemetry.performance.overlayIntervalMs}ms</strong>
             <em>{gpuTelemetry.performance.smoothingMs}ms smooth</em>
@@ -213,6 +233,26 @@ export default function ChartPerceptualDebugPanel({ open, telemetry, gpuTelemetr
           <span>Perf</span>
           <strong>{telemetry.performance.fps.toFixed(0)} fps</strong>
           <em>{telemetry.performance.frameTimeMs.toFixed(1)}ms · cpu {telemetry.performance.cpuLoad.toFixed(2)}</em>
+        </div>
+        <div className="chart-perceptual-row">
+          <span>Live sync</span>
+          <strong>{telemetry.continuity.partialFrames} partial · {telemetry.continuity.coalescedFrames} coal</strong>
+          <em>{telemetry.continuity.looseSyncFrames} loose · {telemetry.continuity.liveFrames} recv / {telemetry.continuity.renderedFrames} rend</em>
+        </div>
+        <div className="chart-perceptual-row">
+          <span>Lost states</span>
+          <strong>{telemetry.continuity.lostIntermediateFrames}</strong>
+          <em>sch {telemetry.continuity.schedulerOverwrites} · raf {telemetry.continuity.rafOverwrites} · confl {telemetry.continuity.conflatedUpdates}</em>
+        </div>
+        <div className="chart-perceptual-row">
+          <span>Redraws</span>
+          <strong>{telemetry.continuity.fullRedraws} setData</strong>
+          <em>fallback {telemetry.continuity.updateFallbackRedraws} · clear {telemetry.continuity.recoveryClears}</em>
+        </div>
+        <div className="chart-perceptual-row">
+          <span>Continuity</span>
+          <strong>{telemetry.continuity.continuityMode}</strong>
+          <em>proj {telemetry.continuity.overlayContinuityStarts}/{telemetry.continuity.overlayContinuitySettles} · jump {formatNumber(telemetry.continuity.latestJumpPx, 1)}px peak {formatNumber(telemetry.continuity.peakJumpPx, 1)}px</em>
         </div>
       </div>
     </aside>

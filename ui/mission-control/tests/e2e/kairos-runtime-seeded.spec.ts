@@ -12,6 +12,9 @@ const HOT_COMPUTE_LABELS = [
   "multiAnchorVwap",
   "predictorOrderbookSignals",
   "predictorOrderflowSnapshot",
+  "domSnapshot",
+  "executionFootprintSnapshot",
+  "dataReliabilitySnapshot",
 ];
 
 async function seedKairosHarnessReplay(page: Page) {
@@ -70,7 +73,7 @@ async function snapshotTerminalComputePerf(page: Page) {
         }
         return right.count - left.count;
       })
-      .slice(0, 6);
+      .slice(0, 12);
   });
 }
 

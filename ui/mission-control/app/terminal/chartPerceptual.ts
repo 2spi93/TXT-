@@ -7,6 +7,34 @@ export type PerceptualTransitionMode = "init" | "hold" | "soft" | "hard";
 
 export type DenseLegibilityMode = "off" | "dense" | "micro";
 
+export type PerceptualContinuityMode = "idle" | "series-and-overlay" | "overlay-only" | "latest-only";
+
+export type PerceptualContinuityTelemetry = {
+  liveFrames: number;
+  renderedFrames: number;
+  partialFrames: number;
+  coalescedFrames: number;
+  looseSyncFrames: number;
+  schedulerOverwrites: number;
+  schedulerDeferrals: number;
+  rafOverwrites: number;
+  duplicateFrameSkips: number;
+  throttleDeferrals: number;
+  conflatedUpdates: number;
+  partialUpdates: number;
+  fullRedraws: number;
+  updateFallbackRedraws: number;
+  recoveryClears: number;
+  overlayContinuityStarts: number;
+  overlayContinuityFrames: number;
+  overlayContinuitySettles: number;
+  lostIntermediateFrames: number;
+  jumpEvents: number;
+  latestJumpPx: number;
+  peakJumpPx: number;
+  continuityMode: PerceptualContinuityMode;
+};
+
 export type PerceptualSpacingPolicy = {
   profile: PerceptualProfile;
   rightOffset: number;
@@ -117,6 +145,7 @@ export type ChartPerceptualTelemetry = {
     cpuLoad: number;
     workerLatencyMs: number | null;
   };
+  continuity: PerceptualContinuityTelemetry;
   updatedAt: string;
 };
 
@@ -163,6 +192,7 @@ export type GpuPerceptualTelemetry = {
     overlayIntervalMs: number;
     smoothingMs: number;
   };
+  continuity: PerceptualContinuityTelemetry;
   diagnosis: {
     primary: string[];
     summary: string;

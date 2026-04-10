@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
 
 import InstitutionalChart from "./InstitutionalChart";
-import type { DenseLegibilityMode, GpuPerceptualTelemetry } from "./chartPerceptual";
+import type { DenseLegibilityMode, GpuPerceptualTelemetry, PerceptualContinuityTelemetry } from "./chartPerceptual";
 import { applyPerceptionPipeline, resolvePerceptionDensity } from "./perceptionEngine";
 import { createLatestFrameScheduler } from "./frameEngine";
 import { applyVisualProfile, DEFAULT_VISUAL_PROFILE, type VisualProfileName } from "./visualProfiles";
@@ -78,6 +78,71 @@ type GpuMetrics = {
   renderer: string | null;
   overlayIntervalMs: number;
 };
+
+function createGpuContinuityTelemetry(): PerceptualContinuityTelemetry {
+  return {
+    liveFrames: 0,
+    renderedFrames: 0,
+    partialFrames: 0,
+    coalescedFrames: 0,
+    looseSyncFrames: 0,
+    schedulerOverwrites: 0,
+    schedulerDeferrals: 0,
+    rafOverwrites: 0,
+    duplicateFrameSkips: 0,
+    throttleDeferrals: 0,
+    conflatedUpdates: 0,
+    partialUpdates: 0,
+    fullRedraws: 0,
+    updateFallbackRedraws: 0,
+    recoveryClears: 0,
+    overlayContinuityStarts: 0,
+    overlayContinuityFrames: 0,
+    overlayContinuitySettles: 0,
+    lostIntermediateFrames: 0,
+    jumpEvents: 0,
+    latestJumpPx: 0,
+    peakJumpPx: 0,
+    continuityMode: "latest-only",
+  };
+}
+
+function measureGpuLastBarJumpPx(previousBar: OhlcBar | null, nextBar: OhlcBar | null, bars: OhlcBar[], viewportHeight: number): number {
+  if (!previousBar || !nextBar || previousBar.time !== nextBar.time || bars.length === 0 || viewportHeight <= 0) {
+    return 0;
+  }
+
+  let minPrice = Number.POSITIVE_INFINITY;
+  let maxPrice = Number.NEGATIVE_INFINITY;
+  for (const bar of bars) {
+    minPrice = Math.min(minPrice, bar.low, bar.open, bar.close);
+    maxPrice = Math.max(maxPrice, bar.high, bar.open, bar.close);
+  }
+
+  if (!Number.isFinite(minPrice) || !Number.isFinite(maxPrice)) {
+    return 0;
+  }
+
+  const rawRange = Math.max(1e-6, maxPrice - minPrice);
+  const paddedRange = rawRange * 1.08;
+  const pad = (paddedRange - rawRange) * 0.5;
+  const domainMin = minPrice - pad;
+  const domainMax = maxPrice + pad;
+  const priceToY = (price: number) => ((domainMax - price) / Math.max(1e-6, domainMax - domainMin)) * viewportHeight;
+  const ranges = [
+    [previousBar.open, nextBar.open],
+    [previousBar.high, nextBar.high],
+    [previousBar.low, nextBar.low],
+    [previousBar.close, nextBar.close],
+  ] as const;
+
+  let jumpPx = 0;
+  for (const [fromPrice, toPrice] of ranges) {
+    jumpPx = Math.max(jumpPx, Math.abs(priceToY(fromPrice) - priceToY(toPrice)));
+  }
+
+  return jumpPx;
+}
 
 type SpanAuthorityMode = "off" | "benchmark";
 
@@ -589,7 +654,9 @@ export default function GpuChartV4Surface({
   const diagnosticsLoggedRef = useRef(false);
   const fpsSamplesRef = useRef<number[]>([]);
   const liveMetricsRef = useRef<GpuMetrics>({ fps: 0, drawCalls: 0, batchSize: 0, renderer: null, overlayIntervalMs: 250 });
+  const continuityRef = useRef<PerceptualContinuityTelemetry>(createGpuContinuityTelemetry());
   const liveFrameMetaRef = useRef<LiveChartFrameMeta | null>(null);
+  const previousRenderedBarRef = useRef<OhlcBar | null>(null);
   const cameraDatasetRef = useRef<{ timeframe: string; liveFeedKey: string | null; count: number }>({
     timeframe,
     liveFeedKey: liveFeedKey ?? null,
@@ -749,6 +816,16 @@ export default function GpuChartV4Surface({
       if (!isLiveFrameCompatibleWithProps(frame.candles, propCandlesRef.current, timeframeRef.current)) {
         return;
       }
+      continuityRef.current.liveFrames += 1;
+      if (frame.meta.partial) {
+        continuityRef.current.partialFrames += 1;
+      }
+      if (frame.meta.coalesced || frame.meta.syncStatus === "coalesced") {
+        continuityRef.current.coalescedFrames += 1;
+      }
+      if (frame.meta.syncStatus === "loose-sync") {
+        continuityRef.current.looseSyncFrames += 1;
+      }
       liveFrameMetaRef.current = frame.meta;
       viewportMetaRef.current = {
         ...viewportMetaRef.current,
@@ -758,6 +835,19 @@ export default function GpuChartV4Surface({
       setLiveFrameMeta(frame.meta);
       liveFrameSchedulerRef.current.schedule(frame.candles, (nextCandles) => {
         const nextPrimaryBars = toGpuBars(nextCandles, timeframeRef.current, visualProfileRef.current);
+        continuityRef.current.renderedFrames += 1;
+        const jumpPx = measureGpuLastBarJumpPx(
+          previousRenderedBarRef.current,
+          nextPrimaryBars[nextPrimaryBars.length - 1] ?? null,
+          nextPrimaryBars,
+          hostRef.current?.clientHeight || canvasRef.current?.clientHeight || 0,
+        );
+        continuityRef.current.latestJumpPx = jumpPx;
+        continuityRef.current.peakJumpPx = Math.max(continuityRef.current.peakJumpPx, jumpPx);
+        if (jumpPx >= 1.5) {
+          continuityRef.current.jumpEvents += 1;
+        }
+        previousRenderedBarRef.current = nextPrimaryBars[nextPrimaryBars.length - 1] ?? null;
         barsRef.current = nextPrimaryBars;
         feedBarsRef.current = normalizeViewportFeedsForComparison(
           nextPrimaryBars,
@@ -773,6 +863,7 @@ export default function GpuChartV4Surface({
       unsubscribe();
       liveFrameSchedulerRef.current.cancel();
       liveFrameMetaRef.current = null;
+      previousRenderedBarRef.current = null;
       viewportMetaRef.current = Object.fromEntries(
         Object.entries(viewportMetaRef.current).filter(([key]) => key !== "primary"),
       );
@@ -997,6 +1088,8 @@ export default function GpuChartV4Surface({
           window.cancelAnimationFrame(rafRef.current);
           rafRef.current = null;
         }
+        continuityRef.current.recoveryClears += 1;
+        previousRenderedBarRef.current = null;
         setGpuReady(false);
         setGpuReason("context-lost");
         setInitPhase("fallback");
@@ -1145,6 +1238,14 @@ export default function GpuChartV4Surface({
       // Push live metrics → React state every 500ms (avoids per-frame re-renders)
       metricsInterval = setInterval(() => {
         const nextMetrics = { ...liveMetricsRef.current };
+        const schedulerDiagnostics = liveFrameSchedulerRef.current.getDiagnostics();
+        const continuity = continuityRef.current;
+        const continuitySnapshot: PerceptualContinuityTelemetry = {
+          ...continuity,
+          schedulerOverwrites: schedulerDiagnostics.overwrittenPendingCount,
+          schedulerDeferrals: schedulerDiagnostics.minFrameDeferralCount,
+          lostIntermediateFrames: schedulerDiagnostics.overwrittenPendingCount,
+        };
         setGpuMetrics(nextMetrics);
 
         const canvasWidth = host.clientWidth || canvas.clientWidth || 0;
@@ -1235,6 +1336,7 @@ export default function GpuChartV4Surface({
             overlayIntervalMs: nextMetrics.overlayIntervalMs,
             smoothingMs: effectiveSmoothingMs,
           },
+          continuity: continuitySnapshot,
           diagnosis,
           updatedAt: new Date().toISOString(),
         });

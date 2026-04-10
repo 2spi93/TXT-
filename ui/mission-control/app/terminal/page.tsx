@@ -166,6 +166,7 @@ import {
 import { isWebGL2Available } from "../../lib/engine/gpu-chart/context";
 import {
   ControlRoomMonitoringPanel,
+  ExecutionOptimizerMonitoringPanel,
   AlertsDockPanel,
   BlotterDockPanel,
   BrokersDockPanel,
@@ -182,6 +183,7 @@ import {
   RiskTimelineMonitoringPanel,
   TapeDockPanel,
   AlertsMonitoringPanel,
+  VenueTelemetryMonitoringPanel,
 } from "./TerminalSecondaryPanels";
 import { barArrayHash, type Bar } from "../../lib/dataEngine";
 import { indicatorWorkerAdapter } from "../../lib/indicators/workerAdapter";
@@ -189,6 +191,7 @@ import type { ActiveIndicator, IndicatorSeriesData } from "../../lib/indicators/
 import { ExecutionEngineV7, type V7Decision } from "../../lib/executionEngineV7";
 import { aggregateOrderbooks, detectArbitrage, type VenueOrderbook } from "../../lib/multiExchangeBus";
 import { buildMissionControlSnapshot } from "../../lib/missionControlStore";
+import { getConnectorHealthView } from "../../lib/connectorHealth";
 import { evaluateSelfLearningV5Frame } from "../../lib/metaHarnessSafe";
 import { buildHedgingAISnapshot, type HedgingAISnapshot } from "../../lib/hedgingAI";
 import { buildPredictiveLiquiditySnapshot, type LiquidityAISnapshot } from "../../lib/liquidityAI";
@@ -1028,6 +1031,8 @@ const TERMINAL_FOCUS_DECK_THROTTLE_MS: Record<TerminalFocusDeckId, number> = {
 
 const DEBUG_TIME_SYNC = process.env.NEXT_PUBLIC_DEBUG_TIME_SYNC === "1";
 const TERMINAL_COMPUTE_PERF_STORAGE_KEY = "txt.terminal.compute-perf";
+const TERMINAL_ONBOARDING_SEEN_STORAGE_KEY = "txt.terminal.onboarding.seen";
+const TERMINAL_ONBOARDING_PINNED_STORAGE_KEY = "txt.terminal.onboarding.pinned";
 const DEFAULT_BROWSER_LONG_TASK_TELEMETRY: BrowserLongTaskTelemetry = {
   supported: true,
   recentCount: 0,
@@ -4182,6 +4187,9 @@ export default function TradingTerminalPage() {
   const [shadowMetricsPayload, setShadowMetricsPayload] = useState<JsonMap | null>(null);
   const [externalKillSwitchPayload, setExternalKillSwitchPayload] = useState<JsonMap | null>(null);
   const [liveOpsPayload, setLiveOpsPayload] = useState<JsonMap | null>(null);
+  const [executionOptimizerLivePayload, setExecutionOptimizerLivePayload] = useState<JsonMap | null>(null);
+  const [marketVenueTelemetryPayload, setMarketVenueTelemetryPayload] = useState<JsonMap | null>(null);
+  const [routeVenueTelemetryPayload, setRouteVenueTelemetryPayload] = useState<JsonMap | null>(null);
   const [incidents, setIncidents] = useState<JsonMap[]>([]);
   const [pendingLive, setPendingLive] = useState<JsonMap[]>([]);
   const [outcomes, setOutcomes] = useState<JsonMap[]>([]);
@@ -4278,8 +4286,53 @@ export default function TradingTerminalPage() {
   const [chartHapticMode, setChartHapticMode] = useChartHapticMode();
   const [layoutPreset, setLayoutPreset] = useState<LayoutPreset>("swing");
   const [terminalDensityMode, setTerminalDensityMode] = useState<"focus" | "full">("focus");
+  const [terminalOnboardingLoaded, setTerminalOnboardingLoaded] = useState(false);
+  const [terminalOnboardingFirstVisit, setTerminalOnboardingFirstVisit] = useState(false);
+  const [terminalOnboardingPinned, setTerminalOnboardingPinned] = useState(false);
+  const [terminalOnboardingExpanded, setTerminalOnboardingExpanded] = useState(false);
   const [focusDecks, setFocusDecks] = useState<TerminalFocusDeckId[]>([]);
   const [layoutWorkspaceName, setLayoutWorkspaceName] = useState(DEFAULT_LAYOUT_WORKSPACE_NAME);
+
+  const setTerminalOnboardingPinnedPreference = useCallback((nextPinned: boolean) => {
+    setTerminalOnboardingPinned(nextPinned);
+    if (typeof window === "undefined") {
+      return;
+    }
+    try {
+      window.localStorage.setItem(TERMINAL_ONBOARDING_PINNED_STORAGE_KEY, nextPinned ? "1" : "0");
+    } catch {
+      // noop
+    }
+  }, []);
+
+  const collapseTerminalOnboarding = useCallback(() => {
+    setTerminalOnboardingFirstVisit(false);
+    setTerminalOnboardingExpanded(false);
+    if (terminalOnboardingPinned) {
+      setTerminalOnboardingPinnedPreference(false);
+    }
+  }, [setTerminalOnboardingPinnedPreference, terminalOnboardingPinned]);
+
+  const expandTerminalOnboarding = useCallback(() => {
+    setTerminalOnboardingFirstVisit(false);
+    setTerminalOnboardingExpanded(true);
+  }, []);
+
+  const toggleTerminalOnboardingPinned = useCallback(() => {
+    const nextPinned = !terminalOnboardingPinned;
+    setTerminalOnboardingFirstVisit(false);
+    setTerminalOnboardingPinnedPreference(nextPinned);
+    if (nextPinned) {
+      setTerminalOnboardingExpanded(true);
+    }
+  }, [setTerminalOnboardingPinnedPreference, terminalOnboardingPinned]);
+
+  const completeTerminalOnboardingAction = useCallback(() => {
+    setTerminalOnboardingFirstVisit(false);
+    if (!terminalOnboardingPinned) {
+      setTerminalOnboardingExpanded(false);
+    }
+  }, [terminalOnboardingPinned]);
   const [layoutWorkspaceOptions, setLayoutWorkspaceOptions] = useState<string[]>(DEFAULT_LAYOUT_WORKSPACE_OPTIONS);
   const [workspaceHintBadge, setWorkspaceHintBadge] = useState<string | null>(null);
   const [localFeedFallbackSuggestion, setLocalFeedFallbackSuggestion] = useState<LocalFeedFallbackSuggestion | null>(null);
@@ -4300,6 +4353,7 @@ export default function TradingTerminalPage() {
   const [layoutLowerOrder, setLayoutLowerOrder] = useState<DockPanelId[]>([...LOWER_PANEL_IDS]);
   const [layoutMonitoringOrder, setLayoutMonitoringOrder] = useState<DockPanelId[]>([...MONITORING_PANEL_IDS]);
   const [floatingPanels, setFloatingPanels] = useState<FloatingPanelState[]>([]);
+  const [performancePanelsExpanded, setPerformancePanelsExpanded] = useState(uiMode === "expert");
   const [layoutDropPreview, setLayoutDropPreview] = useState<{ zone: DockZone; targetId?: DockPanelId; mode: "zone" | "panel" } | null>(null);
   const [selectedChartSymbol, setSelectedChartSymbol] = useState("BTCUSD");
   const [chartVenueOverride, setChartVenueOverride] = useState<string | null>(null);
@@ -4380,6 +4434,10 @@ export default function TradingTerminalPage() {
   const [chartLockedDatasetRuntime, setChartLockedDatasetRuntime] = useState<LockedDatasetRuntime | null>(null);
   const [chartWindow, setChartWindow] = useState(80);
   // chartWindow remains a UI hint for the initial viewport only.
+  useEffect(() => {
+    setPerformancePanelsExpanded(terminalDensityMode === "full" || uiMode === "expert");
+  }, [terminalDensityMode, uiMode]);
+
   // The chart still receives the full renderable buffer so the renderer can
   // enforce authoritative span targets without an upstream bar-count cap.
   const chartViewportRef = useRef<{ window: number }>({ window: 80 });
@@ -4698,6 +4756,27 @@ export default function TradingTerminalPage() {
     return () => {
       window.removeEventListener("resize", syncLayoutScreenProfile);
     };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    try {
+      const persistedSeen = window.localStorage.getItem(TERMINAL_ONBOARDING_SEEN_STORAGE_KEY) === "1";
+      const persistedPinned = window.localStorage.getItem(TERMINAL_ONBOARDING_PINNED_STORAGE_KEY) === "1";
+      if (!persistedSeen) {
+        window.localStorage.setItem(TERMINAL_ONBOARDING_SEEN_STORAGE_KEY, "1");
+      }
+      setTerminalOnboardingFirstVisit(!persistedSeen);
+      setTerminalOnboardingPinned(persistedPinned);
+      setTerminalOnboardingExpanded(persistedPinned || !persistedSeen);
+    } catch {
+      setTerminalOnboardingFirstVisit(true);
+      setTerminalOnboardingExpanded(true);
+    } finally {
+      setTerminalOnboardingLoaded(true);
+    }
   }, []);
 
   useEffect(() => {
@@ -6642,8 +6721,8 @@ export default function TradingTerminalPage() {
     }
 
     let sawUnauthorized = false;
-    const fetchMaybeUnauthorized = async (url: string): Promise<unknown> => {
-      const response = await fetch(url, { cache: "no-store" });
+    const fetchMaybeUnauthorized = async (url: string, init: RequestInit = {}): Promise<unknown> => {
+      const response = await fetch(url, { cache: "no-store", ...init });
       if (response.status === 401 || response.status === 403) {
         sawUnauthorized = true;
         return null;
@@ -6663,12 +6742,19 @@ export default function TradingTerminalPage() {
       }
     };
 
-    const [snapshotPayload, readinessPayload, aiPayload, overviewPayload, liveOpsResponsePayload, incidentPayload, pendingPayload, outcomePayload, mt5Payload, quotesPayload, positionsPayload, balancePayload, performanceSummaryPayload, performanceAttributionPayload, accountsPayload, connectorAccountsPayload, investorReportsPayload] = await Promise.all([
+    const [snapshotPayload, readinessPayload, aiPayload, overviewPayload, liveOpsResponsePayload, executionOptimizerLiveResponsePayload, marketVenueTelemetryResponsePayload, routeVenueTelemetryResponsePayload, incidentPayload, pendingPayload, outcomePayload, mt5Payload, quotesPayload, positionsPayload, balancePayload, performanceSummaryPayload, performanceAttributionPayload, accountsPayload, connectorAccountsPayload, investorReportsPayload] = await Promise.all([
       fetchMaybeUnauthorized("/api/connectors/status"),
       fetchMaybeUnauthorized("/api/live-readiness/overview"),
       fetchMaybeUnauthorized("/api/ai/health"),
       fetchMaybeUnauthorized("/api/dashboard/overview"),
       fetchMaybeUnauthorized("/api/system/live-ops"),
+      fetchMaybeUnauthorized("/api/execution/optimizer/live-state", {
+        headers: buildRoutingRequestHeaders("ui", selectedChartSymbol),
+      }).catch(() => null),
+      fetchMaybeUnauthorized("/api/market/venues/telemetry").catch(() => null),
+      fetchMaybeUnauthorized("/api/execution/routing/venues/telemetry?lookback_minutes=240", {
+        headers: buildRoutingRequestHeaders("ui", selectedChartSymbol),
+      }).catch(() => null),
       fetchMaybeUnauthorized("/api/incidents"),
       fetchArrayFallback("/api/mt5/orders/live-pending"),
       fetchArrayFallback("/api/outcomes/recent?limit=20"),
@@ -6699,6 +6785,9 @@ export default function TradingTerminalPage() {
     setAiHealth(aiPayload && typeof aiPayload === "object" ? (aiPayload as JsonMap) : null);
     setOverview(overviewPayload && typeof overviewPayload === "object" ? (overviewPayload as JsonMap) : null);
     setLiveOpsPayload(liveOpsResponsePayload && typeof liveOpsResponsePayload === "object" ? (liveOpsResponsePayload as JsonMap) : null);
+    setExecutionOptimizerLivePayload(executionOptimizerLiveResponsePayload && typeof executionOptimizerLiveResponsePayload === "object" ? (executionOptimizerLiveResponsePayload as JsonMap) : null);
+    setMarketVenueTelemetryPayload(marketVenueTelemetryResponsePayload && typeof marketVenueTelemetryResponsePayload === "object" ? (marketVenueTelemetryResponsePayload as JsonMap) : null);
+    setRouteVenueTelemetryPayload(routeVenueTelemetryResponsePayload && typeof routeVenueTelemetryResponsePayload === "object" ? (routeVenueTelemetryResponsePayload as JsonMap) : null);
     const incidentItems = incidentPayload && typeof incidentPayload === "object"
       ? ((((incidentPayload as JsonMap).items as JsonMap[] | undefined) || []))
       : [];
@@ -7814,7 +7903,7 @@ export default function TradingTerminalPage() {
     if (!(notionalUsd > 0)) {
       return 0;
     }
-    return Number((Math.max(50, notionalUsd * riskAiLiveSizeMultiplier * portfolioAllocatorSizeMultiplier * volatilityRegimeRiskMultiplier)).toFixed(2));
+    return Number((Math.max(50, notionalUsd * riskAiLiveSizeMultiplier * volatilityRegimeRiskMultiplier)).toFixed(2));
   }
 
   function getProfitRiskExecutionBlockReason(sideHint?: "buy" | "sell"): string | null {
@@ -8648,8 +8737,9 @@ export default function TradingTerminalPage() {
     const routingCandidates = Array.isArray(routingScore?.candidates)
       ? routingScore.candidates as JsonMap[]
       : [];
+    const gateArbitragePayload = (routingScore?.arbitrage as JsonMap | undefined) || null;
     const decision = executionEngineV7Ref.current.buildDecision({
-      arbitrage: effectiveArbitragePayload,
+      arbitrage: gateArbitragePayload,
       routingCandidates,
       bestRoute: (routingScore?.best as JsonMap | undefined) || null,
       backupRoute: (routingScore?.backup as JsonMap | undefined) || null,
@@ -9005,6 +9095,13 @@ export default function TradingTerminalPage() {
   }
 
   const connectors = (snapshot?.connectors as JsonMap[] | undefined) || [];
+  const connectorByName = new Map(connectors.map((item) => [String(item.name || "").toLowerCase(), item]));
+  const executionConnectorRows = connectors
+    .filter((item) => Number(asJsonMap(item.broker_capabilities).linked_trade_accounts || 0) > 0)
+    .slice(0, 2);
+  const marketHealthRows = ["okx", "binance", "bybit"]
+    .map((provider) => connectorByName.get(provider))
+    .filter((item): item is JsonMap => Boolean(item));
   const alerts = (snapshot?.alerts as JsonMap[] | undefined) || [];
   const liveOpsState = asJsonMap(liveOpsPayload);
   const liveOpsWatchdog = asJsonMap(liveOpsState.watchdog_state);
@@ -15128,6 +15225,104 @@ export default function TradingTerminalPage() {
       : browserLongTaskTelemetry.maxDurationMs >= 100 || browserLongTaskTelemetry.pattern === "steady"
         ? "warn"
         : "neutral";
+  const activeContinuityTelemetry = chartEngineMode === "v4"
+    ? gpuPerceptualTelemetry?.continuity ?? null
+    : chartPerceptualTelemetry?.continuity ?? null;
+  const activeContinuityLosses = activeContinuityTelemetry?.lostIntermediateFrames ?? 0;
+  const activeContinuitySetData = chartEngineMode === "v4"
+    ? gpuPerceptualTelemetry?.continuity.updateFallbackRedraws ?? 0
+    : chartPerceptualTelemetry?.continuity.updateFallbackRedraws ?? 0;
+  const activeContinuityPeakJumpPx = activeContinuityTelemetry?.peakJumpPx ?? 0;
+  const activeContinuitySyncShort = chartEngineMode === "v4"
+    ? gpuPerceptualTelemetry?.sync.status === "atomic"
+      ? "AT"
+      : gpuPerceptualTelemetry?.sync.status === "loose-sync"
+        ? "LS"
+        : gpuPerceptualTelemetry?.sync.status === "coalesced"
+          ? "CO"
+          : "NA"
+    : chartPerceptualTelemetry?.continuity.continuityMode === "overlay-only"
+      ? "OVR"
+      : chartPerceptualTelemetry?.continuity.continuityMode === "series-and-overlay"
+        ? "SO"
+        : "ID";
+  const chartStabilityChipTone = !activeContinuityTelemetry
+    ? "neutral"
+    : activeContinuityLosses <= 1
+      && activeContinuitySetData === 0
+      && activeContinuityPeakJumpPx < 1.5
+      && (chartEngineMode !== "v4" || gpuPerceptualTelemetry?.sync.status === "atomic")
+      ? "good"
+      : activeContinuityLosses <= 4 && activeContinuityPeakJumpPx < 4
+        ? "warn"
+        : "warn";
+  const chartStabilityChipClass = chartStabilityChipTone === "good"
+    ? "chart-overlay-chip-good"
+    : chartStabilityChipTone === "warn"
+      ? "chart-overlay-chip-warn"
+      : "";
+  const chartStabilityChipLabel = !activeContinuityTelemetry
+    ? `${chartEngineMode.toUpperCase()} STAB pending`
+    : `${chartEngineMode.toUpperCase()} STAB li${activeContinuityLosses} set${activeContinuitySetData} j${activeContinuityPeakJumpPx.toFixed(1)}px ${activeContinuitySyncShort}`;
+  const chartStabilityChipTitle = !activeContinuityTelemetry
+    ? `Perceptual ${chartEngineMode.toUpperCase()} continuity telemetry pending`
+    : [
+      `${chartEngineMode.toUpperCase()} continuity`,
+      `live ${activeContinuityTelemetry.liveFrames}`,
+      `rendered ${activeContinuityTelemetry.renderedFrames}`,
+      `lost ${activeContinuityTelemetry.lostIntermediateFrames}`,
+      `scheduler overwrites ${activeContinuityTelemetry.schedulerOverwrites}`,
+      `scheduler deferrals ${activeContinuityTelemetry.schedulerDeferrals}`,
+      `partial ${activeContinuityTelemetry.partialFrames}`,
+      `coalesced ${activeContinuityTelemetry.coalescedFrames}`,
+      `peak jump ${activeContinuityTelemetry.peakJumpPx.toFixed(1)}px`,
+      chartEngineMode === "v4"
+        ? `sync ${gpuPerceptualTelemetry?.sync.status || "unavailable"}`
+        : `mode ${chartPerceptualTelemetry?.continuity.continuityMode || "idle"}`,
+    ].join(" · ");
+  const chartCostChipTone = chartEngineMode === "v4"
+    ? gpuPerceptualTelemetry?.performance.fps != null
+      ? gpuPerceptualTelemetry.performance.fps >= 30 && gpuPerceptualTelemetry.performance.drawCalls <= 72
+        ? "good"
+        : "warn"
+      : "neutral"
+    : chartPerceptualTelemetry?.performance.fps != null
+      ? chartPerceptualTelemetry.performance.fps >= 55 && chartPerceptualTelemetry.performance.cpuLoad <= 0.72
+        ? "good"
+        : "warn"
+      : "neutral";
+  const chartCostChipClass = chartCostChipTone === "good"
+    ? "chart-overlay-chip-good"
+    : chartCostChipTone === "warn"
+      ? "chart-overlay-chip-warn"
+      : "";
+  const chartCostChipLabel = chartEngineMode === "v4"
+    ? gpuPerceptualTelemetry
+      ? `V4 COST ${gpuPerceptualTelemetry.performance.fps.toFixed(0)}fps dc${gpuPerceptualTelemetry.performance.drawCalls} b${gpuPerceptualTelemetry.performance.batchSize}`
+      : "V4 COST pending"
+    : chartPerceptualTelemetry
+      ? `V3 COST ${chartPerceptualTelemetry.performance.fps.toFixed(0)}fps ${chartPerceptualTelemetry.performance.frameTimeMs.toFixed(1)}ms cpu${Math.round(chartPerceptualTelemetry.performance.cpuLoad * 100)}%`
+      : "V3 COST pending";
+  const chartCostChipTitle = chartEngineMode === "v4"
+    ? gpuPerceptualTelemetry
+      ? [
+        `V4 GPU cost`,
+        `fps ${gpuPerceptualTelemetry.performance.fps.toFixed(0)}`,
+        `draw calls ${gpuPerceptualTelemetry.performance.drawCalls}`,
+        `batch ${gpuPerceptualTelemetry.performance.batchSize}`,
+        `overlay ${gpuPerceptualTelemetry.performance.overlayIntervalMs}ms`,
+        `smoothing ${gpuPerceptualTelemetry.performance.smoothingMs}ms`,
+      ].join(" · ")
+      : "Perceptual V4 cost telemetry pending"
+    : chartPerceptualTelemetry
+      ? [
+        `V3 cost`,
+        `fps ${chartPerceptualTelemetry.performance.fps.toFixed(0)}`,
+        `frame ${chartPerceptualTelemetry.performance.frameTimeMs.toFixed(1)}ms`,
+        `cpu ${Math.round(chartPerceptualTelemetry.performance.cpuLoad * 100)}%`,
+        `worker ${chartPerceptualTelemetry.performance.workerLatencyMs != null ? `${chartPerceptualTelemetry.performance.workerLatencyMs.toFixed(1)}ms` : "n/a"}`,
+      ].join(" · ")
+      : "Perceptual V3 cost telemetry pending";
   const candleProbeAgeMs = marketBusKernelTelemetry.lastCandleUpdateAt
     ? Math.max(0, Date.now() - Date.parse(marketBusKernelTelemetry.lastCandleUpdateAt))
     : -1;
@@ -19404,6 +19599,10 @@ export default function TradingTerminalPage() {
         return <BrokersDockPanel providerRows={providerRows} balances={balances} positions={positions} instrumentLabel={instrumentLabel} omsLifecycle={omsLifecycleSummary} portfolioOverlay={portfolioOverlaySummary} aiBridge={aiBridgeSummary} />;
       case "controlroom":
         return <ControlRoomMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} liveOpsPayload={liveOpsPayload} emergencyStopBusy={emergencyStopBusy} emergencyStopFeedback={emergencyStopFeedback} onEmergencyStop={() => { void triggerEmergencyStop(); }} formatClock={formatClock} />;
+      case "optimizer":
+        return <ExecutionOptimizerMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} payload={executionOptimizerLivePayload} formatClock={formatClock} />;
+      case "venues":
+        return <VenueTelemetryMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} marketPayload={marketVenueTelemetryPayload} routePayload={routeVenueTelemetryPayload} formatClock={formatClock} />;
       case "alerts":
         return <AlertsDockPanel filteredAlerts={filteredAlerts} />;
       case "incidents":
@@ -19519,8 +19718,27 @@ export default function TradingTerminalPage() {
           <span className={`th-kpi expert-only ${pendingLive.length > 0 ? "th-warn" : ""}`}>{pendingLive.length} approvals</span>
           <span className={`th-kpi ${String(mt5Health?.status || "") === "ok" ? "" : "th-warn"}`}>MT5 {String(mt5Health?.status || "–")}</span>
         </div>
+        <div className="connector-health-inline connector-health-inline-compact">
+          {executionConnectorRows.map((item) => {
+            const badge = getConnectorHealthView(item);
+            return (
+              <span key={`topbar-exec-${String(item.name)}`} className={`${badge.badgeClassName} is-compact`}>
+                {String(item.name || "").toUpperCase()} {badge.compactLabel}
+              </span>
+            );
+          })}
+          {marketHealthRows.map((item) => {
+            const badge = getConnectorHealthView(item);
+            return (
+              <span key={`topbar-market-${String(item.name)}`} className={`${badge.badgeClassName} is-compact`}>
+                {String(item.name || "").toUpperCase()} {badge.compactLabel}
+              </span>
+            );
+          })}
+        </div>
         <div className="th-nav">
           <Link href="/">Dashboard</Link>
+          <Link href="/learn">Learn</Link>
           <Link href="/ai">IA</Link>
           <Link href="/connectors">Connecteurs</Link>
           <Link href="/live-readiness">Readiness</Link>
@@ -19656,6 +19874,126 @@ export default function TradingTerminalPage() {
           <button type="button" onClick={() => void loadAll()} disabled={busy} className="chart-chip" style={{ fontSize: 11, padding: "4px 10px" }}>↻</button>
         </div>
       </header>
+      {terminalOnboardingLoaded ? (
+        <section
+          className={[
+            "gtix-panel-shell terminal-onboarding",
+            terminalOnboardingExpanded ? "" : "is-collapsed",
+            terminalOnboardingPinned ? "is-pinned" : "",
+          ].filter(Boolean).join(" ")}
+          aria-label="Interactive onboarding"
+        >
+          <div className="terminal-onboarding-head">
+            <div className="terminal-onboarding-head-main">
+              <div className="eyebrow">⭐ Interactive Onboarding</div>
+              <h2 className="terminal-onboarding-title">Prends le terminal en main sans chercher partout</h2>
+              {terminalOnboardingExpanded ? (
+                <p className="subtle terminal-onboarding-copy">
+                  Choisis ce que tu veux faire et le terminal se règle tout de suite sur le bon mode, le bon niveau de détail et la bonne vue.
+                </p>
+              ) : (
+                <p className="terminal-onboarding-summary">
+                  {terminalOnboardingPinned
+                    ? "Toujours visible au démarrage pour un usage quotidien."
+                    : terminalOnboardingFirstVisit
+                      ? "Visible pour ta première visite, puis réduit automatiquement."
+                      : "Réduit après ta première visite. Réouvre-le quand tu veux changer de mode."}
+                </p>
+              )}
+            </div>
+            <div className="terminal-onboarding-head-side">
+              <div className="terminal-onboarding-status">
+                <span className="terminal-onboarding-pill">Mode {uiMode === "novice" ? "Novice" : "Expert"}</span>
+                <span className="terminal-onboarding-pill">Vue {terminalDensityMode === "focus" ? "Focus" : "Full Surface"}</span>
+                <span className="terminal-onboarding-pill">Preset {layoutPreset}</span>
+              </div>
+              <div className="terminal-onboarding-toolbar">
+                <button
+                  type="button"
+                  className="terminal-onboarding-toggle"
+                  onClick={terminalOnboardingExpanded ? collapseTerminalOnboarding : expandTerminalOnboarding}
+                >
+                  {terminalOnboardingExpanded ? "Replier" : "Réouvrir"}
+                </button>
+                <button
+                  type="button"
+                  className={`terminal-onboarding-toggle${terminalOnboardingPinned ? " active" : ""}`}
+                  onClick={toggleTerminalOnboardingPinned}
+                >
+                  {terminalOnboardingPinned ? "Visible chaque jour" : "Garder visible"}
+                </button>
+              </div>
+            </div>
+          </div>
+          {terminalOnboardingExpanded ? (
+            <div className="terminal-onboarding-body">
+              <div className="terminal-onboarding-grid">
+                <article className="terminal-onboarding-card">
+                  <div className="terminal-onboarding-card-label">1. Je découvre</div>
+                  <h3>Voir l'essentiel</h3>
+                  <p>Affiche une vue simple pour lire le marché sans se noyer dans tous les modules.</p>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => {
+                      setUiMode("novice");
+                      setTerminalDensityMode("focus");
+                      applyLayoutPreset("scalp");
+                      completeTerminalOnboardingAction();
+                    }}
+                  >
+                    Activer le mode découverte
+                  </button>
+                </article>
+                <article className="terminal-onboarding-card">
+                  <div className="terminal-onboarding-card-label">2. Je trade</div>
+                  <h3>Préparer une entrée</h3>
+                  <p>Met le terminal sur une vue rapide pour lire le prix, le flux et la décision plus vite.</p>
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    onClick={() => {
+                      setUiMode("expert");
+                      setTerminalDensityMode("focus");
+                      applyLayoutPreset("scalp");
+                      completeTerminalOnboardingAction();
+                    }}
+                  >
+                    Passer en mode trade
+                  </button>
+                </article>
+                <article className="terminal-onboarding-card">
+                  <div className="terminal-onboarding-card-label">3. Je surveille</div>
+                  <h3>Suivre les risques</h3>
+                  <p>Ouvre une vue plus large pour surveiller les alertes, la santé système et les incidents en parallèle.</p>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => {
+                      setUiMode("novice");
+                      setTerminalDensityMode("full");
+                      applyLayoutPreset("monitoring");
+                      completeTerminalOnboardingAction();
+                    }}
+                  >
+                    Ouvrir la vue monitoring
+                  </button>
+                </article>
+                <article className="terminal-onboarding-card">
+                  <div className="terminal-onboarding-card-label">4. J'ai besoin d'aide</div>
+                  <h3>Aller au bon écran</h3>
+                  <p>Utilise les guides si tu hésites entre apprentissage, suivi live ou traitement d'un problème.</p>
+                  <div className="terminal-onboarding-links">
+                    <Link href="/learn" onClick={completeTerminalOnboardingAction}>Ouvrir Learn</Link>
+                    <Link href="/live-ops" onClick={completeTerminalOnboardingAction}>Ouvrir Live Ops</Link>
+                    <Link href="/incidents" onClick={completeTerminalOnboardingAction}>Ouvrir Incidents</Link>
+                  </div>
+                </article>
+              </div>
+            </div>
+          ) : null}
+        </section>
+      ) : null}
 
       {error ? <div className="term-error-bar warn">{error}</div> : null}
 
@@ -19742,7 +20080,45 @@ export default function TradingTerminalPage() {
             </article>
           </div>
 
-          <div className="term-performance-grid">
+          <div className="term-performance-toggle-row">
+            <div>
+              <div className="eyebrow">Analyse detaillee</div>
+              <div className="subtle mini">Les panneaux longs sont replies en mode focus pour garder le terminal plus lisible.</div>
+            </div>
+            <button
+              type="button"
+              className={`chart-chip ${performancePanelsExpanded ? "active" : ""}`}
+              onClick={() => setPerformancePanelsExpanded((current) => !current)}
+            >
+              {performancePanelsExpanded ? "Masquer l'analyse" : "Afficher l'analyse"}
+            </button>
+          </div>
+          {!performancePanelsExpanded ? (
+            <div className="term-performance-summary-strip">
+              <div className="term-performance-summary-item">
+                <span>PnL</span>
+                <strong>{performanceSummary ? performanceSummary.realized_pnl_usd.toLocaleString("fr-FR", { style: "currency", currency: "USD", maximumFractionDigits: 0 }) : "–"}</strong>
+              </div>
+              <div className="term-performance-summary-item">
+                <span>Trades</span>
+                <strong>{performanceSummary ? performanceSummary.trade_count : 0}</strong>
+              </div>
+              <div className="term-performance-summary-item">
+                <span>Regime</span>
+                <strong>{volatilityRegimeSnapshot.regime}</strong>
+              </div>
+              <div className="term-performance-summary-item">
+                <span>Execution</span>
+                <strong>{preferredRouteLabel || "indisponible"}</strong>
+              </div>
+              <div className="term-performance-summary-item">
+                <span>Reporting</span>
+                <strong>{latestInvestorReport?.status || "none"}</strong>
+              </div>
+            </div>
+          ) : null}
+
+          {performancePanelsExpanded ? <div className="term-performance-grid">
             <article className={`term-performance-card tone-${performanceDeskTone}`}>
               <div className="term-performance-head">
                 <div>
@@ -19881,7 +20257,7 @@ export default function TradingTerminalPage() {
                 <span>{multiVenueArbitrageSnapshot.arbitrage ? `Edge cross-venue actif ${multiVenueArbitrageSnapshot.netSpreadBps.toFixed(2)}bps sur ${multiVenueArbitrageSnapshot.buyVenue} → ${multiVenueArbitrageSnapshot.sellVenue}.` : "Pas d’arbitrage net cross-venue exploitable sur la fenêtre courante."}</span>
               </div>
             </article>
-          </div>
+          </div> : null}
         </div>
       </section>
 
@@ -20113,6 +20489,8 @@ export default function TradingTerminalPage() {
             <span className="chart-overlay-chip">{chartTimeframe}</span>
             <span className={`chart-overlay-chip ${deskRenderProfile.resolvedViewMode === "flow" ? "chart-overlay-chip-good" : deskRenderProfile.resolvedViewMode === "candle" ? "chart-overlay-chip-warn" : ""}`}>{chartDeskModeLabel}</span>
             <span className={`chart-overlay-chip ${chartFlowConfidenceLow ? "chart-overlay-chip-warn" : chartRuntimeOrderflowEnabled ? "chart-overlay-chip-good" : ""}`}>{chartFlowConfidenceLabel}</span>
+            <span className={`chart-overlay-chip ${chartStabilityChipClass}`} title={chartStabilityChipTitle}>{chartStabilityChipLabel}</span>
+            <span className={`chart-overlay-chip ${chartCostChipClass}`} title={chartCostChipTitle}>{chartCostChipLabel}</span>
             {chartLowFlowEdgeBlocked ? <span className="chart-overlay-chip chart-overlay-chip-warn">LOW FLOW EDGE</span> : null}
             <span className="chart-overlay-chip">Bars {effectiveChartBarConstructionMode.toUpperCase()}</span>
             {deskRenderProfile.candlesContextOnly ? <span className="chart-overlay-chip">Candles = context only, not signal</span> : null}
@@ -21901,6 +22279,41 @@ export default function TradingTerminalPage() {
               formatClock={formatClock}
             />
             </div>
+            <div
+              className={`layout-draggable-card${layoutEditMode ? " is-edit" : ""}${layoutDropPreview?.zone === "monitoring" && layoutDropPreview.targetId === "optimizer" ? " is-drop-target" : ""}`}
+              draggable={layoutEditMode}
+              onDragStart={() => { layoutDragRef.current = { zone: "monitoring", id: "optimizer" }; setLayoutDropPreview({ zone: "monitoring", targetId: "optimizer", mode: "panel" }); }}
+              onDragEnd={() => { layoutDragRef.current = null; setLayoutDropPreview(null); }}
+              onDragOver={(event) => { if (layoutEditMode) { event.preventDefault(); setLayoutDropPreview({ zone: "monitoring", targetId: "optimizer", mode: "panel" }); } }}
+              onDrop={() => handleLayoutDrop("monitoring", "optimizer")}
+              style={{ order: monitoringOrderById.optimizer ?? 1, display: floatingPanels.some((fp) => fp.id === "optimizer") ? "none" : undefined }}
+            >
+            <ExecutionOptimizerMonitoringPanel
+              badge={publicOpsPanelBadge}
+              layoutEditMode={layoutEditMode}
+              onDetach={() => detachPanel("optimizer", "monitoring")}
+              payload={executionOptimizerLivePayload}
+              formatClock={formatClock}
+            />
+            </div>
+            <div
+            className={`layout-draggable-card${layoutEditMode ? " is-edit" : ""}${layoutDropPreview?.zone === "monitoring" && layoutDropPreview.targetId === "venues" ? " is-drop-target" : ""}`}
+            draggable={layoutEditMode}
+            onDragStart={() => { layoutDragRef.current = { zone: "monitoring", id: "venues" }; setLayoutDropPreview({ zone: "monitoring", targetId: "venues", mode: "panel" }); }}
+            onDragEnd={() => { layoutDragRef.current = null; setLayoutDropPreview(null); }}
+            onDragOver={(event) => { if (layoutEditMode) { event.preventDefault(); setLayoutDropPreview({ zone: "monitoring", targetId: "venues", mode: "panel" }); } }}
+            onDrop={() => handleLayoutDrop("monitoring", "venues")}
+            style={{ order: monitoringOrderById.venues ?? 1, display: floatingPanels.some((fp) => fp.id === "venues") ? "none" : undefined }}
+          >
+          <VenueTelemetryMonitoringPanel
+            badge={publicOpsPanelBadge}
+            layoutEditMode={layoutEditMode}
+            onDetach={() => detachPanel("venues", "monitoring")}
+            marketPayload={marketVenueTelemetryPayload}
+            routePayload={routeVenueTelemetryPayload}
+            formatClock={formatClock}
+          />
+          </div>
             <div
             className={`layout-draggable-card${layoutEditMode ? " is-edit" : ""}${layoutDropPreview?.zone === "monitoring" && layoutDropPreview.targetId === "alerts" ? " is-drop-target" : ""}`}
             draggable={layoutEditMode}
