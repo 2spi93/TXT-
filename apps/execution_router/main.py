@@ -100,6 +100,16 @@ VENUE_EXECUTION_PROFILES: dict[str, dict[str, object]] = {
     },
 }
 
+VENUE_FEE_BPS: dict[str, float] = {
+    "binance": 4.0,
+    "bybit": 4.8,
+    "okx": 4.5,
+    "bitget": 5.8,
+    "bingx": 6.2,
+    "hyperliquid": 5.0,
+    "default": 6.5,
+}
+
 VENUE_PREFERENCE_ALIASES: dict[str, str] = {
     "binance": "binance-public",
     "binance-public": "binance-public",
@@ -146,6 +156,14 @@ def _market_symbol(symbol: str) -> str:
     return normalized
 
 
+def _venue_fee_bps(venue: object) -> float:
+    normalized = str(venue or "").strip().lower()
+    for key, fee_bps in VENUE_FEE_BPS.items():
+        if key != "default" and normalized.startswith(key):
+            return fee_bps
+    return VENUE_FEE_BPS["default"]
+
+
 def _to_float(value: object, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -155,6 +173,20 @@ def _to_float(value: object, default: float = 0.0) -> float:
 
 def _clamp(value: float, minimum: float, maximum: float) -> float:
     return max(minimum, min(maximum, value))
+
+
+def _median_value(values: list[float], default: float = 0.0) -> float:
+    cleaned = sorted(value for value in values if math.isfinite(value))
+    if not cleaned:
+        return default
+    midpoint = len(cleaned) // 2
+    if len(cleaned) % 2:
+        return cleaned[midpoint]
+    return (cleaned[midpoint - 1] + cleaned[midpoint]) / 2.0
+
+
+def _normalize_requested_notional_usd(value: object, default: float = 1000.0) -> float:
+    return max(25.0, _to_float(value, default))
 
 
 def _as_dict(value: object) -> dict[str, object]:
@@ -1042,6 +1074,519 @@ def _best_quote_alignment(candidate: dict[str, object], side: str, best_bid: flo
     return _clamp(1.0 - (((best_bid - candidate_bid) / max(best_bid, 1e-9)) * 10000.0) / 18.0, 0.0, 1.0)
 
 
+def _annotate_multi_venue_dominance(candidates: list[dict[str, object]]) -> list[dict[str, object]]:
+    if not candidates:
+        return candidates
+
+    latency_baseline_ms = _median_value([_to_float(candidate.get("latency_ms"), math.nan) for candidate in candidates], 45.0)
+    depth_baseline_usd = _median_value([_to_float(candidate.get("available_depth_usd"), math.nan) for candidate in candidates], 5000.0)
+    fill_baseline = _median_value([_to_float(candidate.get("fill_probability"), math.nan) for candidate in candidates], 0.5)
+    legacy_score_baseline = _median_value([_to_float(candidate.get("score"), math.nan) for candidate in candidates], 0.25)
+
+    for candidate in candidates:
+        available_depth_usd = max(0.0, _to_float(candidate.get("available_depth_usd"), 0.0))
+        fill_probability = _clamp(_to_float(candidate.get("fill_probability"), 0.0), 0.0, 1.0)
+        queue_position = _clamp(_to_float(candidate.get("queue_priority_risk"), 0.5), 0.0, 1.0)
+        spread_bps = max(0.0, _to_float(candidate.get("spread_bps"), 0.0))
+        latency_ms = max(1.0, _to_float(candidate.get("latency_ms"), latency_baseline_ms))
+        depth_confidence = _clamp(_to_float(candidate.get("depth_confidence"), 0.0), 0.0, 1.0)
+        partial_fill_risk = _clamp(_to_float(candidate.get("partial_fill_risk"), 0.0), 0.0, 1.0)
+        legacy_score = _clamp(_to_float(candidate.get("score"), 0.0), 0.0, 1.0)
+
+        depth_score = _clamp(math.log10(max(50.0, available_depth_usd)) / 5.2, 0.0, 1.0)
+        depth_pressure = available_depth_usd / max(depth_baseline_usd, 1.0)
+        depth_edge_score = _clamp(0.5 + (depth_pressure - 1.0) * 0.35, 0.0, 1.0)
+        queue_execution_score = _clamp((1.0 - queue_position) * 0.5 + fill_probability * 0.5, 0.0, 1.0)
+        latency_penalty = _clamp(latency_ms / max(120.0, latency_baseline_ms * 2.5), 0.0, 1.0)
+        latency_edge_ms = latency_baseline_ms - latency_ms
+        latency_edge_score = _clamp(0.5 + latency_edge_ms / max(60.0, latency_baseline_ms * 1.5), 0.0, 1.0)
+        slippage_cost_bps = (
+            spread_bps * (0.58 + queue_position * 0.42)
+            + partial_fill_risk * 2.5
+            + latency_penalty * 1.6
+            + (1.0 - depth_confidence) * 1.4
+        )
+        slippage_score = _clamp(1.0 - min(slippage_cost_bps, 14.0) / 14.0, 0.0, 1.0)
+        fill_edge = fill_probability - fill_baseline
+        fill_edge_score = _clamp(0.5 + fill_edge / 0.4, 0.0, 1.0)
+        dominance_score = _clamp(
+            fill_probability * 0.28
+            + depth_score * 0.18
+            + depth_edge_score * 0.12
+            + queue_execution_score * 0.18
+            + latency_edge_score * 0.14
+            + slippage_score * 0.1
+            + fill_edge_score * 0.08,
+            0.0,
+            1.0,
+        )
+        smart_router_score = _clamp(
+            dominance_score * 0.72
+            + _clamp((legacy_score + legacy_score_baseline) / 2.0, 0.0, 1.0) * 0.28,
+            0.0,
+            1.0,
+        )
+        candidate["legacy_score"] = legacy_score
+        candidate["depth_score"] = depth_score
+        candidate["depth_edge_score"] = depth_edge_score
+        candidate["queue_position"] = queue_position
+        candidate["queue_execution_score"] = queue_execution_score
+        candidate["latency_penalty"] = latency_penalty
+        candidate["latency_baseline_ms"] = latency_baseline_ms
+        candidate["latency_edge_ms"] = latency_edge_ms
+        candidate["latency_edge_score"] = latency_edge_score
+        candidate["slippage_cost_bps"] = slippage_cost_bps
+        candidate["slippage_score"] = slippage_score
+        candidate["fill_edge"] = fill_edge
+        candidate["dominance_score"] = dominance_score
+        candidate["smart_router_score"] = smart_router_score
+        candidate["score"] = smart_router_score
+        candidate["source"] = "v5-multi-venue-dominance"
+
+    return candidates
+
+
+def _build_multi_venue_split_plan(
+    candidates: list[dict[str, object]],
+    side: str,
+    requested_notional_usd: float,
+    *,
+    max_slices: int = 3,
+) -> dict[str, object]:
+    target_notional_usd = _normalize_requested_notional_usd(requested_notional_usd)
+    if not candidates:
+        return {
+            "mode": "singleVenue",
+            "slices": [],
+            "total_notional_usd": 0.0,
+            "remaining_notional_usd": target_notional_usd,
+            "coverage_ratio": 0.0,
+            "estimated_average_price": 0.0,
+            "estimated_slippage_bps": 0.0,
+            "primary_venue": None,
+            "venue_count": 0,
+        }
+
+    eligible: list[dict[str, object]] = []
+    for candidate in candidates[: max(2, max_slices + 1)]:
+        dominance_score = _clamp(_to_float(candidate.get("dominance_score"), _to_float(candidate.get("score"), 0.0)), 0.0, 1.0)
+        fill_probability = _clamp(_to_float(candidate.get("fill_probability"), 0.0), 0.0, 1.0)
+        queue_position = _clamp(_to_float(candidate.get("queue_position"), _to_float(candidate.get("queue_priority_risk"), 0.5)), 0.0, 1.0)
+        available_depth_usd = max(0.0, _to_float(candidate.get("available_depth_usd"), 0.0))
+        depth_confidence = _clamp(_to_float(candidate.get("depth_confidence"), 0.0), 0.0, 1.0)
+        capacity_usd = available_depth_usd * _clamp(fill_probability * 0.95 + depth_confidence * 0.35 - queue_position * 0.2, 0.18, 0.92)
+        if dominance_score < 0.18 or fill_probability < 0.22 or capacity_usd < 25.0:
+            continue
+        eligible.append(
+            {
+                "candidate": candidate,
+                "capacity_usd": capacity_usd,
+                "weight": max(1e-6, dominance_score * (0.85 + _to_float(candidate.get("depth_score"), 0.0) * 0.15)),
+            }
+        )
+
+    if not eligible:
+        leader = candidates[0]
+        return {
+            "mode": "singleVenue",
+            "slices": [
+                {
+                    "venue": str(leader.get("venue") or "unknown"),
+                    "notional_usd": round(target_notional_usd, 6),
+                    "share_pct": 1.0,
+                    "expected_latency_ms": round(_to_float(leader.get("latency_ms"), 0.0), 3),
+                    "fill_probability": round(_to_float(leader.get("fill_probability"), 0.0), 6),
+                    "route_score": round(_to_float(leader.get("dominance_score"), _to_float(leader.get("score"), 0.0)), 6),
+                    "queue_position": round(_to_float(leader.get("queue_position"), _to_float(leader.get("queue_priority_risk"), 0.0)), 6),
+                    "slippage_cost_bps": round(_to_float(leader.get("slippage_cost_bps"), 0.0), 6),
+                }
+            ],
+            "total_notional_usd": round(target_notional_usd, 6),
+            "remaining_notional_usd": 0.0,
+            "coverage_ratio": 1.0,
+            "estimated_average_price": round(_to_float(leader.get("best_ask" if side == "buy" else "best_bid"), _to_float(leader.get("last"), 0.0)), 8),
+            "estimated_slippage_bps": round(_to_float(leader.get("slippage_cost_bps"), 0.0), 6),
+            "primary_venue": str(leader.get("venue") or "unknown"),
+            "venue_count": 1,
+        }
+
+    eligible = sorted(eligible, key=lambda item: item["weight"], reverse=True)[:max_slices]
+    total_weight = sum(_to_float(item.get("weight"), 0.0) for item in eligible)
+    remaining_notional_usd = target_notional_usd
+    allocations: list[dict[str, object]] = []
+
+    for item in eligible:
+        candidate = item["candidate"]
+        capacity_usd = max(0.0, _to_float(item.get("capacity_usd"), 0.0))
+        proportional_notional = target_notional_usd * (_to_float(item.get("weight"), 0.0) / max(total_weight, 1e-9))
+        allocated_notional = min(capacity_usd, proportional_notional)
+        allocations.append({"candidate": candidate, "allocated_notional": allocated_notional, "capacity_usd": capacity_usd})
+        remaining_notional_usd -= allocated_notional
+
+    if remaining_notional_usd > 25.0:
+        for item in allocations:
+            if remaining_notional_usd <= 1e-9:
+                break
+            spare_capacity = max(0.0, _to_float(item.get("capacity_usd"), 0.0) - _to_float(item.get("allocated_notional"), 0.0))
+            if spare_capacity <= 0:
+                continue
+            top_up = min(spare_capacity, remaining_notional_usd)
+            item["allocated_notional"] = _to_float(item.get("allocated_notional"), 0.0) + top_up
+            remaining_notional_usd -= top_up
+
+    slices: list[dict[str, object]] = []
+    for item in allocations:
+        allocated_notional = max(0.0, _to_float(item.get("allocated_notional"), 0.0))
+        if allocated_notional < 25.0:
+            continue
+        candidate = item["candidate"]
+        slices.append(
+            {
+                "venue": str(candidate.get("venue") or "unknown"),
+                "notional_usd": round(allocated_notional, 6),
+                "share_pct": round(allocated_notional / max(target_notional_usd, 1e-9), 6),
+                "expected_latency_ms": round(_to_float(candidate.get("latency_ms"), 0.0), 3),
+                "fill_probability": round(_to_float(candidate.get("fill_probability"), 0.0), 6),
+                "route_score": round(_to_float(candidate.get("dominance_score"), _to_float(candidate.get("score"), 0.0)), 6),
+                "queue_position": round(_to_float(candidate.get("queue_position"), _to_float(candidate.get("queue_priority_risk"), 0.0)), 6),
+                "slippage_cost_bps": round(_to_float(candidate.get("slippage_cost_bps"), 0.0), 6),
+            }
+        )
+
+    slices.sort(key=lambda item: _to_float(item.get("notional_usd"), 0.0), reverse=True)
+    total_notional_usd = sum(_to_float(item.get("notional_usd"), 0.0) for item in slices)
+    reference_price = min(
+        (
+            _to_float(candidate.get("best_ask"), 0.0)
+            for candidate in candidates
+            if side == "buy" and _to_float(candidate.get("best_ask"), 0.0) > 0
+        ),
+        default=0.0,
+    ) if side == "buy" else max((_to_float(candidate.get("best_bid"), 0.0) for candidate in candidates), default=0.0)
+    weighted_price = 0.0
+    weighted_slippage = 0.0
+    for slice_item in slices:
+        venue = str(slice_item.get("venue") or "unknown")
+        candidate = next((entry for entry in candidates if str(entry.get("venue") or "") == venue), None)
+        if candidate is None:
+            continue
+        route_price = _to_float(candidate.get("best_ask" if side == "buy" else "best_bid"), _to_float(candidate.get("last"), 0.0))
+        slice_notional = _to_float(slice_item.get("notional_usd"), 0.0)
+        weighted_price += route_price * slice_notional
+        weighted_slippage += _to_float(slice_item.get("slippage_cost_bps"), 0.0) * slice_notional
+
+    estimated_average_price = weighted_price / max(total_notional_usd, 1e-9)
+    estimated_slippage_bps = weighted_slippage / max(total_notional_usd, 1e-9)
+    if reference_price > 0 and estimated_average_price > 0:
+        estimated_slippage_bps = max(
+            estimated_slippage_bps,
+            abs(estimated_average_price - reference_price) / max(reference_price, 1e-9) * 10000.0,
+        )
+
+    return {
+        "mode": "multiVenueSplit" if len(slices) >= 2 else "singleVenue",
+        "slices": slices,
+        "total_notional_usd": round(total_notional_usd, 6),
+        "remaining_notional_usd": round(max(0.0, target_notional_usd - total_notional_usd), 6),
+        "coverage_ratio": round(_clamp(total_notional_usd / max(target_notional_usd, 1e-9), 0.0, 1.0), 6),
+        "estimated_average_price": round(estimated_average_price, 8),
+        "estimated_slippage_bps": round(estimated_slippage_bps, 6),
+        "primary_venue": slices[0]["venue"] if slices else None,
+        "venue_count": len(slices),
+    }
+
+
+def _build_arb_execution_plan(opportunity: dict[str, object], requested_notional_usd: float) -> dict[str, object] | None:
+    buy_price = _to_float(opportunity.get("buy_price"), 0.0)
+    sell_price = _to_float(opportunity.get("sell_price"), 0.0)
+    if buy_price <= 0 or sell_price <= 0:
+        return None
+
+    total_notional_usd = min(
+        _normalize_requested_notional_usd(requested_notional_usd),
+        max(25.0, _to_float(opportunity.get("max_executable_usd"), 0.0)),
+    )
+    if total_notional_usd <= 0:
+        return None
+
+    slice_count = max(1, min(3, int(math.ceil(total_notional_usd / 2500.0))))
+    slice_weights = [0.52, 0.3, 0.18][:slice_count]
+    weight_total = sum(slice_weights) or 1.0
+    latency_gap_ms = max(0.0, _to_float(opportunity.get("latency_gap_ms"), 0.0))
+    gross_spread = _to_float(opportunity.get("gross_spread"), 0.0)
+    gross_spread_bps = _to_float(opportunity.get("gross_spread_bps"), 0.0)
+    net_spread_bps = _to_float(opportunity.get("net_spread_bps"), 0.0)
+    fill_probability = _clamp(_to_float(opportunity.get("fill_probability"), 0.0), 0.0, 1.0)
+    route_score = _clamp(_to_float(opportunity.get("opportunity_score"), 0.0) / 100.0, 0.0, 1.0)
+    slices: list[dict[str, object]] = []
+    weighted_buy_price = 0.0
+    weighted_sell_price = 0.0
+
+    for index, weight in enumerate(slice_weights):
+        slice_notional_usd = total_notional_usd * (weight / weight_total)
+        weighted_buy_price += buy_price * slice_notional_usd
+        weighted_sell_price += sell_price * slice_notional_usd
+        slices.append(
+            {
+                "id": f"slice-{index + 1}",
+                "notionalUsd": round(slice_notional_usd, 6),
+                "quantity": round(slice_notional_usd / max(buy_price, 1e-9), 8),
+                "grossSpread": round(gross_spread, 8),
+                "grossSpreadBps": round(gross_spread_bps, 6),
+                "netSpreadBps": round(net_spread_bps, 6),
+                "latencyGapMs": round(latency_gap_ms * (1.0 + index * 0.08), 6),
+                "buy": {
+                    "venue": str(opportunity.get("buy") or opportunity.get("buy_venue") or ""),
+                    "price": round(buy_price, 8),
+                    "size": round(slice_notional_usd / max(buy_price, 1e-9), 8),
+                    "notionalUsd": round(slice_notional_usd, 6),
+                    "latencyMs": round(_to_float(opportunity.get("buy_latency_ms"), 0.0), 6),
+                    "feeBps": round(_to_float(opportunity.get("buy_fee_bps"), 0.0), 6),
+                    "fillProbability": round(fill_probability, 6),
+                    "routeScore": round(route_score, 6),
+                    "levelIndex": index,
+                },
+                "sell": {
+                    "venue": str(opportunity.get("sell") or opportunity.get("sell_venue") or ""),
+                    "price": round(sell_price, 8),
+                    "size": round(slice_notional_usd / max(sell_price, 1e-9), 8),
+                    "notionalUsd": round(slice_notional_usd, 6),
+                    "latencyMs": round(_to_float(opportunity.get("sell_latency_ms"), 0.0), 6),
+                    "feeBps": round(_to_float(opportunity.get("sell_fee_bps"), 0.0), 6),
+                    "fillProbability": round(fill_probability, 6),
+                    "routeScore": round(route_score, 6),
+                    "levelIndex": index,
+                },
+            }
+        )
+
+    return {
+        "slices": slices,
+        "totalNotionalUsd": round(total_notional_usd, 6),
+        "weightedBuyPrice": round(weighted_buy_price / max(total_notional_usd, 1e-9), 8),
+        "weightedSellPrice": round(weighted_sell_price / max(total_notional_usd, 1e-9), 8),
+        "weightedGrossSpreadBps": round(gross_spread_bps, 6),
+        "weightedNetSpreadBps": round(net_spread_bps, 6),
+        "weightedLatencyGapMs": round(latency_gap_ms, 6),
+    }
+
+
+def _detect_cross_exchange_arbitrage(
+    candidates: list[dict[str, object]],
+    requested_notional_usd: float,
+) -> dict[str, object]:
+    opportunities: list[dict[str, object]] = []
+    for buy_candidate in candidates:
+        buy_venue = str(buy_candidate.get("venue") or "")
+        buy_price = _to_float(buy_candidate.get("best_ask"), 0.0)
+        if buy_price <= 0:
+            continue
+        buy_depth_usd = max(0.0, _to_float(buy_candidate.get("available_depth_usd"), 0.0))
+        buy_fill_probability = _clamp(_to_float(buy_candidate.get("fill_probability"), 0.0), 0.0, 1.0)
+        buy_queue_position = _clamp(_to_float(buy_candidate.get("queue_position"), _to_float(buy_candidate.get("queue_priority_risk"), 0.5)), 0.0, 1.0)
+        for sell_candidate in candidates:
+            sell_venue = str(sell_candidate.get("venue") or "")
+            if not sell_venue or sell_venue == buy_venue:
+                continue
+            sell_price = _to_float(sell_candidate.get("best_bid"), 0.0)
+            if sell_price <= 0 or sell_price <= buy_price:
+                continue
+            sell_depth_usd = max(0.0, _to_float(sell_candidate.get("available_depth_usd"), 0.0))
+            sell_fill_probability = _clamp(_to_float(sell_candidate.get("fill_probability"), 0.0), 0.0, 1.0)
+            sell_queue_position = _clamp(_to_float(sell_candidate.get("queue_position"), _to_float(sell_candidate.get("queue_priority_risk"), 0.5)), 0.0, 1.0)
+            midpoint = max((buy_price + sell_price) / 2.0, 1e-9)
+            gross_spread = sell_price - buy_price
+            gross_spread_bps = gross_spread / midpoint * 10000.0
+            latency_gap_ms = abs(_to_float(buy_candidate.get("latency_ms"), 0.0) - _to_float(sell_candidate.get("latency_ms"), 0.0))
+            latency_cost_bps = latency_gap_ms / 90.0
+            queue_penalty_bps = (buy_queue_position + sell_queue_position) * 2.4
+            fee_bps = _venue_fee_bps(buy_venue) + _venue_fee_bps(sell_venue)
+            net_spread_bps = gross_spread_bps - fee_bps - latency_cost_bps - queue_penalty_bps
+            net_spread_price = gross_spread - midpoint * ((fee_bps + latency_cost_bps + queue_penalty_bps) / 10000.0)
+            max_executable_usd = min(buy_depth_usd, sell_depth_usd) * _clamp(
+                (buy_fill_probability + sell_fill_probability) * 0.4 + 0.18,
+                0.18,
+                0.82,
+            )
+            execution_confidence = _clamp((buy_fill_probability + sell_fill_probability) * 0.5, 0.0, 1.0)
+            latency_score = _clamp(1.0 - latency_gap_ms / 450.0, 0.0, 1.0)
+            depth_score = _clamp(math.log10(max(50.0, max_executable_usd)) / 5.2, 0.0, 1.0)
+            opportunity_score = net_spread_bps * 0.78 + execution_confidence * 6.0 + depth_score * 4.0 + latency_score * 3.0
+            opportunity = {
+                "buy": buy_venue,
+                "sell": sell_venue,
+                "buy_venue": buy_venue,
+                "sell_venue": sell_venue,
+                "buyVenue": buy_venue,
+                "sellVenue": sell_venue,
+                "buy_price": round(buy_price, 8),
+                "sell_price": round(sell_price, 8),
+                "gross_spread": round(gross_spread, 8),
+                "net_spread": round(net_spread_price, 8),
+                "gross_spread_bps": round(gross_spread_bps, 6),
+                "net_spread_bps": round(net_spread_bps, 6),
+                "latency_gap_ms": round(latency_gap_ms, 6),
+                "latency_cost_bps": round(latency_cost_bps, 6),
+                "queue_penalty_bps": round(queue_penalty_bps, 6),
+                "max_executable_usd": round(max_executable_usd, 6),
+                "fill_probability": round(execution_confidence, 6),
+                "buy_latency_ms": round(_to_float(buy_candidate.get("latency_ms"), 0.0), 6),
+                "sell_latency_ms": round(_to_float(sell_candidate.get("latency_ms"), 0.0), 6),
+                "buy_fee_bps": round(_venue_fee_bps(buy_venue), 6),
+                "sell_fee_bps": round(_venue_fee_bps(sell_venue), 6),
+                "opportunity_score": round(opportunity_score, 6),
+                "executable": bool(net_spread_bps > 0 and max_executable_usd >= 25.0),
+            }
+            opportunity["execution_plan"] = _build_arb_execution_plan(opportunity, requested_notional_usd)
+            opportunity["executionPlan"] = opportunity["execution_plan"]
+            opportunities.append(opportunity)
+
+    opportunities.sort(
+        key=lambda item: (
+            bool(item.get("executable")),
+            _to_float(item.get("opportunity_score"), 0.0),
+            _to_float(item.get("net_spread_bps"), 0.0),
+        ),
+        reverse=True,
+    )
+    best = opportunities[0] if opportunities else None
+    if not isinstance(best, dict):
+        return {
+            "opportunity": False,
+            "executable": False,
+            "spread": 0.0,
+            "net_spread": 0.0,
+            "gross_spread_bps": 0.0,
+            "net_spread_bps": 0.0,
+            "buy": "",
+            "sell": "",
+            "buy_venue": "",
+            "sell_venue": "",
+            "buyVenue": None,
+            "sellVenue": None,
+            "latency_gap_ms": 0.0,
+            "latency_cost_bps": 0.0,
+            "queue_penalty_bps": 0.0,
+            "max_executable_usd": 0.0,
+            "opportunity_score": 0.0,
+            "execution_plan": None,
+            "executionPlan": None,
+            "opportunities": [],
+        }
+
+    return {
+        "opportunity": bool(best.get("executable")),
+        "executable": bool(best.get("executable")),
+        "spread": _to_float(best.get("gross_spread"), 0.0),
+        "net_spread": _to_float(best.get("net_spread"), 0.0),
+        "gross_spread_bps": _to_float(best.get("gross_spread_bps"), 0.0),
+        "net_spread_bps": _to_float(best.get("net_spread_bps"), 0.0),
+        "buy": str(best.get("buy") or ""),
+        "sell": str(best.get("sell") or ""),
+        "buy_venue": str(best.get("buy_venue") or ""),
+        "sell_venue": str(best.get("sell_venue") or ""),
+        "buyVenue": best.get("buyVenue"),
+        "sellVenue": best.get("sellVenue"),
+        "buy_price": _to_float(best.get("buy_price"), 0.0),
+        "sell_price": _to_float(best.get("sell_price"), 0.0),
+        "latency_gap_ms": _to_float(best.get("latency_gap_ms"), 0.0),
+        "latency_cost_bps": _to_float(best.get("latency_cost_bps"), 0.0),
+        "queue_penalty_bps": _to_float(best.get("queue_penalty_bps"), 0.0),
+        "max_executable_usd": _to_float(best.get("max_executable_usd"), 0.0),
+        "opportunity_score": _to_float(best.get("opportunity_score"), 0.0),
+        "execution_plan": best.get("execution_plan"),
+        "executionPlan": best.get("executionPlan"),
+        "opportunities": opportunities[:5],
+    }
+
+
+def _build_hedge_recommendation(
+    side: str,
+    requested_notional_usd: float,
+    selected: dict[str, object] | None,
+    backup: dict[str, object] | None,
+    split_plan: dict[str, object] | None,
+    arbitrage: dict[str, object] | None,
+) -> dict[str, object]:
+    target_notional_usd = _normalize_requested_notional_usd(requested_notional_usd)
+    if isinstance(arbitrage, dict) and bool(arbitrage.get("opportunity")):
+        return {
+            "enabled": True,
+            "mode": "crossExchangeLock",
+            "buy_venue": arbitrage.get("buy"),
+            "sell_venue": arbitrage.get("sell"),
+            "trigger_delta_usd": round(target_notional_usd * 0.08, 6),
+            "hedge_notional_usd": round(min(target_notional_usd, _to_float(arbitrage.get("max_executable_usd"), target_notional_usd)), 6),
+            "reasons": ["cross_exchange_arbitrage_positive", "delta_neutral_lock_recommended"],
+        }
+
+    slices = split_plan.get("slices") if isinstance(split_plan, dict) and isinstance(split_plan.get("slices"), list) else []
+    primary_slice = slices[0] if slices else {}
+    dominant_share = _to_float(primary_slice.get("share_pct"), 1.0 if selected else 0.0)
+    backup_venue = str((backup or {}).get("venue") or "").strip()
+    if backup_venue and target_notional_usd >= 250.0 and dominant_share >= 0.7:
+        return {
+            "enabled": True,
+            "mode": "inventoryDeltaGuard",
+            "venue": backup_venue,
+            "side": "sell" if str(side).lower() == "buy" else "buy",
+            "trigger_delta_usd": round(target_notional_usd * 0.2, 6),
+            "hedge_notional_usd": round(target_notional_usd * min(0.35, max(0.12, dominant_share - 0.45)), 6),
+            "reasons": ["venue_concentration_high", "backup_venue_ready_for_delta_hedge"],
+        }
+
+    return {
+        "enabled": False,
+        "mode": "standby",
+        "trigger_delta_usd": round(target_notional_usd * 0.25, 6),
+        "hedge_notional_usd": 0.0,
+        "reasons": [],
+    }
+
+
+def _simulate_split_fills(
+    decision_id: str,
+    side: str,
+    instrument: str,
+    split_plan: dict[str, object],
+    candidates_by_venue: dict[str, dict[str, object]],
+    execution_delay_ms: int = 0,
+) -> tuple[list[dict[str, object]], float]:
+    slices = split_plan.get("slices") if isinstance(split_plan.get("slices"), list) else []
+    all_fills: list[dict[str, object]] = []
+    weighted_price = 0.0
+    total_notional = 0.0
+
+    for slice_index, slice_item in enumerate(slices):
+        venue = str(slice_item.get("venue") or "")
+        candidate = candidates_by_venue.get(venue)
+        if candidate is None:
+            continue
+        slice_notional = max(0.0, _to_float(slice_item.get("notional_usd"), 0.0))
+        if slice_notional <= 0.0:
+            continue
+        slice_fills, _ = _simulate_fills(
+            decision_id=f"{decision_id}-mv-{slice_index + 1}",
+            side=side,
+            notional_usd=slice_notional,
+            depth_payload=(candidate.get("depth_payload") or {}),
+            venue=venue,
+            instrument=instrument,
+            execution_delay_ms=execution_delay_ms + slice_index * max(4, execution_delay_ms // 2),
+        )
+        for fill in slice_fills:
+            fill_notional = _to_float(fill.get("notional_usd"), 0.0)
+            fill_price = _to_float(fill.get("price"), 0.0)
+            weighted_price += fill_price * fill_notional
+            total_notional += fill_notional
+            fill["decision_id"] = decision_id
+            fill["fill_id"] = f"{decision_id}-mv-{len(all_fills) + 1}"
+            all_fills.append(fill)
+
+    avg_fill_price = weighted_price / max(total_notional, 1e-9)
+    return all_fills, avg_fill_price
+
+
 def _route_selection_score(
     candidate: dict[str, object],
     side: str,
@@ -1062,6 +1607,10 @@ def _route_selection_score(
     queue_efficiency = _clamp(1.0 - _to_float(candidate.get("queue_priority_risk"), 0.0), 0.0, 1.0)
     raw_score = _clamp(_to_float(candidate.get("raw_score"), 0.0) / 1.2, 0.0, 1.0)
     quote_alignment = _best_quote_alignment(candidate, side, best_bid, best_ask)
+    dominance_score = _clamp(_to_float(candidate.get("dominance_score"), _to_float(candidate.get("score"), 0.0)), 0.0, 1.0)
+    queue_execution_score = _clamp(_to_float(candidate.get("queue_execution_score"), (queue_efficiency + fill_score) * 0.5), 0.0, 1.0)
+    latency_edge_score = _clamp(_to_float(candidate.get("latency_edge_score"), latency_score), 0.0, 1.0)
+    slippage_score = _clamp(_to_float(candidate.get("slippage_score"), spread_score), 0.0, 1.0)
     execution_style = _normalize_execution_style(preferences.get("execution_style"))
     route_mode_override = _normalize_route_mode_override(preferences.get("route_mode_override"))
     preferred_venue = str(preferences.get("preferred_venue") or "").strip()
@@ -1119,6 +1668,10 @@ def _route_selection_score(
             + quote_alignment * 0.12
             + latency_score * 0.12
         )
+
+    score = score * 0.72 + dominance_score * 0.18 + queue_execution_score * 0.06 + latency_edge_score * 0.04
+    if execution_style == "aggressive_confirmed":
+        score = score * 0.92 + slippage_score * 0.08
 
     if preferred_venue:
         if _venue_matches_preference(candidate.get("venue"), preferred_venue):
@@ -1664,10 +2217,13 @@ async def _build_route_candidates(symbol: str, infra_context: dict[str, object] 
                 }
             )
 
-    return sorted(candidates, key=lambda item: item["score"], reverse=True)
+    ranked_candidates = sorted(_annotate_multi_venue_dominance(candidates), key=lambda item: item["score"], reverse=True)
+    for index, candidate in enumerate(ranked_candidates):
+        candidate["dominance_rank"] = index + 1
+    return ranked_candidates
 
 
-def _build_route_context(candidates: list[dict]) -> dict:
+def _build_route_context(candidates: list[dict], requested_notional_usd: float | None = None) -> dict:
     price_weights = [(_to_float(candidate.get("last"), 0.0), max(_to_float(candidate.get("available_depth_usd"), 0.0), 1.0)) for candidate in candidates]
     fusion_price = _weighted_median_price(price_weights)
     best = candidates[0] if candidates else None
@@ -1677,11 +2233,11 @@ def _build_route_context(candidates: list[dict]) -> dict:
     best_ask = min(asks) if asks else 0.0
     buy = next((candidate.get("venue") for candidate in candidates if _to_float(candidate.get("best_ask"), 0.0) == best_ask and best_ask > 0), "")
     sell = next((candidate.get("venue") for candidate in candidates if _to_float(candidate.get("best_bid"), 0.0) == best_bid and best_bid > 0), "")
-    gross_spread = max(0.0, best_bid - best_ask) if best_bid > 0 and best_ask > 0 else 0.0
-    fee_cost = (fusion_price or ((best_bid + best_ask) / 2 if best_bid > 0 and best_ask > 0 else 0.0)) * ((6.0 + 1.5) / 10000.0)
-    net_spread = gross_spread - fee_cost
     mids = [price for price, _ in price_weights if price > 0]
     deviation_bps = ((max(mids) - min(mids)) / fusion_price * 10000) if len(mids) >= 2 and fusion_price > 0 else 0.0
+    target_notional_usd = _normalize_requested_notional_usd(requested_notional_usd, 1000.0)
+    split_plan = _build_multi_venue_split_plan(candidates, "buy", target_notional_usd)
+    arbitrage = _detect_cross_exchange_arbitrage(candidates, target_notional_usd)
     route_reason = "no_market_candidates"
     if best:
         best_state = str(best.get("stability_state") or "watch")
@@ -1694,16 +2250,26 @@ def _build_route_context(candidates: list[dict]) -> dict:
     return {
         "fusion_price": fusion_price,
         "deviation_bps": deviation_bps,
-        "arbitrage": {
-            "opportunity": net_spread > 0,
-            "spread": gross_spread,
-            "net_spread": net_spread,
-            "buy": buy,
-            "sell": sell,
+        "arbitrage": arbitrage,
+        "dominance": {
+            "leader_venue": str((best or {}).get("venue") or ""),
+            "runner_up_venue": str((backup or {}).get("venue") or ""),
+            "leader_score": round(_to_float((best or {}).get("dominance_score"), _to_float((best or {}).get("score"), 0.0)), 6),
+            "runner_up_score": round(_to_float((backup or {}).get("dominance_score"), _to_float((backup or {}).get("score"), 0.0)), 6),
+            "score_gap": round(
+                _to_float((best or {}).get("dominance_score"), _to_float((best or {}).get("score"), 0.0))
+                - _to_float((backup or {}).get("dominance_score"), _to_float((backup or {}).get("score"), 0.0)),
+                6,
+            ),
+            "latency_edge_ms": round(_to_float((best or {}).get("latency_edge_ms"), 0.0), 6),
+            "queue_position": round(_to_float((best or {}).get("queue_position"), _to_float((best or {}).get("queue_priority_risk"), 0.0)), 6),
+            "mode": str(split_plan.get("mode") or "singleVenue"),
         },
+        "split_plan": split_plan,
         "best": best,
         "backup": backup,
         "reason": route_reason,
+        "hedge_recommendation": _build_hedge_recommendation("buy", target_notional_usd, best, backup, split_plan, arbitrage),
     }
 
 
@@ -1916,12 +2482,17 @@ async def execution_optimizer_live_state() -> dict:
 
 
 @app.get("/v1/routes/score")
-async def route_score(symbol: str, infra_health: float | None = None, network_regime: str | None = None) -> dict:
+async def route_score(
+    symbol: str,
+    infra_health: float | None = None,
+    network_regime: str | None = None,
+    estimated_notional_usd: float | None = None,
+) -> dict:
     resolved_infra = _resolve_infra_context(
         {"infra_health": infra_health, "network_regime": network_regime}
     )
     candidates = await _build_route_candidates(symbol, infra_context=resolved_infra)
-    context = _build_route_context(candidates)
+    context = _build_route_context(candidates, requested_notional_usd=estimated_notional_usd)
     failure_attribution = _build_route_failure_attribution(candidates, context, resolved_infra)
     return {
         "symbol": _normalize_symbol(symbol),
@@ -1930,7 +2501,10 @@ async def route_score(symbol: str, infra_health: float | None = None, network_re
         "fusion_price": context.get("fusion_price"),
         "deviation_bps": context.get("deviation_bps"),
         "arbitrage": context.get("arbitrage"),
-        "source": "v6-price-fusion-stability-infra",
+        "dominance": context.get("dominance"),
+        "split_plan": context.get("split_plan"),
+        "hedge_recommendation": context.get("hedge_recommendation"),
+        "source": "v5-multi-venue-dominance",
         "reason": context.get("reason") or "no_market_candidates",
         "infra_health": _to_float(resolved_infra.get("infra_health"), 1.0),
         "network_regime": str(resolved_infra.get("network_regime") or "stable"),
@@ -1959,7 +2533,7 @@ async def place_routed_order(payload: dict) -> dict:
     if not candidates:
         raise HTTPException(status_code=502, detail="no route candidates available")
 
-    context = _build_route_context(candidates)
+    context = _build_route_context(candidates, requested_notional_usd=notional)
     failure_attribution = _build_route_failure_attribution(candidates, context, resolved_infra)
     route_preferences = _resolve_route_preferences(payload)
     pre_trade_memory_gate = _extract_pre_trade_memory_gate(payload)
@@ -1988,6 +2562,27 @@ async def place_routed_order(payload: dict) -> dict:
         }
         for candidate in ranked_candidates
     ]
+    split_plan = context.get("split_plan") if isinstance(context.get("split_plan"), dict) else {}
+    if _normalize_execution_style(route_preferences.get("execution_style")) == "primary_only":
+        split_plan = {
+            "mode": "singleVenueOverride",
+            "slices": [],
+            "total_notional_usd": round(notional, 6),
+            "remaining_notional_usd": 0.0,
+            "coverage_ratio": 1.0,
+            "estimated_average_price": 0.0,
+            "estimated_slippage_bps": 0.0,
+            "primary_venue": str(selected.get("venue") or "unknown"),
+            "venue_count": 1,
+        }
+    hedge_recommendation = _build_hedge_recommendation(
+        side,
+        notional,
+        selected if isinstance(selected, dict) else None,
+        backup if isinstance(backup, dict) else None,
+        split_plan,
+        context.get("arbitrage") if isinstance(context.get("arbitrage"), dict) else None,
+    )
     selected_entry = next(
         (
             entry
@@ -2039,6 +2634,9 @@ async def place_routed_order(payload: dict) -> dict:
             for entry in evaluated_candidates[:5]
         ],
     }
+    route_selection["dominance"] = context.get("dominance") if isinstance(context.get("dominance"), dict) else {}
+    route_selection["split_plan"] = split_plan
+    route_selection["hedge_recommendation"] = hedge_recommendation
     effective_live_context = apply_order_management_to_live_context(live_context, selected_optimizer_v3) if bool(live_context.get("enabled")) else live_context
     if execution_delay_ms > 0:
         await asyncio.sleep(execution_delay_ms / 1000.0)
@@ -2063,22 +2661,43 @@ async def place_routed_order(payload: dict) -> dict:
                 )
             )
     else:
-        fills, avg_fill_price = _simulate_fills(
-            decision_id=decision_id,
-            side=side,
-            notional_usd=notional,
-            depth_payload=(selected.get("depth_payload") or {}),
-            venue=str(selected.get("venue", "unknown")),
-            instrument=symbol,
-            execution_delay_ms=execution_delay_ms,
+        split_slices = split_plan.get("slices") if isinstance(split_plan, dict) and isinstance(split_plan.get("slices"), list) else []
+        use_split_simulation = (
+            len(split_slices) >= 2
+            and _normalize_execution_style(route_preferences.get("execution_style")) != "primary_only"
+            and _normalize_route_mode_override(route_preferences.get("route_mode_override")) != "dualVenueExecution"
         )
+        if use_split_simulation:
+            fills, avg_fill_price = _simulate_split_fills(
+                decision_id=decision_id,
+                side=side,
+                instrument=symbol,
+                split_plan=split_plan,
+                candidates_by_venue={str(candidate.get("venue") or ""): candidate for candidate in candidates},
+                execution_delay_ms=execution_delay_ms,
+            )
+        else:
+            fills, avg_fill_price = _simulate_fills(
+                decision_id=decision_id,
+                side=side,
+                notional_usd=notional,
+                depth_payload=(selected.get("depth_payload") or {}),
+                venue=str(selected.get("venue", "unknown")),
+                instrument=symbol,
+                execution_delay_ms=execution_delay_ms,
+            )
         filled_notional = sum(_to_float(fill.get("notional_usd"), 0.0) for fill in fills)
         order_status = "filled"
-        actual_venue = str(selected.get("venue", "unknown"))
+        actual_venue = str(split_plan.get("primary_venue") or selected.get("venue", "unknown"))
 
     spread_bps = _to_float(selected.get("spread_bps"), 0.0)
     reference_price = _to_float(selected.get("best_ask" if side == "buy" else "best_bid"), avg_fill_price)
-    expected_slippage_bps = max(0.2, _to_float(selected_optimizer_v3.get("expected_slippage_bps"), 0.0), spread_bps * 0.7)
+    expected_slippage_bps = max(
+        0.2,
+        _to_float(selected_optimizer_v3.get("expected_slippage_bps"), 0.0),
+        spread_bps * 0.7,
+        _to_float(split_plan.get("estimated_slippage_bps"), 0.0),
+    )
     realized_slippage_bps = abs(avg_fill_price - reference_price) / max(reference_price, 1e-9) * 10000 if avg_fill_price > 0 and reference_price > 0 else 0.0
     fill_quality_score = max(0.0, 100.0 - spread_bps * 1.6 - realized_slippage_bps * 2.0)
 
@@ -2131,6 +2750,8 @@ async def place_routed_order(payload: dict) -> dict:
                 "chosen": str(selected.get("venue") or actual_venue),
                 "backup": str(backup.get("venue") or "") if isinstance(backup, dict) else "",
                 "reason": route_reason,
+                "split_plan": split_plan,
+                "hedge_recommendation": hedge_recommendation,
             },
             "execution_optimizer_v3": {
                 "selected": selected_optimizer_v3,
@@ -2188,7 +2809,11 @@ async def place_routed_order(payload: dict) -> dict:
             "selection": route_selection,
             "mode": "live" if broker_order else "simulated",
             "execution_target": actual_venue,
-            "source": "v6-price-fusion-stability-infra",
+            "source": "v5-multi-venue-dominance",
+            "dominance": context.get("dominance") if isinstance(context.get("dominance"), dict) else {},
+            "split_plan": split_plan,
+            "hedge_recommendation": hedge_recommendation,
+            "arbitrage": context.get("arbitrage"),
             "failure_source": failure_attribution.get("failure_source"),
             "failure_reasons": failure_attribution.get("failure_reasons"),
             "failure_blocking": bool(failure_attribution.get("failure_blocking")),

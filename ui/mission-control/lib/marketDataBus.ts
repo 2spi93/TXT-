@@ -2308,6 +2308,9 @@ class MarketDataBus {
     if (!fusion) {
       return baseRouting;
     }
+    const baseArbitrage = baseRouting?.arbitrage && typeof baseRouting.arbitrage === "object" && !Array.isArray(baseRouting.arbitrage)
+      ? baseRouting.arbitrage as JsonMap
+      : null;
     const baseCandidates = Array.isArray(baseRouting?.candidates)
       ? baseRouting.candidates as JsonMap[]
       : [];
@@ -2332,11 +2335,16 @@ class MarketDataBus {
       fusion_price: fusion.fusionPrice,
       display_price: fusion.displayPrice,
       arbitrage: {
+        ...(baseArbitrage || {}),
         opportunity: fusion.arbitrage.opportunity,
         spread: fusion.arbitrage.spread,
         net_spread: fusion.arbitrage.netSpread,
         buy: fusion.arbitrage.buy,
         sell: fusion.arbitrage.sell,
+        buy_venue: fusion.arbitrage.buy || baseArbitrage?.buy_venue,
+        sell_venue: fusion.arbitrage.sell || baseArbitrage?.sell_venue,
+        buyVenue: fusion.arbitrage.buy || baseArbitrage?.buyVenue,
+        sellVenue: fusion.arbitrage.sell || baseArbitrage?.sellVenue,
       },
       best: candidates[0] || ((baseRouting?.best as JsonMap | undefined) || null),
       backup: candidates[1] || ((baseRouting?.backup as JsonMap | undefined) || null),

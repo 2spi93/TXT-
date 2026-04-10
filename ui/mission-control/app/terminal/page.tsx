@@ -19600,7 +19600,7 @@ export default function TradingTerminalPage() {
       case "controlroom":
         return <ControlRoomMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} liveOpsPayload={liveOpsPayload} emergencyStopBusy={emergencyStopBusy} emergencyStopFeedback={emergencyStopFeedback} onEmergencyStop={() => { void triggerEmergencyStop(); }} formatClock={formatClock} />;
       case "optimizer":
-        return <ExecutionOptimizerMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} payload={executionOptimizerLivePayload} formatClock={formatClock} />;
+        return <ExecutionOptimizerMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} payload={executionOptimizerLivePayload} routingPayload={routingScore} formatClock={formatClock} />;
       case "venues":
         return <VenueTelemetryMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} marketPayload={marketVenueTelemetryPayload} routePayload={routeVenueTelemetryPayload} formatClock={formatClock} />;
       case "alerts":
@@ -22293,6 +22293,7 @@ export default function TradingTerminalPage() {
               layoutEditMode={layoutEditMode}
               onDetach={() => detachPanel("optimizer", "monitoring")}
               payload={executionOptimizerLivePayload}
+              routingPayload={routingScore}
               formatClock={formatClock}
             />
             </div>

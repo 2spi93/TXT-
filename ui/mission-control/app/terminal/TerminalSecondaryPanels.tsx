@@ -1004,18 +1004,39 @@ export function ExecutionOptimizerMonitoringPanel({
   layoutEditMode,
   onDetach,
   payload,
+  routingPayload,
   formatClock,
 }: {
   badge: ReactNode;
   layoutEditMode: boolean;
   onDetach: () => void;
   payload: ExecutionOptimizerLivePayload | null;
+  routingPayload: Record<string, unknown> | null;
   formatClock: (value: string) => string;
 }) {
   const envelope = safeRecord(payload);
+  const routingEnvelope = safeRecord(routingPayload);
   const profilesRecord = safeRecord(envelope.profiles);
   const activeOrders = safeRows(envelope.active_orders);
   const recentEvents = safeRows(envelope.recent_events);
+  const dominance = safeRecord(routingEnvelope.dominance);
+  const splitPlan = safeRecord(routingEnvelope.split_plan);
+  const hedgeRecommendation = safeRecord(routingEnvelope.hedge_recommendation);
+  const bestRoute = safeRecord(routingEnvelope.best);
+  const backupRoute = safeRecord(routingEnvelope.backup);
+  const splitSlices = safeRows(splitPlan.slices).slice(0, 3);
+  const hedgeReasons = Array.isArray(hedgeRecommendation.reasons)
+    ? hedgeRecommendation.reasons.map((item) => String(item)).filter(Boolean).slice(0, 3)
+    : [];
+  const routingAvailable = Object.keys(routingEnvelope).length > 0;
+  const routingLeader = String(dominance.leader_venue || bestRoute.venue || "--");
+  const routingRunnerUp = String(dominance.runner_up_venue || backupRoute.venue || "--");
+  const splitMode = String(splitPlan.mode || dominance.mode || "singleVenue");
+  const hedgeMode = String(hedgeRecommendation.mode || "standby");
+  const hedgeEnabled = Boolean(hedgeRecommendation.enabled);
+  const hedgeVenueLabel = hedgeMode === "crossExchangeLock"
+    ? `${String(hedgeRecommendation.buy_venue || "--")}→${String(hedgeRecommendation.sell_venue || "--")}`
+    : String(hedgeRecommendation.venue || "--");
   const profileRows = Object.values(profilesRecord)
     .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
     .sort((left, right) => safeNumber(right.sample_count, 0) - safeNumber(left.sample_count, 0));
@@ -1038,6 +1059,54 @@ export function ExecutionOptimizerMonitoringPanel({
             <span className="venue-telemetry-pill">profiles {profileRows.length}</span>
             <span className="venue-telemetry-pill">events {recentEvents.length}</span>
             <span className="venue-telemetry-pill">updated {updatedAt ? formatCompactClock(updatedAt, formatClock) : "--:--:--"}</span>
+          </div>
+          <div className="optimizer-live-section">
+            <div className="subtle mini">V5 multi-venue routing</div>
+            {!routingAvailable ? <p className="subtle mini">Dominance, split et hedge V5 indisponibles.</p> : null}
+            {routingAvailable ? (
+              <div className="optimizer-live-grid">
+                <div className={`venue-telemetry-item ${safeNumber(dominance.score_gap, 0) >= 0.08 ? "good" : "subtle"}`}>
+                  <div className="venue-telemetry-head">
+                    <span className="venue-telemetry-venue">Dominance</span>
+                    <span className={`venue-telemetry-state ${safeNumber(dominance.score_gap, 0) >= 0.08 ? "good" : "subtle"}`}>{routingLeader}</span>
+                  </div>
+                  <div className="mon-row"><span>Leader / backup</span><span>{routingLeader} · {routingRunnerUp}</span></div>
+                  <div className="mon-row"><span>Score gap</span><span>{safeNumber(dominance.score_gap, 0).toFixed(3)} · lead {(safeNumber(dominance.leader_score, 0) * 100).toFixed(0)}%</span></div>
+                  <div className="mon-row"><span>Latency edge</span><span>{formatCompactMetricMs(dominance.latency_edge_ms)} · queue {(safeNumber(dominance.queue_position, 0) * 100).toFixed(0)}%</span></div>
+                  <div className="mon-row"><span>Route score</span><span>{(safeNumber(bestRoute.score, safeNumber(dominance.leader_score, 0)) * 100).toFixed(0)}% · reason {String(routingEnvelope.reason || "best_route_candidate").replace(/_/g, " ")}</span></div>
+                </div>
+                <div className={`venue-telemetry-item ${splitMode === "multiVenueSplit" ? "good" : "subtle"}`}>
+                  <div className="venue-telemetry-head">
+                    <span className="venue-telemetry-venue">Split</span>
+                    <span className={`venue-telemetry-state ${splitMode === "multiVenueSplit" ? "good" : "subtle"}`}>{splitMode.replace(/_/g, " ")}</span>
+                  </div>
+                  <div className="mon-row"><span>Primary / venues</span><span>{String(splitPlan.primary_venue || routingLeader || "--")} · {safeNumber(splitPlan.venue_count, splitSlices.length || 1).toFixed(0)} venues</span></div>
+                  <div className="mon-row"><span>Coverage / slip</span><span>{(safeNumber(splitPlan.coverage_ratio, 0) * 100).toFixed(0)}% · {safeNumber(splitPlan.estimated_slippage_bps, 0).toFixed(2)}bps</span></div>
+                  <div className="mon-row"><span>Plan size</span><span>{formatCompactUsd(splitPlan.total_notional_usd)} · rem {formatCompactUsd(splitPlan.remaining_notional_usd)}</span></div>
+                  <div className="optimizer-live-reasons">
+                    {splitSlices.length === 0 ? <span className="optimizer-live-chip warn">no split slices</span> : null}
+                    {splitSlices.map((slice, index) => (
+                      <span key={`split-slice-${index}-${String(slice.venue || "venue")}`} className="optimizer-live-chip good">
+                        {String(slice.venue || "?")} {(safeNumber(slice.share_pct, 0) * 100).toFixed(0)}% · {formatCompactUsd(slice.notional_usd)}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                <div className={`venue-telemetry-item ${hedgeEnabled ? "good" : "subtle"}`}>
+                  <div className="venue-telemetry-head">
+                    <span className="venue-telemetry-venue">Hedge</span>
+                    <span className={`venue-telemetry-state ${hedgeEnabled ? "good" : "subtle"}`}>{hedgeMode.replace(/_/g, " ")}</span>
+                  </div>
+                  <div className="mon-row"><span>State</span><span>{hedgeEnabled ? "enabled" : "standby"}</span></div>
+                  <div className="mon-row"><span>Venue</span><span>{hedgeVenueLabel}</span></div>
+                  <div className="mon-row"><span>Trigger / size</span><span>{formatCompactUsd(hedgeRecommendation.trigger_delta_usd)} · {formatCompactUsd(hedgeRecommendation.hedge_notional_usd)}</span></div>
+                  <div className="optimizer-live-reasons">
+                    {hedgeReasons.length === 0 ? <span className="optimizer-live-chip warn">no hedge trigger</span> : null}
+                    {hedgeReasons.map((reason) => <span key={reason} className="optimizer-live-chip good">{reason}</span>)}
+                  </div>
+                </div>
+              </div>
+            ) : null}
           </div>
           <div className="optimizer-live-section">
             <div className="subtle mini">Live managed orders</div>
