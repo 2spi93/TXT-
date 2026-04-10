@@ -135,7 +135,7 @@ export default function IncidentsPage() {
     <main className="shell txt-page-shell">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.4fr 1fr" }}>
         <div className="panel txt-page-hero">
-          <div className="eyebrow">Incident Desk <HelpHint text="Console d'incidents: suivi, assignation, cloture, traçabilite operationnelle." examples={["Exemple simple: filtre open, assigne un ticket a toi, corrige, puis close avec une note claire.", "Si un incident touche execution ou broker, ouvre aussi Trading Terminal pour voir l'etat global."]} /></div>
+          <div className="eyebrow">Incident Desk <HelpHint text="Cette page sert à suivre les incidents, dire qui s'en occupe et garder une trace claire de la résolution." examples={["Filtre les incidents ouverts, prends-en un, corrige-le puis ferme-le avec une note utile.", "Si l'incident touche l'exécution, regarde aussi l'état global du terminal."]} /></div>
           <h1 className="title" style={{ fontSize: 34 }}>Incidents Operations</h1>
           <p className="subtle">Pilote les incidents ouverts par le chatbot et les operateurs.</p>
           <TxtMiniGuide
@@ -156,7 +156,7 @@ export default function IncidentsPage() {
           {error ? <p className="warn">{error}</p> : null}
         </div>
         <div className="panel">
-          <div className="eyebrow">Filtres <HelpHint text="Filtre rapide par statut incident." examples={["Choisis open pour traiter d'abord le backlog critique du moment.", "Resolution note sera reutilisee a la cloture, donc ecris directement une phrase utile."]} /></div>
+          <div className="eyebrow">Filtres <HelpHint text="Ces filtres servent à faire ressortir vite les incidents qui demandent ton attention." examples={["Commence souvent par les incidents ouverts.", "Prépare une note de résolution claire dès que tu comprends le problème."]} /></div>
           {slaBreachedCount > 0 ? (
             <p className="warn">Alerte: {slaBreachedCount} incident(s) non assignes au-dela de {slaMinutes} min.</p>
           ) : null}
@@ -251,7 +251,7 @@ export default function IncidentsPage() {
 
       <section className="grid" style={{ gridTemplateColumns: "1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Liste incidents <HelpHint text="Assigner un ticket a soi puis le cloturer avec note de resolution." examples={["Assign to me quand tu prends la main sur le sujet.", "Close seulement quand la cause est comprise et que la note de resolution permet a un autre operateur de suivre."]} /></div>
+          <div className="eyebrow">Liste incidents <HelpHint text="La liste te permet de prendre un ticket, suivre son état et le fermer proprement." examples={["Assigne-toi le ticket dès que tu prends la main.", "Ne ferme l'incident que si la cause est comprise et bien écrite dans la note."]} /></div>
           {visibleItems.length === 0 ? <p className="subtle">Aucun incident.</p> : null}
           {visibleItems.map((item) => {
             const key = String(item.ticket_key || "");

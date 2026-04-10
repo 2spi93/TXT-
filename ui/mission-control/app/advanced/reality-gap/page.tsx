@@ -230,15 +230,14 @@ export default function RealityGapPage() {
     <main className="shell txt-page-shell">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.2fr 0.9fr", gap: 14 }}>
         <div className="panel txt-page-hero">
-          <div className="eyebrow">Reality Gap <HelpHint text="Compare prediction d'execution vs realise, puis montre la calibration appliquee au profil." examples={["Si la latence reelle depasse souvent la prediction, le multiplicateur de jitter doit monter.", "Si le fill ratio reel tombe sous la prediction, surveille partial_fill_risk_delta et queue_risk_delta."]} /></div>
+          <div className="eyebrow">Reality Gap <HelpHint text="Cette page compare ce qu'on pensait voir à l'exécution et ce qui s'est vraiment passé." examples={["Si le délai réel dépasse souvent le délai attendu, il faut durcir les réglages.", "Si les ordres se remplissent moins bien que prévu, il faut relire le profil de la plateforme."]} /></div>
           <h1 className="title" style={{ fontSize: 30, marginBottom: 8 }}>Recent Samples & Profiles</h1>
           <p className="subtle" style={{ marginBottom: 12 }}>Vue ops dense pour suivre le flux reality-gap, verifier l'auto-ingestion post-trade et lire rapidement le diff predicted vs realized.</p>
           <TxtMiniGuide
             title="Guide Reality Gap"
-            what="Mesure l'ecart entre execution predite et execution realisee."
-            why="Transformer les replays post-trade en calibration exploitable par le predicteur et le moteur d'execution."
-            example="Quand gap latency et gap impact montent ensemble, le profil du venue devient plus conservateur."
-            terms={["slippage", "fill ratio", "queue risk"]}
+            what="La différence entre l'exécution attendue et l'exécution réelle."
+            why="Comprendre si le moteur lit bien le terrain ou s'il faut le rendre plus prudent."
+            example="Si le délai et l'écart de prix montent ensemble, il faut traiter la plateforme comme plus difficile."
           />
           <div className="grid" style={{ gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10, marginTop: 12 }}>
             <StatChip label="Samples" value={String(samples.length)} />
