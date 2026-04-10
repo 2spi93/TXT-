@@ -75,6 +75,12 @@ type AiBridgeSummary = {
   routeScore: number;
   v7Label: string;
   v7Tone: "good" | "warn" | "neutral";
+  v6Action: string;
+  v6ConfidencePct: number;
+  v6Regime: string;
+  v6PersistenceAvailable: boolean;
+  v6PersistenceLabel: string;
+  v6PersistenceError: string;
   edgeBps: number;
   v8Execute: boolean;
   v8ProbabilityPct: number;
@@ -536,12 +542,18 @@ export function BrokersDockPanel({
           <div className="brokers-section">
             <div className="chart-stat-label" style={{ marginBottom: 6 }}>AI Execution Bridge</div>
             <div className="row"><span>V7 gate</span><span className={aiBridge.v7Tone === "good" ? "good" : aiBridge.v7Tone === "warn" ? "warn" : "subtle"}>{aiBridge.v7Label}</span></div>
+            <div className="row"><span>V6 policy</span><span className={aiBridge.v6Action === "HOLD" ? "subtle" : "good"}>{aiBridge.v6Action} | {aiBridge.v6ConfidencePct.toFixed(0)}%</span></div>
+            <div className="row"><span>V6 regime</span><span>{aiBridge.v6Regime}</span></div>
+            <div className="row"><span>V6 DB</span><span className={aiBridge.v6PersistenceAvailable ? "good" : "warn"}>{aiBridge.v6PersistenceLabel}</span></div>
             <div className="row"><span>Route</span><span>{aiBridge.routeLabel} | {aiBridge.routeScore.toFixed(2)}</span></div>
             <div className="row"><span>Final edge</span><span className={aiBridge.edgeBps >= 0 ? "good" : "warn"}>{aiBridge.edgeBps.toFixed(1)} bps</span></div>
             <div className="row"><span>V8 execute</span><span className={aiBridge.v8Execute ? "good" : "subtle"}>{aiBridge.v8Execute ? "yes" : "hold"} | {aiBridge.v8ProbabilityPct.toFixed(0)}%</span></div>
             <div className="row"><span>Brain</span><span>{aiBridge.brainAction} | {aiBridge.brainConfidencePct.toFixed(0)}%</span></div>
             <div className="row"><span>Regime</span><span>{aiBridge.brainRegime}</span></div>
             <div className="subtle mini gtix-ellipsis" style={{ marginTop: 6 }}>{aiBridge.reasonLabel || "No predictor rationale"}</div>
+            {!aiBridge.v6PersistenceAvailable && aiBridge.v6PersistenceError ? (
+              <div className="warn mini gtix-ellipsis" style={{ marginTop: 4 }}>{aiBridge.v6PersistenceError}</div>
+            ) : null}
             {providerRows.slice(0, 3).map((item, index) => (
               <div key={`fbr-ag-${index}`} className="agent-row">
                 <span className="agent-name gtix-ellipsis">{String(item.route || "–").slice(0, 14)}</span>
@@ -1134,6 +1146,7 @@ export function ExecutionOptimizerMonitoringPanel({
                       <div className="mon-row"><span>Regime / venue</span><span>{String(executionAiV6State.market_regime || "balanced")} · {String(executionAiV6State.venue || routingLeader || "--")}</span></div>
                       <div className="mon-row"><span>Queue / fill</span><span>{(safeNumber(executionAiV6State.queue_position, 0) * 100).toFixed(0)}% · {(safeNumber(executionAiV6State.fill_probability, 0) * 100).toFixed(0)}%</span></div>
                       <div className="mon-row"><span>Learning</span><span>{executionAiV6LearningEnabled ? "enabled" : "frozen"} · {safeNumber(executionAiV6Snapshot.context_count, 0).toFixed(0)} ctx</span></div>
+                      <div className="mon-row"><span>Persistence</span><span className={Boolean(executionAiV6Guardrails.persistence_available) ? "good" : "warn"}>{Boolean(executionAiV6Guardrails.persistence_available) ? "db online" : "db degraded"}</span></div>
                       <div className="optimizer-live-reasons">
                         {executionAiV6Reasons.length === 0 ? <span className="optimizer-live-chip subtle">no policy reasons</span> : null}
                         {executionAiV6Reasons.map((reason) => <span key={reason} className="optimizer-live-chip good">{reason}</span>)}
@@ -1152,6 +1165,9 @@ export function ExecutionOptimizerMonitoringPanel({
                       <div className="mon-row"><span>EMA / drawdown</span><span>{safeNumber(executionAiV6Guardrails.reward_ema, 0).toFixed(2)} · dd {safeNumber(executionAiV6Guardrails.reward_drawdown, 0).toFixed(2)}</span></div>
                       <div className="mon-row"><span>Vol / streak</span><span>{safeNumber(executionAiV6Guardrails.reward_volatility, 0).toFixed(2)} · {safeNumber(executionAiV6Guardrails.negative_streak, 0).toFixed(0)} neg</span></div>
                       <div className="mon-row"><span>Loaded</span><span>{Boolean(executionAiV6Guardrails.loaded) ? formatCompactClock(executionAiV6Guardrails.loaded_at, formatClock) : "cold"}</span></div>
+                      {!Boolean(executionAiV6Guardrails.persistence_available) && String(executionAiV6Guardrails.last_persist_error || "") ? (
+                        <div className="mon-row"><span>DB error</span><span className="warn gtix-ellipsis">{String(executionAiV6Guardrails.last_persist_error || "")}</span></div>
+                      ) : null}
                       <div className="optimizer-live-reasons">
                         {executionAiV6FreezeReasons.length === 0 ? <span className="optimizer-live-chip good">guardrails clean</span> : null}
                         {executionAiV6FreezeReasons.map((reason) => <span key={reason} className="optimizer-live-chip warn">{reason}</span>)}

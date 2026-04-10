@@ -14327,6 +14327,23 @@ export default function TradingTerminalPage() {
   }), [aggregatedMultiVenueBook, aiAdjustedAutoNotionalUsd, autoExecutionMode, notional, side]);
   const preferredRoute = (routingScore?.best as JsonMap | undefined) || routeCandidates[0] || null;
   const backupRoute = (routingScore?.backup as JsonMap | undefined) || routeCandidates[1] || null;
+  const routingExecutionAiV6 = routingScore?.execution_ai_v6 && typeof routingScore.execution_ai_v6 === "object"
+    ? routingScore.execution_ai_v6 as JsonMap
+    : null;
+  const routingExecutionAiV6State = routingExecutionAiV6?.state && typeof routingExecutionAiV6.state === "object"
+    ? routingExecutionAiV6.state as JsonMap
+    : null;
+  const routingExecutionAiV6Decision = routingExecutionAiV6?.decision && typeof routingExecutionAiV6.decision === "object"
+    ? routingExecutionAiV6.decision as JsonMap
+    : null;
+  const routingExecutionAiV6Snapshot = routingExecutionAiV6?.snapshot && typeof routingExecutionAiV6.snapshot === "object"
+    ? routingExecutionAiV6.snapshot as JsonMap
+    : null;
+  const routingExecutionAiV6Guardrails = routingExecutionAiV6Decision?.guardrails && typeof routingExecutionAiV6Decision.guardrails === "object"
+    ? routingExecutionAiV6Decision.guardrails as JsonMap
+    : routingExecutionAiV6Snapshot?.guardrails && typeof routingExecutionAiV6Snapshot.guardrails === "object"
+      ? routingExecutionAiV6Snapshot.guardrails as JsonMap
+      : null;
   const routingReasonLabel = String(routingScore?.reason || (routingCandidatesV6.length > 0 ? "best_route_candidate" : "best_quote_spread")).replace(/_/g, " ");
   const routingInfraHealth = clamp(toNumber(routingScore?.infra_health, 1), 0.05, 1);
   const routingNetworkRegime = String(routingScore?.network_regime || "stable");
@@ -15416,6 +15433,16 @@ export default function TradingTerminalPage() {
     routeScore: preferredRouteScore,
     v7Label: v7StatusLabel,
     v7Tone: v7StatusTone as "good" | "warn" | "neutral",
+    v6Action: String(routingExecutionAiV6Decision?.action || "hold").toUpperCase(),
+    v6ConfidencePct: clamp(toNumber(routingExecutionAiV6Decision?.confidence, 0) * 100, 0, 100),
+    v6Regime: String(routingExecutionAiV6State?.market_regime || "n/a").toUpperCase(),
+    v6PersistenceAvailable: typeof routingExecutionAiV6Guardrails?.persistence_available === "boolean"
+      ? Boolean(routingExecutionAiV6Guardrails.persistence_available)
+      : true,
+    v6PersistenceLabel: typeof routingExecutionAiV6Guardrails?.persistence_available === "boolean"
+      ? (Boolean(routingExecutionAiV6Guardrails.persistence_available) ? "DB online" : "DB degraded")
+      : "DB unknown",
+    v6PersistenceError: String(routingExecutionAiV6Guardrails?.last_persist_error || ""),
     edgeBps: toNumber(backendFinalEdgeBps, 0),
     v8Execute: effectiveV8ShouldExecute,
     v8ProbabilityPct: clamp(effectiveV8Probability * 100, 0, 100),
@@ -15792,36 +15819,71 @@ export default function TradingTerminalPage() {
     flowBands: chartFlowSignalBands,
     arbitrageBands: chartArbitrageSignalBands,
   }), [chartArbitrageSignalBands, chartExecutionOverlay, chartExecutionSlippageBands, chartFlowSignalBands, chartLiquidityPredictionLevels]);
-  const v6StateLabel = chartMarketSimulation
-    ? chartMarketSimulation.stateLabel.replace(/_/g, " ").toUpperCase()
-    : "STBY";
-  const v6DecisionChipTone = !chartMarketSimulation
-    ? "neutral"
-    : chartMarketSimulation.stateLabel === "chaos"
+  const backendExecutionAiV6Available = Boolean(routingExecutionAiV6Decision);
+  const backendExecutionAiV6Action = String(routingExecutionAiV6Decision?.action || "hold").toUpperCase();
+  const backendExecutionAiV6Confidence = clamp(toNumber(routingExecutionAiV6Decision?.confidence, 0), 0, 1);
+  const backendExecutionAiV6ShouldExecute = typeof routingExecutionAiV6Decision?.should_execute === "boolean"
+    ? Boolean(routingExecutionAiV6Decision.should_execute)
+    : false;
+  const backendExecutionAiV6Regime = String(routingExecutionAiV6State?.market_regime || "stby").replace(/_/g, " ").toUpperCase();
+  const backendExecutionAiV6ProjectedReward = toNumber(routingExecutionAiV6Decision?.projected_reward, 0);
+  const backendExecutionAiV6PersistenceAvailable = typeof routingExecutionAiV6Guardrails?.persistence_available === "boolean"
+    ? Boolean(routingExecutionAiV6Guardrails.persistence_available)
+    : true;
+  const v6StateLabel = backendExecutionAiV6Available
+    ? backendExecutionAiV6Regime
+    : chartMarketSimulation
+      ? chartMarketSimulation.stateLabel.replace(/_/g, " ").toUpperCase()
+      : "STBY";
+  const v6DecisionChipTone = backendExecutionAiV6Available
+    ? !backendExecutionAiV6PersistenceAvailable
       ? "warn"
-      : chartMarketSimulation.decision.shouldExecute
-        ? chartMarketSimulation.execution.fillProb >= 0.58 && chartMarketSimulation.execution.slippage <= Math.max(8, Math.abs(chartMarketSimulation.decision.confidence * 10) + 4)
+      : backendExecutionAiV6ShouldExecute
+        ? backendExecutionAiV6Confidence >= 0.58
           ? "good"
-          : "warn"
-        : chartMarketSimulation.liquidityCollapse
-          ? "warn"
-          : "neutral";
-  const v6ProjectionChipTone = !chartMarketSimulation
-    ? "neutral"
-    : chartMarketSimulation.liquidityCollapse || chartMarketSimulation.stateLabel === "chaos"
+          : "subtle"
+        : "neutral"
+    : !chartMarketSimulation
+      ? "neutral"
+      : chartMarketSimulation.stateLabel === "chaos"
+        ? "warn"
+        : chartMarketSimulation.decision.shouldExecute
+          ? chartMarketSimulation.execution.fillProb >= 0.58 && chartMarketSimulation.execution.slippage <= Math.max(8, Math.abs(chartMarketSimulation.decision.confidence * 10) + 4)
+            ? "good"
+            : "warn"
+          : chartMarketSimulation.liquidityCollapse
+            ? "warn"
+            : "neutral";
+  const v6ProjectionChipTone = backendExecutionAiV6Available
+    ? !backendExecutionAiV6PersistenceAvailable
       ? "warn"
-      : Math.abs(chartMarketSimulation.t250ms.moveBps) >= 6 || chartMarketSimulation.execution.fillProb >= 0.64
+      : backendExecutionAiV6ProjectedReward >= 0.2
         ? "good"
-        : "neutral";
-  const v6DecisionLabel = !chartMarketSimulation
-    ? "V6 STBY"
-    : `V6 ${chartMarketSimulation.decision.shouldExecute ? chartMarketSimulation.decision.action.toUpperCase() : "HOLD"} ${(chartMarketSimulation.confidence * 100).toFixed(0)}%`;
-  const v6ProjectionCompactLabel = !chartMarketSimulation
-    ? "SIM idle"
-    : `SIM ${chartMarketSimulation.t250ms.moveBps >= 0 ? "+" : ""}${chartMarketSimulation.t250ms.moveBps.toFixed(1)}bps f${(chartMarketSimulation.execution.fillProb * 100).toFixed(0)}%`;
-  const v6ProjectionLabel = !chartMarketSimulation
-    ? "SIM idle"
-    : `SIM ${v6StateLabel} · 250 ${chartMarketSimulation.t250ms.moveBps >= 0 ? "+" : ""}${chartMarketSimulation.t250ms.moveBps.toFixed(1)}bps · fill ${(chartMarketSimulation.execution.fillProb * 100).toFixed(0)}% · slip ${chartMarketSimulation.execution.slippage.toFixed(1)}bps`;
+        : backendExecutionAiV6ProjectedReward < 0
+          ? "warn"
+          : "neutral"
+    : !chartMarketSimulation
+      ? "neutral"
+      : chartMarketSimulation.liquidityCollapse || chartMarketSimulation.stateLabel === "chaos"
+        ? "warn"
+        : Math.abs(chartMarketSimulation.t250ms.moveBps) >= 6 || chartMarketSimulation.execution.fillProb >= 0.64
+          ? "good"
+          : "neutral";
+  const v6DecisionLabel = backendExecutionAiV6Available
+    ? `V6 ${backendExecutionAiV6ShouldExecute ? backendExecutionAiV6Action : "HOLD"} ${(backendExecutionAiV6Confidence * 100).toFixed(0)}%`
+    : !chartMarketSimulation
+      ? "V6 STBY"
+      : `V6 ${chartMarketSimulation.decision.shouldExecute ? chartMarketSimulation.decision.action.toUpperCase() : "HOLD"} ${(chartMarketSimulation.confidence * 100).toFixed(0)}%`;
+  const v6ProjectionCompactLabel = backendExecutionAiV6Available
+    ? `RT ${backendExecutionAiV6ProjectedReward >= 0 ? "+" : ""}${backendExecutionAiV6ProjectedReward.toFixed(1)} ${backendExecutionAiV6PersistenceAvailable ? "db" : "db!"}`
+    : !chartMarketSimulation
+      ? "SIM idle"
+      : `SIM ${chartMarketSimulation.t250ms.moveBps >= 0 ? "+" : ""}${chartMarketSimulation.t250ms.moveBps.toFixed(1)}bps f${(chartMarketSimulation.execution.fillProb * 100).toFixed(0)}%`;
+  const v6ProjectionLabel = backendExecutionAiV6Available
+    ? `RT ${v6StateLabel} · reward ${backendExecutionAiV6ProjectedReward >= 0 ? "+" : ""}${backendExecutionAiV6ProjectedReward.toFixed(2)} · ${backendExecutionAiV6PersistenceAvailable ? "db online" : "db degraded"}`
+    : !chartMarketSimulation
+      ? "SIM idle"
+      : `SIM ${v6StateLabel} · 250 ${chartMarketSimulation.t250ms.moveBps >= 0 ? "+" : ""}${chartMarketSimulation.t250ms.moveBps.toFixed(1)}bps · fill ${(chartMarketSimulation.execution.fillProb * 100).toFixed(0)}% · slip ${chartMarketSimulation.execution.slippage.toFixed(1)}bps`;
 
   const refreshBackendPredictorStats = useCallback(async () => {
     try {
