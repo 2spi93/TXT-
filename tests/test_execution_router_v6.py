@@ -179,6 +179,24 @@ class ExecutionRouterV6Tests(unittest.TestCase):
         self.assertEqual(decision["learned_bias"]["action"], "join_best_limit")
         self.assertGreaterEqual(decision["learned_bias"]["sample_count"], 2)
 
+    def test_policy_freeze_learning_skips_bucket_updates(self) -> None:
+        state = self._state()
+        result = _execution_ai_v6_learn(
+            state,
+            {"action": "join_best_limit"},
+            requested_notional_usd=5000.0,
+            filled_notional_usd=5000.0,
+            realized_slippage_bps=0.9,
+            fill_latency_ms=22.0,
+            adverse_selection_score=0.08,
+            edge_bps=2.5,
+            policy_context={"freeze_learning": True, "freeze_learning_reasons": ["fallback_rules_only"]},
+        )
+
+        self.assertTrue(result["policy_freeze_learning"])
+        self.assertFalse(result["learning_applied"])
+        self.assertEqual(EXECUTION_AI_V6_STATE["actions"], {})
+
 
 if __name__ == "__main__":
     unittest.main()

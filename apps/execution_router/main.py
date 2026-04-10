@@ -10,6 +10,11 @@ from uuid import uuid4
 import httpx
 from fastapi import FastAPI, HTTPException
 
+from apps.execution_router.context_v1 import (
+    apply_execution_context_to_fill_snapshot,
+    build_execution_context,
+    build_market_structure_snapshot,
+)
 from apps.execution_router.optimizer_v3 import (
     apply_order_management_to_live_context,
     build_execution_optimizer_snapshot,
@@ -750,6 +755,8 @@ def _compact_execution_optimizer_candidate(candidate: dict[str, object], snapsho
     queue = snapshot.get("queue") if isinstance(snapshot.get("queue"), dict) else {}
     guard = snapshot.get("slippage_guard") if isinstance(snapshot.get("slippage_guard"), dict) else {}
     order_management = snapshot.get("order_management") if isinstance(snapshot.get("order_management"), dict) else {}
+    market_structure = snapshot.get("market_structure") if isinstance(snapshot.get("market_structure"), dict) else {}
+    execution_context = snapshot.get("execution_context") if isinstance(snapshot.get("execution_context"), dict) else {}
     return {
         "venue": str(candidate.get("venue") or "unknown"),
         "spread_bps": round(_to_float(candidate.get("spread_bps"), 0.0), 6),
@@ -759,8 +766,25 @@ def _compact_execution_optimizer_candidate(candidate: dict[str, object], snapsho
         "queue_edge": round(_to_float(queue.get("queue_edge"), 0.0), 6),
         "slippage_guard": guard,
         "order_management": order_management,
+        "market_structure": market_structure,
+        "execution_context": execution_context,
         "desk_profile": snapshot.get("desk_profile") if isinstance(snapshot.get("desk_profile"), dict) else {},
     }
+
+
+def _enrich_execution_optimizer_snapshot(
+    candidate: dict[str, object],
+    snapshot: dict[str, object],
+    side: str,
+    notional_usd: float,
+) -> dict[str, object]:
+    enriched = dict(snapshot)
+    market_structure = build_market_structure_snapshot(candidate, side)
+    fill_prediction = snapshot.get("fill_prediction") if isinstance(snapshot.get("fill_prediction"), dict) else {}
+    execution_context = build_execution_context(candidate, market_structure, fill_prediction, side, notional_usd)
+    enriched["market_structure"] = market_structure
+    enriched["execution_context"] = execution_context
+    return enriched
 
 
 async def _execute_live_order(payload: dict[str, object], live_context: dict[str, object], decision_id: str) -> dict[str, object]:
@@ -903,6 +927,8 @@ def _compact_execution_optimizer_live_order(state: dict[str, object]) -> dict[st
     latest_guard = latest_v4.get("guard") if isinstance(latest_v4.get("guard"), dict) else {}
     latest_spoof = latest_v4.get("spoof") if isinstance(latest_v4.get("spoof"), dict) else {}
     latest_lifecycle = latest_v4.get("lifecycle") if isinstance(latest_v4.get("lifecycle"), dict) else {}
+    latest_context = latest_v4.get("context") if isinstance(latest_v4.get("context"), dict) else {}
+    latest_market_structure = latest_v4.get("market_structure") if isinstance(latest_v4.get("market_structure"), dict) else {}
     queue = latest_snapshot.get("queue") if isinstance(latest_snapshot.get("queue"), dict) else {}
     queue_tracker = latest_v4.get("queue_tracker") if isinstance(latest_v4.get("queue_tracker"), dict) else {}
     fill_state = latest_v4.get("fill") if isinstance(latest_v4.get("fill"), dict) else {}
@@ -936,6 +962,8 @@ def _compact_execution_optimizer_live_order(state: dict[str, object]) -> dict[st
         "lifecycle_action": latest_lifecycle.get("action"),
         "lifecycle_reason": latest_lifecycle.get("reason"),
         "timing": latest_lifecycle.get("timing"),
+        "market_structure": latest_market_structure,
+        "execution_context": latest_context,
         "desk_profile": state.get("desk_profile") if isinstance(state.get("desk_profile"), dict) else {},
         "updated_at": state.get("updated_at"),
         "history": state.get("history") if isinstance(state.get("history"), list) else [],
@@ -985,14 +1013,19 @@ async def _run_execution_optimizer_live_loop(
     market_venue = str(selected_candidate.get("venue") or live_context.get("provider") or "unknown")
     broker_provider = str(live_context.get("provider") or broker_order.get("venue") or "unknown")
     desk_profile = _execution_optimizer_profile_for_venue(market_venue)
-    latest_snapshot = build_execution_optimizer_snapshot(
+    latest_snapshot = _enrich_execution_optimizer_snapshot(
         selected_candidate,
+        build_execution_optimizer_snapshot(
+            selected_candidate,
+            str(payload.get("side") or "buy"),
+            _remaining_notional_usd(broker_order),
+            str(route_preferences.get("execution_style") or "default"),
+            str(live_context.get("order_type") or "LIMIT"),
+            _to_float(live_context.get("price"), 0.0),
+            desk_profile=desk_profile,
+        ),
         str(payload.get("side") or "buy"),
         _remaining_notional_usd(broker_order),
-        str(route_preferences.get("execution_style") or "default"),
-        str(live_context.get("order_type") or "LIMIT"),
-        _to_float(live_context.get("price"), 0.0),
-        desk_profile=desk_profile,
     )
     queue_tracker = initialize_queue_tracker(selected_candidate, latest_snapshot.get("queue") if isinstance(latest_snapshot.get("queue"), dict) else {})
     state: dict[str, object] = {
@@ -1039,20 +1072,27 @@ async def _run_execution_optimizer_live_loop(
             loop_elapsed_ms = max(1.0, (time.perf_counter() - last_cycle_started) * 1000.0)
             last_cycle_started = time.perf_counter()
             queue_tracker = update_queue_tracker(queue_tracker, previous_candidate, current_candidate, str(payload.get("side") or "buy"), loop_elapsed_ms)
-            latest_snapshot = build_execution_optimizer_snapshot(
+            latest_snapshot = _enrich_execution_optimizer_snapshot(
                 current_candidate,
+                build_execution_optimizer_snapshot(
+                    current_candidate,
+                    str(payload.get("side") or "buy"),
+                    _to_float(state.get("remaining_notional_usd"), 0.0),
+                    str(route_preferences.get("execution_style") or "default"),
+                    str(current_order.get("order_type") or live_context.get("order_type") or "LIMIT"),
+                    _to_float(current_order.get("limit_price"), _to_float(live_context.get("price"), 0.0)),
+                    desk_profile=desk_profile,
+                ),
                 str(payload.get("side") or "buy"),
                 _to_float(state.get("remaining_notional_usd"), 0.0),
-                str(route_preferences.get("execution_style") or "default"),
-                str(current_order.get("order_type") or live_context.get("order_type") or "LIMIT"),
-                _to_float(current_order.get("limit_price"), _to_float(live_context.get("price"), 0.0)),
-                desk_profile=desk_profile,
             )
+            market_structure = latest_snapshot.get("market_structure") if isinstance(latest_snapshot.get("market_structure"), dict) else {}
+            execution_context = latest_snapshot.get("execution_context") if isinstance(latest_snapshot.get("execution_context"), dict) else {}
             spoof_signal = detect_spoof_signal(previous_candidate, current_candidate, str(payload.get("side") or "buy"), desk_profile, loop_elapsed_ms)
-            live_fill = compute_live_fill_score(queue_tracker, current_candidate, desk_profile)
+            live_fill = compute_live_fill_score(queue_tracker, current_candidate, desk_profile, execution_context)
             liquidity_signal = detect_liquidity_trap(current_candidate, live_fill, desk_profile)
-            live_signal = {**live_fill, **liquidity_signal}
-            v4_guard = adaptive_slippage_guard(current_candidate, desk_profile, _to_float(live_signal.get("fill_score"), 0.0), spoof_signal, liquidity_signal)
+            live_signal = apply_execution_context_to_fill_snapshot({**live_fill, **liquidity_signal}, execution_context, market_structure)
+            v4_guard = adaptive_slippage_guard(current_candidate, desk_profile, _to_float(live_signal.get("fill_score"), 0.0), spoof_signal, liquidity_signal, execution_context)
             lifecycle = decide_order_lifecycle(
                 current_candidate,
                 queue_tracker,
@@ -1074,6 +1114,8 @@ async def _run_execution_optimizer_live_loop(
                 "fill": live_signal,
                 "spoof": spoof_signal,
                 "guard": v4_guard,
+                "market_structure": market_structure,
+                "context": execution_context,
                 "candidate_metrics": {
                     "latency_ms": _to_float(current_candidate.get("latency_ms"), 0.0),
                     "freshness_ms": _to_float(current_candidate.get("freshness_ms"), 0.0),
@@ -1088,6 +1130,7 @@ async def _run_execution_optimizer_live_loop(
                     "dominance_score": _to_float(live_signal.get("dominance_score"), 0.0),
                     "adverse_selection_score": _to_float(live_signal.get("adverse_selection_score"), 0.0),
                     "liquidity_decay_rate": _to_float(live_signal.get("liquidity_decay_rate"), 0.0),
+                    "context_confidence": _to_float(execution_context.get("confidence"), 0.0),
                 },
                 "lifecycle": lifecycle,
             }
@@ -1114,6 +1157,12 @@ async def _run_execution_optimizer_live_loop(
                     "dominance_score": live_signal.get("dominance_score"),
                     "adverse_selection_score": live_signal.get("adverse_selection_score"),
                     "liquidity_decay_rate": live_signal.get("liquidity_decay_rate"),
+                    "market_bias": execution_context.get("bias"),
+                    "volatility_regime": execution_context.get("volatility_regime"),
+                    "liquidity_state": execution_context.get("liquidity_state"),
+                    "zone": execution_context.get("zone"),
+                    "context_confidence": execution_context.get("confidence"),
+                    "context_no_trade": execution_context.get("no_trade"),
                     "guard_reasons": v4_guard.get("reasons"),
                     "spoof_detected": spoof_signal.get("spoof_detected"),
                     "liquidity_trap_detected": live_signal.get("liquidity_trap_detected"),
@@ -1158,7 +1207,7 @@ async def _run_execution_optimizer_live_loop(
                 return
 
             next_live_context = dict(live_context)
-            notional_scale = _clamp(_to_float(lifecycle.get("target_notional_scale"), 1.0), 0.2, 1.0)
+            notional_scale = _clamp(_to_float(lifecycle.get("target_notional_scale"), _to_float(live_signal.get("context_size_multiplier"), 1.0)), 0.2, 1.0)
             next_live_context["notional_usd"] = _to_float(state.get("remaining_notional_usd"), 0.0) * notional_scale
             next_live_context["client_order_id"] = f"txt-{decision_id[:18]}-v4-{cycle}"[:40]
             target_order_type = str(lifecycle.get("target_order_type") or "LIMIT").strip().upper() or "LIMIT"
@@ -2104,7 +2153,11 @@ def _execution_ai_v6_learn(
     fill_latency_ms: float,
     adverse_selection_score: float = 0.0,
     edge_bps: float = 0.0,
+    policy_context: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    policy = policy_context if isinstance(policy_context, dict) else {}
+    policy_freeze_learning = bool(policy.get("freeze_learning"))
+    policy_freeze_reasons = [str(reason) for reason in policy.get("freeze_learning_reasons", []) if str(reason)]
     reward_payload = _compute_execution_ai_v6_reward(
         state,
         action=str(decision.get("action") or "hold"),
@@ -2116,7 +2169,7 @@ def _execution_ai_v6_learn(
         edge_bps=edge_bps,
     )
     reward = _to_float(reward_payload.get("reward"), 0.0)
-    learning_was_frozen = bool(EXECUTION_AI_V6_STATE.get("learning_frozen"))
+    learning_was_frozen = bool(EXECUTION_AI_V6_STATE.get("learning_frozen")) or policy_freeze_learning
     episode = {
         "decision_id": decision_id,
         "timestamp": _now_iso(),
@@ -2125,6 +2178,8 @@ def _execution_ai_v6_learn(
         "action": str(decision.get("action") or "hold"),
         "reward": round(reward, 6),
         "learning_applied": not learning_was_frozen,
+        "policy_freeze_learning": policy_freeze_learning,
+        "policy_freeze_reasons": policy_freeze_reasons,
         "reward_components": reward_payload,
     }
     episodes = EXECUTION_AI_V6_STATE.get("episodes") if isinstance(EXECUTION_AI_V6_STATE.get("episodes"), list) else []
@@ -2180,6 +2235,8 @@ def _execution_ai_v6_learn(
         "episode": episode,
         "guardrails": _execution_ai_v6_guardrails(),
         "learning_applied": not learning_was_frozen,
+        "policy_freeze_learning": policy_freeze_learning,
+        "policy_freeze_reasons": policy_freeze_reasons,
     }
 
 
@@ -3114,6 +3171,21 @@ async def route_score(
     )
     execution_ai_v6_decision = _execution_ai_v6_decide(execution_ai_v6_state)
     failure_attribution = _build_route_failure_attribution(candidates, context, resolved_infra)
+    best_candidate = context.get("best") if isinstance(context.get("best"), dict) else None
+    best_optimizer_snapshot = _enrich_execution_optimizer_snapshot(
+        best_candidate,
+        build_execution_optimizer_snapshot(
+            best_candidate,
+            "buy",
+            _to_float(estimated_notional_usd, 0.0),
+            "default",
+            "MARKET",
+            0.0,
+            desk_profile=_execution_optimizer_profile_for_venue(str(best_candidate.get("venue") or "unknown")),
+        ) if isinstance(best_candidate, dict) else {},
+        "buy",
+        _to_float(estimated_notional_usd, 0.0),
+    ) if isinstance(best_candidate, dict) else {}
     return {
         "symbol": _normalize_symbol(symbol),
         "best": context.get("best"),
@@ -3131,6 +3203,9 @@ async def route_score(
             "decision": execution_ai_v6_decision,
             "snapshot": _execution_ai_v6_snapshot(),
         },
+        "market_structure": best_optimizer_snapshot.get("market_structure") if isinstance(best_optimizer_snapshot.get("market_structure"), dict) else {},
+        "execution_context": best_optimizer_snapshot.get("execution_context") if isinstance(best_optimizer_snapshot.get("execution_context"), dict) else {},
+        "execution_optimizer_v3": best_optimizer_snapshot,
         "infra_health": _to_float(resolved_infra.get("infra_health"), 1.0),
         "network_regime": str(resolved_infra.get("network_regime") or "stable"),
         "failure_source": failure_attribution.get("failure_source"),
@@ -3176,14 +3251,19 @@ async def place_routed_order(payload: dict) -> dict:
     evaluated_candidates = [
         {
             "candidate": candidate,
-            "snapshot": build_execution_optimizer_snapshot(
+            "snapshot": _enrich_execution_optimizer_snapshot(
                 candidate,
+                build_execution_optimizer_snapshot(
+                    candidate,
+                    side,
+                    notional,
+                    str(route_preferences.get("execution_style") or "default"),
+                    str(live_context.get("order_type") or "MARKET"),
+                    _to_float(live_context.get("price"), 0.0),
+                    desk_profile=_execution_optimizer_profile_for_venue(str(candidate.get("venue") or "unknown")),
+                ),
                 side,
                 notional,
-                str(route_preferences.get("execution_style") or "default"),
-                str(live_context.get("order_type") or "MARKET"),
-                _to_float(live_context.get("price"), 0.0),
-                desk_profile=_execution_optimizer_profile_for_venue(str(candidate.get("venue") or "unknown")),
             ),
         }
         for candidate in ranked_candidates
@@ -3266,6 +3346,11 @@ async def place_routed_order(payload: dict) -> dict:
     if backup_entry is not None:
         backup = backup_entry["candidate"]
     backup_optimizer_v3 = backup_entry["snapshot"] if isinstance(backup_entry, dict) else {}
+    selected_execution_context = selected_optimizer_v3.get("execution_context") if isinstance(selected_optimizer_v3.get("execution_context"), dict) else {}
+    selected_market_structure = selected_optimizer_v3.get("market_structure") if isinstance(selected_optimizer_v3.get("market_structure"), dict) else {}
+    adjusted_notional = _to_float(selected_execution_context.get("target_notional_usd"), notional)
+    if adjusted_notional <= 0:
+        adjusted_notional = notional
     route_selection["execution_optimizer_v3"] = {
         "selected_venue": str(selected.get("venue") or "unknown"),
         "fallback_used": str(selected.get("venue") or "") != str((context.get("best") or {}).get("venue") or ""),
@@ -3274,6 +3359,8 @@ async def place_routed_order(payload: dict) -> dict:
             for entry in evaluated_candidates[:5]
         ],
     }
+    route_selection["market_structure"] = selected_market_structure
+    route_selection["execution_context"] = selected_execution_context
     route_selection["dominance"] = context.get("dominance") if isinstance(context.get("dominance"), dict) else {}
     route_selection["split_plan"] = split_plan
     route_selection["hedge_recommendation"] = hedge_recommendation
@@ -3282,6 +3369,8 @@ async def place_routed_order(payload: dict) -> dict:
         "decision": execution_ai_v6_decision,
     }
     effective_live_context = apply_order_management_to_live_context(live_context, selected_optimizer_v3) if bool(live_context.get("enabled")) else live_context
+    if _to_float(effective_live_context.get("notional_usd"), 0.0) > 0:
+        effective_live_context["notional_usd"] = min(_to_float(effective_live_context.get("notional_usd"), 0.0), adjusted_notional)
     execution_ai_action = str(execution_ai_v6_decision.get("action") or "hold")
     best_bid = _to_float(selected.get("best_bid"), 0.0)
     best_ask = _to_float(selected.get("best_ask"), 0.0)
@@ -3298,6 +3387,7 @@ async def place_routed_order(payload: dict) -> dict:
         elif execution_ai_action == "move_to_mid" and midpoint_price > 0:
             effective_live_context["order_type"] = "LIMIT"
             effective_live_context["price"] = midpoint_price
+    execution_notional_usd = adjusted_notional
     if execution_delay_ms > 0:
         await asyncio.sleep(execution_delay_ms / 1000.0)
 
@@ -3334,7 +3424,10 @@ async def place_routed_order(payload: dict) -> dict:
                 decision_id=decision_id,
                 side=side,
                 instrument=symbol,
-                split_plan=split_plan,
+                split_plan={
+                    **split_plan,
+                    "total_notional_usd": round(execution_notional_usd, 6),
+                },
                 candidates_by_venue={str(candidate.get("venue") or ""): candidate for candidate in candidates},
                 execution_delay_ms=execution_delay_ms,
             )
@@ -3342,7 +3435,7 @@ async def place_routed_order(payload: dict) -> dict:
             fills, avg_fill_price = _simulate_fills(
                 decision_id=decision_id,
                 side=side,
-                notional_usd=notional,
+                notional_usd=execution_notional_usd,
                 depth_payload=(selected.get("depth_payload") or {}),
                 venue=str(selected.get("venue", "unknown")),
                 instrument=symbol,
@@ -3383,12 +3476,13 @@ async def place_routed_order(payload: dict) -> dict:
         execution_ai_v6_state,
         execution_ai_v6_decision,
         decision_id=decision_id,
-        requested_notional_usd=notional,
+        requested_notional_usd=execution_notional_usd,
         filled_notional_usd=filled_notional,
         realized_slippage_bps=realized_slippage_bps,
         fill_latency_ms=average_fill_latency_ms,
         adverse_selection_score=adverse_selection_score,
         edge_bps=edge_bps,
+        policy_context=selected_execution_context,
     )
 
     if filled_notional > 0:
@@ -3417,7 +3511,7 @@ async def place_routed_order(payload: dict) -> dict:
             actual_venue,
             symbol,
             side,
-            notional,
+            execution_notional_usd,
             filled_notional,
             avg_fill_price,
             execution_mode,
@@ -3442,6 +3536,10 @@ async def place_routed_order(payload: dict) -> dict:
                 "reason": route_reason,
                 "split_plan": split_plan,
                 "hedge_recommendation": hedge_recommendation,
+                "market_structure": selected_market_structure,
+                "execution_context": selected_execution_context,
+                "original_requested_notional_usd": notional,
+                "context_adjusted_notional_usd": execution_notional_usd,
             },
             "execution_optimizer_v3": {
                 "selected": selected_optimizer_v3,
@@ -3488,7 +3586,9 @@ async def place_routed_order(payload: dict) -> dict:
         "venue": actual_venue,
         "instrument": symbol,
         "side": side,
-        "requested_notional_usd": notional,
+        "requested_notional_usd": execution_notional_usd,
+        "original_requested_notional_usd": notional,
+        "context_adjusted_notional_usd": execution_notional_usd,
         "filled_notional_usd": filled_notional,
         "avg_fill_price": avg_fill_price,
         "execution_mode": execution_mode,
@@ -3508,6 +3608,10 @@ async def place_routed_order(payload: dict) -> dict:
             "reason": route_reason,
             "preferences": route_preferences,
             "selection": route_selection,
+            "market_structure": selected_market_structure,
+            "execution_context": selected_execution_context,
+            "original_requested_notional_usd": notional,
+            "context_adjusted_notional_usd": execution_notional_usd,
             "mode": "live" if broker_order else "simulated",
             "execution_target": actual_venue,
             "source": "v5-multi-venue-dominance",
@@ -3550,7 +3654,7 @@ async def place_routed_order(payload: dict) -> dict:
             venue=actual_venue,
             instrument=symbol,
             side=side,
-            requested_notional_usd=notional,
+            requested_notional_usd=execution_notional_usd,
             filled_notional_usd=filled_notional,
             avg_fill_price=avg_fill_price,
             execution_mode=execution_mode,

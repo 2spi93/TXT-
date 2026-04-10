@@ -328,6 +328,10 @@ const PANEL_HINTS: Record<string, { text: string; examples: string[] }> = {
     text: "Observabilite du moteur d'execution V6: persistence DB, guardrails, top actions apprises et episodes recents.",
     examples: ["Si la DB passe en degrade, l'alerte doit etre visible meme sans routing score actif.", "Les top actions et freeze reasons montrent si le moteur apprend encore ou s'est auto-protege."],
   },
+  "Execution Context": {
+    text: "Panneau desk policy: market structure, contexte d'execution, no-trade, sizing volatilite, fallback et freeze learning.",
+    examples: ["Si le fallback passe en rules_only, le desk sait que l'execution reste possible mais sous regles strictes.", "Les seuils, la zone, le biais et le sizing montrent pourquoi le moteur coupe ou reduit un trade."],
+  },
   "Venue Telemetry": {
     text: "Rassemble la sante feed et execution par venue: fraicheur quotes/depth/trades, spread, slippage, fill quality et contraintes de route.",
     examples: ["Si la fraicheur depth explose mais le proxy reste healthy, le souci vient du feed venue, pas du control plane.", "Une venue avec fill quality faible et slippage eleve doit etre re-degradee ou reroutee avant live."],
@@ -1024,6 +1028,150 @@ export function ExecutionAiV6ObservabilityPanel({
                 <span className={safeNumber(row.reward, 0) >= 0 ? "good" : "warn"}>{safeNumber(row.reward, 0).toFixed(2)}</span>
               </div>
             ))}
+          </div>
+        </>
+      ) : null}
+    </MonitoringPanelCard>
+  );
+}
+
+export function ExecutionContextMonitoringPanel({
+  badge,
+  layoutEditMode,
+  onDetach,
+  routingPayload,
+  optimizerPayload,
+  formatClock,
+}: {
+  badge: ReactNode;
+  layoutEditMode: boolean;
+  onDetach: () => void;
+  routingPayload: Record<string, unknown> | null;
+  optimizerPayload: ExecutionOptimizerLivePayload | null;
+  formatClock: (value: string) => string;
+}) {
+  const routingEnvelope = safeRecord(routingPayload);
+  const optimizerEnvelope = safeRecord(optimizerPayload);
+  const marketStructure = safeRecord(routingEnvelope.market_structure);
+  const executionContext = safeRecord(routingEnvelope.execution_context);
+  const policy = safeRecord(executionContext.policy);
+  const thresholds = safeRecord(policy.thresholds);
+  const bias = safeRecord(marketStructure.bias);
+  const volatility = safeRecord(marketStructure.volatility);
+  const zone = safeRecord(marketStructure.zone);
+  const volumeProfile = safeRecord(marketStructure.volume_profile);
+  const activeOrders = safeRows(optimizerEnvelope.active_orders).slice(0, 3);
+  const noTradeReasons = Array.isArray(executionContext.no_trade_reasons)
+    ? executionContext.no_trade_reasons.map((item) => String(item)).filter(Boolean).slice(0, 4)
+    : [];
+  const freezeReasons = Array.isArray(executionContext.freeze_learning_reasons)
+    ? executionContext.freeze_learning_reasons.map((item) => String(item)).filter(Boolean).slice(0, 4)
+    : [];
+  const hvnZones = Array.isArray(volumeProfile.hvn_zones) ? volumeProfile.hvn_zones.slice(0, 3).map((item) => safeNumber(item, 0).toFixed(2)) : [];
+  const lvnZones = Array.isArray(volumeProfile.lvn_zones) ? volumeProfile.lvn_zones.slice(0, 3).map((item) => safeNumber(item, 0).toFixed(2)) : [];
+  const fallbackMode = String(executionContext.fallback_mode || policy.fallback_mode || "normal");
+  const freezeLearning = Boolean(executionContext.freeze_learning || policy.freeze_learning);
+  const noTrade = Boolean(executionContext.no_trade || policy.no_trade);
+  const confidence = safeNumber(executionContext.confidence, 0);
+  const targetNotionalUsd = safeNumber(executionContext.target_notional_usd, 0);
+  const sizeMultiplier = safeNumber(executionContext.size_multiplier, 0);
+  const entryBoost = safeNumber(executionContext.entry_boost_adjustment, 0);
+  const titleBadge = (
+    <>
+      {badge}
+      <span className={`venue-telemetry-proxy-badge ${noTrade ? "degraded" : freezeLearning ? "retry_recovered" : "healthy"}`}>
+        {noTrade ? "no-trade" : freezeLearning ? "frozen" : fallbackMode.replace(/_/g, " ")}
+      </span>
+    </>
+  );
+
+  return (
+    <MonitoringPanelCard title="Execution Context" badge={titleBadge} layoutEditMode={layoutEditMode} onDetach={onDetach}>
+      {!routingPayload ? <p className="subtle mini">Contexte d'execution indisponible.</p> : null}
+      {routingPayload ? (
+        <>
+          <div className="venue-telemetry-summary">
+            <span className="venue-telemetry-pill">bias {String(executionContext.bias || bias.state || "neutral")}</span>
+            <span className="venue-telemetry-pill">vol {String(executionContext.volatility_regime || volatility.regime || "normal")}</span>
+            <span className="venue-telemetry-pill">zone {String(executionContext.zone || zone.state || "none")}</span>
+            <span className="venue-telemetry-pill">conf {(confidence * 100).toFixed(0)}%</span>
+          </div>
+          <div className="optimizer-live-grid">
+            <div className={`venue-telemetry-item ${noTrade ? "warn" : confidence >= 0.6 ? "good" : "subtle"}`}>
+              <div className="venue-telemetry-head">
+                <span className="venue-telemetry-venue">Desk policy</span>
+                <span className={`venue-telemetry-state ${noTrade ? "warn" : confidence >= 0.6 ? "good" : "subtle"}`}>{fallbackMode.replace(/_/g, " ")}</span>
+              </div>
+              <div className="mon-row"><span>Trade gate</span><span className={noTrade ? "warn" : "good"}>{noTrade ? "NO_TRADE" : "eligible"}</span></div>
+              <div className="mon-row"><span>Learning</span><span className={freezeLearning ? "warn" : "good"}>{freezeLearning ? "frozen" : String(policy.learning_mode || executionContext.learning_mode || "online")}</span></div>
+              <div className="mon-row"><span>Daily loss</span><span>{safeNumber(policy.daily_loss_pct, 0).toFixed(2)}% / {safeNumber(thresholds.daily_loss_limit_pct, 0).toFixed(2)}%</span></div>
+              <div className="optimizer-live-reasons">
+                {noTradeReasons.length === 0 ? <span className="optimizer-live-chip good">trade allowed</span> : null}
+                {noTradeReasons.map((reason) => <span key={reason} className="optimizer-live-chip warn">{reason}</span>)}
+              </div>
+            </div>
+            <div className={`venue-telemetry-item ${sizeMultiplier >= 1 ? "good" : "subtle"}`}>
+              <div className="venue-telemetry-head">
+                <span className="venue-telemetry-venue">Sizing & boost</span>
+                <span className={`venue-telemetry-state ${sizeMultiplier >= 1 ? "good" : "subtle"}`}>x{sizeMultiplier.toFixed(2)}</span>
+              </div>
+              <div className="mon-row"><span>Target notional</span><span>{formatCompactUsd(targetNotionalUsd)}</span></div>
+              <div className="mon-row"><span>Vol sizing</span><span>x{safeNumber(policy.volatility_sizing_multiplier, sizeMultiplier).toFixed(2)} · {String(executionContext.volatility_regime || volatility.regime || "normal")}</span></div>
+              <div className="mon-row"><span>Entry boost</span><span>+{entryBoost.toFixed(2)} · aggr x{safeNumber(executionContext.aggressiveness_multiplier, 1).toFixed(2)}</span></div>
+              <div className="optimizer-live-reasons">
+                {Array.isArray(executionContext.reasons) && executionContext.reasons.length === 0 ? <span className="optimizer-live-chip subtle">no context reasons</span> : null}
+                {Array.isArray(executionContext.reasons) ? executionContext.reasons.map((reason) => <span key={String(reason)} className="optimizer-live-chip good">{String(reason)}</span>) : null}
+              </div>
+            </div>
+            <div className="venue-telemetry-item subtle">
+              <div className="venue-telemetry-head">
+                <span className="venue-telemetry-venue">Market structure</span>
+                <span className="venue-telemetry-state subtle">{String(bias.state || executionContext.bias || "neutral")}</span>
+              </div>
+              <div className="mon-row"><span>Reference / POC</span><span>{safeNumber(marketStructure.reference_price, 0).toFixed(2)} · {safeNumber(volumeProfile.poc, 0).toFixed(2)}</span></div>
+              <div className="mon-row"><span>Value area</span><span>{safeNumber(volumeProfile.value_area_low, 0).toFixed(2)} → {safeNumber(volumeProfile.value_area_high, 0).toFixed(2)}</span></div>
+              <div className="mon-row"><span>Zone / source</span><span>{String(zone.state || executionContext.zone || "none")} · {String(volumeProfile.source || zone.source || "derived")}</span></div>
+              <div className="optimizer-live-reasons">
+                {hvnZones.length === 0 ? <span className="optimizer-live-chip subtle">no HVN</span> : null}
+                {hvnZones.map((price) => <span key={`hvn-${price}`} className="optimizer-live-chip good">HVN {price}</span>)}
+                {lvnZones.map((price) => <span key={`lvn-${price}`} className="optimizer-live-chip warn">LVN {price}</span>)}
+              </div>
+            </div>
+            <div className={`venue-telemetry-item ${freezeLearning ? "warn" : "subtle"}`}>
+              <div className="venue-telemetry-head">
+                <span className="venue-telemetry-venue">Policy thresholds</span>
+                <span className={`venue-telemetry-state ${freezeLearning ? "warn" : "subtle"}`}>{freezeLearning ? "freeze" : "watch"}</span>
+              </div>
+              <div className="mon-row"><span>Confidence floor</span><span>{(safeNumber(thresholds.confidence_floor, 0) * 100).toFixed(0)}%</span></div>
+              <div className="mon-row"><span>Latency / fill floor</span><span>{safeNumber(thresholds.latency_ceiling_ms, 0).toFixed(0)}ms · {(safeNumber(thresholds.fill_probability_floor, 0) * 100).toFixed(0)}%</span></div>
+              <div className="mon-row"><span>High vol spread</span><span>{safeNumber(thresholds.high_vol_spread_bps, 0).toFixed(1)}bps · stale {formatCompactMetricMs(thresholds.stale_market_ms)}</span></div>
+              <div className="optimizer-live-reasons">
+                {freezeReasons.length === 0 ? <span className="optimizer-live-chip good">learning online</span> : null}
+                {freezeReasons.map((reason) => <span key={reason} className="optimizer-live-chip warn">{reason}</span>)}
+              </div>
+            </div>
+          </div>
+          <div className="optimizer-live-section">
+            <div className="subtle mini">Active order context</div>
+            {activeOrders.length === 0 ? <p className="subtle mini">Aucun ordre live avec contexte actif.</p> : null}
+            {activeOrders.map((order, index) => {
+              const orderContext = safeRecord(order.execution_context);
+              const orderStructure = safeRecord(order.market_structure);
+              const orderPolicy = safeRecord(orderContext.policy);
+              return (
+                <div key={`ctx-order-${index}-${String(order.order_id || order.decision_id || "row")}`} className="mon-row">
+                  <span>{String(order.symbol || "?")} · {String(order.market_venue || "venue")}</span>
+                  <span className="subtle mini">{String(orderContext.bias || safeRecord(orderStructure.bias).state || "neutral")} / {String(orderContext.zone || safeRecord(orderStructure.zone).state || "none")}</span>
+                  <span className={Boolean(orderContext.no_trade || orderPolicy.no_trade) ? "warn" : Boolean(orderContext.freeze_learning || orderPolicy.freeze_learning) ? "subtle" : "good"}>
+                    {Boolean(orderContext.no_trade || orderPolicy.no_trade)
+                      ? "NO_TRADE"
+                      : Boolean(orderContext.freeze_learning || orderPolicy.freeze_learning)
+                        ? "freeze"
+                        : `${safeNumber(orderContext.target_notional_usd, 0).toFixed(0)} USD`}
+                  </span>
+                </div>
+              );
+            })}
           </div>
         </>
       ) : null}

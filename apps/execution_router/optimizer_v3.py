@@ -308,11 +308,17 @@ def build_execution_optimizer_snapshot(
 def execution_optimizer_allows_trade(snapshot: dict[str, Any]) -> bool:
     guard = _as_dict(snapshot.get("slippage_guard"))
     order_management = _as_dict(snapshot.get("order_management"))
-    return bool(guard.get("allowed")) and str(order_management.get("action") or "keep") != "cancel"
+    execution_context = _as_dict(snapshot.get("execution_context"))
+    return (
+        bool(guard.get("allowed"))
+        and str(order_management.get("action") or "keep") != "cancel"
+        and not bool(execution_context.get("no_trade"))
+    )
 
 
 def apply_order_management_to_live_context(live_context: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
     order_management = _as_dict(snapshot.get("order_management"))
+    execution_context = _as_dict(snapshot.get("execution_context"))
     if not order_management:
         return dict(live_context)
     adapted = dict(live_context)
@@ -323,4 +329,8 @@ def apply_order_management_to_live_context(live_context: dict[str, Any], snapsho
         adapted["price"] = limit_price
     elif target_order_type == "MARKET":
         adapted.pop("price", None)
+    target_notional_usd = _to_float(execution_context.get("target_notional_usd"), 0.0)
+    current_notional_usd = _to_float(adapted.get("notional_usd"), 0.0)
+    if target_notional_usd > 0 and current_notional_usd > 0:
+        adapted["notional_usd"] = min(current_notional_usd, target_notional_usd)
     return adapted

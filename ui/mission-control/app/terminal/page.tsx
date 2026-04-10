@@ -166,6 +166,7 @@ import {
 import { isWebGL2Available } from "../../lib/engine/gpu-chart/context";
 import {
   ControlRoomMonitoringPanel,
+  ExecutionContextMonitoringPanel,
   ExecutionAiV6ObservabilityPanel,
   ExecutionOptimizerMonitoringPanel,
   AlertsDockPanel,
@@ -19700,6 +19701,8 @@ export default function TradingTerminalPage() {
         return <ControlRoomMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} liveOpsPayload={liveOpsPayload} executionAiV6Payload={executionAiV6Payload} emergencyStopBusy={emergencyStopBusy} emergencyStopFeedback={emergencyStopFeedback} onEmergencyStop={() => { void triggerEmergencyStop(); }} formatClock={formatClock} />;
       case "optimizer":
         return <ExecutionOptimizerMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} payload={executionOptimizerLivePayload} routingPayload={routingScore} formatClock={formatClock} />;
+      case "marketcontext":
+        return <ExecutionContextMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} routingPayload={routingScore} optimizerPayload={executionOptimizerLivePayload} formatClock={formatClock} />;
       case "v6observability":
         return <ExecutionAiV6ObservabilityPanel badge={null} layoutEditMode={false} onDetach={() => {}} payload={executionAiV6Payload} formatClock={formatClock} />;
       case "venues":
@@ -22396,6 +22399,24 @@ export default function TradingTerminalPage() {
               onDetach={() => detachPanel("optimizer", "monitoring")}
               payload={executionOptimizerLivePayload}
               routingPayload={routingScore}
+              formatClock={formatClock}
+            />
+            </div>
+            <div
+              className={`layout-draggable-card${layoutEditMode ? " is-edit" : ""}${layoutDropPreview?.zone === "monitoring" && layoutDropPreview.targetId === "marketcontext" ? " is-drop-target" : ""}`}
+              draggable={layoutEditMode}
+              onDragStart={() => { layoutDragRef.current = { zone: "monitoring", id: "marketcontext" }; setLayoutDropPreview({ zone: "monitoring", targetId: "marketcontext", mode: "panel" }); }}
+              onDragEnd={() => { layoutDragRef.current = null; setLayoutDropPreview(null); }}
+              onDragOver={(event) => { if (layoutEditMode) { event.preventDefault(); setLayoutDropPreview({ zone: "monitoring", targetId: "marketcontext", mode: "panel" }); } }}
+              onDrop={() => handleLayoutDrop("monitoring", "marketcontext")}
+              style={{ order: monitoringOrderById.marketcontext ?? 2, display: floatingPanels.some((fp) => fp.id === "marketcontext") ? "none" : undefined }}
+            >
+            <ExecutionContextMonitoringPanel
+              badge={publicOpsPanelBadge}
+              layoutEditMode={layoutEditMode}
+              onDetach={() => detachPanel("marketcontext", "monitoring")}
+              routingPayload={routingScore}
+              optimizerPayload={executionOptimizerLivePayload}
               formatClock={formatClock}
             />
             </div>

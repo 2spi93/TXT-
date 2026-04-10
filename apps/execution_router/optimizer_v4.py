@@ -341,7 +341,9 @@ def compute_live_fill_score(
     queue_tracker: dict[str, Any],
     current_candidate: dict[str, Any],
     desk_profile: dict[str, Any],
+    context_adjustments: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    context = context_adjustments if isinstance(context_adjustments, dict) else {}
     queue_position_usd = max(0.0, _to_float(queue_tracker.get("queue_position_usd"), 0.0))
     total_queue_usd = max(1.0, _to_float(queue_tracker.get("total_queue_usd"), 1.0))
     queue_rank_estimate = _clamp(_to_float(queue_tracker.get("queue_rank_estimate"), queue_position_usd / total_queue_usd), 0.0, 1.0)
@@ -360,7 +362,9 @@ def compute_live_fill_score(
     entry_boost = 0.0
     if spread_bps > 0 and spread_bps <= max(0.0, _to_float(desk_profile.get("entry_boost_spread_bps"), 0.0)):
         entry_boost = max(0.0, _to_float(desk_profile.get("entry_boost_fill_score"), 0.0))
+    entry_boost += max(0.0, _to_float(context.get("entry_boost_adjustment"), 0.0))
     confidence = _clamp((1.0 - latency_penalty) * 0.45 + (1.0 - freshness_penalty) * 0.35 + (1.0 - volatility) * 0.2, 0.0, 1.0)
+    confidence = _clamp(confidence * 0.78 + _clamp(_to_float(context.get("confidence"), confidence), 0.0, 1.0) * 0.22, 0.0, 1.0)
     probabilistic_fill_probability = _clamp(
         queue_factor + trade_flow * 0.6 + cancel_rate_estimate * 0.4 - latency_penalty * 0.18 - freshness_penalty * 0.08 - volatility * 0.16 + entry_boost,
         0.0,
@@ -377,6 +381,7 @@ def compute_live_fill_score(
         aggressiveness += 0.2
     if queue_rank_estimate > _to_float(desk_profile.get("queue_tail_reprice_threshold"), 0.68):
         aggressiveness += 0.15
+    aggressiveness *= _clamp(_to_float(context.get("aggressiveness_multiplier"), 1.0), 0.5, 1.25)
     aggressiveness = _clamp(aggressiveness, 0.0, 1.0)
     adverse_selection_score = _clamp(volatility * 0.46 + latency_penalty * 0.16 + freshness_penalty * 0.1 + liquidity_decay_rate * 0.12 + aggressiveness * 0.16, 0.0, 1.0)
     dominance_score = _clamp(probabilistic_fill_probability * 0.4 + queue_factor * 0.3 + aggressiveness * 0.3, 0.0, 1.0)
@@ -419,6 +424,9 @@ def compute_live_fill_score(
         "adverse_selection_score": round(adverse_selection_score, 6),
         "dominance_score": round(dominance_score, 6),
         "should_move_ahead": should_move_ahead,
+        "context_size_multiplier": round(_clamp(_to_float(context.get("size_multiplier"), 1.0), 0.2, 1.0), 6),
+        "context_no_trade": bool(context.get("no_trade")),
+        "context_no_trade_reasons": [str(reason) for reason in context.get("no_trade_reasons", []) if str(reason)],
     }
 
 
@@ -499,7 +507,9 @@ def adaptive_slippage_guard(
     fill_score: float,
     spoof_signal: dict[str, Any],
     liquidity_signal: dict[str, Any] | None = None,
+    execution_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    context = execution_context if isinstance(execution_context, dict) else {}
     reasons: list[str] = []
     soft_reasons: list[str] = []
     latency_ms = _to_float(current_candidate.get("latency_ms"), 0.0)
@@ -528,6 +538,11 @@ def adaptive_slippage_guard(
         reasons.append("liquidity_trap_detected")
     if fill_score < _to_float(desk_profile.get("min_fill_probability"), 0.5):
         reasons.append("fill_score_below_profile")
+    if bool(context.get("no_trade")):
+        for reason in context.get("no_trade_reasons", []):
+            normalized = str(reason).strip()
+            if normalized:
+                reasons.append(normalized)
     soft_guard_only = bool(reasons) and set(reasons).issubset(_soft_guard_reason_set(desk_profile))
     return {
         "allowed": not reasons,
