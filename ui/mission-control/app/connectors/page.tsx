@@ -11,6 +11,7 @@ import {
   WALLET_CONNECTION_CATALOG,
   type ConnectionProviderType,
 } from "../../lib/connectionCatalog";
+import { getConnectorHealthView } from "../../lib/connectorHealth";
 
 type JsonMap = Record<string, unknown>;
 
@@ -478,7 +479,7 @@ export default function ConnectorsPage() {
     return Number(capitalSummary.account_count || 0) > 0 || Number(incidentSummary.active_count || 0) > 0 || Boolean(item.healthy);
   });
   const connectorCapitalRows = connectorDeskRows.filter((item) => Number(asMap(item.capital_summary).account_count || 0) > 0);
-  const connectorIncidentRows = connectorDeskRows.filter((item) => Number(asMap(item.incident_summary).active_count || 0) > 0 || String(asMap(item.degradation_engine).state || "") !== "ok");
+  const connectorIncidentRows = connectorDeskRows.filter((item) => Number(asMap(item.incident_summary).active_count || 0) > 0 || getConnectorHealthView(item).action !== "ok");
   const canonicalByAccount = new Map(canonicalAccounts.map((item) => [String(item.account_id || ""), item]));
   const brokerCapabilityRows = linkedConnectorAccounts.map((account) => {
     const permissionsView = asMap(account.permissions_view);
@@ -606,12 +607,18 @@ export default function ConnectorsPage() {
       <section className="grid" style={{ gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
           <div className="eyebrow">Connecteurs Live <HelpHint text="Disponibilite instantanee des integrations critiques." examples={["Chaque ligne doit etre healthy=true avant une vraie session de trading.", "Si un connecteur devient false, considere l'environnement comme degrade jusqu'a verification."]} /></div>
-          {connectors.map((item) => (
-            <div className="row" key={String(item.name)}>
-              <span>{String(item.name)} ({String(item.transport)}) | REST {formatMs(item.rest_latency_ms)} | WS {formatMs(item.websocket_latency_ms)}</span>
-              <span className={item.healthy ? "good" : "warn"}>{String(asMap(item.degradation_engine).state || item.healthy)}</span>
-            </div>
-          ))}
+          {connectors.map((item) => {
+            const badge = getConnectorHealthView(item);
+            return (
+              <div className="row" key={String(item.name)}>
+                <span>{String(item.name)} ({String(item.transport)}) | REST {formatMs(item.rest_latency_ms)} | WS {formatMs(item.websocket_latency_ms)}</span>
+                <span className="connector-health-stack">
+                  <span className={badge.badgeClassName}>{badge.label}</span>
+                  <span className={badge.noteClassName}>{badge.message}</span>
+                </span>
+              </div>
+            );
+          })}
         </div>
 
         <div className="panel">
@@ -666,10 +673,17 @@ export default function ConnectorsPage() {
           const feedQuality = asMap(item.feed_quality);
           const incidentSummary = asMap(item.incident_summary);
           const degradation = asMap(item.degradation_engine);
+          const badge = getConnectorHealthView(item);
           return (
             <div className="panel" key={`quality-${String(item.name)}`}>
               <div className="eyebrow">Health & Latency | {String(item.name)}</div>
+              <div style={{ marginBottom: 12 }}>
+                <span className={badge.badgeClassName}>{badge.label}</span>
+                <div className={badge.noteClassName} style={{ marginTop: 8 }}>{badge.message}</div>
+              </div>
               <div className="row"><span>Etat engine</span><span className={toneClass(String(degradation.state || "watch"))}>{String(degradation.state || "watch")}</span></div>
+              <div className="row"><span>Health score</span><span>{badge.scoreText}</span></div>
+              <div className="row"><span>Action</span><span>{String(degradation.health_action || badge.action)}</span></div>
               <div className="row"><span>Latence REST</span><span>{formatMs(item.rest_latency_ms)}</span></div>
               <div className="row"><span>Latence WebSocket</span><span>{formatMs(item.websocket_latency_ms)}</span></div>
               <div className="row"><span>Taux d'erreur 24h</span><span>{formatPct(item.error_rate_pct, 2)}</span></div>
@@ -717,10 +731,14 @@ export default function ConnectorsPage() {
           {connectorIncidentRows.map((item) => {
             const incidentSummary = asMap(item.incident_summary);
             const degradation = asMap(item.degradation_engine);
+            const badge = getConnectorHealthView(item);
             return (
               <div className="panel" key={`degrade-${String(item.name)}`} style={{ marginTop: 12, borderRadius: 12 }}>
-                <div className="row"><span>{String(item.name)}</span><span className={toneClass(String(degradation.state || "watch"))}>{String(degradation.state || "watch")}</span></div>
+                <div className="row"><span>{String(item.name)}</span><span className={badge.badgeClassName}>{badge.label}</span></div>
+                <div className={badge.noteClassName} style={{ marginBottom: 10 }}>{badge.message}</div>
                 <div className="row"><span>Diagnostic</span><span>{String(degradation.diagnostic || incidentSummary.top_diagnostic || "nominal")}</span></div>
+                <div className="row"><span>Health score</span><span>{badge.scoreText}</span></div>
+                <div className="row"><span>Action</span><span>{String(degradation.health_action || badge.action)}</span></div>
                 <div className="row"><span>Path</span><span>{((degradation.auto_downgrade_path as string[] | undefined) || []).join(" -> ") || "n/a"}</span></div>
                 <div className="row"><span>Auto-disable</span><span>{String(Boolean(degradation.auto_disable_live))}</span></div>
                 <div className="row"><span>Auto-reroute</span><span>{String(degradation.auto_reroute_target || "n/a")}</span></div>

@@ -11,8 +11,22 @@ import {
   WALLET_CONNECTION_CATALOG,
   type ConnectionProviderType,
 } from "../../lib/connectionCatalog";
+import {
+  getExchangeCapability,
+  normalizeExchangeCapabilityMap,
+  suggestedExchangeVenue,
+  type ExchangeCapability,
+} from "../../lib/exchangeCapabilities";
 
 type JsonMap = Record<string, unknown>;
+
+function asMap(value: unknown): JsonMap {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as JsonMap : {};
+}
+
+function asList(value: unknown): JsonMap[] {
+  return Array.isArray(value) ? value.filter((item): item is JsonMap => Boolean(item) && typeof item === "object" && !Array.isArray(item)) : [];
+}
 
 function walletProviderSupportsAgentExecution(providerMode: string): boolean {
   const normalized = String(providerMode || "").trim().toLowerCase();
@@ -80,17 +94,44 @@ export default function ConnectionsPage() {
   const [walletAddress, setWalletAddress] = useState("");
   const [walletPublicKey, setWalletPublicKey] = useState("");
   const [walletAccessMode, setWalletAccessMode] = useState("read");
+  const [exchangeCapabilities, setExchangeCapabilities] = useState<Record<string, ExchangeCapability>>({});
+  const [integrationRoutes, setIntegrationRoutes] = useState<JsonMap[]>([]);
+  const [integrationSource, setIntegrationSource] = useState("kairos");
+  const [integrationRouteKey, setIntegrationRouteKey] = useState("default");
+  const [integrationAccountId, setIntegrationAccountId] = useState("");
+  const [integrationPreferredVenue, setIntegrationPreferredVenue] = useState("bingx");
+  const [integrationNotionalUsd, setIntegrationNotionalUsd] = useState(7);
+  const [integrationLiveEnabled, setIntegrationLiveEnabled] = useState(true);
+  const selectedExchangeProvider = EXCHANGE_CONNECTION_CATALOG.find((item) => item.providerId === exchangeProviderId) || EXCHANGE_CONNECTION_CATALOG[0];
+  const selectedExchangeCapability = getExchangeCapability(exchangeCapabilities, exchangeProviderId);
+  const exchangePassphraseRequired = selectedExchangeCapability.api_key_requires_passphrase || ["okx", "bitget"].includes(exchangeProviderId);
   const selectedWalletProvider = WALLET_CONNECTION_CATALOG.find((item) => item.providerId === walletProviderId) || WALLET_CONNECTION_CATALOG[0];
 
+  const linkedExchangeAccounts = linkedAccounts.filter((item) => String(item.provider || "") !== "mt5" && String(item.provider_type || "") !== "wallet");
+  const selectedIntegrationAccount = linkedExchangeAccounts.find((item) => String(item.account_id || "") === integrationAccountId) || null;
+  const selectedIntegrationCapability = getExchangeCapability(exchangeCapabilities, String(selectedIntegrationAccount?.provider || ""));
+
   async function loadConnectionsState(): Promise<void> {
-    const [mt5Response, connectorsResponse] = await Promise.all([
+    const [mt5Response, connectorsResponse, routesResponse, capabilitiesResponse] = await Promise.all([
       fetch("/api/mt5/accounts", { cache: "no-store" }),
       fetch("/api/connectors/accounts", { cache: "no-store" }),
+      fetch("/api/integrations/routes", { cache: "no-store" }),
+      fetch("/api/connectors/exchange-capabilities", { cache: "no-store" }),
     ]);
     const mt5Payload = mt5Response.ok ? await mt5Response.json().catch(() => []) : [];
     const connectorsPayload = connectorsResponse.ok ? await connectorsResponse.json().catch(() => ({})) : {};
+    const routesPayload = routesResponse.ok ? await routesResponse.json().catch(() => ({}) ) : {};
+    const capabilitiesPayload = capabilitiesResponse.ok ? await capabilitiesResponse.json().catch(() => ({})) : {};
+    const nextLinkedAccounts = Array.isArray(connectorsPayload?.accounts) ? (connectorsPayload.accounts as JsonMap[]) : [];
+    const nextRoutes = asList(asMap(routesPayload).routes);
     setMt5Accounts(Array.isArray(mt5Payload) ? mt5Payload : []);
-    setLinkedAccounts(Array.isArray(connectorsPayload?.accounts) ? (connectorsPayload.accounts as JsonMap[]) : []);
+    setLinkedAccounts(nextLinkedAccounts);
+    setExchangeCapabilities(normalizeExchangeCapabilityMap(capabilitiesPayload));
+    setIntegrationRoutes(nextRoutes);
+    const exchangeAccounts = nextLinkedAccounts.filter((item) => String(item.provider || "") !== "mt5" && String(item.provider_type || "") !== "wallet");
+    if (!integrationAccountId || !exchangeAccounts.some((item) => String(item.account_id || "") === integrationAccountId)) {
+      setIntegrationAccountId(String(exchangeAccounts[0]?.account_id || ""));
+    }
   }
 
   useEffect(() => {
@@ -133,6 +174,22 @@ export default function ConnectionsPage() {
   }
 
   async function linkExchangeApiKey(): Promise<void> {
+    if (!exchangeAccountId.trim()) {
+      setError("Ajoute l'identifiant du compte ou du sous-compte sur l'exchange.");
+      return;
+    }
+    if (!exchangeApiKey.trim()) {
+      setError("Ajoute la clé API.");
+      return;
+    }
+    if (!exchangeApiSecret.trim()) {
+      setError("Ajoute le secret API.");
+      return;
+    }
+    if (exchangePassphraseRequired && !exchangePassphrase.trim()) {
+      setError(`Pour ${selectedExchangeProvider?.provider || "cet exchange"}, ajoute aussi la passphrase créée avec la clé API.`);
+      return;
+    }
     setBusy(true);
     setError(null);
     setResult(null);
@@ -236,6 +293,56 @@ export default function ConnectionsPage() {
     }
   }
 
+  async function upsertIntegrationRoute(): Promise<void> {
+    if (!selectedIntegrationAccount) {
+      setError("Selectionne d'abord un compte exchange lie.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setResult(null);
+    try {
+      const response = await fetch("/api/integrations/routes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source: integrationSource,
+          route_key: integrationRouteKey || "default",
+          provider: String(selectedIntegrationAccount.provider || "").trim().toLowerCase(),
+          account_id: String(selectedIntegrationAccount.account_id || "").trim(),
+          live_enabled: integrationLiveEnabled,
+          preferred_venue: integrationPreferredVenue || suggestedExchangeVenue(
+            selectedIntegrationCapability,
+            integrationLiveEnabled,
+            String(asMap(selectedIntegrationAccount.broker_capabilities).preferred_venue || selectedIntegrationAccount.provider || "AUTO"),
+          ),
+          notional_usd: integrationNotionalUsd,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(String(payload?.detail || "Creation de route impossible"));
+      }
+      setResult((payload || null) as JsonMap | null);
+      await loadConnectionsState();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Creation de route impossible");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!selectedIntegrationAccount) {
+      return;
+    }
+    const provider = String(selectedIntegrationAccount.provider || "").trim().toLowerCase();
+    const fallbackVenue = String(asMap(selectedIntegrationAccount.broker_capabilities).preferred_venue || provider || "AUTO");
+    const liveVenue = suggestedExchangeVenue(selectedIntegrationCapability, true, fallbackVenue);
+    const paperVenue = suggestedExchangeVenue(selectedIntegrationCapability, false, fallbackVenue);
+    setIntegrationPreferredVenue(integrationLiveEnabled ? liveVenue : paperVenue);
+  }, [integrationAccountId, integrationLiveEnabled, selectedIntegrationAccount, selectedIntegrationCapability]);
+
   return (
     <main className="shell txt-page-shell">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.2fr 0.8fr" }}>
@@ -301,31 +408,77 @@ export default function ConnectionsPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Connexion exchange par API key <HelpHint text="Liaison directe des comptes CEX supportes via cle API chiffree." examples={["Bitget ou BingX: renseignez account label, api key, secret et passphrase si requise.", "Utilisez read si vous voulez seulement supervision, trade si TXT doit executer."]} /></div>
+          <div className="eyebrow">Enregistrer un compte exchange <HelpHint text="Renseigne ici les accès créés sur l'exchange. TXT vérifie maintenant la clé tout de suite pour éviter d'enregistrer un mauvais accès." examples={["Pour OKX, remplis la clé API, le secret API, la passphrase créée avec la clé et l'identifiant du compte ou du sous-compte.", "Choisis Lecture seule pour voir le compte sans autoriser d'ordre."]} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <select value={exchangeProviderId} onChange={(e) => setExchangeProviderId(e.target.value)}>
               {EXCHANGE_CONNECTION_CATALOG.filter((item) => item.mode === "api-key").map((item) => (
                 <option value={item.providerId} key={item.providerId}>{item.provider}</option>
               ))}
             </select>
-            <input value={exchangeAccountId} onChange={(e) => setExchangeAccountId(e.target.value)} placeholder="exchange account_id / subaccount" />
-            <input value={exchangeLabel} onChange={(e) => setExchangeLabel(e.target.value)} placeholder="label affichage" />
-            <input value={exchangeApiKey} onChange={(e) => setExchangeApiKey(e.target.value)} placeholder="api key" />
-            <input type="password" value={exchangeApiSecret} onChange={(e) => setExchangeApiSecret(e.target.value)} placeholder="api secret" />
-            <input type="password" value={exchangePassphrase} onChange={(e) => setExchangePassphrase(e.target.value)} placeholder="passphrase (optionnelle)" />
+            <input value={exchangeAccountId} onChange={(e) => setExchangeAccountId(e.target.value)} placeholder="Identifiant du compte sur l'exchange ou sous-compte" />
+            <input value={exchangeLabel} onChange={(e) => setExchangeLabel(e.target.value)} placeholder="Nom affiché du compte (facultatif)" />
+            <input value={exchangeApiKey} onChange={(e) => setExchangeApiKey(e.target.value)} placeholder="Clé API" />
+            <input type="password" value={exchangeApiSecret} onChange={(e) => setExchangeApiSecret(e.target.value)} placeholder="Secret API" />
+            <input type="password" value={exchangePassphrase} onChange={(e) => setExchangePassphrase(e.target.value)} placeholder={exchangePassphraseRequired ? "Passphrase API (obligatoire)" : "Passphrase API (laisser vide si non demandée)"} />
             <select value={exchangeAccessMode} onChange={(e) => setExchangeAccessMode(e.target.value)}>
-              <option value="read">read</option>
-              <option value="trade">trade</option>
+              <option value="read">Lecture seule</option>
+              <option value="trade">Trading autorisé</option>
             </select>
-            <button type="button" onClick={() => linkExchangeApiKey()} disabled={busy}>{busy ? "Connexion…" : "Lier API key"}</button>
+            <button type="button" onClick={() => linkExchangeApiKey()} disabled={busy}>{busy ? "Vérification…" : "Enregistrer le compte"}</button>
           </div>
+          <p className="subtle" style={{ marginTop: 10 }}>
+            {exchangePassphraseRequired
+              ? `Pour ${selectedExchangeProvider?.provider || "cet exchange"}, la passphrase est obligatoire et doit être exactement celle créée en même temps que la clé API.`
+              : "Colle ici exactement les accès visibles dans l'interface de l'exchange. TXT vérifie la clé avant de la garder."}
+          </p>
           {linkedAccounts.filter((item) => String(item.provider || "") !== "mt5" && String(item.provider_type || "") !== "wallet").length > 0 ? (
             <div className="panel" style={{ marginTop: 12, borderRadius: 12 }}>
-              <div className="eyebrow">Exchanges lies</div>
+              <div className="eyebrow">Comptes exchange enregistrés</div>
               {linkedAccounts.filter((item) => String(item.provider || "") !== "mt5" && String(item.provider_type || "") !== "wallet").slice(0, 6).map((item) => (
                 <div className="row" key={`${String(item.provider)}-${String(item.account_id)}`}>
                   <span>{String(item.provider)} | {String(item.account_id)} | {String(item.label || "-")}</span>
                   <span>{String(item.mode || "-")} / {item.has_credentials ? "secret ok" : "secret missing"}</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+
+        <div className="panel">
+          <div className="eyebrow">Route d'integration live <HelpHint text="Expose la creation de route pour un signal autonome vers un compte exchange lie, y compris BingX live." examples={["Source kairos + route default + live enabled = le moteur peut demander du vrai live gouverne.", "Si tu veux rester sans risque, desactive live_enabled ou garde un venue paper."]} /></div>
+          <div className="form-grid" style={{ marginTop: 12 }}>
+            <input value={integrationSource} onChange={(e) => setIntegrationSource(e.target.value)} placeholder="source (ex: kairos)" />
+            <input value={integrationRouteKey} onChange={(e) => setIntegrationRouteKey(e.target.value)} placeholder="route_key" />
+            <select value={integrationAccountId} onChange={(e) => setIntegrationAccountId(e.target.value)}>
+              <option value="">compte exchange lie</option>
+              {linkedExchangeAccounts.map((item) => (
+                <option value={String(item.account_id)} key={`${String(item.provider)}-${String(item.account_id)}`}>
+                  {String(item.provider)} | {String(item.account_id)} | {String(item.mode || "-")}
+                </option>
+              ))}
+            </select>
+            <input value={integrationPreferredVenue} onChange={(e) => setIntegrationPreferredVenue(e.target.value)} placeholder="preferred_venue" />
+            <input type="number" step="0.1" value={integrationNotionalUsd} onChange={(e) => setIntegrationNotionalUsd(Number(e.target.value || 0))} placeholder="notional_usd" />
+            <label className="row" style={{ gap: 8 }}>
+              <span>Live enabled</span>
+              <input type="checkbox" checked={integrationLiveEnabled} onChange={(e) => setIntegrationLiveEnabled(e.target.checked)} />
+            </label>
+            <button type="button" onClick={() => { void upsertIntegrationRoute(); }} disabled={busy || !integrationSource || !integrationAccountId}>
+              {busy ? "Enregistrement…" : "Enregistrer la route"}
+            </button>
+          </div>
+          <div className="panel" style={{ marginTop: 12, borderRadius: 12 }}>
+            <div className="row"><span>Compte choisi</span><span>{selectedIntegrationAccount ? `${String(selectedIntegrationAccount.provider)} | ${String(selectedIntegrationAccount.account_id)} | ${String(selectedIntegrationAccount.mode || "-")}` : "Aucun"}</span></div>
+            <div className="row"><span>Permission trade</span><span>{selectedIntegrationAccount ? String(asMap(asMap(selectedIntegrationAccount.permissions_view).permissions).trade || false) : "false"}</span></div>
+            <div className="row"><span>Venue suggere</span><span>{selectedIntegrationAccount ? String(asMap(selectedIntegrationAccount.broker_capabilities).preferred_venue || "-") : "-"}</span></div>
+          </div>
+          {integrationRoutes.length > 0 ? (
+            <div className="panel" style={{ marginTop: 12, borderRadius: 12 }}>
+              <div className="eyebrow">Routes existantes</div>
+              {integrationRoutes.slice(0, 8).map((item) => (
+                <div className="row" key={`${String(item.source)}-${String(item.route_key)}`}>
+                  <span>{String(item.source)} | {String(item.route_key || "default")} | {String(item.provider || "-")} | {String(item.account_id || "-")}</span>
+                  <span>{String(Boolean(item.live_enabled))} / {String(item.preferred_venue || "-")}</span>
                 </div>
               ))}
             </div>

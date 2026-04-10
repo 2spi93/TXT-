@@ -291,6 +291,58 @@ CREATE TABLE IF NOT EXISTS execution_fill_events (
     UNIQUE (decision_id, fill_id)
 );
 
+CREATE TABLE IF NOT EXISTS execution_optimizer_active_orders (
+    decision_id TEXT PRIMARY KEY,
+    order_id TEXT,
+    account_id TEXT,
+    broker_provider TEXT NOT NULL,
+    market_venue TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    side TEXT NOT NULL,
+    status TEXT NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    requested_notional_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    filled_notional_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    remaining_notional_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    lifecycle_action TEXT,
+    lifecycle_reason TEXT,
+    queue_edge DOUBLE PRECISION,
+    predicted_fill_probability DOUBLE PRECISION,
+    fill_score DOUBLE PRECISION,
+    spoof_detected BOOLEAN NOT NULL DEFAULT FALSE,
+    desk_profile JSONB NOT NULL DEFAULT '{}'::jsonb,
+    latest_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+    latest_v4 JSONB NOT NULL DEFAULT '{}'::jsonb,
+    history JSONB NOT NULL DEFAULT '[]'::jsonb,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finalized_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS execution_optimizer_lifecycle_events (
+    id BIGSERIAL PRIMARY KEY,
+    decision_id TEXT NOT NULL,
+    order_id TEXT,
+    account_id TEXT,
+    broker_provider TEXT NOT NULL,
+    market_venue TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    side TEXT NOT NULL,
+    cycle_index INTEGER,
+    event_type TEXT NOT NULL,
+    action TEXT,
+    reason TEXT,
+    status TEXT,
+    queue_edge DOUBLE PRECISION,
+    predicted_fill_probability DOUBLE PRECISION,
+    fill_score DOUBLE PRECISION,
+    expected_slippage_bps DOUBLE PRECISION,
+    spoof_detected BOOLEAN NOT NULL DEFAULT FALSE,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS reality_gap_samples (
     sample_id TEXT PRIMARY KEY,
     decision_id TEXT NOT NULL,
@@ -1043,6 +1095,18 @@ ON execution_fill_events (decision_id, filled_at ASC);
 
 CREATE INDEX IF NOT EXISTS idx_execution_fill_events_symbol_time
 ON execution_fill_events (instrument, filled_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_execution_optimizer_active_orders_active
+ON execution_optimizer_active_orders (active, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_execution_optimizer_active_orders_market_venue
+ON execution_optimizer_active_orders (market_venue, active, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_execution_optimizer_lifecycle_events_decision
+ON execution_optimizer_lifecycle_events (decision_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_execution_optimizer_lifecycle_events_market_venue
+ON execution_optimizer_lifecycle_events (market_venue, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_reality_gap_samples_decision
 ON reality_gap_samples (decision_id, created_at DESC);
