@@ -15,6 +15,8 @@ type BrokerProviderRow = Record<string, unknown>;
 type BrokerBalanceRow = Record<string, unknown>;
 type BrokerPositionRow = Record<string, unknown>;
 type AlertRow = Record<string, unknown>;
+type ExecutionOptimizerLivePayload = Record<string, unknown>;
+type VenueTelemetryPayload = Record<string, unknown>;
 type IncidentItemRow = {
   item: Record<string, unknown>;
   status: string;
@@ -112,6 +114,155 @@ function formatCompactUsd(value: unknown): string {
   return `${amount.toFixed(Math.abs(amount) >= 100 ? 0 : 2)} USD`;
 }
 
+function formatCompactMetricMs(value: unknown): string {
+  const numeric = safeNumber(value, -1);
+  if (numeric < 0) {
+    return "n/a";
+  }
+  if (numeric < 1000) {
+    return `${Math.round(numeric)}ms`;
+  }
+  if (numeric < 60_000) {
+    return `${(numeric / 1000).toFixed(numeric < 10_000 ? 1 : 0)}s`;
+  }
+  return `${Math.round(numeric / 60_000)}m`;
+}
+
+function formatCompactClock(value: unknown, formatClock: (value: string) => string): string {
+  const iso = String(value || "").trim();
+  return iso ? formatClock(iso) : "--:--:--";
+}
+
+function resolveVenueTelemetryTone(input: {
+  freshestMs: number;
+  avgSlippageBps: number;
+  avgFillLatencyMs: number;
+  avgFillQualityScore: number;
+  stabilityState: string;
+  proxyState: string;
+}): "good" | "subtle" | "warn" {
+  const freshness = Math.max(0, input.freshestMs);
+  const stability = input.stabilityState.trim().toLowerCase();
+  const proxyState = input.proxyState.trim().toLowerCase();
+  if (
+    proxyState === "degraded"
+    || freshness >= 120_000
+    || stability === "critical"
+    || (input.avgFillQualityScore > 0 && input.avgFillQualityScore < 60)
+  ) {
+    return "warn";
+  }
+  if (
+    proxyState === "retry_recovered"
+    || freshness >= 20_000
+    || input.avgSlippageBps >= 8
+    || input.avgFillLatencyMs >= 220
+    || stability === "degraded"
+    || stability === "watch"
+    || (input.avgFillQualityScore > 0 && input.avgFillQualityScore < 78)
+  ) {
+    return "subtle";
+  }
+
+  return "good";
+}
+
+function resolveExecutionOptimizerTone(order: Record<string, unknown>): "good" | "subtle" | "warn" {
+  const guardReasons = Array.isArray(order.guard_reasons) ? order.guard_reasons.length : 0;
+  const lifecycleAction = String(order.lifecycle_action || "keep").trim().toLowerCase();
+  const fillScore = safeNumber(order.fill_score, 0);
+  const predictedFill = safeNumber(order.predicted_fill_probability, 0);
+  const adverseSelectionScore = safeNumber(order.adverse_selection_score, 0);
+  if (guardReasons > 0 || Boolean(order.spoof_detected) || Boolean(order.liquidity_trap_detected) || lifecycleAction === "cancel" || adverseSelectionScore >= 0.78) {
+    return "warn";
+  }
+  if (lifecycleAction === "replace" || lifecycleAction === "upgrade_to_market" || Boolean(order.should_move_ahead) || fillScore < 0.65 || predictedFill < 0.65) {
+    return "subtle";
+  }
+  return "good";
+}
+
+function buildVenueTelemetryRows(
+  marketPayload: VenueTelemetryPayload | null,
+  routePayload: VenueTelemetryPayload | null,
+): Array<Record<string, unknown>> {
+  const marketEnvelope = safeRecord(marketPayload);
+  const routeEnvelope = safeRecord(routePayload);
+  const marketVenues = safeRows(marketEnvelope.venues);
+  const routeVenues = safeRows(routeEnvelope.venues);
+  const marketByVenue = new Map<string, Record<string, unknown>>();
+  const routeByVenue = new Map<string, Record<string, unknown>>();
+
+  for (const item of marketVenues) {
+    const venue = String(item.venue || "unknown").trim();
+    if (venue) {
+      marketByVenue.set(venue, item);
+    }
+  }
+  for (const item of routeVenues) {
+    const venue = String(item.venue || "unknown").trim();
+    if (venue) {
+      routeByVenue.set(venue, item);
+    }
+  }
+
+  const allVenues = [...new Set([...marketByVenue.keys(), ...routeByVenue.keys()])];
+  const sharedProxyState = [String(routeEnvelope.network_state || ""), String(marketEnvelope.network_state || "")]
+    .map((value) => value.trim().toLowerCase())
+    .find((value) => value === "degraded")
+    || [String(routeEnvelope.network_state || ""), String(marketEnvelope.network_state || "")]
+      .map((value) => value.trim().toLowerCase())
+      .find((value) => value === "retry_recovered")
+    || "healthy";
+
+  const rows = allVenues.map((venue) => {
+    const routeRow = safeRecord(routeByVenue.get(venue));
+    const routeMarket = safeRecord(routeRow.market);
+    const fallbackMarket = safeRecord(marketByVenue.get(venue));
+    const marketRow = Object.keys(routeMarket).length > 0 ? routeMarket : fallbackMarket;
+    const executionRow = safeRecord(routeRow.execution);
+    const stabilityRow = safeRecord(routeRow.stability);
+    const profileRow = safeRecord(routeRow.profile);
+    const instrumentRows = safeRows(marketRow.instruments);
+    const freshestMs = Math.max(
+      safeNumber(marketRow.max_quote_freshness_ms, 0),
+      safeNumber(marketRow.max_depth_freshness_ms, 0),
+      safeNumber(marketRow.max_trade_freshness_ms, 0),
+    );
+    const avgSlippageBps = safeNumber(executionRow.avg_slippage_bps, 0);
+    const avgFillLatencyMs = safeNumber(executionRow.avg_fill_latency_ms, 0);
+    const avgFillQualityScore = safeNumber(executionRow.avg_fill_quality_score, 0);
+    const stabilityState = String(stabilityRow.state || stabilityRow.stability_state || "nominal");
+    const tone = resolveVenueTelemetryTone({
+      freshestMs,
+      avgSlippageBps,
+      avgFillLatencyMs,
+      avgFillQualityScore,
+      stabilityState,
+      proxyState: sharedProxyState,
+    });
+
+    return {
+      venue,
+      tone,
+      market: marketRow,
+      execution: executionRow,
+      stability: stabilityRow,
+      profile: profileRow,
+      instruments: instrumentRows,
+      severity_score:
+        freshestMs
+        + Math.max(0, avgSlippageBps * 2_000)
+        + Math.max(0, avgFillLatencyMs * 20)
+        + (avgFillQualityScore > 0 ? Math.max(0, (100 - avgFillQualityScore) * 1_000) : 0)
+        + (tone === "warn" ? 250_000 : tone === "subtle" ? 80_000 : 0),
+    };
+  });
+
+  rows.sort((left, right) => safeNumber(right.severity_score, 0) - safeNumber(left.severity_score, 0) || String(left.venue || "").localeCompare(String(right.venue || "")));
+  return rows;
+}
+
 function ScrollWrap({ children, className }: { children: ReactNode; className?: string }) {
   return <div className={className} style={{ height: "100%", overflow: "auto" }}>{children}</div>;
 }
@@ -164,6 +315,10 @@ const PANEL_HINTS: Record<string, { text: string; examples: string[] }> = {
   "H24 Control Room": {
     text: "Salle de controle live: watchdog, gouvernance, memory gate, recovery, audit et warfare core sur un seul panneau.",
     examples: ["Si le watchdog passe en HALT, le bouton rouge doit etre considere comme prioritaire.", "Croiser health score, market state et audit trail avant toute promotion live."],
+  },
+  "Venue Telemetry": {
+    text: "Rassemble la sante feed et execution par venue: fraicheur quotes/depth/trades, spread, slippage, fill quality et contraintes de route.",
+    examples: ["Si la fraicheur depth explose mais le proxy reste healthy, le souci vient du feed venue, pas du control plane.", "Une venue avec fill quality faible et slippage eleve doit etre re-degradee ou reroutee avant live."],
   },
 };
 
@@ -750,6 +905,200 @@ export function ControlRoomMonitoringPanel({
                 <span className={safeNumber(row.dd_pct, 0) >= 2 ? "warn" : "subtle"}>{safeNumber(row.dd_pct, 0).toFixed(2)}%</span>
               </div>
             ))}
+          </div>
+        </>
+      ) : null}
+    </MonitoringPanelCard>
+  );
+}
+
+export function VenueTelemetryMonitoringPanel({
+  badge,
+  layoutEditMode,
+  onDetach,
+  marketPayload,
+  routePayload,
+  formatClock,
+}: {
+  badge: ReactNode;
+  layoutEditMode: boolean;
+  onDetach: () => void;
+  marketPayload: VenueTelemetryPayload | null;
+  routePayload: VenueTelemetryPayload | null;
+  formatClock: (value: string) => string;
+}) {
+  const marketEnvelope = safeRecord(marketPayload);
+  const routeEnvelope = safeRecord(routePayload);
+  const rows = buildVenueTelemetryRows(marketPayload, routePayload);
+  const updatedAt = String(routeEnvelope.updated_at || marketEnvelope.updated_at || "").trim();
+  const marketProxyState = String(marketEnvelope.network_state || "healthy").trim().toLowerCase();
+  const routeProxyState = String(routeEnvelope.network_state || "healthy").trim().toLowerCase();
+  const proxyState = marketProxyState === "degraded" || routeProxyState === "degraded"
+    ? "degraded"
+    : marketProxyState === "retry_recovered" || routeProxyState === "retry_recovered"
+      ? "retry_recovered"
+      : "healthy";
+  const titleBadge = (
+    <>
+      {badge}
+      <span className={`venue-telemetry-proxy-badge ${proxyState}`}>{proxyState.replace(/_/g, " ")}</span>
+    </>
+  );
+
+  return (
+    <MonitoringPanelCard title="Venue Telemetry" badge={titleBadge} layoutEditMode={layoutEditMode} onDetach={onDetach}>
+      {!marketPayload && !routePayload ? <p className="subtle mini">Télémétrie venue indisponible.</p> : null}
+      {(marketPayload || routePayload) ? (
+        <>
+          <div className="venue-telemetry-summary">
+            <span className="venue-telemetry-pill">proxy {proxyState}</span>
+            <span className="venue-telemetry-pill">venues {rows.length}</span>
+            <span className="venue-telemetry-pill">updated {updatedAt ? formatCompactClock(updatedAt, formatClock) : "--:--:--"}</span>
+          </div>
+          {rows.length === 0 ? <p className="subtle mini">Aucune venue observée.</p> : null}
+          <div className="venue-telemetry-list">
+            {rows.slice(0, 8).map((row) => {
+              const market = safeRecord(row.market);
+              const execution = safeRecord(row.execution);
+              const stability = safeRecord(row.stability);
+              const profile = safeRecord(row.profile);
+              const instruments = safeRows(row.instruments);
+              const tone = String(row.tone || "subtle");
+              const feedLine = `q ${formatCompactMetricMs(market.max_quote_freshness_ms)} · d ${formatCompactMetricMs(market.max_depth_freshness_ms)} · t ${formatCompactMetricMs(market.max_trade_freshness_ms)}`;
+              const marketLine = `${safeNumber(market.avg_spread_bps, 0).toFixed(2)}bp · depth ${safeNumber(market.avg_depth_levels, 0).toFixed(0)} · dlat ${formatCompactMetricMs(market.avg_depth_latency_ms)}`;
+              const executionLine = Object.keys(execution).length > 0
+                ? `${safeNumber(execution.fill_count, 0)} fills · ${safeNumber(execution.avg_slippage_bps, 0).toFixed(2)}bp · qual ${safeNumber(execution.avg_fill_quality_score, 0).toFixed(0)}`
+                : "no fills in window";
+              const instrumentLine = instruments.length > 0
+                ? instruments.slice(0, 2).map((item) => `${String(item.instrument || "?")} ${safeNumber(item.spread_bps, 0).toFixed(2)}bp`).join(" · ")
+                : "no market instruments";
+              return (
+                <div key={String(row.venue || "venue")} className={`venue-telemetry-item ${tone}`}>
+                  <div className="venue-telemetry-head">
+                    <span className="venue-telemetry-venue">{String(row.venue || "venue")}</span>
+                    <span className={`venue-telemetry-state ${tone}`}>{String(stability.state || stability.stability_state || tone)}</span>
+                  </div>
+                  <div className="venue-telemetry-meta">
+                    <span>Feed</span>
+                    <strong>{feedLine}</strong>
+                    <span>Market</span>
+                    <strong>{marketLine}</strong>
+                    <span>Exec</span>
+                    <strong>{executionLine}</strong>
+                    <span>Profile</span>
+                    <strong>{String(profile.matching_rule || "price-time")} · q {safeNumber(profile.queue_priority_bias, 0).toFixed(2)}</strong>
+                  </div>
+                  <div className="venue-telemetry-instruments">{instrumentLine}</div>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      ) : null}
+    </MonitoringPanelCard>
+  );
+}
+
+export function ExecutionOptimizerMonitoringPanel({
+  badge,
+  layoutEditMode,
+  onDetach,
+  payload,
+  formatClock,
+}: {
+  badge: ReactNode;
+  layoutEditMode: boolean;
+  onDetach: () => void;
+  payload: ExecutionOptimizerLivePayload | null;
+  formatClock: (value: string) => string;
+}) {
+  const envelope = safeRecord(payload);
+  const profilesRecord = safeRecord(envelope.profiles);
+  const activeOrders = safeRows(envelope.active_orders);
+  const recentEvents = safeRows(envelope.recent_events);
+  const profileRows = Object.values(profilesRecord)
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+    .sort((left, right) => safeNumber(right.sample_count, 0) - safeNumber(left.sample_count, 0));
+  const updatedAt = String(envelope.updated_at || envelope.profiles_updated_at || "").trim();
+  const proxyState = String(envelope.network_state || "healthy").trim().toLowerCase();
+  const titleBadge = (
+    <>
+      {badge}
+      <span className={`venue-telemetry-proxy-badge ${proxyState}`}>{proxyState.replace(/_/g, " ")}</span>
+    </>
+  );
+
+  return (
+    <MonitoringPanelCard title="Execution Optimizer" badge={titleBadge} layoutEditMode={layoutEditMode} onDetach={onDetach}>
+      {!payload ? <p className="subtle mini">Optimizer live-state indisponible.</p> : null}
+      {payload ? (
+        <>
+          <div className="venue-telemetry-summary">
+            <span className="venue-telemetry-pill">active {activeOrders.length}</span>
+            <span className="venue-telemetry-pill">profiles {profileRows.length}</span>
+            <span className="venue-telemetry-pill">events {recentEvents.length}</span>
+            <span className="venue-telemetry-pill">updated {updatedAt ? formatCompactClock(updatedAt, formatClock) : "--:--:--"}</span>
+          </div>
+          <div className="optimizer-live-section">
+            <div className="subtle mini">Live managed orders</div>
+            {activeOrders.length === 0 ? <p className="subtle mini">Aucun ordre live actuellement managé.</p> : null}
+            <div className="optimizer-live-grid">
+              {activeOrders.slice(0, 4).map((order, index) => {
+                const tone = resolveExecutionOptimizerTone(order);
+                const guardReasons = Array.isArray(order.guard_reasons) ? order.guard_reasons.map((item) => String(item)).filter(Boolean).slice(0, 3) : [];
+                const deskProfile = safeRecord(order.desk_profile);
+                return (
+                  <div key={`optimizer-active-${index}-${String(order.order_id || order.decision_id || "row")}`} className={`venue-telemetry-item ${tone}`}>
+                    <div className="venue-telemetry-head">
+                      <span className="venue-telemetry-venue">{String(order.symbol || "?")} · {String(order.side || "buy").toUpperCase()}</span>
+                      <span className={`venue-telemetry-state ${tone}`}>{String(order.lifecycle_action || order.status || "keep").replace(/_/g, " ")}</span>
+                    </div>
+                    <div className="mon-row"><span>Venue</span><span>{String(order.market_venue || order.broker_provider || "unknown")}</span></div>
+                    <div className="mon-row"><span>Queue / fill</span><span>{(safeNumber(order.queue_rank_estimate, 0) * 100).toFixed(0)}% tail · {(safeNumber(order.fill_score, 0) * 100).toFixed(0)}%</span></div>
+                    <div className="mon-row"><span>Predicted fill</span><span>{(safeNumber(order.predicted_fill_probability, 0) * 100).toFixed(0)}% · {(safeNumber(order.dominance_score, 0) * 100).toFixed(0)} dom</span></div>
+                    <div className="mon-row"><span>Queue clock</span><span>{formatCompactMetricMs(order.time_in_queue_ms)} · TTF {formatCompactMetricMs(order.time_to_fill_estimate_ms)}</span></div>
+                    <div className="mon-row"><span>Toxicity</span><span>{(safeNumber(order.adverse_selection_score, 0) * 100).toFixed(0)}% adv · {(safeNumber(order.liquidity_decay_rate, 0) * 100).toFixed(0)}% decay</span></div>
+                    <div className="mon-row"><span>Timing</span><span>{String(order.timing || "WAIT")}</span></div>
+                    <div className="mon-row"><span>Profile</span><span>{safeNumber(deskProfile.sample_count, 0)} fills · max {safeNumber(deskProfile.max_spread_bps, 0).toFixed(1)}bps</span></div>
+                    <div className="optimizer-live-reasons">
+                      {guardReasons.length === 0 ? <span className="optimizer-live-chip good">guard clean</span> : null}
+                      {guardReasons.map((reason) => <span key={reason} className="optimizer-live-chip warn">{reason}</span>)}
+                      {Boolean(order.spoof_detected) ? <span className="optimizer-live-chip warn">spoof</span> : null}
+                      {Boolean(order.liquidity_trap_detected) ? <span className="optimizer-live-chip warn">trap</span> : null}
+                      {Boolean(order.should_move_ahead) ? <span className="optimizer-live-chip good">move-ahead</span> : null}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div className="optimizer-live-section">
+            <div className="subtle mini">Recent lifecycle events</div>
+            {recentEvents.length === 0 ? <p className="subtle mini">Aucun event recent.</p> : null}
+            {recentEvents.slice(0, 4).map((event, index) => (
+              <div key={`optimizer-event-${index}`} className="mon-row">
+                <span>{String(event.updated_at || "") ? formatClock(String(event.updated_at)) : "--:--:--"}</span>
+                <span className="subtle mini">{String(event.symbol || "?")} · {String(event.market_venue || event.broker_provider || "unknown")}</span>
+                <span className={resolveExecutionOptimizerTone(event)}>{String(event.lifecycle_action || event.status || "keep")}</span>
+              </div>
+            ))}
+          </div>
+          <div className="optimizer-live-section">
+            <div className="subtle mini">Calibrated venue desk profiles</div>
+            {profileRows.length === 0 ? <p className="subtle mini">Pas encore de calibration fills.</p> : null}
+            <div className="optimizer-profile-grid">
+              {profileRows.slice(0, 4).map((profile, index) => (
+                <div key={`optimizer-profile-${index}-${String(profile.venue || "venue")}`} className="venue-telemetry-item subtle">
+                  <div className="venue-telemetry-head">
+                    <span className="venue-telemetry-venue">{String(profile.venue || "venue")}</span>
+                    <span className="venue-telemetry-state subtle">{safeNumber(profile.sample_count, 0)} fills</span>
+                  </div>
+                  <div className="mon-row"><span>Spread / latency</span><span>{safeNumber(profile.max_spread_bps, 0).toFixed(1)}bps · {Math.round(safeNumber(profile.max_latency_ms, 0))}ms</span></div>
+                  <div className="mon-row"><span>Fill guard</span><span>{(safeNumber(profile.min_fill_probability, 0) * 100).toFixed(0)}% / {(safeNumber(profile.replace_below_fill_probability, 0) * 100).toFixed(0)}%</span></div>
+                  <div className="mon-row"><span>Spoof wall</span><span>{formatCompactUsd(profile.spoof_notional_usd)} · {Math.round(safeNumber(profile.spoof_lifetime_ms, 0))}ms</span></div>
+                </div>
+              ))}
+            </div>
           </div>
         </>
       ) : null}
