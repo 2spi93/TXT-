@@ -343,6 +343,18 @@ CREATE TABLE IF NOT EXISTS execution_optimizer_lifecycle_events (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS execution_ai_v6_episodes (
+    id BIGSERIAL PRIMARY KEY,
+    decision_id TEXT,
+    context_key TEXT NOT NULL,
+    action TEXT NOT NULL,
+    reward DOUBLE PRECISION NOT NULL,
+    learning_applied BOOLEAN NOT NULL DEFAULT TRUE,
+    state JSONB NOT NULL DEFAULT '{}'::jsonb,
+    reward_components JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS reality_gap_samples (
     sample_id TEXT PRIMARY KEY,
     decision_id TEXT NOT NULL,
@@ -1107,6 +1119,12 @@ ON execution_optimizer_lifecycle_events (decision_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_execution_optimizer_lifecycle_events_market_venue
 ON execution_optimizer_lifecycle_events (market_venue, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_execution_ai_v6_episodes_created
+ON execution_ai_v6_episodes (created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_execution_ai_v6_episodes_context
+ON execution_ai_v6_episodes (context_key, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_reality_gap_samples_decision
 ON reality_gap_samples (decision_id, created_at DESC);

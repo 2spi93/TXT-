@@ -40,6 +40,23 @@ EXECUTION_OPTIMIZER_PROFILE_CACHE: dict[str, object] = {"expires_at": 0.0, "prof
 ACTIVE_EXECUTION_ORDERS: dict[str, dict[str, object]] = {}
 ACTIVE_EXECUTION_ORDER_TASKS: dict[str, asyncio.Task] = {}
 RECENT_EXECUTION_OPTIMIZER_EVENTS: list[dict[str, object]] = []
+EXECUTION_AI_V6_STATE: dict[str, object] = {
+    "episodes": [],
+    "actions": {},
+    "contexts": {},
+    "reward_ema": 0.0,
+    "reward_peak": 0.0,
+    "reward_drawdown": 0.0,
+    "reward_volatility": 0.0,
+    "negative_streak": 0,
+    "learning_frozen": False,
+    "freeze_reasons": [],
+    "loaded": False,
+    "loaded_at": None,
+    "persistence_available": True,
+    "last_persist_error": None,
+    "updated_at": None,
+}
 
 VENUE_EXECUTION_PROFILES: dict[str, dict[str, object]] = {
     "binance": {
@@ -202,6 +219,191 @@ def _as_list(value: object) -> list[dict[str, object]]:
 def _append_execution_optimizer_event(event: dict[str, object]) -> None:
     RECENT_EXECUTION_OPTIMIZER_EVENTS.insert(0, event)
     del RECENT_EXECUTION_OPTIMIZER_EVENTS[80:]
+
+
+def _reset_execution_ai_v6_runtime_state(*, loaded: bool = False) -> None:
+    EXECUTION_AI_V6_STATE.clear()
+    EXECUTION_AI_V6_STATE.update(
+        {
+            "episodes": [],
+            "actions": {},
+            "contexts": {},
+            "reward_ema": 0.0,
+            "reward_peak": 0.0,
+            "reward_drawdown": 0.0,
+            "reward_volatility": 0.0,
+            "negative_streak": 0,
+            "learning_frozen": False,
+            "freeze_reasons": [],
+            "loaded": loaded,
+            "loaded_at": _now_iso() if loaded else None,
+            "persistence_available": True,
+            "last_persist_error": None,
+            "updated_at": None,
+        }
+    )
+
+
+def _persist_execution_ai_v6_episode(episode: dict[str, object]) -> bool:
+    if not bool(EXECUTION_AI_V6_STATE.get("persistence_available", True)):
+        return False
+    reward_components = episode.get("reward_components") if isinstance(episode.get("reward_components"), dict) else {}
+    try:
+        execute(
+            """
+            INSERT INTO execution_ai_v6_episodes (
+              decision_id,
+              context_key,
+              action,
+              reward,
+              learning_applied,
+              state,
+              reward_components,
+              created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
+            """,
+            (
+                str(episode.get("decision_id") or "") or None,
+                str(episode.get("context_key") or "unknown"),
+                str(episode.get("action") or "hold"),
+                _to_float(episode.get("reward"), 0.0),
+                bool(episode.get("learning_applied", True)),
+                json_dumps(episode.get("state") if isinstance(episode.get("state"), dict) else {}),
+                json_dumps(reward_components),
+                datetime.fromisoformat(str(episode.get("timestamp") or _now_iso())),
+            ),
+        )
+    except Exception as exc:
+        EXECUTION_AI_V6_STATE.update(
+            {
+                "persistence_available": False,
+                "last_persist_error": str(exc)[:240],
+                "updated_at": _now_iso(),
+            }
+        )
+        return False
+    EXECUTION_AI_V6_STATE.update(
+        {
+            "persistence_available": True,
+            "last_persist_error": None,
+        }
+    )
+    return True
+
+
+def _load_execution_ai_v6_episodes(limit: int = 240) -> list[dict[str, object]]:
+    if not bool(EXECUTION_AI_V6_STATE.get("persistence_available", True)):
+        return []
+    try:
+        rows = fetch_all(
+            """
+            SELECT decision_id, context_key, action, reward, learning_applied, state, reward_components, created_at
+            FROM execution_ai_v6_episodes
+            ORDER BY created_at DESC, id DESC
+            LIMIT %s
+            """,
+            (max(1, limit),),
+        )
+    except Exception as exc:
+        EXECUTION_AI_V6_STATE.update(
+            {
+                "persistence_available": False,
+                "last_persist_error": str(exc)[:240],
+                "updated_at": _now_iso(),
+            }
+        )
+        return []
+    episodes: list[dict[str, object]] = []
+    for row in rows:
+        state = row.get("state") if isinstance(row.get("state"), dict) else {}
+        reward_components = row.get("reward_components") if isinstance(row.get("reward_components"), dict) else {}
+        created_at = row.get("created_at")
+        episodes.append(
+            {
+                "decision_id": row.get("decision_id"),
+                "timestamp": created_at.isoformat() if isinstance(created_at, datetime) else _now_iso(),
+                "context_key": str(row.get("context_key") or "unknown"),
+                "state": state,
+                "action": str(row.get("action") or "hold"),
+                "reward": round(_to_float(row.get("reward"), 0.0), 6),
+                "learning_applied": bool(row.get("learning_applied", True)),
+                "reward_components": reward_components,
+            }
+        )
+    EXECUTION_AI_V6_STATE.update(
+        {
+            "persistence_available": True,
+            "last_persist_error": None,
+        }
+    )
+    return episodes
+
+
+def _rebuild_execution_ai_v6_state_from_episodes(episodes: list[dict[str, object]]) -> None:
+    _reset_execution_ai_v6_runtime_state(loaded=True)
+    if not episodes:
+        return
+
+    action_buckets: dict[str, dict[str, object]] = {}
+    context_buckets: dict[str, dict[str, object]] = {}
+    chronological = list(reversed(episodes))
+    reward_ema = 0.0
+    reward_peak = 0.0
+    negative_streak = 0
+    replayed: list[dict[str, object]] = []
+
+    for episode in chronological:
+        reward = _to_float(episode.get("reward"), 0.0)
+        action = str(episode.get("action") or "hold")
+        context_key = str(episode.get("context_key") or "unknown")
+        learning_applied = bool(episode.get("learning_applied", True))
+        replayed.append(episode)
+        reward_ema = reward if len(replayed) == 1 else reward_ema * 0.82 + reward * 0.18
+        reward_peak = max(reward_peak, reward_ema)
+        negative_streak = 0 if reward > 0 else negative_streak + 1
+
+        if learning_applied:
+            action_bucket = action_buckets.get(action)
+            if not isinstance(action_bucket, dict):
+                action_bucket = _execution_ai_v6_bucket()
+                action_buckets[action] = action_bucket
+            _execution_ai_v6_update_bucket(action_bucket, reward)
+
+            context_bucket = context_buckets.get(context_key)
+            if not isinstance(context_bucket, dict):
+                context_bucket = {"actions": {}, "sample_count": 0, "last_updated_at": None}
+                context_buckets[context_key] = context_bucket
+            context_actions = context_bucket.get("actions") if isinstance(context_bucket.get("actions"), dict) else {}
+            context_action_bucket = context_actions.get(action)
+            if not isinstance(context_action_bucket, dict):
+                context_action_bucket = _execution_ai_v6_bucket()
+                context_actions[action] = context_action_bucket
+            _execution_ai_v6_update_bucket(context_action_bucket, reward)
+            context_bucket["actions"] = context_actions
+            context_bucket["sample_count"] = int(_to_float(context_bucket.get("sample_count"), 0.0)) + 1
+            context_bucket["last_updated_at"] = str(episode.get("timestamp") or _now_iso())
+
+    EXECUTION_AI_V6_STATE.update(
+        {
+            "episodes": list(reversed(replayed))[:240],
+            "actions": action_buckets,
+            "contexts": context_buckets,
+            "reward_ema": round(reward_ema, 6),
+            "reward_peak": round(reward_peak, 6),
+            "negative_streak": negative_streak,
+            "loaded": True,
+            "loaded_at": _now_iso(),
+            "updated_at": str(episodes[0].get("timestamp") or _now_iso()),
+        }
+    )
+    _execution_ai_v6_recompute_guardrails()
+
+
+def _ensure_execution_ai_v6_state_loaded(force: bool = False) -> None:
+    if bool(EXECUTION_AI_V6_STATE.get("loaded")) and not force:
+        return
+    persisted = _load_execution_ai_v6_episodes(limit=240)
+    _rebuild_execution_ai_v6_state_from_episodes(persisted)
 
 
 def _compact_persisted_execution_optimizer_order(row: dict[str, object]) -> dict[str, object]:
@@ -1587,6 +1789,400 @@ def _simulate_split_fills(
     return all_fills, avg_fill_price
 
 
+def _execution_ai_v6_bucket() -> dict[str, object]:
+    return {
+        "sample_count": 0,
+        "wins": 0,
+        "cumulative_reward": 0.0,
+        "avg_reward": 0.0,
+        "last_reward": 0.0,
+        "last_updated_at": None,
+    }
+
+
+def _execution_ai_v6_market_regime(state: dict[str, object]) -> str:
+    if bool(state.get("arbitrage_executable")):
+        return "arb"
+    if _to_float(state.get("slippage_cost_bps"), 0.0) >= 8.0 or _to_float(state.get("latency_ms"), 0.0) >= 95.0:
+        return "stressed"
+    if _to_float(state.get("queue_position"), 0.0) >= 0.72 or _to_float(state.get("liquidity_pressure"), 0.0) >= 0.88:
+        return "fragile"
+    if _to_float(state.get("dominance_score"), 0.0) >= 0.72 and _to_float(state.get("fill_probability"), 0.0) >= 0.7:
+        return "dominant"
+    return "balanced"
+
+
+def _build_execution_ai_v6_state(
+    side: str,
+    requested_notional_usd: float,
+    selected: dict[str, object] | None,
+    backup: dict[str, object] | None,
+    context: dict[str, object] | None,
+    route_preferences: dict[str, object] | None = None,
+) -> dict[str, object]:
+    selected = selected if isinstance(selected, dict) else {}
+    backup = backup if isinstance(backup, dict) else {}
+    context = context if isinstance(context, dict) else {}
+    route_preferences = route_preferences if isinstance(route_preferences, dict) else {}
+    split_plan = context.get("split_plan") if isinstance(context.get("split_plan"), dict) else {}
+    arbitrage = context.get("arbitrage") if isinstance(context.get("arbitrage"), dict) else {}
+    hedge = context.get("hedge_recommendation") if isinstance(context.get("hedge_recommendation"), dict) else {}
+    target_notional_usd = _normalize_requested_notional_usd(requested_notional_usd)
+    available_depth_usd = max(25.0, _to_float(selected.get("available_depth_usd"), target_notional_usd))
+    state = {
+        "side": str(side or "buy").lower(),
+        "notional_usd": round(target_notional_usd, 6),
+        "venue": str(selected.get("venue") or "unknown"),
+        "backup_venue": str(backup.get("venue") or ""),
+        "fill_probability": round(_clamp(_to_float(selected.get("fill_probability"), 0.0), 0.0, 1.0), 6),
+        "dominance_score": round(_clamp(_to_float(selected.get("dominance_score"), _to_float(selected.get("score"), 0.0)), 0.0, 1.0), 6),
+        "route_score": round(_clamp(_to_float(selected.get("score"), 0.0), 0.0, 1.0), 6),
+        "backup_score": round(_clamp(_to_float(backup.get("score"), 0.0), 0.0, 1.0), 6),
+        "queue_position": round(_clamp(_to_float(selected.get("queue_position"), _to_float(selected.get("queue_priority_risk"), 0.0)), 0.0, 1.0), 6),
+        "spread_bps": round(max(0.0, _to_float(selected.get("spread_bps"), 0.0)), 6),
+        "slippage_cost_bps": round(max(0.0, _to_float(selected.get("slippage_cost_bps"), 0.0)), 6),
+        "latency_ms": round(max(0.0, _to_float(selected.get("latency_ms"), 0.0)), 6),
+        "flow_intensity": round(max(0.0, _to_float(selected.get("incoming_flow_usd_per_min"), 0.0)), 6),
+        "available_depth_usd": round(available_depth_usd, 6),
+        "liquidity_pressure": round(_clamp(target_notional_usd / max(available_depth_usd, 1e-9), 0.0, 2.0), 6),
+        "depth_imbalance": round(_to_float(selected.get("depth_imbalance"), 0.0), 6),
+        "volume_imbalance": round(_to_float(selected.get("volume_imbalance"), 0.0), 6),
+        "split_mode": str(split_plan.get("mode") or "singleVenue"),
+        "split_coverage": round(_clamp(_to_float(split_plan.get("coverage_ratio"), 0.0), 0.0, 1.0), 6),
+        "split_venue_count": int(max(0, _to_float(split_plan.get("venue_count"), 0.0))),
+        "arbitrage_executable": bool(arbitrage.get("executable") or arbitrage.get("opportunity")),
+        "arb_net_spread_bps": round(_to_float(arbitrage.get("net_spread_bps"), 0.0), 6),
+        "hedge_mode": str(hedge.get("mode") or "standby"),
+        "execution_style": str(route_preferences.get("execution_style") or "default"),
+    }
+    state["market_regime"] = _execution_ai_v6_market_regime(state)
+    return state
+
+
+def _execution_ai_v6_context_key(state: dict[str, object]) -> str:
+    queue_bucket = "late" if _to_float(state.get("queue_position"), 0.0) >= 0.66 else "mid" if _to_float(state.get("queue_position"), 0.0) >= 0.33 else "front"
+    liquidity_bucket = "thin" if _to_float(state.get("liquidity_pressure"), 0.0) >= 0.8 else "normal"
+    return "|".join(
+        [
+            str(state.get("market_regime") or "balanced"),
+            str(state.get("split_mode") or "singleVenue"),
+            queue_bucket,
+            liquidity_bucket,
+            str(state.get("venue") or "unknown"),
+        ]
+    )
+
+
+def _execution_ai_v6_guardrails() -> dict[str, object]:
+    return {
+        "learning_frozen": bool(EXECUTION_AI_V6_STATE.get("learning_frozen")),
+        "freeze_reasons": list(EXECUTION_AI_V6_STATE.get("freeze_reasons") or []),
+        "reward_ema": round(_to_float(EXECUTION_AI_V6_STATE.get("reward_ema"), 0.0), 6),
+        "reward_drawdown": round(_to_float(EXECUTION_AI_V6_STATE.get("reward_drawdown"), 0.0), 6),
+        "reward_volatility": round(_to_float(EXECUTION_AI_V6_STATE.get("reward_volatility"), 0.0), 6),
+        "negative_streak": int(_to_float(EXECUTION_AI_V6_STATE.get("negative_streak"), 0.0)),
+        "loaded": bool(EXECUTION_AI_V6_STATE.get("loaded")),
+        "loaded_at": EXECUTION_AI_V6_STATE.get("loaded_at"),
+        "persistence_available": bool(EXECUTION_AI_V6_STATE.get("persistence_available", True)),
+        "last_persist_error": EXECUTION_AI_V6_STATE.get("last_persist_error"),
+        "updated_at": EXECUTION_AI_V6_STATE.get("updated_at"),
+    }
+
+
+def _execution_ai_v6_snapshot() -> dict[str, object]:
+    actions = EXECUTION_AI_V6_STATE.get("actions") if isinstance(EXECUTION_AI_V6_STATE.get("actions"), dict) else {}
+    action_rows = []
+    for action, payload in actions.items():
+        if not isinstance(payload, dict):
+            continue
+        action_rows.append(
+            {
+                "action": str(action),
+                "sample_count": int(_to_float(payload.get("sample_count"), 0.0)),
+                "avg_reward": round(_to_float(payload.get("avg_reward"), 0.0), 6),
+                "win_rate": round(_to_float(payload.get("wins"), 0.0) / max(1, int(_to_float(payload.get("sample_count"), 0.0))), 6),
+            }
+        )
+    action_rows.sort(key=lambda item: (item["avg_reward"], item["sample_count"]), reverse=True)
+    return {
+        "guardrails": _execution_ai_v6_guardrails(),
+        "top_actions": action_rows[:5],
+        "recent_episodes": list(EXECUTION_AI_V6_STATE.get("episodes") or [])[:8],
+        "context_count": len(EXECUTION_AI_V6_STATE.get("contexts") or {}),
+        "updated_at": EXECUTION_AI_V6_STATE.get("updated_at"),
+    }
+
+
+def _execution_ai_v6_preferred_action(state: dict[str, object]) -> tuple[str | None, float, int]:
+    contexts = EXECUTION_AI_V6_STATE.get("contexts") if isinstance(EXECUTION_AI_V6_STATE.get("contexts"), dict) else {}
+    context_bucket = contexts.get(_execution_ai_v6_context_key(state)) if isinstance(contexts.get(_execution_ai_v6_context_key(state)), dict) else {}
+    action_buckets = context_bucket.get("actions") if isinstance(context_bucket.get("actions"), dict) else {}
+    best_action = None
+    best_reward = -1e9
+    best_count = 0
+    for action, payload in action_buckets.items():
+        if not isinstance(payload, dict):
+            continue
+        avg_reward = _to_float(payload.get("avg_reward"), 0.0)
+        sample_count = int(_to_float(payload.get("sample_count"), 0.0))
+        if sample_count <= 0:
+            continue
+        if avg_reward > best_reward or (avg_reward == best_reward and sample_count > best_count):
+            best_action = str(action)
+            best_reward = avg_reward
+            best_count = sample_count
+    return best_action, best_reward if best_action else 0.0, best_count
+
+
+def _execution_ai_v6_decide(state: dict[str, object]) -> dict[str, object]:
+    scores = {
+        "hold": 0.0,
+        "join_best_limit": 0.0,
+        "move_to_mid": 0.0,
+        "cancel_replace": 0.0,
+        "market_sweep": 0.0,
+        "split_ioc": 0.0,
+    }
+    fill_probability = _to_float(state.get("fill_probability"), 0.0)
+    dominance_score = _to_float(state.get("dominance_score"), 0.0)
+    queue_position = _to_float(state.get("queue_position"), 0.0)
+    slippage_cost_bps = _to_float(state.get("slippage_cost_bps"), 0.0)
+    latency_ms = _to_float(state.get("latency_ms"), 0.0)
+    liquidity_pressure = _to_float(state.get("liquidity_pressure"), 0.0)
+    split_mode = str(state.get("split_mode") or "singleVenue")
+    split_coverage = _to_float(state.get("split_coverage"), 0.0)
+    split_venue_count = max(0, int(_to_float(state.get("split_venue_count"), 0.0)))
+    arbitrage_executable = bool(state.get("arbitrage_executable"))
+    arb_net_spread_bps = _to_float(state.get("arb_net_spread_bps"), 0.0)
+    flow_intensity = _to_float(state.get("flow_intensity"), 0.0)
+
+    scores["hold"] = (0.5 - fill_probability) * 2.6 + max(0.0, slippage_cost_bps - 6.0) * 0.2
+    scores["join_best_limit"] = dominance_score * 3.1 + fill_probability * 2.2 - queue_position * 1.5 - liquidity_pressure * 0.8 - latency_ms / 220.0
+    scores["move_to_mid"] = queue_position * 2.0 + (1.0 - fill_probability) * 1.2 + (1.0 if _to_float(state.get("spread_bps"), 0.0) <= 4.0 else -0.8)
+    scores["cancel_replace"] = (1.6 if queue_position >= 0.7 else 0.0) + (1.0 if latency_ms >= 90.0 else 0.0) + (1.0 if slippage_cost_bps >= 8.0 else 0.0)
+    scores["market_sweep"] = (2.4 if arbitrage_executable else 0.0) + arb_net_spread_bps * 0.08 + min(1.0, flow_intensity / 15000.0) - slippage_cost_bps * 0.18
+    scores["split_ioc"] = (2.6 if split_mode == "multiVenueSplit" else -1.0) + split_coverage * 1.8 + min(1.2, split_venue_count * 0.28) + (0.8 if arbitrage_executable else 0.0)
+
+    learned_action, learned_reward, learned_count = _execution_ai_v6_preferred_action(state)
+    contexts = EXECUTION_AI_V6_STATE.get("contexts") if isinstance(EXECUTION_AI_V6_STATE.get("contexts"), dict) else {}
+    context_bucket = contexts.get(_execution_ai_v6_context_key(state)) if isinstance(contexts.get(_execution_ai_v6_context_key(state)), dict) else {}
+    action_buckets = context_bucket.get("actions") if isinstance(context_bucket.get("actions"), dict) else {}
+    for action, payload in action_buckets.items():
+        if not isinstance(payload, dict) or action not in scores:
+            continue
+        sample_count = int(_to_float(payload.get("sample_count"), 0.0))
+        avg_reward = _to_float(payload.get("avg_reward"), 0.0)
+        if sample_count <= 0:
+            continue
+        scores[str(action)] += _clamp(avg_reward / 6.0, -1.2, 1.2) * min(1.0, sample_count / 6.0)
+
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    best_action, best_score = ranked[0]
+    second_score = ranked[1][1] if len(ranked) > 1 else ranked[0][1]
+    reasons = [
+        f"regime:{state.get('market_regime')}",
+        f"queue:{queue_position:.2f}",
+        f"fill:{fill_probability:.2f}",
+        f"slip:{slippage_cost_bps:.2f}",
+    ]
+    if learned_action:
+        reasons.append(f"memory:{learned_action}:{learned_reward:.2f}:{learned_count}")
+
+    guardrails = _execution_ai_v6_guardrails()
+    if bool(guardrails.get("learning_frozen")) and best_action in {"market_sweep", "split_ioc"} and not arbitrage_executable:
+        best_action = "join_best_limit" if dominance_score >= 0.45 else "hold"
+        reasons.append("guardrails_safe_downgrade")
+        best_score = scores.get(best_action, best_score)
+
+    confidence = _clamp(0.42 + max(0.0, best_score - second_score) * 0.18 + dominance_score * 0.15 + fill_probability * 0.12, 0.0, 0.99)
+    should_execute = best_action != "hold" and (best_score > 0.15 or arbitrage_executable)
+    return {
+        "action": best_action,
+        "should_execute": should_execute,
+        "confidence": round(confidence, 6),
+        "projected_reward": round(best_score, 6),
+        "context_key": _execution_ai_v6_context_key(state),
+        "learning_enabled": not bool(guardrails.get("learning_frozen")),
+        "guardrails": guardrails,
+        "ranked_actions": [{"action": action, "score": round(score, 6)} for action, score in ranked],
+        "reasons": reasons,
+        "learned_bias": {
+            "action": learned_action,
+            "avg_reward": round(learned_reward, 6),
+            "sample_count": learned_count,
+        },
+    }
+
+
+def _compute_execution_ai_v6_reward(
+    state: dict[str, object],
+    *,
+    action: str,
+    requested_notional_usd: float,
+    filled_notional_usd: float,
+    realized_slippage_bps: float,
+    fill_latency_ms: float,
+    adverse_selection_score: float = 0.0,
+    edge_bps: float = 0.0,
+) -> dict[str, object]:
+    fill_ratio = _clamp(filled_notional_usd / max(requested_notional_usd, 1e-9), 0.0, 1.0)
+    completion_bonus = fill_ratio * 14.0
+    edge_bonus = _clamp(edge_bps, -12.0, 12.0) * 0.8
+    split_bonus = 1.6 if action == "split_ioc" and str(state.get("split_mode") or "") == "multiVenueSplit" else 0.0
+    slippage_penalty = max(0.0, realized_slippage_bps) * 0.95
+    latency_penalty = max(0.0, fill_latency_ms) / 48.0
+    toxicity_penalty = max(0.0, adverse_selection_score) * 6.0
+    incompletion_penalty = max(0.0, 1.0 - fill_ratio) * 8.0
+    reward = completion_bonus + edge_bonus + split_bonus - slippage_penalty - latency_penalty - toxicity_penalty - incompletion_penalty
+    return {
+        "reward": round(reward, 6),
+        "fill_ratio": round(fill_ratio, 6),
+        "completion_bonus": round(completion_bonus, 6),
+        "edge_bonus": round(edge_bonus, 6),
+        "split_bonus": round(split_bonus, 6),
+        "slippage_penalty": round(slippage_penalty, 6),
+        "latency_penalty": round(latency_penalty, 6),
+        "toxicity_penalty": round(toxicity_penalty, 6),
+        "incompletion_penalty": round(incompletion_penalty, 6),
+    }
+
+
+def _execution_ai_v6_recompute_guardrails() -> None:
+    episodes = EXECUTION_AI_V6_STATE.get("episodes") if isinstance(EXECUTION_AI_V6_STATE.get("episodes"), list) else []
+    recent_rewards = [_to_float(item.get("reward"), 0.0) for item in episodes[:12] if isinstance(item, dict)]
+    reward_ema = _to_float(EXECUTION_AI_V6_STATE.get("reward_ema"), 0.0)
+    reward_peak = _to_float(EXECUTION_AI_V6_STATE.get("reward_peak"), 0.0)
+    negative_streak = int(_to_float(EXECUTION_AI_V6_STATE.get("negative_streak"), 0.0))
+    reward_volatility = 0.0
+    if recent_rewards:
+        reward_volatility = math.sqrt(sum((reward - (sum(recent_rewards) / len(recent_rewards))) ** 2 for reward in recent_rewards) / len(recent_rewards))
+    freeze_reasons: list[str] = []
+    reward_drawdown = max(0.0, reward_peak - reward_ema)
+    if len(recent_rewards) >= 5 and reward_ema <= -1.75:
+        freeze_reasons.append("reward_ema_breach")
+    if len(recent_rewards) >= 6 and reward_volatility >= 5.5:
+        freeze_reasons.append("reward_volatility_unstable")
+    if reward_drawdown >= 10.0:
+        freeze_reasons.append("reward_drawdown_limit")
+    if negative_streak >= 4:
+        freeze_reasons.append("negative_streak_limit")
+    EXECUTION_AI_V6_STATE.update(
+        {
+            "reward_drawdown": round(reward_drawdown, 6),
+            "reward_volatility": round(reward_volatility, 6),
+            "learning_frozen": bool(freeze_reasons),
+            "freeze_reasons": freeze_reasons,
+            "updated_at": _now_iso(),
+        }
+    )
+
+
+def _execution_ai_v6_update_bucket(bucket: dict[str, object], reward: float) -> None:
+    sample_count = int(_to_float(bucket.get("sample_count"), 0.0)) + 1
+    wins = int(_to_float(bucket.get("wins"), 0.0)) + (1 if reward > 0 else 0)
+    cumulative_reward = _to_float(bucket.get("cumulative_reward"), 0.0) + reward
+    bucket.update(
+        {
+            "sample_count": sample_count,
+            "wins": wins,
+            "cumulative_reward": round(cumulative_reward, 6),
+            "avg_reward": round(cumulative_reward / max(1, sample_count), 6),
+            "last_reward": round(reward, 6),
+            "last_updated_at": _now_iso(),
+        }
+    )
+
+
+def _execution_ai_v6_learn(
+    state: dict[str, object],
+    decision: dict[str, object],
+    *,
+    decision_id: str | None = None,
+    requested_notional_usd: float,
+    filled_notional_usd: float,
+    realized_slippage_bps: float,
+    fill_latency_ms: float,
+    adverse_selection_score: float = 0.0,
+    edge_bps: float = 0.0,
+) -> dict[str, object]:
+    reward_payload = _compute_execution_ai_v6_reward(
+        state,
+        action=str(decision.get("action") or "hold"),
+        requested_notional_usd=requested_notional_usd,
+        filled_notional_usd=filled_notional_usd,
+        realized_slippage_bps=realized_slippage_bps,
+        fill_latency_ms=fill_latency_ms,
+        adverse_selection_score=adverse_selection_score,
+        edge_bps=edge_bps,
+    )
+    reward = _to_float(reward_payload.get("reward"), 0.0)
+    learning_was_frozen = bool(EXECUTION_AI_V6_STATE.get("learning_frozen"))
+    episode = {
+        "decision_id": decision_id,
+        "timestamp": _now_iso(),
+        "context_key": _execution_ai_v6_context_key(state),
+        "state": state,
+        "action": str(decision.get("action") or "hold"),
+        "reward": round(reward, 6),
+        "learning_applied": not learning_was_frozen,
+        "reward_components": reward_payload,
+    }
+    episodes = EXECUTION_AI_V6_STATE.get("episodes") if isinstance(EXECUTION_AI_V6_STATE.get("episodes"), list) else []
+    episodes.insert(0, episode)
+    del episodes[240:]
+    reward_ema = _to_float(EXECUTION_AI_V6_STATE.get("reward_ema"), 0.0)
+    reward_ema = reward if not episodes[1:] else reward_ema * 0.82 + reward * 0.18
+    reward_peak = max(_to_float(EXECUTION_AI_V6_STATE.get("reward_peak"), reward_ema), reward_ema)
+    negative_streak = 0 if reward > 0 else int(_to_float(EXECUTION_AI_V6_STATE.get("negative_streak"), 0.0)) + 1
+    EXECUTION_AI_V6_STATE.update(
+        {
+            "episodes": episodes,
+            "reward_ema": round(reward_ema, 6),
+            "reward_peak": round(reward_peak, 6),
+            "negative_streak": negative_streak,
+            "updated_at": _now_iso(),
+        }
+    )
+
+    if not learning_was_frozen:
+        actions = EXECUTION_AI_V6_STATE.get("actions") if isinstance(EXECUTION_AI_V6_STATE.get("actions"), dict) else {}
+        action_key = str(decision.get("action") or "hold")
+        action_bucket = actions.get(action_key)
+        if not isinstance(action_bucket, dict):
+            action_bucket = _execution_ai_v6_bucket()
+            actions[action_key] = action_bucket
+        _execution_ai_v6_update_bucket(action_bucket, reward)
+
+        contexts = EXECUTION_AI_V6_STATE.get("contexts") if isinstance(EXECUTION_AI_V6_STATE.get("contexts"), dict) else {}
+        context_key = _execution_ai_v6_context_key(state)
+        context_bucket = contexts.get(context_key)
+        if not isinstance(context_bucket, dict):
+            context_bucket = {"actions": {}, "sample_count": 0, "last_updated_at": None}
+            contexts[context_key] = context_bucket
+        context_actions = context_bucket.get("actions") if isinstance(context_bucket.get("actions"), dict) else {}
+        context_action_bucket = context_actions.get(action_key)
+        if not isinstance(context_action_bucket, dict):
+            context_action_bucket = _execution_ai_v6_bucket()
+            context_actions[action_key] = context_action_bucket
+        _execution_ai_v6_update_bucket(context_action_bucket, reward)
+        context_bucket["actions"] = context_actions
+        context_bucket["sample_count"] = int(_to_float(context_bucket.get("sample_count"), 0.0)) + 1
+        context_bucket["last_updated_at"] = _now_iso()
+        EXECUTION_AI_V6_STATE["actions"] = actions
+        EXECUTION_AI_V6_STATE["contexts"] = contexts
+
+    _persist_execution_ai_v6_episode(episode)
+    EXECUTION_AI_V6_STATE["loaded"] = True
+    EXECUTION_AI_V6_STATE["loaded_at"] = EXECUTION_AI_V6_STATE.get("loaded_at") or _now_iso()
+    _execution_ai_v6_recompute_guardrails()
+    return {
+        "reward": round(reward, 6),
+        "episode": episode,
+        "guardrails": _execution_ai_v6_guardrails(),
+        "learning_applied": not learning_was_frozen,
+    }
+
+
 def _route_selection_score(
     candidate: dict[str, object],
     side: str,
@@ -2481,6 +3077,15 @@ async def execution_optimizer_live_state() -> dict:
     }
 
 
+@app.get("/v1/execution-ai/v6/state")
+async def execution_ai_v6_state() -> dict:
+    _ensure_execution_ai_v6_state_loaded()
+    return {
+        "status": "ok",
+        "snapshot": _execution_ai_v6_snapshot(),
+    }
+
+
 @app.get("/v1/routes/score")
 async def route_score(
     symbol: str,
@@ -2488,11 +3093,26 @@ async def route_score(
     network_regime: str | None = None,
     estimated_notional_usd: float | None = None,
 ) -> dict:
+    _ensure_execution_ai_v6_state_loaded()
     resolved_infra = _resolve_infra_context(
         {"infra_health": infra_health, "network_regime": network_regime}
     )
     candidates = await _build_route_candidates(symbol, infra_context=resolved_infra)
     context = _build_route_context(candidates, requested_notional_usd=estimated_notional_usd)
+    execution_ai_v6_context = {
+        "split_plan": context.get("split_plan"),
+        "arbitrage": context.get("arbitrage"),
+        "hedge_recommendation": context.get("hedge_recommendation"),
+    }
+    execution_ai_v6_state = _build_execution_ai_v6_state(
+        "buy",
+        _to_float(estimated_notional_usd, 0.0),
+        context.get("best") if isinstance(context.get("best"), dict) else None,
+        context.get("backup") if isinstance(context.get("backup"), dict) else None,
+        execution_ai_v6_context,
+        {},
+    )
+    execution_ai_v6_decision = _execution_ai_v6_decide(execution_ai_v6_state)
     failure_attribution = _build_route_failure_attribution(candidates, context, resolved_infra)
     return {
         "symbol": _normalize_symbol(symbol),
@@ -2506,6 +3126,11 @@ async def route_score(
         "hedge_recommendation": context.get("hedge_recommendation"),
         "source": "v5-multi-venue-dominance",
         "reason": context.get("reason") or "no_market_candidates",
+        "execution_ai_v6": {
+            "state": execution_ai_v6_state,
+            "decision": execution_ai_v6_decision,
+            "snapshot": _execution_ai_v6_snapshot(),
+        },
         "infra_health": _to_float(resolved_infra.get("infra_health"), 1.0),
         "network_regime": str(resolved_infra.get("network_regime") or "stable"),
         "failure_source": failure_attribution.get("failure_source"),
@@ -2517,6 +3142,7 @@ async def route_score(
 
 @app.post("/v1/orders/routed")
 async def place_routed_order(payload: dict) -> dict:
+    _ensure_execution_ai_v6_state_loaded()
     symbol = _normalize_symbol(str(payload.get("symbol", "")))
     if not symbol:
         raise HTTPException(status_code=400, detail="symbol is required")
@@ -2583,6 +3209,20 @@ async def place_routed_order(payload: dict) -> dict:
         split_plan,
         context.get("arbitrage") if isinstance(context.get("arbitrage"), dict) else None,
     )
+    execution_ai_v6_context = {
+        "split_plan": split_plan,
+        "arbitrage": context.get("arbitrage"),
+        "hedge_recommendation": hedge_recommendation,
+    }
+    execution_ai_v6_state = _build_execution_ai_v6_state(
+        side,
+        notional,
+        selected if isinstance(selected, dict) else None,
+        backup if isinstance(backup, dict) else None,
+        execution_ai_v6_context,
+        route_preferences,
+    )
+    execution_ai_v6_decision = _execution_ai_v6_decide(execution_ai_v6_state)
     selected_entry = next(
         (
             entry
@@ -2637,7 +3277,27 @@ async def place_routed_order(payload: dict) -> dict:
     route_selection["dominance"] = context.get("dominance") if isinstance(context.get("dominance"), dict) else {}
     route_selection["split_plan"] = split_plan
     route_selection["hedge_recommendation"] = hedge_recommendation
+    route_selection["execution_ai_v6"] = {
+        "state": execution_ai_v6_state,
+        "decision": execution_ai_v6_decision,
+    }
     effective_live_context = apply_order_management_to_live_context(live_context, selected_optimizer_v3) if bool(live_context.get("enabled")) else live_context
+    execution_ai_action = str(execution_ai_v6_decision.get("action") or "hold")
+    best_bid = _to_float(selected.get("best_bid"), 0.0)
+    best_ask = _to_float(selected.get("best_ask"), 0.0)
+    midpoint_price = (best_bid + best_ask) / 2.0 if best_bid > 0 and best_ask > 0 else 0.0
+    if bool(effective_live_context.get("enabled")):
+        if execution_ai_action == "market_sweep":
+            effective_live_context["order_type"] = "MARKET"
+            effective_live_context.pop("price", None)
+        elif execution_ai_action in {"join_best_limit", "cancel_replace"}:
+            effective_live_context["order_type"] = "LIMIT"
+            target_limit_price = best_bid if side == "buy" else best_ask
+            if target_limit_price > 0:
+                effective_live_context["price"] = target_limit_price
+        elif execution_ai_action == "move_to_mid" and midpoint_price > 0:
+            effective_live_context["order_type"] = "LIMIT"
+            effective_live_context["price"] = midpoint_price
     if execution_delay_ms > 0:
         await asyncio.sleep(execution_delay_ms / 1000.0)
 
@@ -2667,6 +3327,8 @@ async def place_routed_order(payload: dict) -> dict:
             and _normalize_execution_style(route_preferences.get("execution_style")) != "primary_only"
             and _normalize_route_mode_override(route_preferences.get("route_mode_override")) != "dualVenueExecution"
         )
+        if execution_ai_action == "split_ioc" and len(split_slices) >= 2:
+            use_split_simulation = True
         if use_split_simulation:
             fills, avg_fill_price = _simulate_split_fills(
                 decision_id=decision_id,
@@ -2700,6 +3362,34 @@ async def place_routed_order(payload: dict) -> dict:
     )
     realized_slippage_bps = abs(avg_fill_price - reference_price) / max(reference_price, 1e-9) * 10000 if avg_fill_price > 0 and reference_price > 0 else 0.0
     fill_quality_score = max(0.0, 100.0 - spread_bps * 1.6 - realized_slippage_bps * 2.0)
+    average_fill_latency_ms = (
+        sum(_to_float(fill.get("fill_latency_ms"), 0.0) for fill in fills) / max(1, len(fills))
+        if fills
+        else 0.0
+    )
+    adverse_selection_score = _clamp(
+        (
+            _to_float(selected.get("partial_fill_risk"), 0.0)
+            + _to_float(selected.get("queue_position"), _to_float(selected.get("queue_priority_risk"), 0.0))
+        )
+        / 2.0,
+        0.0,
+        1.0,
+    )
+    edge_bps = _to_float((context.get("arbitrage") or {}).get("net_spread_bps"), 0.0)
+    if edge_bps == 0.0:
+        edge_bps = expected_slippage_bps - realized_slippage_bps
+    execution_ai_v6_learning = _execution_ai_v6_learn(
+        execution_ai_v6_state,
+        execution_ai_v6_decision,
+        decision_id=decision_id,
+        requested_notional_usd=notional,
+        filled_notional_usd=filled_notional,
+        realized_slippage_bps=realized_slippage_bps,
+        fill_latency_ms=average_fill_latency_ms,
+        adverse_selection_score=adverse_selection_score,
+        edge_bps=edge_bps,
+    )
 
     if filled_notional > 0:
         signed_notional = filled_notional if side == "buy" else -filled_notional
@@ -2758,6 +3448,11 @@ async def place_routed_order(payload: dict) -> dict:
                 "backup": backup_optimizer_v3,
                 "profile": selected_optimizer_v3.get("desk_profile") if isinstance(selected_optimizer_v3.get("desk_profile"), dict) else {},
             },
+            "execution_ai_v6": {
+                "state": execution_ai_v6_state,
+                "decision": execution_ai_v6_decision,
+                "learning": execution_ai_v6_learning,
+            },
             "expected_slippage_bps": expected_slippage_bps,
             "realized_slippage_bps": realized_slippage_bps,
             "fill_quality_score": fill_quality_score,
@@ -2801,6 +3496,12 @@ async def place_routed_order(payload: dict) -> dict:
         "realized_slippage_bps": realized_slippage_bps,
         "fill_quality_score": fill_quality_score,
         "execution_delay_ms_applied": execution_delay_ms,
+        "execution_ai_v6": {
+            "state": execution_ai_v6_state,
+            "decision": execution_ai_v6_decision,
+            "learning": execution_ai_v6_learning,
+            "snapshot": _execution_ai_v6_snapshot(),
+        },
         "route": {
             "chosen": selected,
             "backup": backup,

@@ -1022,18 +1022,35 @@ export function ExecutionOptimizerMonitoringPanel({
   const dominance = safeRecord(routingEnvelope.dominance);
   const splitPlan = safeRecord(routingEnvelope.split_plan);
   const hedgeRecommendation = safeRecord(routingEnvelope.hedge_recommendation);
+  const executionAiV6 = safeRecord(routingEnvelope.execution_ai_v6);
+  const executionAiV6State = safeRecord(executionAiV6.state);
+  const executionAiV6Decision = safeRecord(executionAiV6.decision);
+  const executionAiV6Snapshot = safeRecord(executionAiV6.snapshot);
+  const executionAiV6Guardrails = safeRecord(executionAiV6Decision.guardrails || executionAiV6Snapshot.guardrails);
   const bestRoute = safeRecord(routingEnvelope.best);
   const backupRoute = safeRecord(routingEnvelope.backup);
   const splitSlices = safeRows(splitPlan.slices).slice(0, 3);
+  const executionAiV6TopActions = safeRows(executionAiV6Snapshot.top_actions).slice(0, 3);
+  const executionAiV6Episodes = safeRows(executionAiV6Snapshot.recent_episodes).slice(0, 3);
   const hedgeReasons = Array.isArray(hedgeRecommendation.reasons)
     ? hedgeRecommendation.reasons.map((item) => String(item)).filter(Boolean).slice(0, 3)
     : [];
+  const executionAiV6Reasons = Array.isArray(executionAiV6Decision.reasons)
+    ? executionAiV6Decision.reasons.map((item) => String(item)).filter(Boolean).slice(0, 4)
+    : [];
+  const executionAiV6FreezeReasons = Array.isArray(executionAiV6Guardrails.freeze_reasons)
+    ? executionAiV6Guardrails.freeze_reasons.map((item) => String(item)).filter(Boolean).slice(0, 3)
+    : [];
   const routingAvailable = Object.keys(routingEnvelope).length > 0;
+  const executionAiV6Available = Object.keys(executionAiV6).length > 0;
   const routingLeader = String(dominance.leader_venue || bestRoute.venue || "--");
   const routingRunnerUp = String(dominance.runner_up_venue || backupRoute.venue || "--");
   const splitMode = String(splitPlan.mode || dominance.mode || "singleVenue");
   const hedgeMode = String(hedgeRecommendation.mode || "standby");
   const hedgeEnabled = Boolean(hedgeRecommendation.enabled);
+  const executionAiV6Action = String(executionAiV6Decision.action || "hold");
+  const executionAiV6LearningEnabled = Boolean(executionAiV6Decision.learning_enabled);
+  const executionAiV6Frozen = Boolean(executionAiV6Guardrails.learning_frozen);
   const hedgeVenueLabel = hedgeMode === "crossExchangeLock"
     ? `${String(hedgeRecommendation.buy_venue || "--")}→${String(hedgeRecommendation.sell_venue || "--")}`
     : String(hedgeRecommendation.venue || "--");
@@ -1104,6 +1121,55 @@ export function ExecutionOptimizerMonitoringPanel({
                     {hedgeReasons.length === 0 ? <span className="optimizer-live-chip warn">no hedge trigger</span> : null}
                     {hedgeReasons.map((reason) => <span key={reason} className="optimizer-live-chip good">{reason}</span>)}
                   </div>
+                </div>
+                <div className={`venue-telemetry-item ${executionAiV6Frozen ? "warn" : executionAiV6Action === "hold" ? "subtle" : "good"}`}>
+                  <div className="venue-telemetry-head">
+                    <span className="venue-telemetry-venue">Execution AI V6</span>
+                    <span className={`venue-telemetry-state ${executionAiV6Frozen ? "warn" : executionAiV6Action === "hold" ? "subtle" : "good"}`}>{executionAiV6Action.replace(/_/g, " ")}</span>
+                  </div>
+                  {!executionAiV6Available ? <div className="mon-row"><span>State</span><span>indisponible</span></div> : null}
+                  {executionAiV6Available ? (
+                    <>
+                      <div className="mon-row"><span>Confiance / reward</span><span>{(safeNumber(executionAiV6Decision.confidence, 0) * 100).toFixed(0)}% · {safeNumber(executionAiV6Decision.projected_reward, 0).toFixed(2)}</span></div>
+                      <div className="mon-row"><span>Regime / venue</span><span>{String(executionAiV6State.market_regime || "balanced")} · {String(executionAiV6State.venue || routingLeader || "--")}</span></div>
+                      <div className="mon-row"><span>Queue / fill</span><span>{(safeNumber(executionAiV6State.queue_position, 0) * 100).toFixed(0)}% · {(safeNumber(executionAiV6State.fill_probability, 0) * 100).toFixed(0)}%</span></div>
+                      <div className="mon-row"><span>Learning</span><span>{executionAiV6LearningEnabled ? "enabled" : "frozen"} · {safeNumber(executionAiV6Snapshot.context_count, 0).toFixed(0)} ctx</span></div>
+                      <div className="optimizer-live-reasons">
+                        {executionAiV6Reasons.length === 0 ? <span className="optimizer-live-chip subtle">no policy reasons</span> : null}
+                        {executionAiV6Reasons.map((reason) => <span key={reason} className="optimizer-live-chip good">{reason}</span>)}
+                      </div>
+                    </>
+                  ) : null}
+                </div>
+                <div className={`venue-telemetry-item ${executionAiV6Frozen ? "warn" : "subtle"}`}>
+                  <div className="venue-telemetry-head">
+                    <span className="venue-telemetry-venue">V6 learning state</span>
+                    <span className={`venue-telemetry-state ${executionAiV6Frozen ? "warn" : "subtle"}`}>{executionAiV6Frozen ? "guarded" : "active"}</span>
+                  </div>
+                  {!executionAiV6Available ? <div className="mon-row"><span>Episodes</span><span>aucune donnee</span></div> : null}
+                  {executionAiV6Available ? (
+                    <>
+                      <div className="mon-row"><span>EMA / drawdown</span><span>{safeNumber(executionAiV6Guardrails.reward_ema, 0).toFixed(2)} · dd {safeNumber(executionAiV6Guardrails.reward_drawdown, 0).toFixed(2)}</span></div>
+                      <div className="mon-row"><span>Vol / streak</span><span>{safeNumber(executionAiV6Guardrails.reward_volatility, 0).toFixed(2)} · {safeNumber(executionAiV6Guardrails.negative_streak, 0).toFixed(0)} neg</span></div>
+                      <div className="mon-row"><span>Loaded</span><span>{Boolean(executionAiV6Guardrails.loaded) ? formatCompactClock(executionAiV6Guardrails.loaded_at, formatClock) : "cold"}</span></div>
+                      <div className="optimizer-live-reasons">
+                        {executionAiV6FreezeReasons.length === 0 ? <span className="optimizer-live-chip good">guardrails clean</span> : null}
+                        {executionAiV6FreezeReasons.map((reason) => <span key={reason} className="optimizer-live-chip warn">{reason}</span>)}
+                        {executionAiV6TopActions.map((row) => (
+                          <span key={`v6-top-${String(row.action || "hold")}`} className="optimizer-live-chip subtle">
+                            {String(row.action || "hold")} {safeNumber(row.avg_reward, 0).toFixed(2)} · {safeNumber(row.sample_count, 0).toFixed(0)}
+                          </span>
+                        ))}
+                      </div>
+                      <div className="optimizer-live-reasons">
+                        {executionAiV6Episodes.map((episode, index) => (
+                          <span key={`v6-episode-${index}-${String(episode.timestamp || "ts")}`} className={`optimizer-live-chip ${safeNumber(episode.reward, 0) >= 0 ? "good" : "warn"}`}>
+                            {String(episode.action || "hold")} {safeNumber(episode.reward, 0).toFixed(2)}
+                          </span>
+                        ))}
+                      </div>
+                    </>
+                  ) : null}
                 </div>
               </div>
             ) : null}
