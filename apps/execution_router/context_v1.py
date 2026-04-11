@@ -249,6 +249,9 @@ def build_execution_context(
         "clean_spread_bps": _clamp(_to_float(policy_overrides.get("clean_spread_bps"), 3.0), 0.1, 12.0),
         "boost_fill_probability": _clamp(_to_float(policy_overrides.get("boost_fill_probability"), 0.7), 0.3, 0.95),
         "queue_pressure_boost_ceiling": _clamp(_to_float(policy_overrides.get("queue_pressure_boost_ceiling"), 0.35), 0.05, 0.95),
+        "dominance_soft_signals_limit": _clamp(_to_float(policy_overrides.get("dominance_soft_signals_limit"), 3.0), 1.0, 5.0),
+        "dominance_confidence_buffer": _clamp(_to_float(policy_overrides.get("dominance_confidence_buffer"), 0.08), 0.0, 0.25),
+        "dominance_high_queue_pressure": _clamp(_to_float(policy_overrides.get("dominance_high_queue_pressure"), 0.72), 0.3, 0.98),
     }
 
     if freshness_ms >= desk_thresholds["stale_market_ms"]:
@@ -354,6 +357,50 @@ def build_execution_context(
     if directional_mismatch and confidence < 0.45:
         no_trade_reasons.append("directional_context_mismatch")
 
+    dominance_soft_signals: list[str] = []
+    if volatility_regime == "high":
+        dominance_soft_signals.append("high_volatility_regime")
+    if liquidity_state in {"thin", "stale", "imbalanced"}:
+        dominance_soft_signals.append(f"liquidity_{liquidity_state}")
+    if directional_mismatch:
+        dominance_soft_signals.append("directional_bias_mismatch")
+    if queue_pressure >= desk_thresholds["dominance_high_queue_pressure"]:
+        dominance_soft_signals.append("queue_pressure_high")
+    if confidence <= desk_thresholds["confidence_floor"] + desk_thresholds["dominance_confidence_buffer"]:
+        dominance_soft_signals.append("confidence_near_floor")
+    if fill_probability <= desk_thresholds["fill_probability_floor"] + 0.08:
+        dominance_soft_signals.append("fill_probability_near_floor")
+    if len(dominance_soft_signals) >= int(round(desk_thresholds["dominance_soft_signals_limit"])):
+        no_trade_reasons.append("dominance_environment_stack")
+
+    hard_no_trade_reasons = {
+        "daily_loss_limit",
+        "latency_too_high",
+        "high_volatility_spread",
+        "stale_liquidity_context",
+        "depth_cover_too_thin",
+    }
+    dominant_reasons = [reason for reason in no_trade_reasons if reason in hard_no_trade_reasons]
+    if not dominant_reasons and "dominance_environment_stack" in no_trade_reasons:
+        dominant_reasons = ["dominance_environment_stack", *dominance_soft_signals[:3]]
+    no_trade_dominance = bool(dominant_reasons)
+    no_trade_state = (
+        "hard_block"
+        if any(reason in hard_no_trade_reasons for reason in dominant_reasons)
+        else "dominant_block"
+        if no_trade_dominance
+        else "soft_block"
+        if no_trade_reasons
+        else "eligible"
+    )
+    no_trade_dominance_score = _clamp(
+        len(dominance_soft_signals) / max(1.0, desk_thresholds["dominance_soft_signals_limit"])
+        + (0.45 if no_trade_state == "hard_block" else 0.28 if no_trade_state == "dominant_block" else 0.0)
+        + max(0.0, desk_thresholds["confidence_floor"] - confidence) * 0.8,
+        0.0,
+        1.0,
+    )
+
     fallback_mode = "normal"
     if daily_loss_pct >= desk_thresholds["daily_loss_limit_pct"]:
         fallback_mode = "halt"
@@ -381,6 +428,11 @@ def build_execution_context(
         "thresholds": {key: round(value, 6) for key, value in desk_thresholds.items()},
         "no_trade": bool(no_trade_reasons),
         "no_trade_reasons": no_trade_reasons,
+        "no_trade_state": no_trade_state,
+        "no_trade_dominance": no_trade_dominance,
+        "no_trade_dominance_score": round(no_trade_dominance_score, 6),
+        "dominant_reasons": dominant_reasons,
+        "dominance_soft_signals": dominance_soft_signals,
         "fallback_mode": fallback_mode,
         "freeze_learning": freeze_learning,
         "freeze_learning_reasons": freeze_learning_reasons,
@@ -409,6 +461,11 @@ def build_execution_context(
         "reasons": reasons,
         "no_trade": bool(no_trade_reasons),
         "no_trade_reasons": no_trade_reasons,
+        "no_trade_state": no_trade_state,
+        "no_trade_dominance": no_trade_dominance,
+        "no_trade_dominance_score": round(no_trade_dominance_score, 6),
+        "dominant_reasons": dominant_reasons,
+        "dominance_soft_signals": dominance_soft_signals,
         "fallback_mode": fallback_mode,
         "freeze_learning": freeze_learning,
         "freeze_learning_reasons": freeze_learning_reasons,
@@ -451,6 +508,9 @@ def apply_execution_context_to_fill_snapshot(
             "context_reasons": list(context.get("reasons") or []),
             "context_no_trade": bool(context.get("no_trade")),
             "context_no_trade_reasons": list(context.get("no_trade_reasons") or []),
+            "context_no_trade_state": str(context.get("no_trade_state") or "eligible"),
+            "context_no_trade_dominance": bool(context.get("no_trade_dominance")),
+            "context_dominant_reasons": list(context.get("dominant_reasons") or []),
             "context_fallback_mode": str(context.get("fallback_mode") or "normal"),
             "context_freeze_learning": bool(context.get("freeze_learning")),
             "context_freeze_learning_reasons": list(context.get("freeze_learning_reasons") or []),

@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 
-import TxtMiniGuide from "../../components/ui/TxtMiniGuide";
+import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
 import {
   applyLocalUserUiPreferences,
   fetchBackendUserUiPreferences,
@@ -251,7 +251,7 @@ export default function SettingsPage() {
             reason: {compactSyncReasonLabel(prefsSyncReason)}
           </span>
         </div>
-        <TxtMiniGuide
+        <OperatorPanelGuide
           title="Guide Settings"
           what="Controle du mode d'affichage et des preferences de layout TXT."
           why="Adapter l'interface a ton niveau sans perdre la profondeur du terminal."

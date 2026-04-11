@@ -6,7 +6,7 @@ import type { ChartSidecarLayoutState } from "./chartSidecarTypes";
 
 export type LayoutPreset = "scalp" | "swing" | "monitoring";
 export type DockZone = "micro" | "lower" | "monitoring";
-export type DockPanelId = "dom" | "footprint" | "tape" | "heatmap" | "blotter" | "brokers" | "controlroom" | "optimizer" | "marketcontext" | "v6observability" | "venues" | "alerts" | "incidents" | "governance" | "readiness" | "risktimeline";
+export type DockPanelId = "dom" | "footprint" | "tape" | "heatmap" | "blotter" | "brokers" | "controlroom" | "pnltruth" | "optimizer" | "marketcontext" | "v6observability" | "venues" | "alerts" | "incidents" | "governance" | "readiness" | "risktimeline";
 export type FloatingPanelState = { id: DockPanelId; fromZone: DockZone; x: number; y: number; w: number; h: number };
 
 export type TerminalLayoutConfig = {
@@ -57,7 +57,7 @@ const DEFAULT_CHART_LINK = {
 
 export const MICRO_PANEL_IDS: DockPanelId[] = ["dom", "footprint", "tape", "heatmap"];
 export const LOWER_PANEL_IDS: DockPanelId[] = ["blotter", "brokers"];
-export const MONITORING_PANEL_IDS: DockPanelId[] = ["controlroom", "optimizer", "marketcontext", "v6observability", "venues", "alerts", "incidents", "governance", "readiness", "risktimeline"];
+export const MONITORING_PANEL_IDS: DockPanelId[] = ["controlroom", "pnltruth", "optimizer", "marketcontext", "v6observability", "venues", "alerts", "incidents", "governance", "readiness", "risktimeline"];
 export const ALL_DOCK_PANEL_IDS: DockPanelId[] = [
   "dom",
   "footprint",
@@ -66,6 +66,7 @@ export const ALL_DOCK_PANEL_IDS: DockPanelId[] = [
   "blotter",
   "brokers",
   "controlroom",
+  "pnltruth",
   "optimizer",
   "marketcontext",
   "v6observability",
@@ -122,7 +123,7 @@ export function buildLayoutPreset(preset: LayoutPreset, novice: boolean): Termin
       coreSplit: novice ? 70 : 76,
       microOrder: ["dom", "tape", "footprint", "heatmap"],
       lowerOrder: ["blotter", "brokers"],
-      monitoringOrder: ["controlroom", "optimizer", "marketcontext", "v6observability", "venues", "alerts", "governance", "incidents", "readiness", "risktimeline"],
+      monitoringOrder: ["controlroom", "pnltruth", "optimizer", "marketcontext", "v6observability", "venues", "alerts", "governance", "incidents", "readiness", "risktimeline"],
       floatingPanels: [],
       chartSidecar: defaultChartSidecar,
       chartLink: { ...DEFAULT_CHART_LINK },
@@ -135,7 +136,7 @@ export function buildLayoutPreset(preset: LayoutPreset, novice: boolean): Termin
       coreSplit: novice ? 62 : 66,
       microOrder: ["heatmap", "dom", "footprint", "tape"],
       lowerOrder: ["brokers", "blotter"],
-      monitoringOrder: ["controlroom", "optimizer", "marketcontext", "v6observability", "venues", "governance", "incidents", "alerts", "readiness", "risktimeline"],
+      monitoringOrder: ["controlroom", "pnltruth", "optimizer", "marketcontext", "v6observability", "venues", "governance", "incidents", "alerts", "readiness", "risktimeline"],
       floatingPanels: [],
       chartSidecar: defaultChartSidecar,
       chartLink: { ...DEFAULT_CHART_LINK },
@@ -147,7 +148,7 @@ export function buildLayoutPreset(preset: LayoutPreset, novice: boolean): Termin
     coreSplit: novice ? 72 : 78,
     microOrder: ["dom", "footprint", "tape", "heatmap"],
     lowerOrder: ["blotter", "brokers"],
-    monitoringOrder: ["controlroom", "optimizer", "marketcontext", "v6observability", "venues", "alerts", "incidents", "governance", "readiness", "risktimeline"],
+    monitoringOrder: ["controlroom", "pnltruth", "optimizer", "marketcontext", "v6observability", "venues", "alerts", "incidents", "governance", "readiness", "risktimeline"],
     floatingPanels: [],
     chartSidecar: defaultChartSidecar,
     chartLink: { ...DEFAULT_CHART_LINK },

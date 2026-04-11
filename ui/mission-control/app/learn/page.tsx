@@ -1,6 +1,6 @@
 import Link from "next/link";
 
-import TxtMiniGuide from "../../components/ui/TxtMiniGuide";
+import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
 import TxtWorkspaceHelper from "../../components/ui/TxtWorkspaceHelper";
 
 const TOPICS = [
@@ -20,7 +20,7 @@ export default function LearnPage() {
         <div className="eyebrow">TXT Learn</div>
         <h1 className="title" style={{ fontSize: 34 }}>Apprendre le trading de facon claire</h1>
         <p className="subtle">Parcours pedagogique concu pour les debutants avec exemples, schemas et vocabulaire simple.</p>
-        <TxtMiniGuide
+        <OperatorPanelGuide
           title="Guide Learn"
           what="Des modules pedagogiques progressifs pour comprendre le trading sans pre-requis institutionnel."
           why="Permettre a un debutant d'etre autonome et de lire le terminal rapidement."

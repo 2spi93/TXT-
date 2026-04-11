@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 
 import HelpHint from "../../components/HelpHint";
-import TxtMiniGuide from "../../components/ui/TxtMiniGuide";
+import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
 import {
   BROKER_CONNECTION_CATALOG,
   EXCHANGE_CONNECTION_CATALOG,
@@ -1061,15 +1061,19 @@ export default function FundManagerPage() {
     <main className="shell txt-page-shell">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.3fr 1fr" }}>
         <div className="panel txt-page-hero">
-          <div className="eyebrow">Fund Manager Desk <HelpHint text="Cette page sert à cadrer le fonds, suivre les grandes poches de risque, garder les décisions importantes et lire le bilan global au même endroit." examples={["Commence par vérifier l'objectif et les limites du fonds, puis ajuste les poches qui prennent trop de place.", "Avant un point investisseur, regarde ici la performance, la baisse maximale et les sources principales du résultat."]} /></div>
-          <h1 className="title" style={{ fontSize: 34 }}>Hedge Fund Manager Workspace</h1>
-          <p className="subtle">Un cockpit buy-side structure pour ecrire le mandat, cadrer le regime, piloter les sleeves, garder la memoire IC et sortir un reporting allocator credible sans quitter le desk.</p>
-          <TxtMiniGuide
+          <div className="eyebrow">Fund Manager Desk</div>
+          <h1 className="title" style={{ fontSize: 34 }}>Desk de pilotage du fonds</h1>
+          <p className="subtle txt-page-hero-copy">Un seul cockpit pour cadrer le mandat, repartir le capital, conserver les decisions importantes et lire le resultat global sans changer d'ecran.</p>
+          <OperatorPanelGuide
             title="Guide Fund Manager"
             what="Un espace unique pour écrire le cadre du fonds, répartir le capital, noter les décisions et suivre le résultat."
             why="Éviter d'ouvrir plusieurs écrans quand tu dois piloter le fonds et expliquer clairement ce qui se passe."
             example="Le matin, relis le cadre du fonds, ajuste les grandes poches, puis vérifie si le risque et le capital réel restent cohérents."
           />
+          <div className="txt-page-guide-note">
+            <strong>Routine utile</strong>
+            1. Relis le mandat. 2. Verifie le capital reel et le drift des poches. 3. Controle drawdown, levier et concentration. 4. Seulement apres, ajuste le risque ou les allocations.
+          </div>
           <div style={{ marginTop: 12, display: "flex", flexWrap: "wrap", gap: 10 }}>
             <span className="pill">Mandate: {notes.mandateObjective.split(".")[0]}</span>
             <span className="pill">AUM {formatMoney(equityUsd)}</span>
@@ -1118,26 +1122,28 @@ export default function FundManagerPage() {
         <div className="panel">
           <div className="eyebrow">Capital Integration <HelpHint text="Montre combien d'argent réel est placé dans chaque poche et si on s'éloigne du plan prévu." examples={["Une poche peut sembler bonne sur le papier mais manquer de capital réel.", "Sépare toujours l'argent disponible et la valeur totale du compte pour éviter les malentendus."]} /></div>
           {capitalIntegrationSleeves.length === 0 ? <p className="subtle" style={{ marginTop: 10 }}>Aucune intégration Live Capital active sur ce portefeuille. Attache des comptes canonisés avec `capital_sleeve` pour voir le capital réel par sleeve.</p> : null}
-          {capitalIntegrationSleeves.slice(0, 5).map((row) => (
-            <div key={String(row.sleeve || "unassigned")} className="panel" style={{ marginTop: 12, borderRadius: 14 }}>
-              <div className="row"><span>{String(row.sleeve || "unassigned")}</span><span>{formatMoney(toNumber(row.actual_equivalent_usd, 0))} eq / {formatMoney(toNumber(row.actual_raw_cash_usd, 0))} cash</span></div>
-              <div className="row"><span>Allocation réelle vs cible</span><span>{formatPct(toNumber(row.actual_allocation_pct, 0), 1)} / {formatPct(toNumber(row.target_allocation_pct, 0), 1)}</span></div>
-              <div className="row"><span>Drift</span><span>{formatPct(toNumber(row.drift_pct, 0), 1)}</span></div>
-              <div className="row"><span>PnL réalisé / latent</span><span>{formatMoney(toNumber(row.realized_pnl_usd, 0))} / {formatMoney(toNumber(row.unrealized_pnl_usd, 0))}</span></div>
-              <div className="row"><span>Cashflow net / funding</span><span>{formatMoney(toNumber(row.net_external_cashflow_usd, 0))} / {formatMoney(toNumber(row.funding_fee_usd, 0))}</span></div>
-              <div className="row"><span>Venues</span><span>{Array.isArray(row.venues) && row.venues.length > 0 ? row.venues.join(", ") : "n/a"}</span></div>
-              {Array.isArray(row.pocket_breakdown) && row.pocket_breakdown.length > 0 ? (
-                <div style={{ marginTop: 10 }}>
-                  {row.pocket_breakdown.map((pocket, index) => (
-                    <div key={`${String(row.sleeve || "sleeve")}-${String((pocket as JsonMap).pocket || index)}`} className="row">
-                      <span>{String((pocket as JsonMap).pocket || "other")}</span>
-                      <span>{formatMoney(toNumber((pocket as JsonMap).equivalent_usd, 0))} eq / {formatMoney(toNumber((pocket as JsonMap).raw_cash_usd, 0))} cash</span>
-                    </div>
-                  ))}
-                </div>
-              ) : null}
-            </div>
-          ))}
+          <div className="txt-scroll-shell">
+            {capitalIntegrationSleeves.slice(0, 5).map((row) => (
+              <div key={String(row.sleeve || "unassigned")} className="panel" style={{ borderRadius: 14 }}>
+                <div className="row"><span>{String(row.sleeve || "unassigned")}</span><span>{formatMoney(toNumber(row.actual_equivalent_usd, 0))} eq / {formatMoney(toNumber(row.actual_raw_cash_usd, 0))} cash</span></div>
+                <div className="row"><span>Allocation réelle vs cible</span><span>{formatPct(toNumber(row.actual_allocation_pct, 0), 1)} / {formatPct(toNumber(row.target_allocation_pct, 0), 1)}</span></div>
+                <div className="row"><span>Drift</span><span>{formatPct(toNumber(row.drift_pct, 0), 1)}</span></div>
+                <div className="row"><span>PnL réalisé / latent</span><span>{formatMoney(toNumber(row.realized_pnl_usd, 0))} / {formatMoney(toNumber(row.unrealized_pnl_usd, 0))}</span></div>
+                <div className="row"><span>Cashflow net / funding</span><span>{formatMoney(toNumber(row.net_external_cashflow_usd, 0))} / {formatMoney(toNumber(row.funding_fee_usd, 0))}</span></div>
+                <div className="row"><span>Venues</span><span>{Array.isArray(row.venues) && row.venues.length > 0 ? row.venues.join(", ") : "n/a"}</span></div>
+                {Array.isArray(row.pocket_breakdown) && row.pocket_breakdown.length > 0 ? (
+                  <div style={{ marginTop: 10 }}>
+                    {row.pocket_breakdown.map((pocket, index) => (
+                      <div key={`${String(row.sleeve || "sleeve")}-${String((pocket as JsonMap).pocket || index)}`} className="row">
+                        <span>{String((pocket as JsonMap).pocket || "other")}</span>
+                        <span>{formatMoney(toNumber((pocket as JsonMap).equivalent_usd, 0))} eq / {formatMoney(toNumber((pocket as JsonMap).raw_cash_usd, 0))} cash</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ))}
+          </div>
         </div>
 
         <div className="panel">

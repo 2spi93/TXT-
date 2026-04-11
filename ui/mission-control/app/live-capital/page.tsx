@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 
 import HelpHint from "../../components/HelpHint";
-import TxtMiniGuide from "../../components/ui/TxtMiniGuide";
+import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
 import { EXCHANGE_CONNECTION_CATALOG, WALLET_CONNECTION_CATALOG } from "../../lib/connectionCatalog";
 import {
   getExchangeCapability,
@@ -1975,23 +1975,27 @@ export default function LiveCapitalPage() {
   }
 
   return (
-    <main className="shell txt-page-shell">
+    <main className="shell txt-page-shell" data-testid="mission-control-live-capital-page">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.35fr 0.9fr" }}>
         <div className="panel txt-page-hero">
-          <div className="eyebrow">Live Capital Desk <HelpHint text="Cette page sert à distinguer l'argent de test, l'argent réel, les comptes d'exchange et les wallets avant de les utiliser." examples={["Un compte peut être bien branché mais pas encore prêt pour être alloué.", "Avant d'envoyer du vrai capital vers une stratégie, vérifie toujours la nature exacte de la source."]} /></div>
+          <div className="eyebrow">Live Capital Desk</div>
           <h1 className="title" style={{ fontSize: 34 }}>Sources connectées → capital gouverné → agents live</h1>
-          <p className="subtle">
+          <p className="subtle txt-page-hero-copy">
             Le bloc Performance Desk du terminal doit distinguer les fonds issus d'un broker paper, d'un broker live, d'un exchange ou d'un wallet.
             Cette page sert de bureau de contrôle: elle montre les sources réelles, permet de les canoniser si besoin, vérifie les informations disponibles de la plateforme,
             puis attache un cap USD à un portefeuille avant toute promotion live.
           </p>
-          <TxtMiniGuide
+          <OperatorPanelGuide
             title="Guide Live Capital"
             what="Voir toutes les sources de capital, distinguer leur nature, vérifier ce qui est réellement contrôlable et allouer seulement les sources gouvernées."
             why="Un exchange ou un wallet connecté n'est pas automatiquement prêt pour allocation. Il faut rendre la source canonique, lisible et vérifiable."
             example="Sélectionne une source Bitget ou wallet, canonise-la si nécessaire, vérifie les informations plateforme/fonds disponibles, puis rattache-la à un portefeuille avec un cap USD."
             terms={["allocation", "portfolio", "paper", "live", "exchange", "wallet"]}
           />
+          <div className="txt-page-guide-note">
+            <strong>Avant d'allouer</strong>
+            1. Identifie la nature de la source. 2. Verifie si elle est canonique et vraiment pilotable. 3. Controle les informations plateforme disponibles. 4. Seulement ensuite, attache un cap USD au portefeuille.
+          </div>
           <p>
             <Link href="/terminal">Terminal</Link>
             {" | "}
@@ -2020,28 +2024,32 @@ export default function LiveCapitalPage() {
         <div className="panel">
           <div className="eyebrow">Sources canoniques allocables <HelpHint text="Ces sources sont déjà prêtes dans le registre principal. Tu peux donc les vérifier, les rattacher à un portefeuille et les utiliser." examples={["Un compte réel déjà validé peut être alloué directement.", "Un exchange déjà préparé peut afficher ses montants avant allocation."]} /></div>
           {capitalSources.filter((row) => row.canonical).length === 0 ? <p className="subtle">Aucune source canonique visible.</p> : null}
-          {capitalSources.filter((row) => row.canonical).map((row) => (
-            <div key={row.key} className="row">
-              <span>{row.display_name} · {row.source_type} · {row.platform}</span>
-              <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-                <span className={toneForEnvironment(row.environment)}>{row.environment} · {row.status} · {formatUsd(row.latest_equity_usd)}</span>
-                <button type="button" onClick={() => deleteCanonicalAccount(row.account_id)} disabled={busy}>
-                  Supprimer
-                </button>
-              </span>
-            </div>
-          ))}
+          <div className="txt-scroll-shell">
+            {capitalSources.filter((row) => row.canonical).map((row) => (
+              <div key={row.key} className="row">
+                <span>{row.display_name} · {row.source_type} · {row.platform}</span>
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+                  <span className={toneForEnvironment(row.environment)}>{row.environment} · {row.status} · {formatUsd(row.latest_equity_usd)}</span>
+                  <button type="button" onClick={() => deleteCanonicalAccount(row.account_id)} disabled={busy}>
+                    Supprimer
+                  </button>
+                </span>
+              </div>
+            ))}
+          </div>
         </div>
 
         <div className="panel">
           <div className="eyebrow">Sources plateforme non encore canonisées <HelpHint text="Ces sources sont déjà branchées, mais pas encore prêtes pour une allocation officielle." examples={["Un exchange relié par clé API peut apparaître ici sans être encore utilisable.", "Un wallet en lecture seule peut être visible mais rester hors allocation."]} /></div>
           {capitalSources.filter((row) => !row.canonical).length === 0 ? <p className="subtle">Tous les exchange/wallet visibles sont déjà canonisés ou aucune source connecteur additionnelle n'est présente.</p> : null}
-          {capitalSources.filter((row) => !row.canonical).map((row) => (
-            <div key={row.key} className="row">
-              <span>{row.display_name} · {row.source_type} · {row.platform}</span>
-              <span>{row.permission_label} · {row.summary}</span>
-            </div>
-          ))}
+          <div className="txt-scroll-shell">
+            {capitalSources.filter((row) => !row.canonical).map((row) => (
+              <div key={row.key} className="row">
+                <span>{row.display_name} · {row.source_type} · {row.platform}</span>
+                <span>{row.permission_label} · {row.summary}</span>
+              </div>
+            ))}
+          </div>
         </div>
       </section>
 

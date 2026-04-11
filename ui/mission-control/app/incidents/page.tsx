@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 
 import HelpHint from "../../components/HelpHint";
-import TxtMiniGuide from "../../components/ui/TxtMiniGuide";
+import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
 
 type JsonMap = Record<string, unknown>;
 
@@ -135,10 +135,10 @@ export default function IncidentsPage() {
     <main className="shell txt-page-shell">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.4fr 1fr" }}>
         <div className="panel txt-page-hero">
-          <div className="eyebrow">Incident Desk <HelpHint text="Cette page sert à suivre les incidents, dire qui s'en occupe et garder une trace claire de la résolution." examples={["Filtre les incidents ouverts, prends-en un, corrige-le puis ferme-le avec une note utile.", "Si l'incident touche l'exécution, regarde aussi l'état global du terminal."]} /></div>
+          <div className="eyebrow">Incident Desk</div>
           <h1 className="title" style={{ fontSize: 34 }}>Incidents Operations</h1>
           <p className="subtle">Pilote les incidents ouverts par le chatbot et les operateurs.</p>
-          <TxtMiniGuide
+          <OperatorPanelGuide
             title="Guide Incidents"
             what="Backlog des incidents operationnels avec assignation et cloture tracees."
             why="Reagir vite sans perdre la traçabilite des decisions prises en exploitation."

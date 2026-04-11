@@ -1,6 +1,6 @@
 "use client";
 
-import type { ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 
 import HelpHint from "../../components/HelpHint";
 import PanelShell from "../../components/ui/PanelShell";
@@ -91,6 +91,7 @@ type AiBridgeSummary = {
 };
 
 type ExecutionAiV6PanelPayload = Record<string, unknown>;
+type ExecutionPnlAnalyzerPayload = Record<string, unknown>;
 
 function safeNumber(value: unknown, fallback = 0): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
@@ -103,6 +104,12 @@ function safeRecord(value: unknown): Record<string, unknown> {
 function safeRows(value: unknown): Array<Record<string, unknown>> {
   return Array.isArray(value)
     ? value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+    : [];
+}
+
+function safeTextArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.map((item) => String(item || "").trim()).filter(Boolean)
     : [];
 }
 
@@ -120,6 +127,12 @@ function toneClass(value: string, positive: string, warning: string): string {
 function formatCompactUsd(value: unknown): string {
   const amount = safeNumber(value, 0);
   return `${amount.toFixed(Math.abs(amount) >= 100 ? 0 : 2)} USD`;
+}
+
+function formatSignedCompactUsd(value: unknown): string {
+  const amount = safeNumber(value, 0);
+  const label = formatCompactUsd(amount);
+  return amount > 0 ? `+${label}` : label;
 }
 
 function formatCompactMetricMs(value: unknown): string {
@@ -332,11 +345,69 @@ const PANEL_HINTS: Record<string, { text: string; examples: string[] }> = {
     text: "Panneau desk policy: market structure, contexte d'execution, no-trade, sizing volatilite, fallback et freeze learning.",
     examples: ["Si le fallback passe en rules_only, le desk sait que l'execution reste possible mais sous regles strictes.", "Les seuils, la zone, le biais et le sizing montrent pourquoi le moteur coupe ou reduit un trade."],
   },
+  "Execution PnL Truth": {
+    text: "Verite PnL du desk: gains/pertes executes, frictions reelles, flags haute confiance et poids du no-trade.",
+    examples: ["Si les high-confidence losses montent, le probleme vient du filtre ou de la confiance, pas d'une absence de features.", "Compare regime, venue et execution mode pour voir ou la route gagne ou detruit du PnL reel."],
+  },
   "Venue Telemetry": {
     text: "Rassemble la sante feed et execution par venue: fraicheur quotes/depth/trades, spread, slippage, fill quality et contraintes de route.",
     examples: ["Si la fraicheur depth explose mais le proxy reste healthy, le souci vient du feed venue, pas du control plane.", "Une venue avec fill quality faible et slippage eleve doit etre re-degradee ou reroutee avant live."],
   },
 };
+
+function deriveDeskTruthState(input: {
+  summary: Record<string, unknown>;
+  liveOpsPayload?: Record<string, unknown> | null;
+  executionAiV6Payload?: ExecutionAiV6PanelPayload | null;
+}): { label: "OK" | "REDUCE" | "BLOCK"; tone: "good" | "subtle" | "warn"; reason: string } {
+  const summary = safeRecord(input.summary);
+  const liveOps = safeRecord(input.liveOpsPayload);
+  const watchdog = safeRecord(liveOps.watchdog_state);
+  const governance = safeRecord(liveOps.governance);
+  const v6Envelope = safeRecord(input.executionAiV6Payload);
+  const v6Snapshot = safeRecord(v6Envelope.snapshot);
+  const v6Guardrails = safeRecord(v6Snapshot.guardrails);
+
+  const tradeCount = safeNumber(summary.trade_count, 0);
+  const noTradeCount = safeNumber(summary.no_trade_dominance_count, 0);
+  const highConfidenceLossCount = safeNumber(summary.high_confidence_loss_count, 0);
+  const avgLatencyMs = safeNumber(summary.avg_latency_ms, 0);
+  const avgSlippageBps = safeNumber(summary.avg_slippage_bps, 0);
+  const netPnlUsd = safeNumber(summary.net_pnl_usd, 0);
+  const winRatePct = safeNumber(summary.win_rate_pct, 0);
+  const noTradeRatio = tradeCount > 0 ? noTradeCount / tradeCount : 0;
+  const watchdogStatus = String(watchdog.status || "OK").trim().toUpperCase();
+  const governanceMode = String(governance.mode || "SAFE").trim().toUpperCase();
+  const learningFrozen = Boolean(v6Guardrails.learning_frozen);
+
+  if (watchdogStatus === "HALT" || governanceMode === "LOCKED") {
+    return { label: "BLOCK", tone: "warn", reason: "system guardrails locked the desk" };
+  }
+  if (tradeCount >= 5 && (highConfidenceLossCount >= 2 || (netPnlUsd < 0 && winRatePct < 40))) {
+    return { label: "BLOCK", tone: "warn", reason: "live truth says stop and re-check the filter" };
+  }
+  if (tradeCount < 3) {
+    return { label: "REDUCE", tone: "subtle", reason: "collect more small live samples before trusting the edge" };
+  }
+  if (learningFrozen || avgLatencyMs > 120 || avgSlippageBps > 3 || noTradeRatio < 0.1) {
+    return { label: "REDUCE", tone: "subtle", reason: "keep size down and let no-trade dominate harder" };
+  }
+  return { label: "OK", tone: "good", reason: "truth engine is stable enough for guarded micro-live" };
+}
+
+function aggregateDominanceReasons(trades: Array<Record<string, unknown>>): Array<{ label: string; count: number }> {
+  const counts = new Map<string, number>();
+  for (const trade of trades) {
+    const reasons = [...safeTextArray(trade.dominant_reasons), ...safeTextArray(trade.no_trade_reasons)];
+    for (const reason of reasons) {
+      counts.set(reason, (counts.get(reason) || 0) + 1);
+    }
+  }
+  return [...counts.entries()]
+    .map(([label, count]) => ({ label, count }))
+    .sort((left, right) => right.count - left.count || left.label.localeCompare(right.label))
+    .slice(0, 5);
+}
 
 function titleWithHelp(title: string, badge?: ReactNode): ReactNode {
   const hint = PANEL_HINTS[title];
@@ -366,9 +437,1165 @@ function MonitoringPanelCard({
     <div className="monitoring-col">
       <div className="eyebrow monitoring-panel-head" style={{ marginBottom: 6 }}>
         <span className="monitoring-panel-title">{titleWithHelp(title, badge)}</span>
-        {layoutEditMode ? <button type="button" className="panel-detach-btn" title="Floating" onClick={onDetach}>⤡</button> : null}
+        {layoutEditMode ? <button type="button" className="panel-detach-btn" title="Detacher ce panneau" onClick={onDetach}>⤡</button> : null}
       </div>
-      {children}
+      <div className="monitoring-panel-scroll">{children}</div>
+    </div>
+  );
+}
+
+type OperatorActionSummaryProps = {
+  badge?: ReactNode;
+  executionPnlPayload: ExecutionPnlAnalyzerPayload | null;
+  liveOpsPayload?: Record<string, unknown> | null;
+  executionAiV6Payload?: ExecutionAiV6PanelPayload | null;
+  routingPayload?: Record<string, unknown> | null;
+  journalContext?: {
+    symbol: string;
+    timeframe: string;
+    strategy: string;
+  };
+  formatClock: (value: string) => string;
+  footer?: ReactNode;
+};
+
+type OperatorJournalEntry = {
+  id: string;
+  createdAtIso: string;
+  symbol: string;
+  timeframe: string;
+  strategy: string;
+  action: string;
+  detail: string;
+  meta?: Record<string, unknown>;
+};
+
+type OperatorActionDecision = {
+  action: "STOP" | "NO TRADE" | "WAIT" | "REDUCE SIZE" | "ENTRY SMALL";
+  tone: "good" | "subtle" | "warn";
+  riskLabel: "faible" | "moyen" | "eleve";
+  headline: string;
+  summary: string;
+  reasons: string[];
+  metrics: Array<{ label: string; value: string; tone: "good" | "subtle" | "warn" }>;
+  nextStep: string;
+  updatedAt: string | null;
+  hardGuardActive: boolean;
+  hardGuardLabel: "TRADE BLOQUE" | "GARDE ACTIVE";
+  hardGuardReasons: string[];
+  dominancePct: number;
+  dominanceTone: "good" | "subtle" | "warn";
+  dominanceState: "EXPLOITABLE" | "PRUDENCE" | "ATTENDRE" | "BLOQUE";
+  dominanceDetail: string;
+  postTradeFeedback: {
+    label: "BON TRADE" | "MAUVAIS TRADE" | "PAS DE FEEDBACK";
+    tone: "good" | "subtle" | "warn";
+    summary: string;
+    reasons: string[];
+  };
+};
+
+type DisciplineHeatCell = {
+  label: string;
+  value: string;
+  tone: "good" | "subtle" | "warn";
+};
+
+type DisciplineHeatRow = {
+  label: string;
+  cells: DisciplineHeatCell[];
+};
+
+type DisciplineAnalytics = {
+  score: number;
+  scoreTone: "good" | "subtle" | "warn";
+  scoreLabel: string;
+  driftState: "CALM" | "WATCH" | "DRIFT" | "LOCK";
+  driftTone: "good" | "subtle" | "warn";
+  summary: string;
+  recommendation: string;
+  penalties: string[];
+  driftReasons: string[];
+  latestEvent: OperatorJournalEntry | null;
+  kpis: Array<{ label: string; value: string; tone: "good" | "subtle" | "warn" }>;
+  heatmap: DisciplineHeatRow[];
+};
+
+const OPERATOR_OVERRIDE_STORAGE_KEY = "txt.operator.override.v1";
+
+function isOperatorJournalEntry(value: unknown): value is OperatorJournalEntry {
+  const row = safeRecord(value);
+  return Boolean(
+    String(row.id || "").trim()
+    && String(row.createdAtIso || "").trim()
+    && String(row.symbol || "").trim()
+    && String(row.timeframe || "").trim()
+    && String(row.strategy || "").trim()
+    && String(row.action || "").trim()
+    && String(row.detail || "").trim(),
+  );
+}
+
+function formatOperatorJournalAction(action: string): string {
+  const normalized = action.trim().toLowerCase();
+  switch (normalized) {
+    case "override-visible-on":
+      return "override visible";
+    case "override-visible-off":
+      return "override retire";
+    case "auto-reduce":
+      return "reduction forcee";
+    case "auto-close":
+      return "sortie forcee";
+    case "emergency-stop":
+      return "emergency stop";
+    case "system-mode-changed":
+      return "mode systeme";
+    case "ops-brief-opened":
+      return "brief ops";
+    case "commandant-brief-opened":
+      return "mode commandant";
+    case "daily-plan-brief-opened":
+      return "brief journalier";
+    case "sprint-brief-opened":
+      return "brief sprint";
+    case "daily-plan-task-done":
+      return "tache discipline validee";
+    case "daily-plan-task-reopened":
+      return "tache discipline reouverte";
+    case "daily-plan-sprint-reset":
+      return "sprint recale";
+    default:
+      return normalized.replace(/[-_]/g, " ");
+  }
+}
+
+const DISCIPLINE_ACTIONS = new Set([
+  "auto-reduce",
+  "auto-close",
+  "override-visible-on",
+  "override-visible-off",
+  "emergency-stop",
+  "system-mode-changed",
+  "ops-brief-opened",
+  "commandant-brief-opened",
+  "daily-plan-brief-opened",
+  "sprint-brief-opened",
+  "daily-plan-task-done",
+  "daily-plan-task-reopened",
+  "daily-plan-sprint-reset",
+]);
+
+function buildOperatorJournalAnalytics(entries: OperatorJournalEntry[]): {
+  overrideCount: number;
+  overrideActive: boolean;
+  lastOverrideEntry: OperatorJournalEntry | null;
+  lastOverrideEvent: OperatorJournalEntry | null;
+  disciplineCount: number;
+  latestEntries: OperatorJournalEntry[];
+} {
+  const overrideEvents = entries.filter((entry) => entry.action === "override-visible-on" || entry.action === "override-visible-off");
+  const disciplineEvents = entries.filter((entry) => DISCIPLINE_ACTIONS.has(entry.action));
+  const lastOverrideEvent = overrideEvents[0] || null;
+  const lastOverrideEntry = overrideEvents.find((entry) => entry.action === "override-visible-on") || null;
+  return {
+    overrideCount: overrideEvents.filter((entry) => entry.action === "override-visible-on").length,
+    overrideActive: lastOverrideEvent?.action === "override-visible-on",
+    lastOverrideEntry,
+    lastOverrideEvent,
+    disciplineCount: disciplineEvents.length,
+    latestEntries: entries.slice(0, 6),
+  };
+}
+
+function normalizeOperatorKey(value: unknown): string {
+  return String(value || "").trim().toLowerCase();
+}
+
+function countJournalEntriesWithinHours(entries: OperatorJournalEntry[], actions: Set<string>, hours: number): number {
+  const now = Date.now();
+  const windowMs = hours * 60 * 60 * 1000;
+  return entries.filter((entry) => {
+    if (!actions.has(normalizeOperatorKey(entry.action))) {
+      return false;
+    }
+    const createdAt = Date.parse(entry.createdAtIso);
+    return Number.isFinite(createdAt) && now - createdAt <= windowMs;
+  }).length;
+}
+
+function buildDisciplineHeatmap(entries: OperatorJournalEntry[]): DisciplineHeatRow[] {
+  const windows = [
+    { label: "24h", hours: 24 },
+    { label: "72h", hours: 72 },
+    { label: "7j", hours: 168 },
+  ];
+  const rows = [
+    {
+      label: "Overrides visibles",
+      positive: false,
+      actions: new Set(["override-visible-on"]),
+    },
+    {
+      label: "Protections forcees",
+      positive: false,
+      actions: new Set(["auto-reduce", "auto-close", "emergency-stop"]),
+    },
+    {
+      label: "Checklist reouverte",
+      positive: false,
+      actions: new Set(["daily-plan-task-reopened", "daily-plan-sprint-reset"]),
+    },
+    {
+      label: "Checklist validee",
+      positive: true,
+      actions: new Set(["daily-plan-task-done", "daily-plan-brief-opened", "sprint-brief-opened"]),
+    },
+  ];
+
+  return rows.map((row) => ({
+    label: row.label,
+    cells: windows.map((window) => {
+      const count = countJournalEntriesWithinHours(entries, row.actions, window.hours);
+      const tone = row.positive
+        ? count >= 3
+          ? "good"
+          : count >= 1
+            ? "subtle"
+            : "subtle"
+        : count === 0
+          ? "good"
+          : count === 1
+            ? "subtle"
+            : "warn";
+      return {
+        label: window.label,
+        value: String(count),
+        tone,
+      } satisfies DisciplineHeatCell;
+    }),
+  }));
+}
+
+function resolveDriftItemsFromPayload(payload: unknown): DriftItem[] {
+  const envelope = safeRecord(payload);
+  const nested = safeRecord(envelope.drift);
+  if (Array.isArray(envelope.items)) {
+    return safeRows(envelope.items);
+  }
+  if (Array.isArray(nested.items)) {
+    return safeRows(nested.items);
+  }
+  return [];
+}
+
+function filterRelevantDriftItems(items: DriftItem[], context: { strategy: string; symbol: string }): DriftItem[] {
+  const strategyKey = normalizeOperatorKey(context.strategy);
+  const symbolKey = normalizeOperatorKey(context.symbol);
+  const filtered = items.filter((item) => {
+    const row = safeRecord(item);
+    const candidateKeys = [
+      row.strategy,
+      row.strategy_id,
+      row.scope_id,
+      row.scope_type,
+      row.symbol,
+      row.instrument,
+      row.regime,
+      row.name,
+    ].map(normalizeOperatorKey).filter(Boolean);
+
+    if (strategyKey && candidateKeys.some((candidate) => candidate === strategyKey || candidate.includes(strategyKey) || strategyKey.includes(candidate))) {
+      return true;
+    }
+    if (symbolKey && candidateKeys.some((candidate) => candidate === symbolKey || candidate.includes(symbolKey) || symbolKey.includes(candidate))) {
+      return true;
+    }
+    return false;
+  });
+  return filtered.length > 0 ? filtered : items;
+}
+
+function buildDisciplineAnalytics(input: {
+  entries: OperatorJournalEntry[];
+  decision: OperatorActionDecision;
+  executionPnlPayload: ExecutionPnlAnalyzerPayload | null;
+  liveOpsPayload?: Record<string, unknown> | null;
+  driftItems: DriftItem[];
+  journalContext?: {
+    symbol: string;
+    timeframe: string;
+    strategy: string;
+  };
+}): DisciplineAnalytics {
+  const pnlSummary = safeRecord(safeRecord(input.executionPnlPayload).summary);
+  const liveOps = safeRecord(input.liveOpsPayload);
+  const watchdog = safeRecord(liveOps.watchdog_state);
+  const governance = safeRecord(liveOps.governance);
+  const journalEntries = input.entries;
+  const heatmap = buildDisciplineHeatmap(journalEntries);
+  const overrides24h = countJournalEntriesWithinHours(journalEntries, new Set(["override-visible-on"]), 24);
+  const forced24h = countJournalEntriesWithinHours(journalEntries, new Set(["auto-reduce", "auto-close", "emergency-stop"]), 24);
+  const reopened7d = countJournalEntriesWithinHours(journalEntries, new Set(["daily-plan-task-reopened", "daily-plan-sprint-reset"]), 168);
+  const checklist7d = countJournalEntriesWithinHours(journalEntries, new Set(["daily-plan-task-done", "daily-plan-brief-opened", "sprint-brief-opened"]), 168);
+  const modeChanges72h = countJournalEntriesWithinHours(journalEntries, new Set(["system-mode-changed"]), 72);
+  const tradeCount = safeNumber(pnlSummary.trade_count, 0);
+  const highConfidenceLossCount = safeNumber(pnlSummary.high_confidence_loss_count, 0);
+  const noTradeCount = safeNumber(pnlSummary.no_trade_dominance_count, 0);
+  const noTradeRatioPct = tradeCount > 0 ? (noTradeCount / tradeCount) * 100 : 0;
+  const avgLatencyMs = safeNumber(pnlSummary.avg_latency_ms, 0);
+  const avgSlippageBps = safeNumber(pnlSummary.avg_slippage_bps, 0);
+  const netPnlUsd = safeNumber(pnlSummary.net_pnl_usd, 0);
+  const watchdogStatus = normalizeOperatorKey(watchdog.status).toUpperCase();
+  const governanceMode = normalizeOperatorKey(governance.mode).toUpperCase();
+  const relevantDriftItems = filterRelevantDriftItems(input.driftItems, {
+    strategy: String(input.journalContext?.strategy || ""),
+    symbol: String(input.journalContext?.symbol || ""),
+  });
+  const activeDriftItems = relevantDriftItems.filter((item) => Boolean(safeRecord(item).drift_detected));
+  const driftReasons = [...new Set(activeDriftItems
+    .map((item) => {
+      const row = safeRecord(item);
+      return String(row.reason || row.detail || row.regime || row.strategy || row.symbol || "").trim();
+    })
+    .filter(Boolean))].slice(0, 4);
+  const penalties: string[] = [];
+  let score = 100;
+
+  if (overrides24h > 0) {
+    score -= overrides24h * 12;
+    penalties.push(`${overrides24h} override visible sur 24h`);
+  }
+  if (forced24h > 0) {
+    score -= forced24h * 16;
+    penalties.push(`${forced24h} protection forcee sur 24h`);
+  }
+  if (reopened7d > 0) {
+    score -= Math.min(18, reopened7d * 6);
+    penalties.push(`${reopened7d} checklist reouverte sur 7j`);
+  }
+  if (modeChanges72h >= 2) {
+    score -= 8;
+    penalties.push(`${modeChanges72h} changements de posture en 72h`);
+  }
+  if (input.decision.hardGuardActive) {
+    score -= 10;
+    penalties.push("hard guard actif");
+  }
+  if (input.decision.postTradeFeedback.tone === "warn") {
+    score -= 14;
+    penalties.push("dernier trade juge mauvais");
+  } else if (input.decision.postTradeFeedback.tone === "subtle") {
+    score -= 6;
+  }
+  if (tradeCount >= 5 && netPnlUsd < 0) {
+    score -= 10;
+    penalties.push(`verite PnL ${formatSignedCompactUsd(netPnlUsd)}`);
+  }
+  if (highConfidenceLossCount > 0) {
+    score -= Math.min(16, highConfidenceLossCount * 6);
+    penalties.push(`${highConfidenceLossCount} perte haute confiance`);
+  }
+  if (avgLatencyMs > 120) {
+    score -= avgLatencyMs > 200 ? 10 : 5;
+    penalties.push(`latence ${Math.round(avgLatencyMs)}ms`);
+  }
+  if (avgSlippageBps > 3) {
+    score -= avgSlippageBps > 5 ? 10 : 5;
+    penalties.push(`slippage ${avgSlippageBps.toFixed(2)}bps`);
+  }
+  if (tradeCount >= 3 && noTradeRatioPct < 10) {
+    score -= 8;
+    penalties.push("no-trade trop peu dominant");
+  }
+  if (activeDriftItems.length > 0) {
+    score -= Math.min(20, activeDriftItems.length * 8);
+    penalties.push(`${activeDriftItems.length} ligne de drift active`);
+  }
+  if (watchdogStatus === "HALT" || governanceMode === "LOCKED") {
+    score = Math.min(score, 20);
+    penalties.unshift("desk verrouille par les guardrails");
+  }
+  if (checklist7d > reopened7d && checklist7d > 0) {
+    score += 4;
+  }
+  score = Math.max(0, Math.min(100, Math.round(score)));
+
+  const scoreTone = score >= 82 ? "good" : score >= 65 ? "subtle" : "warn";
+  const scoreLabel = score >= 82 ? "discipline propre" : score >= 65 ? "discipline sous surveillance" : "discipline en derive";
+  const driftState: DisciplineAnalytics["driftState"] = watchdogStatus === "HALT" || governanceMode === "LOCKED" || forced24h > 0 || activeDriftItems.length >= 2 || score < 45
+    ? "LOCK"
+    : activeDriftItems.length >= 1 || score < 65 || input.decision.postTradeFeedback.tone === "warn" || highConfidenceLossCount > 0
+      ? "DRIFT"
+      : overrides24h > 0 || reopened7d > 0 || modeChanges72h >= 2 || score < 82
+        ? "WATCH"
+        : "CALM";
+  const driftTone = driftState === "CALM" ? "good" : driftState === "WATCH" ? "subtle" : "warn";
+  const summary = driftState === "LOCK"
+    ? "La discipline ne tient plus assez proprement pour justifier une acceleration ou un override discret."
+    : driftState === "DRIFT"
+      ? "La derive est visible: il faut ralentir, relire la verite PnL et retirer les frictions avant le prochain cycle."
+      : driftState === "WATCH"
+        ? "Le desk reste exploitable, mais la discipline n'est pas encore assez lisse pour monter en confiance."
+        : "Le journal et la verite live restent coherents: conserve le cadre et n'ajoute pas de complexite inutile.";
+  const recommendation = driftState === "LOCK"
+    ? "Coupe le rythme, retire les overrides et traite d'abord le drift actif ou le hard guard avant toute execution suivante."
+    : driftState === "DRIFT"
+      ? "Repasse en micro-live, force le no-trade et n'autorise qu'un seul ajustement a la fois tant que le score ne remonte pas."
+      : driftState === "WATCH"
+        ? "Garde la taille petite, surveille les reouvertures de checklist et evite les changements de posture rapproches."
+        : "Conserve le meme cadre, logue proprement les exceptions et laisse la discipline dominer l'envie d'agir.";
+  const latestEvent = journalEntries[0] || null;
+  const kpis: DisciplineAnalytics["kpis"] = [
+    { label: "Discipline score", value: `${score}/100`, tone: scoreTone },
+    { label: "Drift watchdog", value: driftState, tone: driftTone },
+    { label: "Overrides 24h", value: String(overrides24h), tone: overrides24h === 0 ? "good" : overrides24h === 1 ? "subtle" : "warn" },
+    { label: "Protections 24h", value: String(forced24h), tone: forced24h === 0 ? "good" : forced24h === 1 ? "subtle" : "warn" },
+    { label: "Checklist 7j", value: `${checklist7d}/${Math.max(checklist7d + reopened7d, 1)}`, tone: checklist7d >= reopened7d ? "good" : "warn" },
+    { label: "Drift actif", value: String(activeDriftItems.length), tone: activeDriftItems.length === 0 ? "good" : activeDriftItems.length === 1 ? "subtle" : "warn" },
+  ];
+
+  return {
+    score,
+    scoreTone,
+    scoreLabel,
+    driftState,
+    driftTone,
+    summary,
+    recommendation,
+    penalties: penalties.length > 0 ? penalties.slice(0, 5) : ["aucune derive recente visible dans le journal discipline"],
+    driftReasons,
+    latestEvent,
+    kpis,
+    heatmap,
+  };
+}
+
+function buildPostTradeFeedback(trades: Array<Record<string, unknown>>): OperatorActionDecision["postTradeFeedback"] {
+  const latestTrade = safeRecord(trades[0]);
+  if (Object.keys(latestTrade).length === 0) {
+    return {
+      label: "PAS DE FEEDBACK",
+      tone: "subtle",
+      summary: "Aucun trade recent a relire, donc pas de feedback execution pour l'instant.",
+      reasons: ["attends un trade execute pour juger l'entree, le fill et la friction reelle"],
+    };
+  }
+
+  const netResultUsd = safeNumber(latestTrade.net_result_usd, 0);
+  const latencyMs = safeNumber(latestTrade.latency_ms, 0);
+  const slippageBps = Math.abs(safeNumber(latestTrade.slippage_real_bps, 0));
+  const confidence = safeNumber(latestTrade.confidence, 0);
+  const fallbackMode = String(latestTrade.fallback_mode || "normal");
+  const againstNoTrade = Boolean(latestTrade.no_trade_dominance);
+  const reasons: string[] = [];
+
+  if (netResultUsd < 0) {
+    reasons.push(`resultat ${formatSignedCompactUsd(netResultUsd)}`);
+  }
+  if (slippageBps > 3) {
+    reasons.push(`fill trop cher ${slippageBps.toFixed(2)}bps`);
+  }
+  if (latencyMs > 120) {
+    reasons.push(`latence mauvaise ${Math.round(latencyMs)}ms`);
+  }
+  if (confidence >= 0.7 && netResultUsd < 0) {
+    reasons.push("perte haute confiance");
+  }
+  if (againstNoTrade) {
+    reasons.push("trade pris contre la dominance no-trade");
+  }
+  if (fallbackMode !== "normal") {
+    reasons.push(`fallback ${fallbackMode.replace(/_/g, " ")}`);
+  }
+
+  if (reasons.length > 0) {
+    return {
+      label: "MAUVAIS TRADE",
+      tone: "warn",
+      summary: "Le dernier trade montre une execution ou une discipline a corriger avant d'accelerer.",
+      reasons,
+    };
+  }
+
+  return {
+    label: "BON TRADE",
+    tone: "good",
+    summary: "Le dernier trade respecte plutot bien le cadre execution/risk du desk.",
+    reasons: [
+      `resultat ${formatSignedCompactUsd(netResultUsd)}`,
+      slippageBps > 0 ? `slippage contenu ${slippageBps.toFixed(2)}bps` : "slippage contenu",
+      latencyMs > 0 ? `latence correcte ${Math.round(latencyMs)}ms` : "latence propre",
+    ],
+  };
+}
+
+function buildOperatorActionDecision(input: {
+  executionPnlPayload: ExecutionPnlAnalyzerPayload | null;
+  liveOpsPayload?: Record<string, unknown> | null;
+  executionAiV6Payload?: ExecutionAiV6PanelPayload | null;
+  routingPayload?: Record<string, unknown> | null;
+}): OperatorActionDecision {
+  const envelope = safeRecord(input.executionPnlPayload);
+  const summary = safeRecord(envelope.summary);
+  const trades = safeRows(envelope.trades);
+  const liveOps = safeRecord(input.liveOpsPayload);
+  const watchdog = safeRecord(liveOps.watchdog_state);
+  const governance = safeRecord(liveOps.governance);
+  const routingEnvelope = safeRecord(input.routingPayload);
+  const executionContext = safeRecord(routingEnvelope.execution_context);
+  const policy = safeRecord(executionContext.policy);
+  const dominance = safeRecord(routingEnvelope.dominance);
+  const bestRoute = safeRecord(routingEnvelope.best);
+  const v6Envelope = safeRecord(input.executionAiV6Payload);
+  const v6Snapshot = safeRecord(v6Envelope.snapshot);
+  const v6Guardrails = safeRecord(v6Snapshot.guardrails);
+  const v6PersistenceAvailable = typeof v6Guardrails.persistence_available === "boolean"
+    ? Boolean(v6Guardrails.persistence_available)
+    : true;
+  const truthState = deriveDeskTruthState({ summary, liveOpsPayload: input.liveOpsPayload, executionAiV6Payload: input.executionAiV6Payload });
+  const dominanceReasons = aggregateDominanceReasons(trades).slice(0, 3).map((item) => `${item.label} x${item.count}`);
+  const noTradeReasons = safeTextArray(executionContext.no_trade_reasons).slice(0, 3);
+  const freezeReasons = safeTextArray(executionContext.freeze_learning_reasons).slice(0, 2);
+  const tradeCount = safeNumber(summary.trade_count, 0);
+  const noTradeCount = safeNumber(summary.no_trade_dominance_count, 0);
+  const noTradeRatioPct = tradeCount > 0 ? (noTradeCount / tradeCount) * 100 : 0;
+  const confidencePct = safeNumber(executionContext.confidence, 0) * 100;
+  const dominanceGapPct = safeNumber(dominance.score_gap, 0) * 100;
+  const avgLatencyMs = safeNumber(summary.avg_latency_ms, 0);
+  const avgSlippageBps = safeNumber(summary.avg_slippage_bps, 0);
+  const learningFrozen = Boolean(v6Guardrails.learning_frozen);
+  const noTrade = Boolean(executionContext.no_trade || policy.no_trade);
+  const watchdogStatus = String(watchdog.status || "OK").trim().toUpperCase();
+  const governanceMode = String(governance.mode || "SAFE").trim().toUpperCase();
+  const leadingVenue = String(dominance.leader_venue || bestRoute.venue || "--");
+  const updatedAt = String(envelope.updated_at || liveOps.updated_at || "").trim() || null;
+  const negativeStreak = (() => {
+    let streak = 0;
+    for (const trade of trades) {
+      if (safeNumber(trade.net_result_usd, 0) < 0) {
+        streak += 1;
+        continue;
+      }
+      break;
+    }
+    return streak;
+  })();
+  const hardGuardReasons: string[] = [];
+  if (watchdogStatus === "HALT") {
+    hardGuardReasons.push("watchdog en HALT");
+  }
+  if (governanceMode === "LOCKED") {
+    hardGuardReasons.push("gouvernance lockee");
+  }
+  if (noTrade) {
+    hardGuardReasons.push("desk policy en NO TRADE");
+  }
+  if (confidencePct > 0 && confidencePct < 40) {
+    hardGuardReasons.push(`confidence ${confidencePct.toFixed(0)}% < 40%`);
+  }
+  if (avgLatencyMs > 120) {
+    hardGuardReasons.push(`latence ${Math.round(avgLatencyMs)}ms > seuil`);
+  }
+  if (negativeStreak >= 2) {
+    hardGuardReasons.push(`streak negatif ${negativeStreak}`);
+  }
+  if (!v6PersistenceAvailable) {
+    hardGuardReasons.push("DB V6 indisponible");
+  }
+  const hardGuardActive = hardGuardReasons.length > 0;
+  const postTradeFeedback = buildPostTradeFeedback(trades);
+  const dominanceTone = noTrade ? "warn" : noTradeRatioPct >= 70 ? "warn" : noTradeRatioPct >= 50 ? "subtle" : "good";
+  const dominanceState = noTrade ? "BLOQUE" : noTradeRatioPct >= 70 ? "ATTENDRE" : noTradeRatioPct >= 50 ? "PRUDENCE" : "EXPLOITABLE";
+  const dominanceDetail = noTrade
+    ? "Le moteur bloque deja l'entree: aucune justification de trade n'est suffisante tant que le contexte ne se nettoie pas."
+    : noTradeRatioPct >= 70
+      ? "Le flux est dominé par le refus de trade: la meilleure action est d'attendre."
+      : noTradeRatioPct >= 50
+        ? "Le desk reste lisible mais demande une prudence forte et une taille minimale."
+        : "Le no-trade ne domine plus le flux: le contexte redevient exploitable sous garde-fous.";
+  const riskLabel = hardGuardActive || truthState.label === "BLOCK"
+    ? "eleve"
+    : truthState.label === "REDUCE" || noTradeRatioPct >= 50 || postTradeFeedback.tone === "warn"
+      ? "moyen"
+      : "faible";
+
+  const metrics: OperatorActionDecision["metrics"] = [
+    { label: "Truth", value: truthState.label, tone: truthState.tone as OperatorActionDecision["metrics"][number]["tone"] },
+    { label: "No-trade", value: `${noTradeRatioPct.toFixed(0)}%`, tone: noTradeRatioPct >= 70 ? "warn" : noTradeRatioPct >= 35 ? "subtle" : "good" },
+    { label: "Confidence", value: confidencePct > 0 ? `${confidencePct.toFixed(0)}%` : "n/a", tone: confidencePct >= 60 ? "good" : confidencePct >= 40 ? "subtle" : "warn" },
+    { label: "Latency", value: formatCompactMetricMs(avgLatencyMs), tone: avgLatencyMs > 120 ? "warn" : avgLatencyMs > 80 ? "subtle" : "good" },
+    { label: "Slippage", value: `${avgSlippageBps.toFixed(2)}bps`, tone: avgSlippageBps > 3 ? "warn" : avgSlippageBps > 1.5 ? "subtle" : "good" },
+    { label: "Dominance", value: leadingVenue === "--" ? "n/a" : `${leadingVenue} ${dominanceGapPct.toFixed(0)}%`, tone: dominanceGapPct >= 8 ? "good" : dominanceGapPct >= 4 ? "subtle" : "warn" },
+  ];
+
+  if (watchdogStatus === "HALT" || governanceMode === "LOCKED" || truthState.label === "BLOCK") {
+    return {
+      action: "STOP",
+      tone: "warn",
+      riskLabel,
+      headline: "Arrete le live et repasse par la verification.",
+      summary: "Le desk n'est pas dans un etat ou une nouvelle prise de risque est defendable.",
+      reasons: [
+        truthState.reason,
+        watchdogStatus === "HALT" ? "watchdog en HALT" : `governance ${governanceMode.toLowerCase()}`,
+        avgLatencyMs > 0 ? `latence moyenne ${Math.round(avgLatencyMs)}ms` : "verite PnL deja en blocage",
+      ],
+      metrics,
+      nextStep: "Traite l'alerte ou la cause de blocage avant toute nouvelle execution.",
+      updatedAt,
+      hardGuardActive,
+      hardGuardLabel: "TRADE BLOQUE",
+      hardGuardReasons,
+      dominancePct: noTradeRatioPct,
+      dominanceTone,
+      dominanceState,
+      dominanceDetail,
+      postTradeFeedback,
+    };
+  }
+
+  if (noTrade) {
+    return {
+      action: "NO TRADE",
+      tone: "warn",
+      riskLabel,
+      headline: "Le filtre d'execution interdit une entree maintenant.",
+      summary: "Le systeme voit un contexte ou la meilleure decision est de ne rien lancer.",
+      reasons: noTradeReasons.length > 0 ? noTradeReasons : ["desk policy activee", truthState.reason, `confidence ${confidencePct.toFixed(0)}%`],
+      metrics,
+      nextStep: "Attends un contexte eligible ou corrige la cause precise avant de reconsiderer le trade.",
+      updatedAt,
+      hardGuardActive: true,
+      hardGuardLabel: "TRADE BLOQUE",
+      hardGuardReasons,
+      dominancePct: noTradeRatioPct,
+      dominanceTone,
+      dominanceState,
+      dominanceDetail,
+      postTradeFeedback,
+    };
+  }
+
+  if (noTradeRatioPct >= 70 || (confidencePct > 0 && confidencePct < 40)) {
+    return {
+      action: "WAIT",
+      tone: "subtle",
+      riskLabel,
+      headline: "Observe encore un cycle avant d'engager du risque.",
+      summary: "Le contexte n'est pas assez propre pour transformer le signal en decision exploitable.",
+      reasons: [
+        noTradeRatioPct >= 70 ? `no-trade dominance ${noTradeRatioPct.toFixed(0)}%` : `confidence faible ${confidencePct.toFixed(0)}%`,
+        dominanceReasons[0] || truthState.reason,
+        avgLatencyMs > 0 ? `latence moyenne ${Math.round(avgLatencyMs)}ms` : "pas assez de confirmations propres",
+      ],
+      metrics,
+      nextStep: "Laisse le marche se clarifier et relis la route quand la dominance ou la confiance remontent.",
+      updatedAt,
+      hardGuardActive,
+      hardGuardLabel: hardGuardActive ? "GARDE ACTIVE" : "TRADE BLOQUE",
+      hardGuardReasons,
+      dominancePct: noTradeRatioPct,
+      dominanceTone,
+      dominanceState,
+      dominanceDetail,
+      postTradeFeedback,
+    };
+  }
+
+  if (learningFrozen || truthState.label === "REDUCE" || avgLatencyMs > 120 || avgSlippageBps > 3) {
+    return {
+      action: "REDUCE SIZE",
+      tone: "subtle",
+      riskLabel,
+      headline: "Si tu executes, reste en micro-size gouverne.",
+      summary: "L'edge n'est pas casse, mais la friction ou les guardrails imposent une posture prudente.",
+      reasons: [
+        learningFrozen ? "learning gele par guardrail" : truthState.reason,
+        avgLatencyMs > 120 ? `latence ${Math.round(avgLatencyMs)}ms` : `slippage ${avgSlippageBps.toFixed(2)}bps`,
+        freezeReasons[0] || dominanceReasons[0] || "friction execution a surveiller",
+      ],
+      metrics,
+      nextStep: "Reduis la taille, confirme la qualite de fill, puis seulement re-augmente si la friction baisse.",
+      updatedAt,
+      hardGuardActive,
+      hardGuardLabel: hardGuardActive ? "GARDE ACTIVE" : "TRADE BLOQUE",
+      hardGuardReasons,
+      dominancePct: noTradeRatioPct,
+      dominanceTone,
+      dominanceState,
+      dominanceDetail,
+      postTradeFeedback,
+    };
+  }
+
+  if (dominanceGapPct >= 8 && confidencePct >= 60) {
+    return {
+      action: "ENTRY SMALL",
+      tone: "good",
+      riskLabel,
+      headline: "Le desk autorise une entree petite et surveillee.",
+      summary: "Les signaux restent assez coherents pour un micro-live, pas pour une acceleration agressive.",
+      reasons: [
+        `dominance claire sur ${leadingVenue}`,
+        `confidence ${confidencePct.toFixed(0)}%`,
+        truthState.reason,
+      ],
+      metrics,
+      nextStep: "Execute petit, surveille fill/slippage, puis confirme que le contexte tient sur les prochains prints.",
+      updatedAt,
+      hardGuardActive,
+      hardGuardLabel: hardGuardActive ? "GARDE ACTIVE" : "TRADE BLOQUE",
+      hardGuardReasons,
+      dominancePct: noTradeRatioPct,
+      dominanceTone,
+      dominanceState,
+      dominanceDetail,
+      postTradeFeedback,
+    };
+  }
+
+  return {
+    action: "WAIT",
+    tone: "subtle",
+    riskLabel,
+    headline: "Le desk reste exploitable, mais pas encore assez propre pour pousser le risque.",
+    summary: "Rien n'impose un stop, mais le contexte ne donne pas encore une autorisation forte.",
+    reasons: [
+      truthState.reason,
+      dominanceReasons[0] || "dominance encore moyenne",
+      confidencePct > 0 ? `confidence ${confidencePct.toFixed(0)}%` : "pas assez de contexte route",
+    ],
+    metrics,
+    nextStep: "Attends un meilleur alignement entre truth, dominance et confiance avant d'agir.",
+    updatedAt,
+    hardGuardActive,
+    hardGuardLabel: hardGuardActive ? "GARDE ACTIVE" : "TRADE BLOQUE",
+    hardGuardReasons,
+    dominancePct: noTradeRatioPct,
+    dominanceTone,
+    dominanceState,
+    dominanceDetail,
+    postTradeFeedback,
+  };
+}
+
+export function OperatorActionSummary({
+  badge,
+  executionPnlPayload,
+  liveOpsPayload,
+  executionAiV6Payload,
+  routingPayload,
+  journalContext,
+  formatClock,
+  footer,
+}: OperatorActionSummaryProps) {
+  const decision = useMemo(() => buildOperatorActionDecision({
+    executionPnlPayload,
+    liveOpsPayload,
+    executionAiV6Payload,
+    routingPayload,
+  }), [executionPnlPayload, liveOpsPayload, executionAiV6Payload, routingPayload]);
+  const journalSymbol = String(journalContext?.symbol || "").trim().toUpperCase();
+  const journalTimeframe = String(journalContext?.timeframe || "").trim();
+  const journalStrategy = String(journalContext?.strategy || "").trim();
+  const journalEnabled = Boolean(journalSymbol && journalTimeframe && journalStrategy);
+  const [overrideArmed, setOverrideArmed] = useState(false);
+  const [overrideDraft, setOverrideDraft] = useState("");
+  const [overrideRecord, setOverrideRecord] = useState<{ reason: string; createdAt: string; action: string } | null>(null);
+  const [journalEntries, setJournalEntries] = useState<OperatorJournalEntry[]>([]);
+  const [journalBusy, setJournalBusy] = useState(false);
+  const [journalError, setJournalError] = useState<string | null>(null);
+  const [driftItems, setDriftItems] = useState<DriftItem[]>([]);
+  const [driftBusy, setDriftBusy] = useState(false);
+  const [driftError, setDriftError] = useState<string | null>(null);
+  const journalAnalytics = useMemo(() => buildOperatorJournalAnalytics(journalEntries), [journalEntries]);
+  const disciplineAnalytics = useMemo(() => buildDisciplineAnalytics({
+    entries: journalEntries,
+    decision,
+    executionPnlPayload,
+    liveOpsPayload,
+    driftItems,
+    journalContext,
+  }), [decision, executionPnlPayload, liveOpsPayload, driftItems, journalContext, journalEntries]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const raw = window.localStorage.getItem(OPERATOR_OVERRIDE_STORAGE_KEY);
+    if (!raw) {
+      return;
+    }
+    try {
+      const parsed = JSON.parse(raw) as { reason?: string; createdAt?: string; action?: string };
+      if (parsed && parsed.reason && parsed.createdAt && parsed.action) {
+        setOverrideRecord({ reason: parsed.reason, createdAt: parsed.createdAt, action: parsed.action });
+      }
+    } catch {
+      window.localStorage.removeItem(OPERATOR_OVERRIDE_STORAGE_KEY);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!journalEnabled) {
+      setJournalEntries([]);
+      setJournalBusy(false);
+      setJournalError(null);
+      return;
+    }
+    let cancelled = false;
+    const loadJournal = async () => {
+      setJournalBusy(true);
+      const query = new URLSearchParams();
+      query.set("symbol", journalSymbol);
+      query.set("timeframe", journalTimeframe);
+      query.set("strategy", journalStrategy);
+      query.set("limit", "80");
+      const response = await fetch(`/api/terminal/v2-risk-journal?${query.toString()}`, { cache: "no-store" }).catch(() => null);
+      const payload = response ? await response.json().catch(() => null) : null;
+      if (cancelled) {
+        return;
+      }
+      if (!response || !response.ok || !payload || !Array.isArray(payload.entries)) {
+        setJournalError("Journal discipline indisponible");
+        setJournalBusy(false);
+        return;
+      }
+      setJournalEntries(payload.entries.filter(isOperatorJournalEntry));
+      setJournalError(null);
+      setJournalBusy(false);
+    };
+    void loadJournal();
+    return () => {
+      cancelled = true;
+    };
+  }, [journalEnabled, journalStrategy, journalSymbol, journalTimeframe]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadDrift = async () => {
+      setDriftBusy(true);
+      const response = await fetch("/api/strategies/drift", { cache: "no-store" }).catch(() => null);
+      const payload = response ? await response.json().catch(() => null) : null;
+      if (cancelled) {
+        return;
+      }
+      if (!response || !response.ok || !payload) {
+        setDriftError("Drift strategy indisponible");
+        setDriftBusy(false);
+        return;
+      }
+      setDriftItems(resolveDriftItemsFromPayload(payload));
+      setDriftError(null);
+      setDriftBusy(false);
+    };
+
+    void loadDrift();
+    const timer = window.setInterval(() => {
+      void loadDrift();
+    }, 30_000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  async function appendOperatorJournalEntry(action: string, detail: string, meta?: Record<string, unknown>): Promise<void> {
+    if (!journalEnabled) {
+      return;
+    }
+    const response = await fetch("/api/terminal/v2-risk-journal", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        symbol: journalSymbol,
+        timeframe: journalTimeframe,
+        strategy: journalStrategy,
+        action,
+        detail,
+        meta: meta || {},
+      }),
+    }).catch(() => null);
+    const payload = response ? await response.json().catch(() => null) : null;
+    if (payload?.entry && isOperatorJournalEntry(payload.entry)) {
+      setJournalEntries((current) => [payload.entry, ...current].slice(0, 80));
+      setJournalError(null);
+      return;
+    }
+    setJournalError("Journal discipline indisponible");
+  }
+
+  function confirmOverride(): void {
+    const reason = overrideDraft.trim();
+    if (!reason || typeof window === "undefined") {
+      return;
+    }
+    const nextRecord = {
+      reason,
+      createdAt: new Date().toISOString(),
+      action: decision.action,
+    };
+    window.localStorage.setItem(OPERATOR_OVERRIDE_STORAGE_KEY, JSON.stringify(nextRecord));
+    setOverrideRecord(nextRecord);
+    setOverrideArmed(false);
+    setOverrideDraft("");
+    void appendOperatorJournalEntry("override-visible-on", reason, {
+      forced_action: decision.action,
+      hard_guard_active: decision.hardGuardActive,
+      hard_guard_reasons: decision.hardGuardReasons,
+      dominance_pct: Number(decision.dominancePct.toFixed(2)),
+      risk_label: decision.riskLabel,
+      source: "operator-action-summary",
+    });
+  }
+
+  function clearOverride(): void {
+    const currentOverride = overrideRecord;
+    if (typeof window !== "undefined") {
+      window.localStorage.removeItem(OPERATOR_OVERRIDE_STORAGE_KEY);
+    }
+    setOverrideRecord(null);
+    setOverrideArmed(false);
+    setOverrideDraft("");
+    if (currentOverride) {
+      void appendOperatorJournalEntry("override-visible-off", currentOverride.reason, {
+        forced_action: currentOverride.action,
+        source: "operator-action-summary",
+      });
+    }
+  }
+
+  return (
+    <div className={`operator-action-panel ${decision.tone}`}>
+      <div className="operator-action-head">
+        <div className="eyebrow" style={{ marginBottom: 6 }}>
+          Que faire maintenant
+          <HelpHint
+            text="Bloc operateur central: il transforme l'etat du desk en action immediate pour eviter la hesitation ou la lecture partielle du terminal."
+            examples={[
+              "STOP = coupe le live et traite le blocage avant de reprendre.",
+              "ENTRY SMALL = entree petite, gouvernee, avec verification fill/slippage.",
+            ]}
+            label="Guide action"
+          />
+        </div>
+        {badge ? <div className="operator-action-badge">{badge}</div> : null}
+      </div>
+      <div className="operator-action-grid">
+        <div className="operator-action-status-card">
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+            <div className={`operator-action-chip ${decision.tone}`}>{decision.action}</div>
+            <div className={`operator-action-risk-pill ${decision.riskLabel === "eleve" ? "warn" : decision.riskLabel === "moyen" ? "subtle" : "good"}`}>
+              risque {decision.riskLabel}
+            </div>
+          </div>
+          <div className="operator-action-headline">{decision.headline}</div>
+          <div className="subtle mini">{decision.summary}</div>
+        </div>
+        <div className="operator-action-reasons-card">
+          <div className="subtle mini" style={{ marginBottom: 6 }}>Pourquoi maintenant</div>
+          {decision.reasons.map((reason) => (
+            <div key={reason} className="operator-action-reason-row">
+              <span className={`operator-action-dot ${decision.tone}`} />
+              <span>{reason}</span>
+            </div>
+          ))}
+          <div className="operator-action-next-step">{decision.nextStep}</div>
+          {decision.updatedAt ? <div className="subtle mini">Derniere mise a jour utile: {formatClock(decision.updatedAt)}</div> : null}
+        </div>
+      </div>
+      <div className={`operator-dominance-card ${decision.dominanceTone}`}>
+        <div>
+          <div className="subtle mini">No-trade dominance</div>
+          <div className="operator-dominance-value">{decision.dominancePct.toFixed(0)}%</div>
+        </div>
+        <div>
+          <div className={`operator-dominance-chip ${decision.dominanceTone}`}>{decision.dominanceState}</div>
+          <div className="operator-dominance-text">{decision.dominanceDetail}</div>
+        </div>
+      </div>
+      {decision.hardGuardActive ? (
+        <div className={`operator-hard-guard ${decision.tone}`}>
+          <div className="operator-hard-guard-head">
+            <div className="operator-hard-guard-label">{decision.hardGuardLabel}</div>
+            <div className="subtle mini">override possible mais visible</div>
+          </div>
+          <div className="operator-hard-guard-list">
+            {decision.hardGuardReasons.map((reason) => (
+              <div key={reason} className="operator-hard-guard-row">{reason}</div>
+            ))}
+          </div>
+          {overrideRecord ? (
+            <div className="operator-override-banner">
+              <div className="subtle mini">Override actif depuis {formatClock(overrideRecord.createdAt)}</div>
+              <div>{overrideRecord.action} force: {overrideRecord.reason}</div>
+              <button type="button" onClick={clearOverride}>Retirer l'override visible</button>
+            </div>
+          ) : overrideArmed ? (
+            <div className="operator-override-compose">
+              <textarea
+                value={overrideDraft}
+                onChange={(event) => setOverrideDraft(event.target.value)}
+                rows={3}
+                placeholder="Raison visible de l'override (ex: je reduis a micro-size pour test strict)."
+              />
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <button type="button" disabled={!overrideDraft.trim()} onClick={confirmOverride}>Confirmer l'override visible</button>
+                <button type="button" onClick={() => setOverrideArmed(false)}>Annuler</button>
+              </div>
+            </div>
+          ) : (
+            <button type="button" onClick={() => setOverrideArmed(true)}>Passer outre quand meme</button>
+          )}
+        </div>
+      ) : null}
+      <div className={`operator-feedback-card ${decision.postTradeFeedback.tone}`}>
+        <div className="operator-feedback-head">
+          <div className={`operator-feedback-chip ${decision.postTradeFeedback.tone}`}>{decision.postTradeFeedback.label}</div>
+          <div className="subtle mini">Feedback post-trade</div>
+        </div>
+        <div className="operator-feedback-summary">{decision.postTradeFeedback.summary}</div>
+        <div className="operator-feedback-list">
+          {decision.postTradeFeedback.reasons.map((reason) => (
+            <div key={reason} className="operator-feedback-row">{reason}</div>
+          ))}
+        </div>
+      </div>
+      <div className="operator-discipline-grid">
+        <div className="operator-discipline-card">
+          <div className="operator-feedback-head">
+            <div>
+              <div className="subtle mini">Discipline analytics</div>
+              <div className="operator-discipline-score-row">
+                <strong className={`operator-discipline-score ${disciplineAnalytics.scoreTone}`}>{disciplineAnalytics.score}/100</strong>
+                <div className={`operator-dominance-chip ${disciplineAnalytics.scoreTone}`}>{disciplineAnalytics.scoreLabel}</div>
+              </div>
+            </div>
+            <div className={`operator-dominance-chip ${disciplineAnalytics.driftTone}`}>{disciplineAnalytics.driftState}</div>
+          </div>
+          <div className="operator-discipline-kpi-grid">
+            {disciplineAnalytics.kpis.map((metric) => (
+              <div key={metric.label} className="operator-journal-kpi">
+                <span className="subtle mini">{metric.label}</span>
+                <strong className={metric.tone}>{metric.value}</strong>
+              </div>
+            ))}
+          </div>
+          <div className="operator-journal-summary">{disciplineAnalytics.summary}</div>
+          <div className="operator-discipline-list">
+            {disciplineAnalytics.penalties.map((penalty) => (
+              <div key={penalty} className="operator-discipline-row">{penalty}</div>
+            ))}
+          </div>
+          {disciplineAnalytics.driftReasons.length > 0 ? (
+            <div className="operator-discipline-drift-box">
+              <div className="subtle mini">Sources probables du drift</div>
+              <div className="operator-discipline-list">
+                {disciplineAnalytics.driftReasons.map((reason) => (
+                  <div key={reason} className="operator-discipline-row">{reason}</div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+          {driftError ? <div className="operator-journal-summary warn">{driftError}</div> : null}
+        </div>
+        <div className="operator-discipline-card">
+          <div className="operator-feedback-head">
+            <div className="subtle mini">Heatmap discipline</div>
+            <div className="subtle mini">{journalBusy || driftBusy ? "sync..." : "24h / 72h / 7j"}</div>
+          </div>
+          <div className="operator-heatmap-grid" role="table" aria-label="Heatmap discipline recente">
+            <div className="operator-heatmap-spacer" />
+            <div className="operator-heatmap-heading">24h</div>
+            <div className="operator-heatmap-heading">72h</div>
+            <div className="operator-heatmap-heading">7j</div>
+            {disciplineAnalytics.heatmap.map((row) => (
+              <div key={row.label} className="operator-heatmap-row-group">
+                <div className="operator-heatmap-label">{row.label}</div>
+                {row.cells.map((cell) => (
+                  <div key={`${row.label}-${cell.label}`} className={`operator-heatmap-cell ${cell.tone}`}>
+                    <strong>{cell.value}</strong>
+                    <span>{cell.label}</span>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+          <div className="operator-journal-summary">{disciplineAnalytics.recommendation}</div>
+          {disciplineAnalytics.latestEvent ? (
+            <div className="subtle mini">
+              Dernier signal journal: {formatOperatorJournalAction(disciplineAnalytics.latestEvent.action)} a {formatClock(disciplineAnalytics.latestEvent.createdAtIso)}.
+            </div>
+          ) : (
+            <div className="subtle mini">Aucun signal journal recent sur ce contexte.</div>
+          )}
+        </div>
+      </div>
+      {journalEnabled ? (
+        <>
+          <div className="operator-journal-grid">
+            <div className="operator-journal-analytics-card">
+              <div className="operator-feedback-head">
+                <div className="subtle mini">Override analytics</div>
+                <div className={`operator-dominance-chip ${journalAnalytics.overrideActive ? "warn" : "good"}`}>
+                  {journalAnalytics.overrideActive ? "override actif" : "override off"}
+                </div>
+              </div>
+              <div className="operator-journal-kpi-grid">
+                <div className="operator-journal-kpi">
+                  <span className="subtle mini">Overrides visibles</span>
+                  <strong>{journalAnalytics.overrideCount}</strong>
+                </div>
+                <div className="operator-journal-kpi">
+                  <span className="subtle mini">Events discipline</span>
+                  <strong>{journalAnalytics.disciplineCount}</strong>
+                </div>
+              </div>
+              {journalAnalytics.lastOverrideEntry ? (
+                <div className="operator-journal-summary">
+                  Dernier forcage {formatClock(journalAnalytics.lastOverrideEntry.createdAtIso)}: {journalAnalytics.lastOverrideEntry.detail}
+                </div>
+              ) : (
+                <div className="operator-journal-summary">Aucun override visible persiste sur ce contexte.</div>
+              )}
+            </div>
+            <div className="operator-journal-analytics-card">
+              <div className="operator-feedback-head">
+                <div className="subtle mini">Journal discipline</div>
+                {journalBusy ? <div className="subtle mini">sync...</div> : null}
+              </div>
+              {journalError ? <div className="operator-journal-summary warn">{journalError}</div> : null}
+              <div className="operator-journal-list">
+                {journalAnalytics.latestEntries.length > 0 ? journalAnalytics.latestEntries.map((entry) => (
+                  <div key={entry.id} className="operator-journal-row">
+                    <div>
+                      <div className="operator-journal-row-head">
+                        <strong>{formatOperatorJournalAction(entry.action)}</strong>
+                        <span className="subtle mini">{formatClock(entry.createdAtIso)}</span>
+                      </div>
+                      <div className="operator-journal-row-detail">{entry.detail}</div>
+                    </div>
+                    <div className="subtle mini">{entry.symbol} · {entry.timeframe} · {entry.strategy}</div>
+                  </div>
+                )) : (
+                  <div className="operator-journal-summary">Aucun evenement de discipline enregistre pour ce contexte.</div>
+                )}
+              </div>
+            </div>
+          </div>
+        </>
+      ) : null}
+      <div className="operator-action-metrics">
+        {decision.metrics.map((metric) => (
+          <div key={metric.label} className="operator-action-metric">
+            <span className="subtle mini">{metric.label}</span>
+            <strong className={metric.tone}>{metric.value}</strong>
+          </div>
+        ))}
+      </div>
+      {footer ? <div className="operator-action-footer">{footer}</div> : null}
     </div>
   );
 }
@@ -942,6 +2169,121 @@ export function ControlRoomMonitoringPanel({
                 <span className={safeNumber(row.dd_pct, 0) >= 2 ? "warn" : "subtle"}>{safeNumber(row.dd_pct, 0).toFixed(2)}%</span>
               </div>
             ))}
+          </div>
+        </>
+      ) : null}
+    </MonitoringPanelCard>
+  );
+}
+
+export function ExecutionPnlTruthMonitoringPanel({
+  badge,
+  layoutEditMode,
+  onDetach,
+  payload,
+  liveOpsPayload,
+  executionAiV6Payload,
+  formatClock,
+}: {
+  badge: ReactNode;
+  layoutEditMode: boolean;
+  onDetach: () => void;
+  payload: ExecutionPnlAnalyzerPayload | null;
+  liveOpsPayload?: Record<string, unknown> | null;
+  executionAiV6Payload?: ExecutionAiV6PanelPayload | null;
+  formatClock: (value: string) => string;
+}) {
+  const envelope = safeRecord(payload);
+  const summary = safeRecord(envelope.summary);
+  const trades = safeRows(envelope.trades);
+  const byRegime = safeRows(envelope.by_regime).slice(0, 3);
+  const byVenue = safeRows(envelope.by_venue).slice(0, 3);
+  const byExecutionMode = safeRows(envelope.by_execution_mode).slice(0, 3);
+  const badModelFlags = safeRows(envelope.bad_model_flags).slice(0, 4);
+  const dominanceReasons = aggregateDominanceReasons(trades);
+  const truthState = deriveDeskTruthState({ summary, liveOpsPayload, executionAiV6Payload });
+  const tradeCount = safeNumber(summary.trade_count, 0);
+  const noTradeCount = safeNumber(summary.no_trade_dominance_count, 0);
+  const noTradeRatioPct = tradeCount > 0 ? (noTradeCount / tradeCount) * 100 : 0;
+
+  return (
+    <MonitoringPanelCard title="Execution PnL Truth" badge={badge} layoutEditMode={layoutEditMode} onDetach={onDetach}>
+      {!payload ? <p className="subtle mini">PnL truth indisponible.</p> : null}
+      {payload ? (
+        <>
+          <div className="venue-telemetry-summary">
+            <span className={`venue-telemetry-pill ${truthState.tone === "warn" ? "warn" : ""}`}>{truthState.label}</span>
+            <span className="venue-telemetry-pill">trades {tradeCount.toFixed(0)}</span>
+            <span className="venue-telemetry-pill">net {formatSignedCompactUsd(summary.net_pnl_usd)}</span>
+            <span className="venue-telemetry-pill">flags {safeNumber(summary.high_confidence_loss_count, 0).toFixed(0)}</span>
+          </div>
+          <div className="subtle mini" style={{ marginBottom: 8 }}>{truthState.reason}</div>
+          <div className="optimizer-live-grid">
+            <div className={`venue-telemetry-item ${safeNumber(summary.net_pnl_usd, 0) >= 0 ? "good" : "warn"}`}>
+              <div className="venue-telemetry-head">
+                <span className="venue-telemetry-venue">Truth line</span>
+                <span className={`venue-telemetry-state ${truthState.tone}`}>{truthState.label}</span>
+              </div>
+              <div className="mon-row"><span>Expectancy</span><span className={safeNumber(summary.avg_pnl_usd, 0) >= 0 ? "good" : "warn"}>{formatSignedCompactUsd(summary.avg_pnl_usd)}</span></div>
+              <div className="mon-row"><span>Win rate</span><span>{safeNumber(summary.win_rate_pct, 0).toFixed(1)}%</span></div>
+              <div className="mon-row"><span>Fees</span><span>{formatCompactUsd(summary.fees_usd)}</span></div>
+            </div>
+            <div className={`venue-telemetry-item ${safeNumber(summary.high_confidence_loss_count, 0) > 0 ? "warn" : "subtle"}`}>
+              <div className="venue-telemetry-head">
+                <span className="venue-telemetry-venue">Execution friction</span>
+                <span className={`venue-telemetry-state ${safeNumber(summary.high_confidence_loss_count, 0) > 0 ? "warn" : "subtle"}`}>{safeNumber(summary.high_confidence_loss_count, 0).toFixed(0)} flag(s)</span>
+              </div>
+              <div className="mon-row"><span>Latency</span><span className={safeNumber(summary.avg_latency_ms, 0) > 120 ? "warn" : "subtle"}>{formatCompactMetricMs(summary.avg_latency_ms)}</span></div>
+              <div className="mon-row"><span>Slippage</span><span className={safeNumber(summary.avg_slippage_bps, 0) > 3 ? "warn" : "subtle"}>{safeNumber(summary.avg_slippage_bps, 0).toFixed(2)}bps</span></div>
+              <div className="mon-row"><span>Bad-model losses</span><span>{safeNumber(summary.high_confidence_loss_count, 0).toFixed(0)}</span></div>
+            </div>
+            <div className={`venue-telemetry-item ${noTradeRatioPct >= 25 ? "good" : noTradeRatioPct >= 10 ? "subtle" : "warn"}`}>
+              <div className="venue-telemetry-head">
+                <span className="venue-telemetry-venue">No-trade dominance</span>
+                <span className={`venue-telemetry-state ${noTradeRatioPct >= 25 ? "good" : noTradeRatioPct >= 10 ? "subtle" : "warn"}`}>{noTradeRatioPct.toFixed(0)}%</span>
+              </div>
+              <div className="mon-row"><span>Dominance trades</span><span>{noTradeCount.toFixed(0)} / {tradeCount.toFixed(0)}</span></div>
+              <div className="optimizer-live-reasons">
+                {dominanceReasons.length === 0 ? <span className="optimizer-live-chip subtle">no dominant reason yet</span> : null}
+                {dominanceReasons.map((reason) => <span key={reason.label} className="optimizer-live-chip warn">{reason.label} x{reason.count}</span>)}
+              </div>
+            </div>
+          </div>
+          <div className="optimizer-live-section">
+            <div className="subtle mini">Best/worst buckets</div>
+            {byRegime.map((row) => (
+              <div key={`pnl-regime-${String(row.regime || "unknown")}`} className="mon-row">
+                <span>{String(row.regime || "UNKNOWN")}</span>
+                <span className="subtle mini">{safeNumber(row.trade_count, 0).toFixed(0)} trades · {safeNumber(row.win_rate_pct, 0).toFixed(1)}%</span>
+                <span className={safeNumber(row.net_pnl_usd, 0) >= 0 ? "good" : "warn"}>{formatSignedCompactUsd(row.net_pnl_usd)}</span>
+              </div>
+            ))}
+            {byVenue.map((row) => (
+              <div key={`pnl-venue-${String(row.venue || "unknown")}`} className="mon-row">
+                <span>{String(row.venue || "unknown")}</span>
+                <span className="subtle mini">{safeNumber(row.avg_latency_ms, 0).toFixed(0)}ms · {safeNumber(row.avg_slippage_bps, 0).toFixed(2)}bps</span>
+                <span className={safeNumber(row.net_pnl_usd, 0) >= 0 ? "good" : "warn"}>{formatSignedCompactUsd(row.net_pnl_usd)}</span>
+              </div>
+            ))}
+            {byExecutionMode.map((row) => (
+              <div key={`pnl-mode-${String(row.execution_mode || "unknown")}`} className="mon-row">
+                <span>{String(row.execution_mode || "unknown")}</span>
+                <span className="subtle mini">flags {safeNumber(row.high_confidence_losses, 0).toFixed(0)}</span>
+                <span className={safeNumber(row.net_pnl_usd, 0) >= 0 ? "good" : "warn"}>{formatSignedCompactUsd(row.net_pnl_usd)}</span>
+              </div>
+            ))}
+          </div>
+          <div className="optimizer-live-section">
+            <div className="subtle mini">Bad-model flags</div>
+            {badModelFlags.length === 0 ? <p className="subtle mini">Aucune perte haute confiance.</p> : null}
+            {badModelFlags.map((row, index) => (
+              <div key={`pnl-flag-${index}`} className="mon-row">
+                <span>{String(row.decision_id || "decision")}</span>
+                <span className="subtle mini">{String(row.regime || "UNKNOWN")} · {String(row.venue || "unknown")}</span>
+                <span className="warn">{formatSignedCompactUsd(row.net_result_usd)}</span>
+              </div>
+            ))}
+            {trades.length > 0 ? <div className="subtle mini" style={{ marginTop: 4 }}>Dernier trade: {formatCompactClock(trades[0]?.created_at, formatClock)}</div> : null}
           </div>
         </>
       ) : null}

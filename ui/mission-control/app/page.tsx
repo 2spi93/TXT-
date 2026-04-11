@@ -7,7 +7,7 @@ import { getLatestLocalTerminalCapture } from "../lib/localTerminalCapture";
 import { readLocalTerminalCaptureStore } from "../lib/localTerminalCaptureStore";
 import { getConnectorHealthView } from "../lib/connectorHealth";
 import HelpHint from "../components/HelpHint";
-import TxtMiniGuide from "../components/ui/TxtMiniGuide";
+import OperatorPanelGuide from "../components/ui/OperatorPanelGuide";
 import { getRoleGroup, getRoleDisplayLabel, isClientRole } from "../lib/roleGroups";
 
 type RecordItem = Record<string, unknown>;
@@ -99,10 +99,10 @@ export default async function Page() {
     <main className="shell txt-page-shell">
       <section className="hero txt-page-hero-grid">
         <div className="panel txt-page-hero">
-          <div className="eyebrow">TXT Dashboard <HelpHint text="Vue macro: supervision execution, strategies, audit et approbations." examples={["Commence ici le matin: regarde System mode, Pending approvals et Open net exposure.", "Si quelque chose semble bloque, ouvre ensuite Incidents ou Trading Terminal pour agir vite."]} /></div>
+          <div className="eyebrow">TXT Dashboard</div>
           <h1 className="title">Trader eXelle Terminal</h1>
           <p className="subtle">Plateforme de trading humaine: lisible pour debutants, puissante pour experts.</p>
-          <TxtMiniGuide
+          <OperatorPanelGuide
             title="Guide Dashboard"
             what="Une vue simplifiee de la sante trading: exposition, approvals, balances et alertes." 
             why="Aider un debutant a savoir quoi verifier avant toute action, sans noyer les infos critiques."

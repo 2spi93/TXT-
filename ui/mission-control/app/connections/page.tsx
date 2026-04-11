@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 
 import HelpHint from "../../components/HelpHint";
-import TxtMiniGuide from "../../components/ui/TxtMiniGuide";
+import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
 import {
   BROKER_CONNECTION_CATALOG,
   EXCHANGE_CONNECTION_CATALOG,
@@ -344,21 +344,25 @@ export default function ConnectionsPage() {
   }, [integrationAccountId, integrationLiveEnabled, selectedIntegrationAccount, selectedIntegrationCapability]);
 
   return (
-    <main className="shell txt-page-shell">
+    <main className="shell txt-page-shell" data-testid="mission-control-connections-page">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.2fr 0.8fr" }}>
         <div className="panel txt-page-hero">
-          <div className="eyebrow">Client Connection Hub <HelpHint text="Page client pour raccorder broker, exchange ou wallet a TXT et trader avec vos agents." examples={["Si vous tradez via MT5, connectez d'abord le compte paper ici avant d'utiliser Terminal.", "Si vous voulez brancher un exchange ou un wallet, creez ici la demande d'onboarding pour l'adaptateur approprie."]} /></div>
+          <div className="eyebrow">Client Connection Hub</div>
           <h1 className="title" style={{ fontSize: 34 }}>Vos connexions de trading</h1>
-          <p className="subtle">
+          <p className="subtle txt-page-hero-copy">
             C'est ici que le client raccorde son broker, son exchange ou son wallet pour trader avec TXT ou deleguer l'execution a nos agents.
           </p>
-          <TxtMiniGuide
+          <OperatorPanelGuide
             title="Guide Connections"
             what="Rattacher vos comptes et vos wallets au bon adaptateur TXT."
             why="Seul un compte ou wallet correctement raccorde peut etre utilise ensuite par le Terminal ou les agents TXT."
             example="Connectez un compte MT5 paper ici, puis ouvrez le Terminal pour executer avec les garde-fous TXT."
             terms={["broker", "exchange", "wallet", "paper"]}
           />
+          <div className="txt-page-guide-note">
+            <strong>Parcours simple</strong>
+            1. Branche le compte ou le wallet. 2. Verifie que le mode est correct, surtout paper vs live. 3. Controle les droits. 4. Ensuite seulement, ouvre le Terminal ou une route agentique.
+          </div>
           <p>
             <Link href="/terminal">Trading Terminal</Link>
             {" | "}
@@ -397,12 +401,14 @@ export default function ConnectionsPage() {
           {mt5Accounts.length > 0 ? (
             <div className="panel" style={{ marginTop: 12, borderRadius: 12 }}>
               <div className="eyebrow">Comptes MT5 visibles</div>
-              {mt5Accounts.slice(0, 6).map((item) => (
-                <div className="row" key={String(item.account_id)}>
-                  <span>{String(item.account_id)} | {String(item.server || "-")} | {String(item.client_id || "client-n/a")}</span>
-                  <span>{String(item.mode || "-")} / {String(item.status || "-")} / {item.has_credentials ? "secret ok" : "secret missing"}</span>
-                </div>
-              ))}
+              <div className="txt-scroll-shell compact">
+                {mt5Accounts.slice(0, 6).map((item) => (
+                  <div className="row" key={String(item.account_id)}>
+                    <span>{String(item.account_id)} | {String(item.server || "-")} | {String(item.client_id || "client-n/a")}</span>
+                    <span>{String(item.mode || "-")} / {String(item.status || "-")} / {item.has_credentials ? "secret ok" : "secret missing"}</span>
+                  </div>
+                ))}
+              </div>
             </div>
           ) : null}
         </div>
@@ -434,12 +440,14 @@ export default function ConnectionsPage() {
           {linkedAccounts.filter((item) => String(item.provider || "") !== "mt5" && String(item.provider_type || "") !== "wallet").length > 0 ? (
             <div className="panel" style={{ marginTop: 12, borderRadius: 12 }}>
               <div className="eyebrow">Comptes exchange enregistrés</div>
-              {linkedAccounts.filter((item) => String(item.provider || "") !== "mt5" && String(item.provider_type || "") !== "wallet").slice(0, 6).map((item) => (
-                <div className="row" key={`${String(item.provider)}-${String(item.account_id)}`}>
-                  <span>{String(item.provider)} | {String(item.account_id)} | {String(item.label || "-")}</span>
-                  <span>{String(item.mode || "-")} / {item.has_credentials ? "secret ok" : "secret missing"}</span>
-                </div>
-              ))}
+              <div className="txt-scroll-shell compact">
+                {linkedAccounts.filter((item) => String(item.provider || "") !== "mt5" && String(item.provider_type || "") !== "wallet").slice(0, 6).map((item) => (
+                  <div className="row" key={`${String(item.provider)}-${String(item.account_id)}`}>
+                    <span>{String(item.provider)} | {String(item.account_id)} | {String(item.label || "-")}</span>
+                    <span>{String(item.mode || "-")} / {item.has_credentials ? "secret ok" : "secret missing"}</span>
+                  </div>
+                ))}
+              </div>
             </div>
           ) : null}
         </div>
@@ -475,12 +483,14 @@ export default function ConnectionsPage() {
           {integrationRoutes.length > 0 ? (
             <div className="panel" style={{ marginTop: 12, borderRadius: 12 }}>
               <div className="eyebrow">Routes existantes</div>
-              {integrationRoutes.slice(0, 8).map((item) => (
-                <div className="row" key={`${String(item.source)}-${String(item.route_key)}`}>
-                  <span>{String(item.source)} | {String(item.route_key || "default")} | {String(item.provider || "-")} | {String(item.account_id || "-")}</span>
-                  <span>{String(Boolean(item.live_enabled))} / {String(item.preferred_venue || "-")}</span>
-                </div>
-              ))}
+              <div className="txt-scroll-shell compact">
+                {integrationRoutes.slice(0, 8).map((item) => (
+                  <div className="row" key={`${String(item.source)}-${String(item.route_key)}`}>
+                    <span>{String(item.source)} | {String(item.route_key || "default")} | {String(item.provider || "-")} | {String(item.account_id || "-")}</span>
+                    <span>{String(Boolean(item.live_enabled))} / {String(item.preferred_venue || "-")}</span>
+                  </div>
+                ))}
+              </div>
             </div>
           ) : null}
         </div>

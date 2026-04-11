@@ -99,6 +99,26 @@ class ExecutionContextV1Tests(unittest.TestCase):
         self.assertGreater(context["entry_boost_adjustment"], 0.15)
         self.assertEqual(context["policy"]["learning_mode"], "online")
 
+    def test_no_trade_dominance_blocks_soft_environment_stack(self) -> None:
+        candidate = self._candidate(
+            spread_bps=3.6,
+            latency_ms=110.0,
+            fill_probability=0.38,
+            depth_imbalance=-0.84,
+            volume_imbalance=-0.8,
+            queue_position=0.82,
+            volatility_regime="high",
+        )
+        structure = build_market_structure_snapshot(candidate, side="buy")
+        context = build_execution_context(candidate, structure, {"predicted_fill_probability": 0.38, "queue_edge": 0.18}, "buy", 1000.0)
+
+        self.assertTrue(context["no_trade"])
+        self.assertTrue(context["no_trade_dominance"])
+        self.assertEqual(context["no_trade_state"], "dominant_block")
+        self.assertIn("dominance_environment_stack", context["no_trade_reasons"])
+        self.assertIn("dominance_environment_stack", context["dominant_reasons"])
+        self.assertIn("queue_pressure_high", context["dominance_soft_signals"])
+
     def test_optimizer_allows_trade_respects_context_no_trade(self) -> None:
         snapshot = {
             "slippage_guard": {"allowed": True},

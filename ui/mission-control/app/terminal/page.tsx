@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import dynamic from "next/dynamic";
 import JSZip from "jszip";
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ComponentProps, ReactNode } from "react";
@@ -9,7 +10,9 @@ import { Panel, PanelGroup, PanelResizeHandle, type ImperativePanelGroupHandle }
 import HelpHint from "../../components/HelpHint";
 import HelpTooltip from "../../components/ui/HelpTooltip";
 import ModuleGuide from "../../components/ui/ModuleGuide";
+import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
 import PanelShell from "../../components/ui/PanelShell";
+import { openOpsCopilotPrompt } from "../../lib/opsCopilot";
 import {
   applyLocalUserUiPreferences,
   fetchBackendUserUiPreferences,
@@ -134,8 +137,6 @@ import { buildExecutionEngineSnapshot, type ExecutionEngineSnapshot } from "../.
 import { buildBrokerAwareSchedulerSnapshot, type BrokerAwareSchedulerInput } from "./executionSchedulerEngine";
 import { computeBetaExposure, computeCorrelations, crossAssetHedge } from "../../lib/crossAssetEngine";
 import { averageVenueLatency, executionWarfareEngine, type WarfareVenueCandidate } from "./executionWarfareEngine";
-import GpuChartV4Surface from "./GpuChartV4Surface";
-import InstitutionalChart from "./InstitutionalChart";
 import { buildInstitutionalSnapshot, buildSelfHealingSnapshot } from "./institutionalEngine";
 import {
   buildFlowState as buildMarketSimulationFlowState,
@@ -146,7 +147,6 @@ import {
 } from "./marketSimulationEngine";
 import { buildStabilitySnapshot } from "./stabilityEngine";
 import { buildStrategyEvolutionSnapshot } from "./strategyEvolutionEngine";
-import TerminalChartV2 from "./TerminalChartV2";
 import type { ChartPerceptualTelemetry, GpuPerceptualTelemetry } from "./chartPerceptual";
 import type { PerceptualExecutionSignal } from "./chartPerceptualEngine";
 import {
@@ -166,21 +166,19 @@ import {
 import { isWebGL2Available } from "../../lib/engine/gpu-chart/context";
 import {
   ControlRoomMonitoringPanel,
+  ExecutionPnlTruthMonitoringPanel,
   ExecutionContextMonitoringPanel,
   ExecutionAiV6ObservabilityPanel,
   ExecutionOptimizerMonitoringPanel,
-  AlertsDockPanel,
   BlotterDockPanel,
   BrokersDockPanel,
   DomDockPanel,
   FootprintDockPanel,
   GovernanceMonitoringPanel,
-  GovernanceDockPanel,
   HeatmapDockPanel,
   IncidentsMonitoringPanel,
-  IncidentsDockPanel,
+  OperatorActionSummary,
   ReadinessMonitoringPanel,
-  ReadinessDockPanel,
   RiskTimelineBody,
   RiskTimelineMonitoringPanel,
   TapeDockPanel,
@@ -1035,6 +1033,9 @@ const DEBUG_TIME_SYNC = process.env.NEXT_PUBLIC_DEBUG_TIME_SYNC === "1";
 const TERMINAL_COMPUTE_PERF_STORAGE_KEY = "txt.terminal.compute-perf";
 const TERMINAL_ONBOARDING_SEEN_STORAGE_KEY = "txt.terminal.onboarding.seen";
 const TERMINAL_ONBOARDING_PINNED_STORAGE_KEY = "txt.terminal.onboarding.pinned";
+const TERMINAL_BOOT_PROFILE_STORAGE_KEY = "txt.terminal.boot-profile";
+const TERMINAL_LIGHT_BOOT_CHART_DELAY_MS = 140;
+const TERMINAL_LIGHT_BOOT_DECKS_DELAY_MS = 900;
 const DEFAULT_BROWSER_LONG_TASK_TELEMETRY: BrowserLongTaskTelemetry = {
   supported: true,
   recentCount: 0,
@@ -1043,6 +1044,48 @@ const DEFAULT_BROWSER_LONG_TASK_TELEMETRY: BrowserLongTaskTelemetry = {
   lastAt: null,
   pattern: "idle",
 };
+type TerminalBootProfile = "light" | "full";
+type TerminalBootStage = "shell" | "chart" | "decks";
+
+function ChartSurfaceLoadingFallback() {
+  return (
+    <div
+      style={{
+        minHeight: 420,
+        display: "grid",
+        placeItems: "center",
+        borderRadius: 18,
+        border: "1px solid rgba(120, 147, 188, 0.18)",
+        background: "linear-gradient(180deg, rgba(8, 15, 27, 0.94), rgba(8, 15, 27, 0.84))",
+        color: "rgba(226, 232, 240, 0.86)",
+        padding: 24,
+        textAlign: "center",
+      }}
+    >
+      <div style={{ display: "grid", gap: 8, justifyItems: "center", maxWidth: 420 }}>
+        <strong style={{ fontSize: 16, lineHeight: 1.2 }}>Chargement du moteur chart</strong>
+        <span style={{ fontSize: 12, lineHeight: 1.5 }}>
+          Le shell du terminal est deja interactif. Le rendu chart lourd est charge a part pour reduire le JS initial.
+        </span>
+      </div>
+    </div>
+  );
+}
+
+const GpuChartV4Surface = dynamic(() => import("./GpuChartV4Surface"), {
+  ssr: false,
+  loading: ChartSurfaceLoadingFallback,
+});
+
+const InstitutionalChart = dynamic(() => import("./InstitutionalChart"), {
+  ssr: false,
+  loading: ChartSurfaceLoadingFallback,
+});
+
+const TerminalChartV2 = dynamic(() => import("./TerminalChartV2"), {
+  ssr: false,
+  loading: ChartSurfaceLoadingFallback,
+});
 const MARKET_SNAPSHOT_CACHE_TTL_MS = 20_000;
 const CHART_ORDER_PRESETS: Record<Exclude<ChartOrderPreset, "custom">, { slPct: number; tpPct: number; notional: number; maxSpread: number }> = {
   scalp: { slPct: 0.003, tpPct: 0.006, notional: 10000, maxSpread: 10 },
@@ -4178,9 +4221,36 @@ function pickTimestamp(item: JsonMap, candidates: string[]): string {
   return "";
 }
 
+function TradingTerminalShell() {
+  return (
+    <main className="term-root ui-expert" data-testid="mission-control-terminal-page">
+      <header className="term-topbar gtix-panel-shell">
+        <span className="eyebrow term-topbar-brand">TXT Trading Terminal</span>
+      </header>
+      <div className="gtix-panel-shell" style={{ margin: "18px 22px", minHeight: 240, display: "grid", placeItems: "center" }}>
+        <div className="term-empty-state">Loading terminal...</div>
+      </div>
+    </main>
+  );
+}
+
 export default function TradingTerminalPage() {
-  const [layoutEditMode, setLayoutEditMode] = useState(false);
   const [isHydrated, setIsHydrated] = useState(false);
+
+  useEffect(() => {
+    setIsHydrated(true);
+  }, []);
+
+  if (!isHydrated) {
+    return <TradingTerminalShell />;
+  }
+
+  return <TradingTerminalPageHydrated />;
+}
+
+function TradingTerminalPageHydrated() {
+  const [layoutEditMode, setLayoutEditMode] = useState(false);
+  const isHydrated = true;
   const [snapshot, setSnapshot] = useState<JsonMap | null>(null);
   const [readiness, setReadiness] = useState<JsonMap | null>(null);
   const [aiHealth, setAiHealth] = useState<JsonMap | null>(null);
@@ -4189,6 +4259,7 @@ export default function TradingTerminalPage() {
   const [shadowMetricsPayload, setShadowMetricsPayload] = useState<JsonMap | null>(null);
   const [externalKillSwitchPayload, setExternalKillSwitchPayload] = useState<JsonMap | null>(null);
   const [liveOpsPayload, setLiveOpsPayload] = useState<JsonMap | null>(null);
+  const [executionPnlAnalyzerPayload, setExecutionPnlAnalyzerPayload] = useState<JsonMap | null>(null);
   const [executionOptimizerLivePayload, setExecutionOptimizerLivePayload] = useState<JsonMap | null>(null);
   const [executionAiV6Payload, setExecutionAiV6Payload] = useState<JsonMap | null>(null);
   const [marketVenueTelemetryPayload, setMarketVenueTelemetryPayload] = useState<JsonMap | null>(null);
@@ -4242,6 +4313,7 @@ export default function TradingTerminalPage() {
   const [browserLongTaskTelemetry, setBrowserLongTaskTelemetry] = useState<BrowserLongTaskTelemetry>(DEFAULT_BROWSER_LONG_TASK_TELEMETRY);
   const [chartPerceptualTelemetry, setChartPerceptualTelemetry] = useState<ChartPerceptualTelemetry | null>(null);
   const [gpuPerceptualTelemetry, setGpuPerceptualTelemetry] = useState<GpuPerceptualTelemetry | null>(null);
+
   const [gpuViewportFrameMeta, setGpuViewportFrameMeta] = useState<Record<string, LiveChartFrameMeta>>({});
   const [gpuGlobalGridBatch, setGpuGlobalGridBatch] = useState<GlobalGridBatchState | null>(null);
   const [chartPerceptualDebugOpen, setChartPerceptualDebugOpen] = useState(false);
@@ -4289,12 +4361,26 @@ export default function TradingTerminalPage() {
   const [chartHapticMode, setChartHapticMode] = useChartHapticMode();
   const [layoutPreset, setLayoutPreset] = useState<LayoutPreset>("swing");
   const [terminalDensityMode, setTerminalDensityMode] = useState<"focus" | "full">("focus");
+  const [terminalBootProfile, setTerminalBootProfile] = useState<TerminalBootProfile>("light");
+  const [terminalBootStage, setTerminalBootStage] = useState<TerminalBootStage>("shell");
   const [terminalOnboardingLoaded, setTerminalOnboardingLoaded] = useState(false);
   const [terminalOnboardingFirstVisit, setTerminalOnboardingFirstVisit] = useState(false);
   const [terminalOnboardingPinned, setTerminalOnboardingPinned] = useState(false);
   const [terminalOnboardingExpanded, setTerminalOnboardingExpanded] = useState(false);
   const [focusDecks, setFocusDecks] = useState<TerminalFocusDeckId[]>([]);
   const [layoutWorkspaceName, setLayoutWorkspaceName] = useState(DEFAULT_LAYOUT_WORKSPACE_NAME);
+
+  const setTerminalBootProfilePreference = useCallback((nextProfile: TerminalBootProfile) => {
+    setTerminalBootProfile(nextProfile);
+    if (typeof window === "undefined") {
+      return;
+    }
+    try {
+      window.localStorage.setItem(TERMINAL_BOOT_PROFILE_STORAGE_KEY, nextProfile);
+    } catch {
+      // noop
+    }
+  }, []);
 
   const setTerminalOnboardingPinnedPreference = useCallback((nextPinned: boolean) => {
     setTerminalOnboardingPinned(nextPinned);
@@ -4733,8 +4819,48 @@ export default function TradingTerminalPage() {
   }, []);
 
   useEffect(() => {
-    setIsHydrated(true);
-  }, []);
+    if (!isHydrated || typeof window === "undefined") {
+      return;
+    }
+
+    if (terminalBootProfile === "full") {
+      setTerminalBootStage("decks");
+      return;
+    }
+
+    setTerminalBootStage("shell");
+
+    const openChart = () => {
+      setTerminalBootStage((current) => (current === "shell" ? "chart" : current));
+    };
+    const openDecks = () => {
+      setTerminalBootStage("decks");
+    };
+
+    let idleChartId: number | null = null;
+    if (typeof window.requestIdleCallback === "function") {
+      idleChartId = window.requestIdleCallback(() => {
+        openChart();
+      }, { timeout: TERMINAL_LIGHT_BOOT_CHART_DELAY_MS });
+    }
+
+    const chartTimer = window.setTimeout(openChart, TERMINAL_LIGHT_BOOT_CHART_DELAY_MS);
+    const decksTimer = window.setTimeout(openDecks, TERMINAL_LIGHT_BOOT_DECKS_DELAY_MS);
+
+    return () => {
+      if (idleChartId !== null && typeof window.cancelIdleCallback === "function") {
+        window.cancelIdleCallback(idleChartId);
+      }
+      window.clearTimeout(chartTimer);
+      window.clearTimeout(decksTimer);
+    };
+  }, [isHydrated, terminalBootProfile]);
+
+  useEffect(() => {
+    if (terminalDensityMode === "full" || focusDecks.length > 0) {
+      setTerminalBootStage("decks");
+    }
+  }, [focusDecks.length, terminalDensityMode]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -4812,6 +4938,8 @@ export default function TradingTerminalPage() {
     const forcedChartIsolation = query.get("chartIsolation") || query.get("isolateChart");
     const persistedChartIsolation = window.localStorage.getItem(TERMINAL_CHART_ISOLATION_STORAGE_KEY);
     const forcedSchedulerScenario = query.get("e2eScheduler");
+    const forcedBootProfile = query.get("boot");
+    const persistedBootProfile = window.localStorage.getItem(TERMINAL_BOOT_PROFILE_STORAGE_KEY);
     const webgl2 = isWebGL2Available();
     const allowAutomationOverride = Boolean(navigator.webdriver)
       || ["127.0.0.1", "localhost"].includes(window.location.hostname);
@@ -4850,6 +4978,22 @@ export default function TradingTerminalPage() {
       setTerminalComputePerfEnabled(true);
     } else if (forcedPerfDebug === "0" || persistedPerfDebug === "0") {
       setTerminalComputePerfEnabled(false);
+    }
+
+    const resolvedBootProfile: TerminalBootProfile = forcedBootProfile === "full" || persistedBootProfile === "full"
+      ? "full"
+      : forcedBootProfile === "light" || persistedBootProfile === "light" || allowAutomationOverride
+        ? "light"
+        : "light";
+    setTerminalBootProfile(resolvedBootProfile);
+    try {
+      window.localStorage.setItem(TERMINAL_BOOT_PROFILE_STORAGE_KEY, resolvedBootProfile);
+    } catch {
+      // noop
+    }
+    if (allowAutomationOverride && resolvedBootProfile === "light") {
+      setTerminalDensityMode("focus");
+      setFocusDecks([]);
     }
 
     console.info("[terminal] engine runtime selection", {
@@ -6182,7 +6326,9 @@ export default function TradingTerminalPage() {
     focusDecksRef.current = focusDecks;
   }, [focusDecks]);
 
-  const renderExtendedTerminalModules = terminalDensityMode === "full";
+  const chartBootReady = terminalBootProfile === "full" || terminalBootStage !== "shell";
+  const deckBootReady = terminalBootProfile === "full" || terminalBootStage === "decks";
+  const renderExtendedTerminalModules = terminalDensityMode === "full" && deckBootReady;
   const focusDeckSet = useMemo(() => new Set<TerminalFocusDeckId>(focusDecks), [focusDecks]);
   const showMicroDeck = !chartIsolationMode && (renderExtendedTerminalModules || focusDeckSet.has("micro"));
   const showMarketsDeck = !chartIsolationMode && (renderExtendedTerminalModules || focusDeckSet.has("markets"));
@@ -6745,12 +6891,15 @@ export default function TradingTerminalPage() {
       }
     };
 
-    const [snapshotPayload, readinessPayload, aiPayload, overviewPayload, liveOpsResponsePayload, executionOptimizerLiveResponsePayload, executionAiV6ResponsePayload, marketVenueTelemetryResponsePayload, routeVenueTelemetryResponsePayload, incidentPayload, pendingPayload, outcomePayload, mt5Payload, quotesPayload, positionsPayload, balancePayload, performanceSummaryPayload, performanceAttributionPayload, accountsPayload, connectorAccountsPayload, investorReportsPayload] = await Promise.all([
+    const [snapshotPayload, readinessPayload, aiPayload, overviewPayload, liveOpsResponsePayload, executionPnlAnalyzerResponsePayload, executionOptimizerLiveResponsePayload, executionAiV6ResponsePayload, marketVenueTelemetryResponsePayload, routeVenueTelemetryResponsePayload, incidentPayload, pendingPayload, outcomePayload, mt5Payload, quotesPayload, positionsPayload, balancePayload, performanceSummaryPayload, performanceAttributionPayload, accountsPayload, connectorAccountsPayload, investorReportsPayload] = await Promise.all([
       fetchMaybeUnauthorized("/api/connectors/status"),
       fetchMaybeUnauthorized("/api/live-readiness/overview"),
       fetchMaybeUnauthorized("/api/ai/health"),
       fetchMaybeUnauthorized("/api/dashboard/overview"),
       fetchMaybeUnauthorized("/api/system/live-ops"),
+      fetchMaybeUnauthorized("/api/execution/pnl-analyzer?scope_type=strategy&scope_id=mt5-live&limit=50", {
+        headers: buildRoutingRequestHeaders("ui", selectedChartSymbol),
+      }).catch(() => null),
       fetchMaybeUnauthorized("/api/execution/optimizer/live-state", {
         headers: buildRoutingRequestHeaders("ui", selectedChartSymbol),
       }).catch(() => null),
@@ -6791,6 +6940,7 @@ export default function TradingTerminalPage() {
     setAiHealth(aiPayload && typeof aiPayload === "object" ? (aiPayload as JsonMap) : null);
     setOverview(overviewPayload && typeof overviewPayload === "object" ? (overviewPayload as JsonMap) : null);
     setLiveOpsPayload(liveOpsResponsePayload && typeof liveOpsResponsePayload === "object" ? (liveOpsResponsePayload as JsonMap) : null);
+    setExecutionPnlAnalyzerPayload(executionPnlAnalyzerResponsePayload && typeof executionPnlAnalyzerResponsePayload === "object" ? (executionPnlAnalyzerResponsePayload as JsonMap) : null);
     setExecutionOptimizerLivePayload(executionOptimizerLiveResponsePayload && typeof executionOptimizerLiveResponsePayload === "object" ? (executionOptimizerLiveResponsePayload as JsonMap) : null);
     setExecutionAiV6Payload(executionAiV6ResponsePayload && typeof executionAiV6ResponsePayload === "object" ? (executionAiV6ResponsePayload as JsonMap) : null);
     setMarketVenueTelemetryPayload(marketVenueTelemetryResponsePayload && typeof marketVenueTelemetryResponsePayload === "object" ? (marketVenueTelemetryResponsePayload as JsonMap) : null);
@@ -19178,7 +19328,7 @@ export default function TradingTerminalPage() {
   const renderChartSidecarCard = (id: ChartSidecarId, floating = false): ReactNode => {
     const headActions = floating ? null : (
       <div className="chart-sidecar-actions">
-        <button type="button" className="chart-sidecar-head-btn" onClick={() => detachChartSidecar(id)}>Float</button>
+        <button type="button" className="chart-sidecar-head-btn" title="Detacher ce sidecar" onClick={() => detachChartSidecar(id)}>Float</button>
       </div>
     );
 
@@ -19699,6 +19849,8 @@ export default function TradingTerminalPage() {
         return <BrokersDockPanel providerRows={providerRows} balances={balances} positions={positions} instrumentLabel={instrumentLabel} omsLifecycle={omsLifecycleSummary} portfolioOverlay={portfolioOverlaySummary} aiBridge={aiBridgeSummary} />;
       case "controlroom":
         return <ControlRoomMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} liveOpsPayload={liveOpsPayload} executionAiV6Payload={executionAiV6Payload} emergencyStopBusy={emergencyStopBusy} emergencyStopFeedback={emergencyStopFeedback} onEmergencyStop={() => { void triggerEmergencyStop(); }} formatClock={formatClock} />;
+      case "pnltruth":
+        return <ExecutionPnlTruthMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} payload={executionPnlAnalyzerPayload} liveOpsPayload={liveOpsPayload} executionAiV6Payload={executionAiV6Payload} formatClock={formatClock} />;
       case "optimizer":
         return <ExecutionOptimizerMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} payload={executionOptimizerLivePayload} routingPayload={routingScore} formatClock={formatClock} />;
       case "marketcontext":
@@ -19708,20 +19860,15 @@ export default function TradingTerminalPage() {
       case "venues":
         return <VenueTelemetryMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} marketPayload={marketVenueTelemetryPayload} routePayload={routeVenueTelemetryPayload} formatClock={formatClock} />;
       case "alerts":
-        return <AlertsDockPanel filteredAlerts={filteredAlerts} />;
+        return <AlertsMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} filteredAlerts={filteredAlerts} />;
       case "incidents":
-        return <IncidentsDockPanel incidentRows={incidentRows} />;
+        return <IncidentsMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} incidents={incidents} incidentRows={incidentRows} />;
       case "governance":
-        return <GovernanceDockPanel governanceFiltered={governanceFiltered} />;
+        return <GovernanceMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} governanceSort={governanceSort} onGovernanceSortChange={setGovernanceSort} incidentSort={incidentSort} onIncidentSortChange={setIncidentSort} governanceOnlyAlerts={governanceOnlyAlerts} onGovernanceOnlyAlertsChange={setGovernanceOnlyAlerts} governanceFilterText={governanceFilterText} onGovernanceFilterTextChange={setGovernanceFilterText} governanceFiltered={governanceFiltered} />;
       case "readiness":
-        return <ReadinessDockPanel driftItems={driftItems} suspendedCount={suspended.length} memorySummary={memorySummary} incidents={incidents} />;
+        return <ReadinessMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} driftItems={driftItems} suspendedCount={suspended.length} memorySummary={memorySummary} incidents={incidents} />;
       case "risktimeline":
-        return (
-          <div className="monitoring-col" style={{ height: "100%", overflow: "auto" }}>
-            <div className="eyebrow" style={{ marginBottom: 8 }}>Risk Compliance Timeline</div>
-            <RiskTimelineBody {...buildRiskTimelineBodyProps(10, "rt")} />
-          </div>
-        );
+        return <RiskTimelineMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} body={<RiskTimelineBody {...buildRiskTimelineBodyProps(10, "rt")} />} />;
       default:
         return null;
     }
@@ -19782,7 +19929,7 @@ export default function TradingTerminalPage() {
 
   if (!isHydrated) {
     return (
-      <main className={`term-root ui-${uiMode}`}>
+      <main className={`term-root ui-${uiMode}`} data-testid="mission-control-terminal-page">
         <header className="term-topbar gtix-panel-shell">
           <span className="eyebrow term-topbar-brand">TXT Trading Terminal</span>
         </header>
@@ -19794,7 +19941,7 @@ export default function TradingTerminalPage() {
   }
 
   return (
-    <main className={`term-root ui-${uiMode}`}>
+    <main className={`term-root ui-${uiMode}`} data-testid="mission-control-terminal-page">
       {hardAlertActive ? (
         <div className="hard-alert-banner">
           HARD ALERT: ratio miss {(toNumber(riskSummary?.ratio_miss_window, 0) * 100).toFixed(0)}% ≥ {hardAlertThreshold}%
@@ -19874,6 +20021,22 @@ export default function TradingTerminalPage() {
               title="All modules"
             >
               Full Surface
+            </button>
+            <button
+              type="button"
+              className={`th-mode-btn${terminalBootProfile === "light" ? " active" : ""}`}
+              onClick={() => setTerminalBootProfilePreference("light")}
+              title="Charge le shell puis monte le chart et les decks progressivement"
+            >
+              Boot Light
+            </button>
+            <button
+              type="button"
+              className={`th-mode-btn${terminalBootProfile === "full" ? " active" : ""}`}
+              onClick={() => setTerminalBootProfilePreference("full")}
+              title="Monte tous les modules immediatement"
+            >
+              Boot Full
             </button>
             <button type="button" className={`th-mode-btn${layoutPreset === "scalp" ? " active" : ""}`} onClick={() => applyLayoutPreset("scalp")} title="Alt+1">Scalp <span className="th-hotkey">1</span></button>
             <button type="button" className={`th-mode-btn${layoutPreset === "swing" ? " active" : ""}`} onClick={() => applyLayoutPreset("swing")} title="Alt+2">Swing <span className="th-hotkey">2</span></button>
@@ -20009,6 +20172,7 @@ export default function TradingTerminalPage() {
               <div className="terminal-onboarding-status">
                 <span className="terminal-onboarding-pill">Mode {uiMode === "novice" ? "Novice" : "Expert"}</span>
                 <span className="terminal-onboarding-pill">Vue {terminalDensityMode === "focus" ? "Focus" : "Full Surface"}</span>
+                <span className="terminal-onboarding-pill">Boot {terminalBootProfile === "light" ? `Light/${terminalBootStage}` : "Full"}</span>
                 <span className="terminal-onboarding-pill">Preset {layoutPreset}</span>
               </div>
               <div className="terminal-onboarding-toolbar">
@@ -20120,6 +20284,45 @@ export default function TradingTerminalPage() {
           <div className="term-decision-card-head">
             <div>
               <span className="eyebrow">Decision Layer</span>
+
+          <section className="term-hero-strip gtix-panel-shell">
+            <div className="term-hero-copy">
+              <div className="eyebrow">Execution cockpit</div>
+              <h1 className="term-hero-title">Terminal live, verite PnL et decision operateur</h1>
+              <p className="subtle">
+                Le terminal sert a lire vite, executer petit, laisser le no-trade dominer et rendre chaque override visible sur le contexte courant.
+              </p>
+            </div>
+            <div className="term-hero-side">
+              <OperatorPanelGuide
+                title="Guide Terminal"
+                what="La decision immediate, la verite PnL, la dominance no-trade et la discipline recente sur le contexte courant."
+                why="Savoir s'il faut attendre, reduire, couper ou executer petit sans se raconter d'histoire."
+                example="Si le bloc operateur affiche STOP ou si le drift passe LOCK, on ne compense pas par plus de taille."
+                compact
+                actions={(
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => openOpsCopilotPrompt({
+                        message: "Mode commandant: que faire maintenant sur le terminal ? Donne DECISION, RISQUE, RAISON et rappelle que l'override doit rester visible.",
+                        autoSend: true,
+                      })}
+                    >
+                      Mode commandant
+                    </button>
+                    <Link href="/live-ops">Live Ops</Link>
+                  </>
+                )}
+              />
+              <div className="txt-page-guide-note">
+                <strong>Note operateur</strong>
+                {hardAlertActive
+                  ? "Hard alert actif: reste en micro-live strict ou stoppe le flux tant que la raison du miss ratio n'est pas traitee."
+                  : "Tant que le discipline score ne remonte pas proprement, le terminal sert a filtrer et documenter, pas a forcer des entrees."}
+              </div>
+            </div>
+          </section>
               <div className="term-decision-title">{decisionGateLabel} · {marketDecisionV1.scenarioLabel}</div>
             </div>
             <span className={`term-decision-badge tone-${decisionGateTone}`}>{decisionGateLabel}</span>
@@ -20828,7 +21031,9 @@ export default function TradingTerminalPage() {
             <span className="chart-overlay-chip">REPLAY {terminalFeatureFlags.REPLAY_MODE ? "ON" : "OFF"}</span>
           </div>
 
-          {terminalV2Enabled ? (
+          {!chartBootReady ? (
+            <ChartSurfaceLoadingFallback />
+          ) : terminalV2Enabled ? (
             <TerminalChartV2
               enabled={terminalV2Enabled}
               onToggleEnabled={toggleTerminalV2}
@@ -22097,7 +22302,7 @@ export default function TradingTerminalPage() {
           <div className="eyebrow micro-panel-title">
             DOM <span className={`micro-stream-badge micro-stream-${displayDepthStreamState}`}>{displayDepthStreamState}</span>
             <HelpTooltip termKey="dom" mode={uiMode} />
-            {layoutEditMode && <button type="button" className="panel-detach-btn" title="Floating" onClick={() => detachPanel("dom", "micro")}>⤡</button>}
+            {layoutEditMode && <button type="button" className="panel-detach-btn" title="Detacher ce panneau" onClick={() => detachPanel("dom", "micro")}>⤡</button>}
           </div>
           <div className="dom-table-compact">
             <div className="dom-header-row"><span>Side</span><span>Prix</span><span>Taille</span><span>Profondeur</span></div>
@@ -22126,7 +22331,7 @@ export default function TradingTerminalPage() {
         <PanelShell className="panel micro-panel gtix-panel-resizable-y">
           <div className="eyebrow micro-panel-title">
             Footprint <HelpTooltip termKey="footprint" mode={uiMode} />
-            {layoutEditMode && <button type="button" className="panel-detach-btn" title="Floating" onClick={() => detachPanel("footprint", "micro")}>⤡</button>}
+            {layoutEditMode && <button type="button" className="panel-detach-btn" title="Detacher ce panneau" onClick={() => detachPanel("footprint", "micro")}>⤡</button>}
           </div>
           <div className="footprint-compact">
             <div className="fp-header-row"><span>Niveau</span><span className="good">Buy</span><span className="warn">Sell</span><span>Δ</span></div>
@@ -22155,7 +22360,7 @@ export default function TradingTerminalPage() {
         <PanelShell className="panel micro-panel gtix-panel-resizable-y">
           <div className="eyebrow micro-panel-title">
             Tape <HelpTooltip termKey="tape" mode={uiMode} />
-            {layoutEditMode && <button type="button" className="panel-detach-btn" title="Floating" onClick={() => detachPanel("tape", "micro")}>⤡</button>}
+            {layoutEditMode && <button type="button" className="panel-detach-btn" title="Detacher ce panneau" onClick={() => detachPanel("tape", "micro")}>⤡</button>}
           </div>
           <div className="tape-compact">
             {activeTape.map((print, ti) => (
@@ -22184,7 +22389,7 @@ export default function TradingTerminalPage() {
           <div className="eyebrow micro-panel-title">
             Heatmap <span className="subtle mini" style={{ marginLeft: 6 }}>{String(sessionState?.session || "–")} · imb {toNumber(marketMicro?.depth_imbalance, 0).toFixed(3)}</span>
             <HelpTooltip termKey="heatmap" mode={uiMode} />
-            {layoutEditMode && <button type="button" className="panel-detach-btn" title="Floating" onClick={() => detachPanel("heatmap", "micro")}>⤡</button>}
+            {layoutEditMode && <button type="button" className="panel-detach-btn" title="Detacher ce panneau" onClick={() => detachPanel("heatmap", "micro")}>⤡</button>}
           </div>
           <div className="heatmap-compact">
             {activeHeatmapLevels.map((lvl, hi) => (
@@ -22257,7 +22462,7 @@ export default function TradingTerminalPage() {
         >
         <PanelShell className="panel term-blotter-panel gtix-panel-resizable-y">
           <div className="eyebrow">Blotter d'exécution <HelpHint text="Journal des exécutions récentes." examples={["Si slippage monte brutalement, suspecte broker ou routeur dégradé."]} />
-            {layoutEditMode && <button type="button" className="panel-detach-btn" title="Floating" onClick={() => detachPanel("blotter", "lower")}>⤡</button>}
+            {layoutEditMode && <button type="button" className="panel-detach-btn" title="Detacher ce panneau" onClick={() => detachPanel("blotter", "lower")}>⤡</button>}
           </div>
           {filteredOutcomes.length === 0 ? <p className="subtle mini" style={{ marginTop: 8 }}>Aucune exécution.</p> : null}
           {filteredOutcomes.length > 0 ? (
@@ -22299,7 +22504,7 @@ export default function TradingTerminalPage() {
         >
         <PanelShell className="panel term-brokers-panel gtix-panel-resizable-y">
           <div className="eyebrow">Desk Bridge · OMS · Overlay <HelpTooltip termKey="brokers" mode={uiMode} />
-            {layoutEditMode && <button type="button" className="panel-detach-btn" title="Floating" onClick={() => detachPanel("brokers", "lower")}>⤡</button>}
+            {layoutEditMode && <button type="button" className="panel-detach-btn" title="Detacher ce panneau" onClick={() => detachPanel("brokers", "lower")}>⤡</button>}
           </div>
           <div className="brokers-grid">
             <div className="brokers-section">
@@ -22342,6 +22547,35 @@ export default function TradingTerminalPage() {
 
       {showMonitoringDeck ? (
       <>
+      <section className="panel term-operator-action-shell">
+        <OperatorActionSummary
+          badge={publicOpsPanelBadge}
+          executionPnlPayload={executionPnlAnalyzerPayload}
+          liveOpsPayload={liveOpsPayload}
+          executionAiV6Payload={executionAiV6Payload}
+          routingPayload={routingScore}
+          journalContext={{
+            symbol: String(selectedChartSymbol || "BTCUSD"),
+            timeframe: String(chartTimeframe || "1m"),
+            strategy: String(chartOrderTicket.preset || "terminal"),
+          }}
+          formatClock={formatClock}
+          footer={(
+            <>
+              <button
+                type="button"
+                onClick={() => openOpsCopilotPrompt({
+                  message: "Mode commandant: que faire maintenant sur le terminal ? Donne DECISION, RISQUE, RAISON et rappelle que l'override doit rester visible.",
+                  autoSend: true,
+                })}
+              >
+                Mode commandant
+              </button>
+              <Link href="/live-ops" className="subtle mini">Ouvrir Live Ops</Link>
+            </>
+          )}
+        />
+      </section>
       {/* ═══════════════ MONITORING ════════════════════════════ */}
       <section className="panel term-monitoring">
         <div className="term-monitoring-bar">
@@ -22385,13 +22619,32 @@ export default function TradingTerminalPage() {
             />
             </div>
             <div
+              className={`layout-draggable-card${layoutEditMode ? " is-edit" : ""}${layoutDropPreview?.zone === "monitoring" && layoutDropPreview.targetId === "pnltruth" ? " is-drop-target" : ""}`}
+              draggable={layoutEditMode}
+              onDragStart={() => { layoutDragRef.current = { zone: "monitoring", id: "pnltruth" }; setLayoutDropPreview({ zone: "monitoring", targetId: "pnltruth", mode: "panel" }); }}
+              onDragEnd={() => { layoutDragRef.current = null; setLayoutDropPreview(null); }}
+              onDragOver={(event) => { if (layoutEditMode) { event.preventDefault(); setLayoutDropPreview({ zone: "monitoring", targetId: "pnltruth", mode: "panel" }); } }}
+              onDrop={() => handleLayoutDrop("monitoring", "pnltruth")}
+              style={{ order: monitoringOrderById.pnltruth ?? 1, display: floatingPanels.some((fp) => fp.id === "pnltruth") ? "none" : undefined }}
+            >
+            <ExecutionPnlTruthMonitoringPanel
+              badge={publicOpsPanelBadge}
+              layoutEditMode={layoutEditMode}
+              onDetach={() => detachPanel("pnltruth", "monitoring")}
+              payload={executionPnlAnalyzerPayload}
+              liveOpsPayload={liveOpsPayload}
+              executionAiV6Payload={executionAiV6Payload}
+              formatClock={formatClock}
+            />
+            </div>
+            <div
               className={`layout-draggable-card${layoutEditMode ? " is-edit" : ""}${layoutDropPreview?.zone === "monitoring" && layoutDropPreview.targetId === "optimizer" ? " is-drop-target" : ""}`}
               draggable={layoutEditMode}
               onDragStart={() => { layoutDragRef.current = { zone: "monitoring", id: "optimizer" }; setLayoutDropPreview({ zone: "monitoring", targetId: "optimizer", mode: "panel" }); }}
               onDragEnd={() => { layoutDragRef.current = null; setLayoutDropPreview(null); }}
               onDragOver={(event) => { if (layoutEditMode) { event.preventDefault(); setLayoutDropPreview({ zone: "monitoring", targetId: "optimizer", mode: "panel" }); } }}
               onDrop={() => handleLayoutDrop("monitoring", "optimizer")}
-              style={{ order: monitoringOrderById.optimizer ?? 1, display: floatingPanels.some((fp) => fp.id === "optimizer") ? "none" : undefined }}
+              style={{ order: monitoringOrderById.optimizer ?? 2, display: floatingPanels.some((fp) => fp.id === "optimizer") ? "none" : undefined }}
             >
             <ExecutionOptimizerMonitoringPanel
               badge={publicOpsPanelBadge}
@@ -22409,7 +22662,7 @@ export default function TradingTerminalPage() {
               onDragEnd={() => { layoutDragRef.current = null; setLayoutDropPreview(null); }}
               onDragOver={(event) => { if (layoutEditMode) { event.preventDefault(); setLayoutDropPreview({ zone: "monitoring", targetId: "marketcontext", mode: "panel" }); } }}
               onDrop={() => handleLayoutDrop("monitoring", "marketcontext")}
-              style={{ order: monitoringOrderById.marketcontext ?? 2, display: floatingPanels.some((fp) => fp.id === "marketcontext") ? "none" : undefined }}
+              style={{ order: monitoringOrderById.marketcontext ?? 3, display: floatingPanels.some((fp) => fp.id === "marketcontext") ? "none" : undefined }}
             >
             <ExecutionContextMonitoringPanel
               badge={publicOpsPanelBadge}
@@ -22427,7 +22680,7 @@ export default function TradingTerminalPage() {
               onDragEnd={() => { layoutDragRef.current = null; setLayoutDropPreview(null); }}
               onDragOver={(event) => { if (layoutEditMode) { event.preventDefault(); setLayoutDropPreview({ zone: "monitoring", targetId: "v6observability", mode: "panel" }); } }}
               onDrop={() => handleLayoutDrop("monitoring", "v6observability")}
-              style={{ order: monitoringOrderById.v6observability ?? 1, display: floatingPanels.some((fp) => fp.id === "v6observability") ? "none" : undefined }}
+              style={{ order: monitoringOrderById.v6observability ?? 4, display: floatingPanels.some((fp) => fp.id === "v6observability") ? "none" : undefined }}
             >
             <ExecutionAiV6ObservabilityPanel
               badge={publicOpsPanelBadge}
@@ -24020,7 +24273,7 @@ export default function TradingTerminalPage() {
                     : entry
                 )))}
               >□+</button>
-              <button type="button" className="floating-panel-dock-btn" title="Redocker" onClick={() => dockChartSidecar(panel.id)}>⤢ Dock</button>
+              <button type="button" className="floating-panel-dock-btn" title="Replacer dans le layout" onClick={() => dockChartSidecar(panel.id)}>⤢ Dock</button>
               <button type="button" className="floating-panel-close-btn" title="Fermer la fenêtre et redocker" onClick={() => dockChartSidecar(panel.id)}>✕</button>
             </div>
           </div>

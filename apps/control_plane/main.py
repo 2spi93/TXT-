@@ -9881,6 +9881,168 @@ def _performance_attribution(scope_type: str, scope_id: str, start: datetime, en
     ]
 
 
+def _execution_pnl_trade_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    router_execution = payload.get("router_execution") if isinstance(payload.get("router_execution"), dict) else {}
+    route = router_execution.get("route") if isinstance(router_execution.get("route"), dict) else {}
+    execution_context = route.get("execution_context") if isinstance(route.get("execution_context"), dict) else {}
+    if not execution_context and isinstance(router_execution.get("execution_context"), dict):
+        execution_context = router_execution.get("execution_context")
+    policy = execution_context.get("policy") if isinstance(execution_context.get("policy"), dict) else {}
+    fallback_mode = str(execution_context.get("fallback_mode") or policy.get("fallback_mode") or "normal")
+    execution_mode = str(
+        router_execution.get("execution_mode")
+        or payload.get("source")
+        or (payload.get("webhook_execution") if isinstance(payload.get("webhook_execution"), dict) else {}).get("execution_mode")
+        or row.get("source")
+        or "unknown"
+    ).strip() or "unknown"
+    venue = str(row.get("route_chosen") or row.get("provider") or "unknown").strip() or "unknown"
+    confidence = _to_float(execution_context.get("confidence"), _to_float(row.get("score_pre_trade"), 0.0))
+    no_trade_reasons = [str(reason) for reason in execution_context.get("no_trade_reasons", []) if str(reason)] if isinstance(execution_context, dict) else []
+    dominant_reasons = [str(reason) for reason in execution_context.get("dominant_reasons", []) if str(reason)] if isinstance(execution_context, dict) else []
+    return {
+        "decision_id": str(row.get("decision_id") or ""),
+        "symbol": str(row.get("symbol") or ""),
+        "regime": str(row.get("regime") or "UNKNOWN").strip().upper() or "UNKNOWN",
+        "venue": venue,
+        "execution_mode": execution_mode,
+        "status": str(row.get("status") or "unknown"),
+        "net_result_usd": round(_to_float(row.get("net_result_usd"), 0.0), 6),
+        "fees_usd": round(_to_float(row.get("fees_usd"), 0.0), 6),
+        "score_pre_trade": round(_to_float(row.get("score_pre_trade"), 0.0), 6),
+        "confidence": round(confidence, 6),
+        "latency_ms": int(round(_to_float(row.get("latency_ms"), _to_float(row.get("latency_e2e_ms"), 0.0)))),
+        "slippage_real_bps": round(_to_float(row.get("slippage_real_bps"), _to_float(row.get("realized_slippage_bps"), 0.0)), 6),
+        "expected_slippage_bps": round(_to_float(row.get("expected_slippage_bps"), 0.0), 6),
+        "fallback_mode": fallback_mode,
+        "no_trade_dominance": bool(execution_context.get("no_trade_dominance") or policy.get("no_trade_dominance")),
+        "no_trade_state": str(execution_context.get("no_trade_state") or policy.get("no_trade_state") or "eligible"),
+        "no_trade_reasons": no_trade_reasons,
+        "dominant_reasons": dominant_reasons,
+        "created_at": str(row.get("created_at") or ""),
+    }
+
+
+def _execution_pnl_group_summary(trades: list[dict[str, Any]], field_name: str) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for trade in trades:
+        key = str(trade.get(field_name) or "unknown").strip() or "unknown"
+        grouped.setdefault(key, []).append(trade)
+    rows: list[dict[str, Any]] = []
+    for key, items in grouped.items():
+        trade_count = len(items)
+        net_pnl_usd = sum(_to_float(item.get("net_result_usd"), 0.0) for item in items)
+        rows.append(
+            {
+                field_name: key,
+                "trade_count": trade_count,
+                "net_pnl_usd": round(net_pnl_usd, 6),
+                "avg_pnl_usd": round(net_pnl_usd / trade_count, 6) if trade_count > 0 else 0.0,
+                "win_rate_pct": round(sum(1 for item in items if _to_float(item.get("net_result_usd"), 0.0) > 0) / trade_count * 100.0, 6) if trade_count > 0 else 0.0,
+                "avg_latency_ms": round(sum(max(0.0, _to_float(item.get("latency_ms"), 0.0)) for item in items) / trade_count, 6) if trade_count > 0 else 0.0,
+                "avg_slippage_bps": round(sum(abs(_to_float(item.get("slippage_real_bps"), 0.0)) for item in items) / trade_count, 6) if trade_count > 0 else 0.0,
+                "high_confidence_losses": sum(1 for item in items if _to_float(item.get("net_result_usd"), 0.0) < 0 and _to_float(item.get("confidence"), 0.0) >= 0.7),
+            }
+        )
+    return sorted(rows, key=lambda item: (-_to_float(item.get("net_pnl_usd"), 0.0), -int(item.get("trade_count") or 0), str(item.get(field_name) or "")))
+
+
+def _build_execution_pnl_analyzer_payload(
+    rows: list[dict[str, Any]],
+    *,
+    scope_type: str,
+    scope_id: str,
+    start: datetime,
+    end: datetime,
+    confidence_flag_threshold: float,
+    trade_limit: int,
+) -> dict[str, Any]:
+    trades = [_execution_pnl_trade_from_row(row) for row in rows]
+    trades.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    net_pnl_usd = sum(_to_float(trade.get("net_result_usd"), 0.0) for trade in trades)
+    trade_count = len(trades)
+    high_confidence_losses = [
+        {
+            **trade,
+            "flag": "bad_model_high_confidence_loss",
+        }
+        for trade in trades
+        if _to_float(trade.get("net_result_usd"), 0.0) < 0 and _to_float(trade.get("confidence"), 0.0) >= confidence_flag_threshold
+    ]
+    no_trade_dominance_trades = sum(1 for trade in trades if bool(trade.get("no_trade_dominance")))
+    return {
+        "scope_type": scope_type,
+        "scope_id": scope_id,
+        "period_start": start.isoformat(),
+        "period_end": end.isoformat(),
+        "summary": {
+            "trade_count": trade_count,
+            "net_pnl_usd": round(net_pnl_usd, 6),
+            "avg_pnl_usd": round(net_pnl_usd / trade_count, 6) if trade_count > 0 else 0.0,
+            "fees_usd": round(sum(_to_float(trade.get("fees_usd"), 0.0) for trade in trades), 6),
+            "win_rate_pct": round(sum(1 for trade in trades if _to_float(trade.get("net_result_usd"), 0.0) > 0) / trade_count * 100.0, 6) if trade_count > 0 else 0.0,
+            "avg_latency_ms": round(sum(max(0.0, _to_float(trade.get("latency_ms"), 0.0)) for trade in trades) / trade_count, 6) if trade_count > 0 else 0.0,
+            "avg_slippage_bps": round(sum(abs(_to_float(trade.get("slippage_real_bps"), 0.0)) for trade in trades) / trade_count, 6) if trade_count > 0 else 0.0,
+            "high_confidence_loss_count": len(high_confidence_losses),
+            "no_trade_dominance_count": no_trade_dominance_trades,
+        },
+        "by_regime": _execution_pnl_group_summary(trades, "regime"),
+        "by_venue": _execution_pnl_group_summary(trades, "venue"),
+        "by_execution_mode": _execution_pnl_group_summary(trades, "execution_mode"),
+        "bad_model_flags": high_confidence_losses[: min(max(trade_limit, 1), 200)],
+        "trades": trades[: min(max(trade_limit, 1), 500)],
+    }
+
+
+def _execution_pnl_analyzer(
+    scope_type: str,
+    scope_id: str,
+    start: datetime,
+    end: datetime,
+    *,
+    trade_limit: int = 50,
+    confidence_flag_threshold: float = 0.7,
+) -> dict[str, Any]:
+    base_query, params = _performance_base_query(scope_type, scope_id, start, end)
+    rows = _normalize_db_rows(
+        fetch_all(
+            f"""
+            SELECT d.decision_id,
+                   d.symbol,
+                   d.provider,
+                   d.regime,
+                   d.score_pre_trade,
+                   d.slippage_real_bps,
+                   d.latency_ms,
+                   d.fees_usd,
+                   d.net_result_usd,
+                   d.status,
+                   d.created_at,
+                   et.route_chosen,
+                   et.expected_slippage_bps,
+                   et.realized_slippage_bps,
+                   et.latency_e2e_ms,
+                   et.payload
+            {base_query}
+              AND COALESCE(d.status, '') <> 'pending'
+            ORDER BY d.created_at DESC
+            LIMIT %s
+            """,
+            tuple([*params, max(1, min(trade_limit, 500))]),
+        )
+    )
+    return _build_execution_pnl_analyzer_payload(
+        rows,
+        scope_type=scope_type,
+        scope_id=scope_id,
+        start=start,
+        end=end,
+        confidence_flag_threshold=_to_float(confidence_flag_threshold, 0.7),
+        trade_limit=trade_limit,
+    )
+
+
 def _coerce_report_month(report_month: str | None) -> tuple[str, datetime, datetime]:
     raw = str(report_month or "").strip()
     if not raw:
@@ -11310,6 +11472,28 @@ async def get_performance_attribution(
         "period_end": end_dt.isoformat(),
         "rows": _performance_attribution(scope_type, scope_id, start_dt, end_dt, group_by=group_by),
     }
+
+
+@app.get("/v1/execution/pnl-analyzer")
+async def get_execution_pnl_analyzer(
+    scope_type: str,
+    scope_id: str,
+    limit: int = 50,
+    confidence_flag_threshold: float = 0.7,
+    start: str | None = None,
+    end: str | None = None,
+    auth: AuthContext = Depends(any_read_auth),
+) -> dict[str, Any]:
+    del auth
+    start_dt, end_dt = _coerce_period_bounds(start, end)
+    return _execution_pnl_analyzer(
+        scope_type,
+        scope_id,
+        start_dt,
+        end_dt,
+        trade_limit=limit,
+        confidence_flag_threshold=confidence_flag_threshold,
+    )
 
 
 @app.get("/v1/investor-reports")
@@ -14636,6 +14820,199 @@ async def live_readiness_overview(auth: AuthContext = Depends(viewer_auth)) -> d
     }
 
 
+async def _fetch_execution_ai_v6_state_snapshot() -> dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{EXECUTION_ROUTER_URL}/v1/execution-ai/v6/state")
+        if response.status_code >= 400:
+            return {"status": "degraded", "detail": response.text[:200]}
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {"status": "degraded"}
+    except Exception as exc:
+        return {"status": "degraded", "detail": str(exc)[:200]}
+
+
+def _format_signed_usd(value: float) -> str:
+    return f"+{value:.2f} USD" if value > 0 else f"{value:.2f} USD"
+
+
+def _build_ops_copilot_desk_brief(
+    *,
+    pnl_payload: dict[str, Any],
+    readiness_payload: dict[str, Any],
+    incidents_payload: dict[str, Any],
+    strategies_payload: list[dict[str, Any]],
+    execution_ai_v6_payload: dict[str, Any],
+) -> dict[str, Any]:
+    pnl_summary = pnl_payload.get("summary") if isinstance(pnl_payload.get("summary"), dict) else {}
+    readiness_drift = readiness_payload.get("drift") if isinstance(readiness_payload.get("drift"), dict) else {}
+    incidents = incidents_payload.get("items") if isinstance(incidents_payload.get("items"), list) else []
+    v6_snapshot = execution_ai_v6_payload.get("snapshot") if isinstance(execution_ai_v6_payload.get("snapshot"), dict) else {}
+    v6_guardrails = v6_snapshot.get("guardrails") if isinstance(v6_snapshot.get("guardrails"), dict) else {}
+
+    trade_count = int(_to_float(pnl_summary.get("trade_count"), 0.0))
+    net_pnl_usd = _to_float(pnl_summary.get("net_pnl_usd"), 0.0)
+    avg_pnl_usd = _to_float(pnl_summary.get("avg_pnl_usd"), 0.0)
+    win_rate_pct = _to_float(pnl_summary.get("win_rate_pct"), 0.0)
+    avg_latency_ms = _to_float(pnl_summary.get("avg_latency_ms"), 0.0)
+    avg_slippage_bps = _to_float(pnl_summary.get("avg_slippage_bps"), 0.0)
+    high_confidence_loss_count = int(_to_float(pnl_summary.get("high_confidence_loss_count"), 0.0))
+    no_trade_dominance_count = int(_to_float(pnl_summary.get("no_trade_dominance_count"), 0.0))
+    no_trade_ratio_pct = (no_trade_dominance_count / trade_count * 100.0) if trade_count > 0 else 0.0
+    suspended_strategies = readiness_drift.get("suspended_strategies") if isinstance(readiness_drift.get("suspended_strategies"), list) else []
+    learning_frozen = bool(v6_guardrails.get("learning_frozen"))
+    reward_ema = _to_float(v6_snapshot.get("reward_ema"), 0.0)
+
+    truth_label = "OK"
+    truth_reason = "guarded micro-live remains acceptable"
+    if trade_count >= 5 and (high_confidence_loss_count >= 2 or (net_pnl_usd < 0 and win_rate_pct < 40.0)):
+        truth_label = "BLOCK"
+        truth_reason = "PnL truth is deteriorating and the filter needs review"
+    elif trade_count < 3 or learning_frozen or avg_latency_ms > 120.0 or avg_slippage_bps > 3.0 or no_trade_ratio_pct < 10.0:
+        truth_label = "REDUCE"
+        truth_reason = "keep size minimal and let no-trade dominate harder"
+
+    top_strategy = None
+    if strategies_payload:
+        ordered = sorted(
+            strategies_payload,
+            key=lambda item: (int(item.get("current_level") or 0), str(item.get("updated_at") or "")),
+            reverse=True,
+        )
+        top_strategy = ordered[0]
+
+    parts = [
+        f"Desk truth {truth_label}. {truth_reason}.",
+        f"PnL net {_format_signed_usd(net_pnl_usd)} sur {trade_count} trade(s), expectancy {_format_signed_usd(avg_pnl_usd)}, win rate {win_rate_pct:.1f}%.",
+        f"Execution friction: {avg_latency_ms:.0f}ms de latence moyenne, {avg_slippage_bps:.2f}bps de slippage, {high_confidence_loss_count} perte(s) haute confiance.",
+        f"No-trade dominance: {no_trade_dominance_count}/{trade_count or 1} trade(s), soit {no_trade_ratio_pct:.0f}% du flux observe.",
+    ]
+    if learning_frozen:
+        parts.append(f"V6 reste figee pour le moment, reward EMA {reward_ema:.3f}.")
+    else:
+        parts.append(f"V6 reste active, reward EMA {reward_ema:.3f}.")
+    if suspended_strategies:
+        parts.append(f"Readiness: {len(suspended_strategies)} strategie(s) suspendue(s) pour drift.")
+    if incidents:
+        parts.append(f"Incidents ouverts: {len(incidents)}.")
+    if top_strategy:
+        parts.append(
+            f"Strategie la plus avancee: {top_strategy.get('strategy_id')} niveau {int(top_strategy.get('current_level') or 0)} ({top_strategy.get('status')})."
+        )
+    parts.append("Calibration semi-auto: reste verrouillee tant que plusieurs jours de micro-live propre et au moins 50 trades n'ont pas ete accumules.")
+
+    return {
+        "status": "ok",
+        "reply": " ".join(parts),
+        "data": {
+            "desk_truth": {
+                "label": truth_label,
+                "reason": truth_reason,
+            },
+            "pnl": pnl_payload,
+            "readiness": readiness_payload,
+            "incidents": incidents_payload,
+            "execution_ai_v6": execution_ai_v6_payload,
+            "strategy_progress": strategies_payload[:5],
+        },
+        "actions": ["open_live_ops", "open_terminal_truth", "open_live_readiness"],
+    }
+
+
+def _build_ops_copilot_command_brief(
+    *,
+    pnl_payload: dict[str, Any],
+    readiness_payload: dict[str, Any],
+    incidents_payload: dict[str, Any],
+    strategies_payload: list[dict[str, Any]],
+    execution_ai_v6_payload: dict[str, Any],
+) -> dict[str, Any]:
+    pnl_summary = pnl_payload.get("summary") if isinstance(pnl_payload.get("summary"), dict) else {}
+    readiness_drift = readiness_payload.get("drift") if isinstance(readiness_payload.get("drift"), dict) else {}
+    incidents = incidents_payload.get("items") if isinstance(incidents_payload.get("items"), list) else []
+    trades = pnl_payload.get("trades") if isinstance(pnl_payload.get("trades"), list) else []
+    v6_snapshot = execution_ai_v6_payload.get("snapshot") if isinstance(execution_ai_v6_payload.get("snapshot"), dict) else {}
+    v6_guardrails = v6_snapshot.get("guardrails") if isinstance(v6_snapshot.get("guardrails"), dict) else {}
+
+    trade_count = int(_to_float(pnl_summary.get("trade_count"), 0.0))
+    net_pnl_usd = _to_float(pnl_summary.get("net_pnl_usd"), 0.0)
+    avg_latency_ms = _to_float(pnl_summary.get("avg_latency_ms"), 0.0)
+    avg_slippage_bps = _to_float(pnl_summary.get("avg_slippage_bps"), 0.0)
+    win_rate_pct = _to_float(pnl_summary.get("win_rate_pct"), 0.0)
+    high_confidence_loss_count = int(_to_float(pnl_summary.get("high_confidence_loss_count"), 0.0))
+    no_trade_dominance_count = int(_to_float(pnl_summary.get("no_trade_dominance_count"), 0.0))
+    no_trade_ratio_pct = (no_trade_dominance_count / trade_count * 100.0) if trade_count > 0 else 0.0
+    learning_frozen = bool(v6_guardrails.get("learning_frozen"))
+    persistence_available = bool(v6_guardrails.get("persistence_available", True))
+    suspended_strategies = readiness_drift.get("suspended_strategies") if isinstance(readiness_drift.get("suspended_strategies"), list) else []
+    negative_streak = 0
+    for trade in trades:
+        if _to_float((trade or {}).get("net_result_usd"), 0.0) < 0.0:
+            negative_streak += 1
+            continue
+        break
+
+    decision = "ENTRY SMALL"
+    risk_label = "faible"
+    reasons: list[str] = []
+
+    if not persistence_available or (trade_count >= 5 and (high_confidence_loss_count >= 2 or (net_pnl_usd < 0.0 and win_rate_pct < 40.0))):
+        decision = "STOP"
+        risk_label = "eleve"
+        reasons = [
+            "verite PnL degradee" if persistence_available else "DB V6 indisponible",
+            f"latence {avg_latency_ms:.0f}ms / slippage {avg_slippage_bps:.2f}bps",
+            f"streak negatif {negative_streak}" if negative_streak >= 2 else f"loss haute confiance {high_confidence_loss_count}",
+        ]
+    elif no_trade_ratio_pct >= 70.0 or suspended_strategies:
+        decision = "WAIT"
+        risk_label = "eleve"
+        reasons = [
+            f"no-trade dominance {no_trade_ratio_pct:.0f}%",
+            f"strategies suspendues {len(suspended_strategies)}" if suspended_strategies else "le flux reste trop filtre pour entrer",
+            f"incidents ouverts {len(incidents)}" if incidents else "attendre un contexte plus propre",
+        ]
+    elif learning_frozen or avg_latency_ms > 120.0 or avg_slippage_bps > 3.0 or trade_count < 3:
+        decision = "REDUCE SIZE"
+        risk_label = "moyen"
+        reasons = [
+            "learning gelee" if learning_frozen else "echantillon live encore faible",
+            f"latence {avg_latency_ms:.0f}ms",
+            f"slippage {avg_slippage_bps:.2f}bps",
+        ]
+    else:
+        reasons = [
+            f"verite PnL {_format_signed_usd(net_pnl_usd)}",
+            f"no-trade dominance {no_trade_ratio_pct:.0f}%",
+            f"friction {avg_latency_ms:.0f}ms / {avg_slippage_bps:.2f}bps",
+        ]
+
+    reply = "\n".join(
+        [
+            f"DECISION: {decision}",
+            f"RISQUE: {risk_label}",
+            f"RAISON: {' ; '.join(reasons)}",
+            "OVERRIDE: possible mais visible. Si tu forces, reste en micro-size et journalise la raison.",
+        ]
+    )
+
+    return {
+        "status": "ok",
+        "reply": reply,
+        "data": {
+            "decision": decision,
+            "risk": risk_label,
+            "reasons": reasons,
+            "pnl": pnl_payload,
+            "readiness": readiness_payload,
+            "incidents": incidents_payload,
+            "execution_ai_v6": execution_ai_v6_payload,
+            "strategy_progress": strategies_payload[:5],
+        },
+        "actions": ["open_live_ops", "open_terminal_truth", "open_live_readiness"],
+    }
+
+
 @app.post("/v1/copilot/chat")
 async def copilot_chat(payload: dict, auth: AuthContext = Depends(viewer_auth)) -> dict:
     confirm_token = str(payload.get("confirm_token", "")).strip()
@@ -14674,13 +15051,52 @@ async def copilot_chat(payload: dict, auth: AuthContext = Depends(viewer_auth)) 
     if not message:
         return {
             "status": "ok",
-            "reply": "Pose une question sur readiness, drift, A/B memory, ou declenche une action guidee.",
-            "actions": ["open_live_readiness", "open_memory_ab_panel"],
+            "reply": "Pose une question sur le desk du jour, la verite PnL, le plan journalier, readiness, drift, A/B memory, ou declenche une action guidee.",
+            "actions": ["open_live_ops", "open_terminal_truth", "open_live_readiness", "open_memory_ab_panel"],
             "suggested_actions": [
                 {"type": "apply_threshold", "label": "Appliquer seuil regime"},
                 {"type": "open_incident_ticket", "label": "Ouvrir ticket incident"},
                 {"type": "run_runbook", "label": "Lancer runbook stabilize_trading"},
             ],
+        }
+
+    if any(keyword in message for keyword in {"commandant", "que faire maintenant", "dois-je trader", "je trade", "trade maintenant", "override"}):
+        end = _now_utc()
+        start = end - timedelta(days=7)
+        pnl_payload = _execution_pnl_analyzer("strategy", "mt5-live", start, end, trade_limit=50, confidence_flag_threshold=0.7)
+        readiness_payload = await live_readiness_overview(auth)
+        incidents_payload = await list_incidents(auth=auth)
+        strategies_payload = await list_strategies(auth=auth)
+        execution_ai_v6_payload = await _fetch_execution_ai_v6_state_snapshot()
+        return _build_ops_copilot_command_brief(
+            pnl_payload=pnl_payload,
+            readiness_payload=readiness_payload,
+            incidents_payload=incidents_payload,
+            strategies_payload=strategies_payload,
+            execution_ai_v6_payload=execution_ai_v6_payload,
+        )
+
+    if any(keyword in message for keyword in {"desk", "pnl", "truth", "verite", "no-trade", "journal", "plan", "priorite", "ops", "exploitation"}):
+        end = _now_utc()
+        start = end - timedelta(days=7)
+        pnl_payload = _execution_pnl_analyzer("strategy", "mt5-live", start, end, trade_limit=50, confidence_flag_threshold=0.7)
+        readiness_payload = await live_readiness_overview(auth)
+        incidents_payload = await list_incidents(auth=auth)
+        strategies_payload = await list_strategies(auth=auth)
+        execution_ai_v6_payload = await _fetch_execution_ai_v6_state_snapshot()
+        return _build_ops_copilot_desk_brief(
+            pnl_payload=pnl_payload,
+            readiness_payload=readiness_payload,
+            incidents_payload=incidents_payload,
+            strategies_payload=strategies_payload,
+            execution_ai_v6_payload=execution_ai_v6_payload,
+        )
+
+    if any(keyword in message for keyword in {"news", "nouvel", "macro", "econom", "fed", "cpi", "fomc", "calendar", "geopolit"}):
+        return {
+            "status": "ok",
+            "reply": "Je n'ai pas encore de feed macro/news live branche dans Ops Copilot. Pour l'instant je peux te rappeler le contexte macro comme filtre operationnel et te dire de bloquer ou reduire le live autour des evenements Fed/CPI/FOMC, mais pas te donner une newswire temps reel fiable.",
+            "actions": ["open_live_ops", "open_ai_desk"],
         }
 
     if "readiness" in message or "live" in message:

@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 
 import HelpHint from "../../components/HelpHint";
-import TxtMiniGuide from "../../components/ui/TxtMiniGuide";
+import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
 
 type JsonMap = Record<string, unknown>;
 
@@ -166,15 +166,19 @@ export default function LiveReadinessPage() {
     <main className="shell txt-page-shell">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.4fr 1fr" }}>
         <div className="panel txt-page-hero">
-          <div className="eyebrow">Live Readiness Center <HelpHint text="Cette page sert à vérifier si le système reste prêt avant d'augmenter le risque." examples={["Avant de pousser plus fort en live, regarde les stratégies stoppées et les signaux d'écart.", "Si un bloc est rouge ou instable, règle d'abord le problème."]} /></div>
-          <h1 className="title" style={{ fontSize: 34 }}>Readiness, Drift, Memory A/B</h1>
-          <p className="subtle">Calibration V3 en boucle fermee: mesure, derive, suspension auto, comparaison memory ON/OFF.</p>
-          <TxtMiniGuide
+          <div className="eyebrow">Live Readiness Center</div>
+          <h1 className="title" style={{ fontSize: 34 }}>Pret pour le live, derive et test memoire</h1>
+          <p className="subtle txt-page-hero-copy">Cette page dit si les strategies restent assez propres pour continuer le live ou s'il faut freiner, suspendre et revalider.</p>
+          <OperatorPanelGuide
             title="Guide Readiness"
             what="Les signaux qui montrent si les stratégies tiennent encore la route ou commencent à s'écarter."
             why="Éviter d'augmenter le risque alors que la qualité se dégrade déjà."
             example="Si plusieurs stratégies sont stoppées en même temps, réduis l'exposition et cherche ce qui a changé."
           />
+          <div className="txt-page-guide-note">
+            <strong>Regle d'usage</strong>
+            Si plusieurs blocs passent au warn en meme temps, ne cherche pas a optimiser. Coupe le rythme, garde le risque bas et traite d'abord la cause de derive.
+          </div>
           <p>
             <Link href="/">Dashboard</Link>
             {" | "}
@@ -265,12 +269,14 @@ export default function LiveReadinessPage() {
           <div className="row"><span>p-value (2-sided)</span><span>{String(withVsWithout.p_value_two_sided ?? "-")}</span></div>
           <div className="row"><span>Significant @95%</span><span>{String(withVsWithout.significant_95 ?? false)}</span></div>
           {abArms.length === 0 ? <p className="subtle">Pas assez d'echantillons A/B.</p> : null}
-          {abArms.map((arm) => (
-            <div className="row" key={String(arm.arm)}>
-              <span>{String(arm.arm)}</span>
-              <span>winrate={String(arm.win_rate || "-")} | avg={String(arm.avg_outcome || "-")}</span>
-            </div>
-          ))}
+          <div className="txt-scroll-shell compact">
+            {abArms.map((arm) => (
+              <div className="row" key={String(arm.arm)}>
+                <span>{String(arm.arm)}</span>
+                <span>winrate={String(arm.win_rate || "-")} | avg={String(arm.avg_outcome || "-")}</span>
+              </div>
+            ))}
+          </div>
         </div>
       </section>
 
@@ -298,14 +304,16 @@ export default function LiveReadinessPage() {
         <div className="panel">
           <div className="eyebrow">Auto-Suspension <HelpHint text="La liste montre les stratégies déjà stoppées automatiquement pour éviter d'aggraver la situation." examples={["Si une stratégie apparaît ici, considère-la comme protégée par défaut.", "Ne la relance que si la cause du problème est comprise et traitée."]} /></div>
           {suspended.length === 0 ? <p className="subtle">Aucune strategie suspendue.</p> : null}
-          {suspended.map((row) => (
-            <div className="row" key={String(row.strategy_id)}>
-              <span>{String(row.strategy_id)} | {String(row.market)}</span>
-              <form method="post" action={`/api/strategies/${String(row.strategy_id)}/resume`}>
-                <button type="submit">Resume</button>
-              </form>
-            </div>
-          ))}
+          <div className="txt-scroll-shell compact">
+            {suspended.map((row) => (
+              <div className="row" key={String(row.strategy_id)}>
+                <span>{String(row.strategy_id)} | {String(row.market)}</span>
+                <form method="post" action={`/api/strategies/${String(row.strategy_id)}/resume`}>
+                  <button type="submit">Resume</button>
+                </form>
+              </div>
+            ))}
+          </div>
         </div>
       </section>
 
@@ -313,14 +321,16 @@ export default function LiveReadinessPage() {
         <div className="panel">
           <div className="eyebrow">Drift Details <HelpHint text="Détail des écarts détectés pour comprendre d'où vient le problème avant de relancer." examples={["Lis la raison affichée pour voir si le souci vient du taux de réussite, de la perte ou du manque d'historique.", "Sers-toi de ce détail pour corriger le cadre plutôt que de relancer au hasard."]} /></div>
           {driftItems.length === 0 ? <p className="subtle">Aucune ligne de drift pour le moment.</p> : null}
-          {driftItems.slice(0, 80).map((row, idx) => (
-            <div className="row" key={`${String(row.strategy_id)}-${String(row.regime)}-${idx}`}>
-              <span>{String(row.strategy_id)} | {String(row.regime)} | sample={String(row.sample_count)}</span>
-              <span className={Boolean(row.drift_detected) ? "warn" : "good"}>
-                drift={String(row.drift_detected)} | win={String(row.win_rate || "-")} | dd={String(row.drawdown_usd || "-")} | {String(row.reason || "")}
-              </span>
-            </div>
-          ))}
+          <div className="txt-scroll-shell">
+            {driftItems.slice(0, 80).map((row, idx) => (
+              <div className="row" key={`${String(row.strategy_id)}-${String(row.regime)}-${idx}`}>
+                <span>{String(row.strategy_id)} | {String(row.regime)} | sample={String(row.sample_count)}</span>
+                <span className={Boolean(row.drift_detected) ? "warn" : "good"}>
+                  drift={String(row.drift_detected)} | win={String(row.win_rate || "-")} | dd={String(row.drawdown_usd || "-")} | {String(row.reason || "")}
+                </span>
+              </div>
+            ))}
+          </div>
         </div>
       </section>
     </main>
