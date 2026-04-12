@@ -402,3 +402,41 @@ export type ChartHudOrderRiskPanelProps = {
   mergedChartSendHistory: ChartSendHistoryEntryShape[];
   formatClock: (value: string) => string;
 };
+
+export type SmartDecisionHudTone = "good" | "subtle" | "warn";
+export type SmartDecisionHudConfidenceBand = "LOW" | "MEDIUM" | "HIGH";
+
+export type SmartDecisionHudStabilityShape = {
+  currentStateLabel: string;
+  lastStableStateLabel: string;
+  stabilityScorePct: number;
+  persistenceMs: number;
+  persistenceLabel: string;
+  flipCount: number;
+  isStable: boolean;
+  confidenceBand: SmartDecisionHudConfidenceBand;
+  statusLabel: string;
+};
+
+export type SmartDecisionHudShape = {
+  state: "NO_TRADE" | "WAIT_CONFIRMATION" | "FAKE_BREAKOUT_RISK" | "ENTRY_VALID";
+  stateLabel: string;
+  displayStateLabel: string;
+  tone: SmartDecisionHudTone;
+  confidencePct: number;
+  confidenceBand: SmartDecisionHudConfidenceBand;
+  headline: string;
+  reason: string;
+  regimeLabel: string;
+  structureLabel: string;
+  liquidityLabel: string;
+  qualityGate: "pass" | "warn" | "fail";
+  qualityGateLabel: string;
+  triggerSide: "long" | "short" | "neutral";
+  triggerLabel: string;
+  invalidationLabel: string;
+  latencyLabel: string;
+  compactLabel: string;
+  assistantSummary: string;
+  stability: SmartDecisionHudStabilityShape;
+};

@@ -4,6 +4,9 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 
 import HelpHint from "../../components/HelpHint";
 import PanelShell from "../../components/ui/PanelShell";
+import type { SmartDecisionHudShape } from "./chartHudTypes";
+import { buildFeedbackSummary } from "./feedbackEngine";
+import SmartDecisionSummary from "./SmartDecisionSummary";
 
 type RiskTimelineFilter = "all" | "compliant" | "miss";
 
@@ -88,6 +91,7 @@ type AiBridgeSummary = {
   brainConfidencePct: number;
   brainRegime: string;
   reasonLabel: string;
+  smartDecision: SmartDecisionHudShape | null;
 };
 
 type ExecutionAiV6PanelPayload = Record<string, unknown>;
@@ -271,12 +275,7 @@ function buildVenueTelemetryRows(
       stability: stabilityRow,
       profile: profileRow,
       instruments: instrumentRows,
-      severity_score:
-        freshestMs
-        + Math.max(0, avgSlippageBps * 2_000)
-        + Math.max(0, avgFillLatencyMs * 20)
-        + (avgFillQualityScore > 0 ? Math.max(0, (100 - avgFillQualityScore) * 1_000) : 0)
-        + (tone === "warn" ? 250_000 : tone === "subtle" ? 80_000 : 0),
+      severity_score: tone === "warn" ? 2 : tone === "subtle" ? 1 : 0,
     };
   });
 
@@ -352,6 +351,10 @@ const PANEL_HINTS: Record<string, { text: string; examples: string[] }> = {
   "Venue Telemetry": {
     text: "Rassemble la sante feed et execution par venue: fraicheur quotes/depth/trades, spread, slippage, fill quality et contraintes de route.",
     examples: ["Si la fraicheur depth explose mais le proxy reste healthy, le souci vient du feed venue, pas du control plane.", "Une venue avec fill quality faible et slippage eleve doit etre re-degradee ou reroutee avant live."],
+  },
+  "Execution Smart Tracker": {
+    text: "Tracker compact pour la calibration live V7 Smart: gate allow/block, delai, reduction de taille, score d'execution, score venue et frictions reelles.",
+    examples: ["Si le score baisse mais que le gate reste allow, on reduit avant d'envisager un blocage global.", "Le panel se lit en sequence: gate live, frictions fenetre, puis PnL par posture d'execution."],
   },
 };
 
@@ -450,6 +453,7 @@ type OperatorActionSummaryProps = {
   liveOpsPayload?: Record<string, unknown> | null;
   executionAiV6Payload?: ExecutionAiV6PanelPayload | null;
   routingPayload?: Record<string, unknown> | null;
+  smartDecision?: SmartDecisionHudShape | null;
   journalContext?: {
     symbol: string;
     timeframe: string;
@@ -516,6 +520,9 @@ type DisciplineAnalytics = {
   recommendation: string;
   penalties: string[];
   driftReasons: string[];
+  blockedOverrideCount24h: number;
+  blockedOverrideEntries: OperatorJournalEntry[];
+  lastBlockedOverrideEvent: OperatorJournalEntry | null;
   latestEvent: OperatorJournalEntry | null;
   kpis: Array<{ label: string; value: string; tone: "good" | "subtle" | "warn" }>;
   heatmap: DisciplineHeatRow[];
@@ -543,6 +550,8 @@ function formatOperatorJournalAction(action: string): string {
       return "override visible";
     case "override-visible-off":
       return "override retire";
+    case "override-blocked-lock":
+      return "override bloque";
     case "auto-reduce":
       return "reduction forcee";
     case "auto-close":
@@ -573,6 +582,7 @@ function formatOperatorJournalAction(action: string): string {
 const DISCIPLINE_ACTIONS = new Set([
   "auto-reduce",
   "auto-close",
+  "override-blocked-lock",
   "override-visible-on",
   "override-visible-off",
   "emergency-stop",
@@ -589,18 +599,23 @@ const DISCIPLINE_ACTIONS = new Set([
 function buildOperatorJournalAnalytics(entries: OperatorJournalEntry[]): {
   overrideCount: number;
   overrideActive: boolean;
+  blockedOverrideCount: number;
+  lastBlockedOverrideEntry: OperatorJournalEntry | null;
   lastOverrideEntry: OperatorJournalEntry | null;
   lastOverrideEvent: OperatorJournalEntry | null;
   disciplineCount: number;
   latestEntries: OperatorJournalEntry[];
 } {
   const overrideEvents = entries.filter((entry) => entry.action === "override-visible-on" || entry.action === "override-visible-off");
+  const blockedOverrideEvents = entries.filter((entry) => entry.action === "override-blocked-lock");
   const disciplineEvents = entries.filter((entry) => DISCIPLINE_ACTIONS.has(entry.action));
   const lastOverrideEvent = overrideEvents[0] || null;
   const lastOverrideEntry = overrideEvents.find((entry) => entry.action === "override-visible-on") || null;
   return {
     overrideCount: overrideEvents.filter((entry) => entry.action === "override-visible-on").length,
     overrideActive: lastOverrideEvent?.action === "override-visible-on",
+    blockedOverrideCount: blockedOverrideEvents.length,
+    lastBlockedOverrideEntry: blockedOverrideEvents[0] || null,
     lastOverrideEntry,
     lastOverrideEvent,
     disciplineCount: disciplineEvents.length,
@@ -635,6 +650,11 @@ function buildDisciplineHeatmap(entries: OperatorJournalEntry[]): DisciplineHeat
       label: "Overrides visibles",
       positive: false,
       actions: new Set(["override-visible-on"]),
+    },
+    {
+      label: "Overrides bloques",
+      positive: false,
+      actions: new Set(["override-blocked-lock"]),
     },
     {
       label: "Protections forcees",
@@ -735,10 +755,12 @@ function buildDisciplineAnalytics(input: {
   const journalEntries = input.entries;
   const heatmap = buildDisciplineHeatmap(journalEntries);
   const overrides24h = countJournalEntriesWithinHours(journalEntries, new Set(["override-visible-on"]), 24);
+  const blockedOverrides24h = countJournalEntriesWithinHours(journalEntries, new Set(["override-blocked-lock"]), 24);
   const forced24h = countJournalEntriesWithinHours(journalEntries, new Set(["auto-reduce", "auto-close", "emergency-stop"]), 24);
   const reopened7d = countJournalEntriesWithinHours(journalEntries, new Set(["daily-plan-task-reopened", "daily-plan-sprint-reset"]), 168);
   const checklist7d = countJournalEntriesWithinHours(journalEntries, new Set(["daily-plan-task-done", "daily-plan-brief-opened", "sprint-brief-opened"]), 168);
   const modeChanges72h = countJournalEntriesWithinHours(journalEntries, new Set(["system-mode-changed"]), 72);
+  const blockedOverrideEntries = journalEntries.filter((entry) => entry.action === "override-blocked-lock").slice(0, 3);
   const tradeCount = safeNumber(pnlSummary.trade_count, 0);
   const highConfidenceLossCount = safeNumber(pnlSummary.high_confidence_loss_count, 0);
   const noTradeCount = safeNumber(pnlSummary.no_trade_dominance_count, 0);
@@ -765,6 +787,10 @@ function buildDisciplineAnalytics(input: {
   if (overrides24h > 0) {
     score -= overrides24h * 12;
     penalties.push(`${overrides24h} override visible sur 24h`);
+  }
+  if (blockedOverrides24h > 0) {
+    score -= Math.min(12, blockedOverrides24h * 4);
+    penalties.push(`${blockedOverrides24h} override bloque sur 24h`);
   }
   if (forced24h > 0) {
     score -= forced24h * 16;
@@ -850,6 +876,7 @@ function buildDisciplineAnalytics(input: {
     { label: "Discipline score", value: `${score}/100`, tone: scoreTone },
     { label: "Drift watchdog", value: driftState, tone: driftTone },
     { label: "Overrides 24h", value: String(overrides24h), tone: overrides24h === 0 ? "good" : overrides24h === 1 ? "subtle" : "warn" },
+    { label: "Overrides bloques", value: String(blockedOverrides24h), tone: blockedOverrides24h === 0 ? "good" : blockedOverrides24h === 1 ? "subtle" : "warn" },
     { label: "Protections 24h", value: String(forced24h), tone: forced24h === 0 ? "good" : forced24h === 1 ? "subtle" : "warn" },
     { label: "Checklist 7j", value: `${checklist7d}/${Math.max(checklist7d + reopened7d, 1)}`, tone: checklist7d >= reopened7d ? "good" : "warn" },
     { label: "Drift actif", value: String(activeDriftItems.length), tone: activeDriftItems.length === 0 ? "good" : activeDriftItems.length === 1 ? "subtle" : "warn" },
@@ -865,6 +892,9 @@ function buildDisciplineAnalytics(input: {
     recommendation,
     penalties: penalties.length > 0 ? penalties.slice(0, 5) : ["aucune derive recente visible dans le journal discipline"],
     driftReasons,
+    blockedOverrideCount24h: blockedOverrides24h,
+    blockedOverrideEntries,
+    lastBlockedOverrideEvent: blockedOverrideEntries[0] || null,
     latestEvent,
     kpis,
     heatmap,
@@ -935,6 +965,7 @@ function buildOperatorActionDecision(input: {
   liveOpsPayload?: Record<string, unknown> | null;
   executionAiV6Payload?: ExecutionAiV6PanelPayload | null;
   routingPayload?: Record<string, unknown> | null;
+  smartDecision?: SmartDecisionHudShape | null;
 }): OperatorActionDecision {
   const envelope = safeRecord(input.executionPnlPayload);
   const summary = safeRecord(envelope.summary);
@@ -953,6 +984,7 @@ function buildOperatorActionDecision(input: {
   const v6PersistenceAvailable = typeof v6Guardrails.persistence_available === "boolean"
     ? Boolean(v6Guardrails.persistence_available)
     : true;
+  const smartDecision = input.smartDecision ?? null;
   const truthState = deriveDeskTruthState({ summary, liveOpsPayload: input.liveOpsPayload, executionAiV6Payload: input.executionAiV6Payload });
   const dominanceReasons = aggregateDominanceReasons(trades).slice(0, 3).map((item) => `${item.label} x${item.count}`);
   const noTradeReasons = safeTextArray(executionContext.no_trade_reasons).slice(0, 3);
@@ -1023,7 +1055,7 @@ function buildOperatorActionDecision(input: {
   const metrics: OperatorActionDecision["metrics"] = [
     { label: "Truth", value: truthState.label, tone: truthState.tone as OperatorActionDecision["metrics"][number]["tone"] },
     { label: "No-trade", value: `${noTradeRatioPct.toFixed(0)}%`, tone: noTradeRatioPct >= 70 ? "warn" : noTradeRatioPct >= 35 ? "subtle" : "good" },
-    { label: "Confidence", value: confidencePct > 0 ? `${confidencePct.toFixed(0)}%` : "n/a", tone: confidencePct >= 60 ? "good" : confidencePct >= 40 ? "subtle" : "warn" },
+    { label: "Confidence", value: smartDecision?.confidenceBand || (confidencePct > 0 ? `${confidencePct.toFixed(0)}%` : "n/a"), tone: smartDecision ? (smartDecision.confidenceBand === "HIGH" ? "good" : smartDecision.confidenceBand === "MEDIUM" ? "subtle" : "warn") : confidencePct >= 60 ? "good" : confidencePct >= 40 ? "subtle" : "warn" },
     { label: "Latency", value: formatCompactMetricMs(avgLatencyMs), tone: avgLatencyMs > 120 ? "warn" : avgLatencyMs > 80 ? "subtle" : "good" },
     { label: "Slippage", value: `${avgSlippageBps.toFixed(2)}bps`, tone: avgSlippageBps > 3 ? "warn" : avgSlippageBps > 1.5 ? "subtle" : "good" },
     { label: "Dominance", value: leadingVenue === "--" ? "n/a" : `${leadingVenue} ${dominanceGapPct.toFixed(0)}%`, tone: dominanceGapPct >= 8 ? "good" : dominanceGapPct >= 4 ? "subtle" : "warn" },
@@ -1068,6 +1100,50 @@ function buildOperatorActionDecision(input: {
       updatedAt,
       hardGuardActive: true,
       hardGuardLabel: "TRADE BLOQUE",
+      hardGuardReasons,
+      dominancePct: noTradeRatioPct,
+      dominanceTone,
+      dominanceState,
+      dominanceDetail,
+      postTradeFeedback,
+    };
+  }
+
+  if (smartDecision?.state === "NO_TRADE") {
+    return {
+      action: "NO TRADE",
+      tone: "warn",
+      riskLabel,
+      headline: "Le smart decision engine invalide l'entree.",
+      summary: "La couche structure/liquidite/regime ne voit pas de trade defendable dans sa forme actuelle.",
+      reasons: [smartDecision.headline, smartDecision.reason, `stability ${smartDecision.stability.statusLabel}`],
+      metrics,
+      nextStep: "Attends une structure plus propre ou une baisse du bruit avant de reconsiderer le live.",
+      updatedAt,
+      hardGuardActive,
+      hardGuardLabel: hardGuardActive ? "GARDE ACTIVE" : "TRADE BLOQUE",
+      hardGuardReasons,
+      dominancePct: noTradeRatioPct,
+      dominanceTone,
+      dominanceState,
+      dominanceDetail,
+      postTradeFeedback,
+    };
+  }
+
+  if (smartDecision?.state === "FAKE_BREAKOUT_RISK" || smartDecision?.state === "WAIT_CONFIRMATION") {
+    return {
+      action: "WAIT",
+      tone: smartDecision.tone,
+      riskLabel,
+      headline: smartDecision.headline,
+      summary: "Le signal instantane n'est pas encore tradable; la priorite est la persistance et non la vitesse.",
+      reasons: [smartDecision.reason, `confidence ${smartDecision.confidenceBand}`, `stability ${smartDecision.stability.statusLabel}`],
+      metrics,
+      nextStep: "Laisse la decision se stabiliser avant d'engager du risque ou d'augmenter la taille.",
+      updatedAt,
+      hardGuardActive,
+      hardGuardLabel: hardGuardActive ? "GARDE ACTIVE" : "TRADE BLOQUE",
       hardGuardReasons,
       dominancePct: noTradeRatioPct,
       dominanceTone,
@@ -1130,17 +1206,19 @@ function buildOperatorActionDecision(input: {
   }
 
   if (dominanceGapPct >= 8 && confidencePct >= 60) {
+    const entryHeadline = smartDecision?.state === "ENTRY_VALID"
+      ? "Le smart decision engine autorise une entree petite et stable."
+      : "Le desk autorise une entree petite et surveillee.";
+    const entryReasons = smartDecision?.state === "ENTRY_VALID"
+      ? [smartDecision.headline, `confidence ${smartDecision.confidenceBand}`, `stability ${smartDecision.stability.statusLabel}`]
+      : [`dominance claire sur ${leadingVenue}`, `confidence ${confidencePct.toFixed(0)}%`, truthState.reason];
     return {
       action: "ENTRY SMALL",
       tone: "good",
       riskLabel,
-      headline: "Le desk autorise une entree petite et surveillee.",
+      headline: entryHeadline,
       summary: "Les signaux restent assez coherents pour un micro-live, pas pour une acceleration agressive.",
-      reasons: [
-        `dominance claire sur ${leadingVenue}`,
-        `confidence ${confidencePct.toFixed(0)}%`,
-        truthState.reason,
-      ],
+      reasons: entryReasons,
       metrics,
       nextStep: "Execute petit, surveille fill/slippage, puis confirme que le contexte tient sur les prochains prints.",
       updatedAt,
@@ -1186,6 +1264,7 @@ export function OperatorActionSummary({
   liveOpsPayload,
   executionAiV6Payload,
   routingPayload,
+  smartDecision,
   journalContext,
   formatClock,
   footer,
@@ -1195,7 +1274,8 @@ export function OperatorActionSummary({
     liveOpsPayload,
     executionAiV6Payload,
     routingPayload,
-  }), [executionPnlPayload, liveOpsPayload, executionAiV6Payload, routingPayload]);
+    smartDecision,
+  }), [executionAiV6Payload, executionPnlPayload, liveOpsPayload, routingPayload, smartDecision]);
   const journalSymbol = String(journalContext?.symbol || "").trim().toUpperCase();
   const journalTimeframe = String(journalContext?.timeframe || "").trim();
   const journalStrategy = String(journalContext?.strategy || "").trim();
@@ -1210,6 +1290,14 @@ export function OperatorActionSummary({
   const [driftBusy, setDriftBusy] = useState(false);
   const [driftError, setDriftError] = useState<string | null>(null);
   const journalAnalytics = useMemo(() => buildOperatorJournalAnalytics(journalEntries), [journalEntries]);
+  const feedbackSummary = useMemo(() => buildFeedbackSummary({
+    executionPnlPayload,
+    liveOpsPayload,
+    executionAiV6Payload,
+    journalEntries,
+  }), [executionAiV6Payload, executionPnlPayload, journalEntries, liveOpsPayload]);
+  const overrideLockActive = feedbackSummary.driftState === "LOCK" || feedbackSummary.learningDisabled;
+  const overrideLockReason = feedbackSummary.protections[0] || "drift LOCK";
   const disciplineAnalytics = useMemo(() => buildDisciplineAnalytics({
     entries: journalEntries,
     decision,
@@ -1236,6 +1324,13 @@ export function OperatorActionSummary({
       window.localStorage.removeItem(OPERATOR_OVERRIDE_STORAGE_KEY);
     }
   }, []);
+
+  useEffect(() => {
+    if (!overrideLockActive) {
+      return;
+    }
+    setOverrideArmed(false);
+  }, [overrideLockActive]);
 
   useEffect(() => {
     if (!journalEnabled) {
@@ -1332,6 +1427,18 @@ export function OperatorActionSummary({
     if (!reason || typeof window === "undefined") {
       return;
     }
+    if (overrideLockActive) {
+      setOverrideArmed(false);
+      setOverrideDraft("");
+      void appendOperatorJournalEntry("override-blocked-lock", `Override bloque: ${overrideLockReason}`, {
+        forced_action: decision.action,
+        drift_state: feedbackSummary.driftState,
+        protections: feedbackSummary.protections,
+        source: "operator-action-summary",
+      });
+      setJournalError(`Override bloque: ${overrideLockReason}`);
+      return;
+    }
     const nextRecord = {
       reason,
       createdAt: new Date().toISOString(),
@@ -1385,6 +1492,7 @@ export function OperatorActionSummary({
       </div>
       <div className="operator-action-grid">
         <div className="operator-action-status-card">
+          {smartDecision ? <SmartDecisionSummary decision={smartDecision} variant="operator" showLevels={false} /> : null}
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
             <div className={`operator-action-chip ${decision.tone}`}>{decision.action}</div>
             <div className={`operator-action-risk-pill ${decision.riskLabel === "eleve" ? "warn" : decision.riskLabel === "moyen" ? "subtle" : "good"}`}>
@@ -1427,6 +1535,12 @@ export function OperatorActionSummary({
               <div key={reason} className="operator-hard-guard-row">{reason}</div>
             ))}
           </div>
+          {overrideLockActive ? (
+            <div className="operator-override-locked">
+              <div className="operator-hard-guard-label">Override bloque</div>
+              <div className="subtle mini">Drift {feedbackSummary.driftState} · {overrideLockReason}</div>
+            </div>
+          ) : null}
           {overrideRecord ? (
             <div className="operator-override-banner">
               <div className="subtle mini">Override actif depuis {formatClock(overrideRecord.createdAt)}</div>
@@ -1442,12 +1556,12 @@ export function OperatorActionSummary({
                 placeholder="Raison visible de l'override (ex: je reduis a micro-size pour test strict)."
               />
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                <button type="button" disabled={!overrideDraft.trim()} onClick={confirmOverride}>Confirmer l'override visible</button>
+                <button type="button" disabled={!overrideDraft.trim() || overrideLockActive} onClick={confirmOverride}>Confirmer l'override visible</button>
                 <button type="button" onClick={() => setOverrideArmed(false)}>Annuler</button>
               </div>
             </div>
           ) : (
-            <button type="button" onClick={() => setOverrideArmed(true)}>Passer outre quand meme</button>
+            <button type="button" disabled={overrideLockActive} onClick={() => setOverrideArmed(true)}>Passer outre quand meme</button>
           )}
         </div>
       ) : null}
@@ -1499,6 +1613,32 @@ export function OperatorActionSummary({
               </div>
             </div>
           ) : null}
+          <div className="operator-discipline-drift-box operator-discipline-blocked-box" data-testid="operator-discipline-blocked-overrides">
+            <div className="operator-feedback-head">
+              <div className="subtle mini">Overrides bloques visibles</div>
+              <div className={`operator-dominance-chip ${disciplineAnalytics.blockedOverrideCount24h === 0 ? "good" : disciplineAnalytics.blockedOverrideCount24h === 1 ? "subtle" : "warn"}`}>
+                {disciplineAnalytics.blockedOverrideCount24h} sur 24h
+              </div>
+            </div>
+            <div className="operator-journal-summary">
+              {disciplineAnalytics.lastBlockedOverrideEvent
+                ? `Derniere tentative a ${formatClock(disciplineAnalytics.lastBlockedOverrideEvent.createdAtIso)}: ${disciplineAnalytics.lastBlockedOverrideEvent.detail}`
+                : "Aucune tentative d'override bloquee sur ce contexte recent."}
+            </div>
+            <div className="operator-discipline-list">
+              {disciplineAnalytics.blockedOverrideEntries.length > 0 ? disciplineAnalytics.blockedOverrideEntries.map((entry) => (
+                <div key={entry.id} className="operator-discipline-row operator-discipline-blocked-row">
+                  <strong>{formatClock(entry.createdAtIso)}</strong>
+                  <span>{entry.detail}</span>
+                </div>
+              )) : (
+                <div className="operator-discipline-row operator-discipline-blocked-row">
+                  <strong>OK</strong>
+                  <span>Le verrou discipline n'a bloque aucun override recent.</span>
+                </div>
+              )}
+            </div>
+          </div>
           {driftError ? <div className="operator-journal-summary warn">{driftError}</div> : null}
         </div>
         <div className="operator-discipline-card">
@@ -1549,10 +1689,19 @@ export function OperatorActionSummary({
                   <strong>{journalAnalytics.overrideCount}</strong>
                 </div>
                 <div className="operator-journal-kpi">
+                  <span className="subtle mini">Overrides bloques</span>
+                  <strong>{journalAnalytics.blockedOverrideCount}</strong>
+                </div>
+                <div className="operator-journal-kpi">
                   <span className="subtle mini">Events discipline</span>
                   <strong>{journalAnalytics.disciplineCount}</strong>
                 </div>
               </div>
+              {journalAnalytics.lastBlockedOverrideEntry ? (
+                <div className="operator-journal-summary warn">
+                  Dernier blocage {formatClock(journalAnalytics.lastBlockedOverrideEntry.createdAtIso)}: {journalAnalytics.lastBlockedOverrideEntry.detail}
+                </div>
+              ) : null}
               {journalAnalytics.lastOverrideEntry ? (
                 <div className="operator-journal-summary">
                   Dernier forcage {formatClock(journalAnalytics.lastOverrideEntry.createdAtIso)}: {journalAnalytics.lastOverrideEntry.detail}
@@ -1778,6 +1927,8 @@ export function BrokersDockPanel({
           </div>
           <div className="brokers-section">
             <div className="chart-stat-label" style={{ marginBottom: 6 }}>AI Execution Bridge</div>
+            {aiBridge.smartDecision ? <div className="row"><span>Smart state</span><span className={aiBridge.smartDecision.tone}>{aiBridge.smartDecision.displayStateLabel} | {aiBridge.smartDecision.confidenceBand}</span></div> : null}
+            {aiBridge.smartDecision ? <div className="row"><span>Decision gate</span><span className={aiBridge.smartDecision.qualityGate === "pass" ? "good" : aiBridge.smartDecision.qualityGate === "warn" ? "subtle" : "warn"}>{aiBridge.smartDecision.qualityGateLabel} | {aiBridge.smartDecision.stability.statusLabel}</span></div> : null}
             <div className="row"><span>V7 gate</span><span className={aiBridge.v7Tone === "good" ? "good" : aiBridge.v7Tone === "warn" ? "warn" : "subtle"}>{aiBridge.v7Label}</span></div>
             <div className="row"><span>V6 policy</span><span className={aiBridge.v6Action === "HOLD" ? "subtle" : "good"}>{aiBridge.v6Action} | {aiBridge.v6ConfidencePct.toFixed(0)}%</span></div>
             <div className="row"><span>V6 regime</span><span>{aiBridge.v6Regime}</span></div>
@@ -1787,7 +1938,8 @@ export function BrokersDockPanel({
             <div className="row"><span>V8 execute</span><span className={aiBridge.v8Execute ? "good" : "subtle"}>{aiBridge.v8Execute ? "yes" : "hold"} | {aiBridge.v8ProbabilityPct.toFixed(0)}%</span></div>
             <div className="row"><span>Brain</span><span>{aiBridge.brainAction} | {aiBridge.brainConfidencePct.toFixed(0)}%</span></div>
             <div className="row"><span>Regime</span><span>{aiBridge.brainRegime}</span></div>
-            <div className="subtle mini gtix-ellipsis" style={{ marginTop: 6 }}>{aiBridge.reasonLabel || "No predictor rationale"}</div>
+            <div className="subtle mini gtix-ellipsis" style={{ marginTop: 6 }}>{aiBridge.smartDecision?.headline || aiBridge.reasonLabel || "No predictor rationale"}</div>
+            {aiBridge.smartDecision ? <div className="subtle mini gtix-ellipsis">{aiBridge.smartDecision.reason}</div> : null}
             {!aiBridge.v6PersistenceAvailable && aiBridge.v6PersistenceError ? (
               <div className="warn mini gtix-ellipsis" style={{ marginTop: 4 }}>{aiBridge.v6PersistenceError}</div>
             ) : null}
@@ -2183,6 +2335,7 @@ export function ExecutionPnlTruthMonitoringPanel({
   payload,
   liveOpsPayload,
   executionAiV6Payload,
+  journalContext,
   formatClock,
 }: {
   badge: ReactNode;
@@ -2191,8 +2344,60 @@ export function ExecutionPnlTruthMonitoringPanel({
   payload: ExecutionPnlAnalyzerPayload | null;
   liveOpsPayload?: Record<string, unknown> | null;
   executionAiV6Payload?: ExecutionAiV6PanelPayload | null;
+  journalContext?: {
+    symbol: string;
+    timeframe: string;
+    strategy: string;
+  };
   formatClock: (value: string) => string;
 }) {
+  const journalSymbol = String(journalContext?.symbol || "").trim().toUpperCase();
+  const journalTimeframe = String(journalContext?.timeframe || "").trim();
+  const journalStrategy = String(journalContext?.strategy || "").trim();
+  const journalEnabled = Boolean(journalSymbol && journalTimeframe && journalStrategy);
+  const [journalEntries, setJournalEntries] = useState<OperatorJournalEntry[]>([]);
+  const [journalBusy, setJournalBusy] = useState(false);
+  const [journalError, setJournalError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!journalEnabled) {
+      setJournalEntries([]);
+      setJournalBusy(false);
+      setJournalError(null);
+      return;
+    }
+    let cancelled = false;
+    const loadJournal = async () => {
+      setJournalBusy(true);
+      const query = new URLSearchParams();
+      query.set("symbol", journalSymbol);
+      query.set("timeframe", journalTimeframe);
+      query.set("strategy", journalStrategy);
+      query.set("limit", "80");
+      const response = await fetch(`/api/terminal/v2-risk-journal?${query.toString()}`, { cache: "no-store" }).catch(() => null);
+      const responsePayload = response ? await response.json().catch(() => null) : null;
+      if (cancelled) {
+        return;
+      }
+      if (!response || !response.ok || !responsePayload || !Array.isArray(responsePayload.entries)) {
+        setJournalError("Journal feedback indisponible");
+        setJournalBusy(false);
+        return;
+      }
+      setJournalEntries(responsePayload.entries.filter(isOperatorJournalEntry));
+      setJournalError(null);
+      setJournalBusy(false);
+    };
+    void loadJournal();
+    const timer = window.setInterval(() => {
+      void loadJournal();
+    }, 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [journalEnabled, journalStrategy, journalSymbol, journalTimeframe]);
+
   const envelope = safeRecord(payload);
   const summary = safeRecord(envelope.summary);
   const trades = safeRows(envelope.trades);
@@ -2205,6 +2410,12 @@ export function ExecutionPnlTruthMonitoringPanel({
   const tradeCount = safeNumber(summary.trade_count, 0);
   const noTradeCount = safeNumber(summary.no_trade_dominance_count, 0);
   const noTradeRatioPct = tradeCount > 0 ? (noTradeCount / tradeCount) * 100 : 0;
+  const feedbackSummary = useMemo(() => buildFeedbackSummary({
+    executionPnlPayload: payload,
+    liveOpsPayload,
+    executionAiV6Payload,
+    journalEntries,
+  }), [executionAiV6Payload, journalEntries, liveOpsPayload, payload]);
 
   return (
     <MonitoringPanelCard title="Execution PnL Truth" badge={badge} layoutEditMode={layoutEditMode} onDetach={onDetach}>
@@ -2218,6 +2429,56 @@ export function ExecutionPnlTruthMonitoringPanel({
             <span className="venue-telemetry-pill">flags {safeNumber(summary.high_confidence_loss_count, 0).toFixed(0)}</span>
           </div>
           <div className="subtle mini" style={{ marginBottom: 8 }}>{truthState.reason}</div>
+          <div className="optimizer-live-section">
+            <div className="venue-telemetry-summary">
+              <span className={`venue-telemetry-pill ${feedbackSummary.modelHealth === "BROKEN" || feedbackSummary.modelHealth === "DEGRADING" ? "warn" : feedbackSummary.modelHealth === "ADAPTING" ? "subtle" : ""}`}>health {feedbackSummary.modelHealth}</span>
+              <span className={`venue-telemetry-pill ${feedbackSummary.driftState === "LOCK" || feedbackSummary.driftState === "DRIFT" ? "warn" : feedbackSummary.driftState === "WATCH" ? "subtle" : ""}`}>drift {feedbackSummary.driftState}</span>
+              <span className={`venue-telemetry-pill ${feedbackSummary.reward.scorePct < 45 ? "warn" : feedbackSummary.reward.scorePct < 65 ? "subtle" : ""}`}>reward {feedbackSummary.reward.scorePct.toFixed(0)}%</span>
+              <span className={`venue-telemetry-pill ${feedbackSummary.shield.learningState === "FROZEN" ? "warn" : feedbackSummary.shield.learningState === "REDUCED" ? "subtle" : ""}`}>learning {feedbackSummary.shield.learningState}</span>
+            </div>
+            {journalBusy ? <div className="subtle mini">journal feedback sync...</div> : null}
+            {journalError ? <div className="warn mini">{journalError}</div> : null}
+            <div className="optimizer-live-grid">
+              <div className={`venue-telemetry-item ${feedbackSummary.reward.scorePct >= 65 ? "good" : feedbackSummary.reward.scorePct >= 45 ? "subtle" : "warn"}`}>
+                <div className="venue-telemetry-head">
+                  <span className="venue-telemetry-venue">Reward pro</span>
+                  <span className={`venue-telemetry-state ${feedbackSummary.reward.scorePct >= 65 ? "good" : feedbackSummary.reward.scorePct >= 45 ? "subtle" : "warn"}`}>{feedbackSummary.reward.scorePct.toFixed(0)}%</span>
+                </div>
+                <div className="mon-row"><span>PnL</span><span>{feedbackSummary.reward.normalizedPnl.toFixed(2)}</span></div>
+                <div className="mon-row"><span>Fill</span><span>{feedbackSummary.reward.fillEfficiency.toFixed(2)}</span></div>
+                <div className="mon-row"><span>Decision</span><span>{feedbackSummary.reward.decisionQuality.toFixed(2)}</span></div>
+                <div className="mon-row"><span>Bias</span><span>{feedbackSummary.reward.regimeBiasLabel}</span></div>
+              </div>
+              <div className={`venue-telemetry-item ${feedbackSummary.shield.freezeLearning ? "warn" : feedbackSummary.shield.multiRegimeValidation === "REVIEW" ? "subtle" : "good"}`}>
+                <div className="venue-telemetry-head">
+                  <span className="venue-telemetry-venue">Anti-overfit shield</span>
+                  <span className={`venue-telemetry-state ${feedbackSummary.shield.freezeLearning ? "warn" : feedbackSummary.shield.multiRegimeValidation === "REVIEW" ? "subtle" : "good"}`}>{feedbackSummary.shield.multiRegimeValidation}</span>
+                </div>
+                <div className="mon-row"><span>Reality ratio</span><span className={feedbackSummary.shield.rollingRealityRatio < 0.6 ? "warn" : "subtle"}>{feedbackSummary.shield.rollingRealityRatio.toFixed(2)}</span></div>
+                <div className="mon-row"><span>Exploration</span><span>{feedbackSummary.shield.explorationMode}</span></div>
+                <div className="mon-row"><span>Context</span><span>{feedbackSummary.shield.contextCompression}</span></div>
+                <div className="optimizer-live-reasons">
+                  {feedbackSummary.shield.reasons.length === 0 ? <span className="optimizer-live-chip subtle">shield nominal</span> : null}
+                  {feedbackSummary.shield.reasons.slice(0, 3).map((reason) => <span key={reason} className="optimizer-live-chip warn">{reason}</span>)}
+                </div>
+              </div>
+              <div className={`venue-telemetry-item ${feedbackSummary.calibrationActions.length === 0 ? "good" : "subtle"}`}>
+                <div className="venue-telemetry-head">
+                  <span className="venue-telemetry-venue">Auto calibration</span>
+                  <span className="venue-telemetry-state subtle">max {feedbackSummary.maxAdjustmentPerDayPct.toFixed(0)}%</span>
+                </div>
+                <div className="mon-row"><span>Reduce size</span><span className={feedbackSummary.reduceSize ? "warn" : "good"}>{feedbackSummary.reduceSize ? "yes" : "no"}</span></div>
+                <div className="mon-row"><span>Force no-trade</span><span className={feedbackSummary.forceNoTrade ? "warn" : "good"}>{feedbackSummary.forceNoTrade ? "yes" : "no"}</span></div>
+                <div className="mon-row"><span>Learning</span><span className={feedbackSummary.learningDisabled ? "warn" : "subtle"}>{feedbackSummary.learningDisabled ? "disabled" : "guarded"}</span></div>
+                <div className="optimizer-live-reasons">
+                  {feedbackSummary.calibrationActions.length === 0 ? <span className="optimizer-live-chip subtle">no threshold change</span> : null}
+                  {feedbackSummary.calibrationActions.map((action) => (
+                    <span key={`${action.target}-${action.direction}`} className="optimizer-live-chip subtle">{action.target} {action.direction === "increase" ? "+" : "-"}{action.magnitudePct.toFixed(1)}%</span>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
           <div className="optimizer-live-grid">
             <div className={`venue-telemetry-item ${safeNumber(summary.net_pnl_usd, 0) >= 0 ? "good" : "warn"}`}>
               <div className="venue-telemetry-head">
@@ -2247,6 +2508,35 @@ export function ExecutionPnlTruthMonitoringPanel({
                 {dominanceReasons.length === 0 ? <span className="optimizer-live-chip subtle">no dominant reason yet</span> : null}
                 {dominanceReasons.map((reason) => <span key={reason.label} className="optimizer-live-chip warn">{reason.label} x{reason.count}</span>)}
               </div>
+            </div>
+          </div>
+          <div className="optimizer-live-section">
+            <div className="subtle mini">Feedback windows</div>
+            {feedbackSummary.windows.map((window) => (
+              <div key={window.key} className="mon-row">
+                <span>{window.label}</span>
+                <span className="subtle mini">{window.sampleSize.toFixed(0)} sample(s)</span>
+                <span className={window.scorePct >= 65 ? "good" : window.scorePct >= 45 ? "subtle" : "warn"}>{window.scorePct.toFixed(0)}%</span>
+              </div>
+            ))}
+            <div className="optimizer-live-reasons">
+              {feedbackSummary.windows.map((window) => <span key={`${window.key}-summary`} className="optimizer-live-chip subtle">{window.summary}</span>)}
+            </div>
+          </div>
+          <div className="optimizer-live-section">
+            <div className="subtle mini">Feedback errors</div>
+            {feedbackSummary.errors.map((error) => (
+              <div key={error.kind} className="mon-row">
+                <span>{error.label}</span>
+                <span className="subtle mini">{error.detail}</span>
+                <span className={error.severity === "high" ? "warn" : error.severity === "medium" ? "subtle" : "good"}>{(error.score * 100).toFixed(0)}%</span>
+              </div>
+            ))}
+            <div className="optimizer-live-reasons">
+              {feedbackSummary.tradeCount === 0 ? <span className="optimizer-live-chip subtle">waiting for live samples</span> : null}
+              {Object.entries(feedbackSummary.tradeQualityCounts).map(([label, count]) => (
+                <span key={label} className={`optimizer-live-chip ${label === feedbackSummary.dominantTradeQuality ? "warn" : "subtle"}`}>{label.toLowerCase()} x{count}</span>
+              ))}
             </div>
           </div>
           <div className="optimizer-live-section">
@@ -2284,6 +2574,16 @@ export function ExecutionPnlTruthMonitoringPanel({
               </div>
             ))}
             {trades.length > 0 ? <div className="subtle mini" style={{ marginTop: 4 }}>Dernier trade: {formatCompactClock(trades[0]?.created_at, formatClock)}</div> : null}
+          </div>
+          <div className="optimizer-live-section">
+            <div className="subtle mini">Recommendations</div>
+            <div className="optimizer-live-reasons">
+              {feedbackSummary.protections.length === 0 ? <span className="optimizer-live-chip subtle">no hard protection</span> : null}
+              {feedbackSummary.protections.map((protection) => <span key={protection} className="optimizer-live-chip warn">{protection}</span>)}
+            </div>
+            <div className="optimizer-live-reasons" style={{ marginTop: 6 }}>
+              {feedbackSummary.recommendations.map((recommendation) => <span key={recommendation} className="optimizer-live-chip subtle">{recommendation}</span>)}
+            </div>
           </div>
         </>
       ) : null}
@@ -2383,6 +2683,7 @@ export function ExecutionContextMonitoringPanel({
   onDetach,
   routingPayload,
   optimizerPayload,
+  smartDecision,
   formatClock,
 }: {
   badge: ReactNode;
@@ -2390,6 +2691,7 @@ export function ExecutionContextMonitoringPanel({
   onDetach: () => void;
   routingPayload: Record<string, unknown> | null;
   optimizerPayload: ExecutionOptimizerLivePayload | null;
+  smartDecision?: SmartDecisionHudShape | null;
   formatClock: (value: string) => string;
 }) {
   const routingEnvelope = safeRecord(routingPayload);
@@ -2437,6 +2739,7 @@ export function ExecutionContextMonitoringPanel({
             <span className="venue-telemetry-pill">vol {String(executionContext.volatility_regime || volatility.regime || "normal")}</span>
             <span className="venue-telemetry-pill">zone {String(executionContext.zone || zone.state || "none")}</span>
             <span className="venue-telemetry-pill">conf {(confidence * 100).toFixed(0)}%</span>
+            {smartDecision ? <span className={`venue-telemetry-pill ${smartDecision.tone}`}>smart {smartDecision.displayStateLabel}</span> : null}
           </div>
           <div className="optimizer-live-grid">
             <div className={`venue-telemetry-item ${noTrade ? "warn" : confidence >= 0.6 ? "good" : "subtle"}`}>
@@ -2445,12 +2748,15 @@ export function ExecutionContextMonitoringPanel({
                 <span className={`venue-telemetry-state ${noTrade ? "warn" : confidence >= 0.6 ? "good" : "subtle"}`}>{fallbackMode.replace(/_/g, " ")}</span>
               </div>
               <div className="mon-row"><span>Trade gate</span><span className={noTrade ? "warn" : "good"}>{noTrade ? "NO_TRADE" : "eligible"}</span></div>
+              {smartDecision ? <div className="mon-row"><span>Smart state</span><span className={smartDecision.tone}>{smartDecision.displayStateLabel} · {smartDecision.confidenceBand}</span></div> : null}
+              {smartDecision ? <div className="mon-row"><span>Stability</span><span className={smartDecision.stability.isStable ? "good" : "warn"}>{smartDecision.stability.statusLabel}</span></div> : null}
               <div className="mon-row"><span>Learning</span><span className={freezeLearning ? "warn" : "good"}>{freezeLearning ? "frozen" : String(policy.learning_mode || executionContext.learning_mode || "online")}</span></div>
               <div className="mon-row"><span>Daily loss</span><span>{safeNumber(policy.daily_loss_pct, 0).toFixed(2)}% / {safeNumber(thresholds.daily_loss_limit_pct, 0).toFixed(2)}%</span></div>
               <div className="optimizer-live-reasons">
                 {noTradeReasons.length === 0 ? <span className="optimizer-live-chip good">trade allowed</span> : null}
                 {noTradeReasons.map((reason) => <span key={reason} className="optimizer-live-chip warn">{reason}</span>)}
               </div>
+              {smartDecision ? <div className="subtle mini gtix-ellipsis" style={{ marginTop: 6 }}>{smartDecision.headline} · {smartDecision.reason}</div> : null}
             </div>
             <div className={`venue-telemetry-item ${sizeMultiplier >= 1 ? "good" : "subtle"}`}>
               <div className="venue-telemetry-head">
@@ -2484,6 +2790,8 @@ export function ExecutionContextMonitoringPanel({
                 <span className="venue-telemetry-venue">Policy thresholds</span>
                 <span className={`venue-telemetry-state ${freezeLearning ? "warn" : "subtle"}`}>{freezeLearning ? "freeze" : "watch"}</span>
               </div>
+              {smartDecision ? <div className="mon-row"><span>Decision gate</span><span className={smartDecision.qualityGate === "pass" ? "good" : smartDecision.qualityGate === "warn" ? "subtle" : "warn"}>{smartDecision.qualityGateLabel}</span></div> : null}
+              {smartDecision ? <div className="mon-row"><span>Latency / invalid</span><span>{smartDecision.latencyLabel} · {smartDecision.invalidationLabel}</span></div> : null}
               <div className="mon-row"><span>Confidence floor</span><span>{(safeNumber(thresholds.confidence_floor, 0) * 100).toFixed(0)}%</span></div>
               <div className="mon-row"><span>Latency / fill floor</span><span>{safeNumber(thresholds.latency_ceiling_ms, 0).toFixed(0)}ms · {(safeNumber(thresholds.fill_probability_floor, 0) * 100).toFixed(0)}%</span></div>
               <div className="mon-row"><span>High vol spread</span><span>{safeNumber(thresholds.high_vol_spread_bps, 0).toFixed(1)}bps · stale {formatCompactMetricMs(thresholds.stale_market_ms)}</span></div>
@@ -2604,6 +2912,178 @@ export function VenueTelemetryMonitoringPanel({
           </div>
         </>
       ) : null}
+    </MonitoringPanelCard>
+  );
+}
+
+export function ExecutionSmartTrackerPanel({
+  badge,
+  layoutEditMode,
+  onDetach,
+  telemetry,
+  outcomes,
+  preview,
+  symbol,
+  formatClock,
+}: {
+  badge: ReactNode;
+  layoutEditMode: boolean;
+  onDetach: () => void;
+  telemetry: Array<Record<string, unknown>>;
+  outcomes: Array<Record<string, unknown>>;
+  preview: Record<string, unknown> | null;
+  symbol: string;
+  formatClock: (value: string) => string;
+}) {
+  const symbolKey = String(symbol || "").trim().toUpperCase();
+  const rows = [...safeRows(telemetry), ...safeRows(outcomes)]
+    .filter((row) => {
+      if (!symbolKey) {
+        return true;
+      }
+      const rowSymbol = String(row.symbol || row.instrument || "").trim().toUpperCase();
+      return !rowSymbol || rowSymbol === symbolKey;
+    })
+    .slice(0, 48);
+  const live = safeRecord(preview);
+  const gateAllow = Boolean(live.allow);
+  const gateReasons = safeTextArray(live.reasons).slice(0, 4);
+  const liveDelayMs = safeNumber(live.delay_ms, safeNumber(live.recommended_delay_ms, 0));
+  const liveSizeMultiplier = safeNumber(live.size_multiplier, 1);
+  const liveVenueScore = safeNumber(live.venue_score, 0);
+  const liveExecutionScore = safeNumber(live.execution_score, 0);
+  const liveContextScore = safeNumber(live.context_score, 0);
+  const liveVenue = String(live.venue || "").trim() || "auto";
+
+  const metrics = rows.map((row) => {
+    const status = String(row.status || row.execution_status || row.order_status || "").toLowerCase();
+    const latencyMs = Math.max(0, safeNumber(row.latency_e2e_ms, safeNumber(row.latency_ms, 0)));
+    const slippageBps = Math.abs(safeNumber(row.realized_slippage_bps, safeNumber(row.slippage_real_bps, safeNumber(row.slippage_bps, 0))));
+    const fillRatio = Math.max(0, Math.min(1, safeNumber(row.fill_ratio, safeNumber(row.executed_ratio, /fill|done|complete|closed/.test(status) ? 1 : /partial/.test(status) ? 0.5 : 0))));
+    const executionScore = Math.max(0, Math.min(1, safeNumber(row.execution_score, safeNumber(row.execution_v7_smart_execution_score, 0))));
+    const sizeMultiplier = Math.max(0, Math.min(1, safeNumber(row.execution_v7_smart_size_multiplier, safeNumber(row.size_multiplier, 1))));
+    const delayMs = Math.max(0, safeNumber(row.execution_v7_smart_gate_delay_ms, safeNumber(row.delay_ms, 0)));
+    const venueScore = Math.max(0, Math.min(1, safeNumber(row.execution_v7_smart_venue_score, safeNumber(row.venue_score, 0))));
+    const pnlUsd = safeNumber(row.pnl_usd, safeNumber(row.net_result_usd, safeNumber(row.realized_pnl_usd, 0)));
+    const blocked = /reject|block|cancel|error|fail|blocked/.test(status) || status === "failed";
+    const reduced = sizeMultiplier > 0 && sizeMultiplier < 0.999;
+    const delayed = delayMs > 0;
+    const posture = blocked ? "blocked" : reduced ? "reduced" : delayed ? "delayed" : "clean";
+    return {
+      raw: row,
+      status,
+      latencyMs,
+      slippageBps,
+      fillRatio,
+      executionScore,
+      sizeMultiplier,
+      delayMs,
+      venueScore,
+      pnlUsd,
+      blocked,
+      reduced,
+      delayed,
+      posture,
+      timestamp: String(row.ts || row.created_at || row.timestamp || row.closed_at || ""),
+    };
+  });
+
+  const avgExecutionScore = metrics.length > 0 ? metrics.reduce((sum, item) => sum + item.executionScore, 0) / metrics.length : 0;
+  const avgLatencyMs = metrics.length > 0 ? metrics.reduce((sum, item) => sum + item.latencyMs, 0) / metrics.length : 0;
+  const avgSlippageBps = metrics.length > 0 ? metrics.reduce((sum, item) => sum + item.slippageBps, 0) / metrics.length : 0;
+  const avgFillRatio = metrics.length > 0 ? metrics.reduce((sum, item) => sum + item.fillRatio, 0) / metrics.length : 0;
+  const blockedCount = metrics.filter((item) => item.blocked).length;
+  const reducedCount = metrics.filter((item) => item.reduced).length;
+  const delayedCount = metrics.filter((item) => item.delayed).length;
+  const positivePnlCount = metrics.filter((item) => item.pnlUsd > 0).length;
+  const liveTone = !preview
+    ? "subtle"
+    : gateAllow
+      ? liveExecutionScore >= 0.72 ? "good" : "subtle"
+      : "warn";
+  const titleBadge = (
+    <>
+      {badge}
+      <span className={`venue-telemetry-proxy-badge ${liveTone === "good" ? "healthy" : liveTone === "warn" ? "degraded" : "retry_recovered"}`}>
+        {preview ? (gateAllow ? "allow" : "block") : "watch"}
+      </span>
+    </>
+  );
+
+  const postureRows = ["clean", "reduced", "delayed", "blocked"].map((posture) => {
+    const postureItems = metrics.filter((item) => item.posture === posture);
+    const pnlUsd = postureItems.reduce((sum, item) => sum + item.pnlUsd, 0);
+    const avgScore = postureItems.length > 0 ? postureItems.reduce((sum, item) => sum + item.executionScore, 0) / postureItems.length : 0;
+    return {
+      posture,
+      count: postureItems.length,
+      pnlUsd,
+      avgScore,
+    };
+  });
+
+  return (
+    <MonitoringPanelCard title="Execution Smart Tracker" badge={titleBadge} layoutEditMode={layoutEditMode} onDetach={onDetach}>
+      <div className="venue-telemetry-summary">
+        <span className="venue-telemetry-pill">samples {metrics.length}</span>
+        <span className="venue-telemetry-pill">score {(avgExecutionScore * 100).toFixed(0)}%</span>
+        <span className="venue-telemetry-pill">blocked {blockedCount}</span>
+        <span className="venue-telemetry-pill">reduced {reducedCount}</span>
+        <span className="venue-telemetry-pill">delayed {delayedCount}</span>
+      </div>
+      <div className="optimizer-live-grid">
+        <div className={`venue-telemetry-item ${liveTone}`}>
+          <div className="venue-telemetry-head">
+            <span className="venue-telemetry-venue">Live gate</span>
+            <span className={`venue-telemetry-state ${liveTone}`}>{preview ? (gateAllow ? "ALLOW" : "BLOCK") : "watch"}</span>
+          </div>
+          <div className="mon-row"><span>Venue</span><span>{liveVenue}</span></div>
+          <div className="mon-row"><span>Delay</span><span>{liveDelayMs.toFixed(0)}ms</span></div>
+          <div className="mon-row"><span>Size multiplier</span><span>x{liveSizeMultiplier.toFixed(2)}</span></div>
+          <div className="mon-row"><span>Venue / exec</span><span>{(liveVenueScore * 100).toFixed(0)}% · {(liveExecutionScore * 100).toFixed(0)}%</span></div>
+          <div className="mon-row"><span>Context score</span><span>{(liveContextScore * 100).toFixed(0)}%</span></div>
+          <div className="optimizer-live-reasons">
+            {gateReasons.length === 0 ? <span className="optimizer-live-chip good">gate clean</span> : null}
+            {gateReasons.map((reason) => <span key={reason} className="optimizer-live-chip warn">{reason}</span>)}
+          </div>
+        </div>
+        <div className={`venue-telemetry-item ${blockedCount > 0 ? "warn" : avgExecutionScore >= 0.72 ? "good" : "subtle"}`}>
+          <div className="venue-telemetry-head">
+            <span className="venue-telemetry-venue">Window frictions</span>
+            <span className={`venue-telemetry-state ${blockedCount > 0 ? "warn" : avgExecutionScore >= 0.72 ? "good" : "subtle"}`}>{metrics.length} obs</span>
+          </div>
+          <div className="mon-row"><span>Latency</span><span>{avgLatencyMs.toFixed(0)}ms</span></div>
+          <div className="mon-row"><span>Slippage</span><span>{avgSlippageBps.toFixed(2)}bps</span></div>
+          <div className="mon-row"><span>Fill ratio</span><span>{(avgFillRatio * 100).toFixed(0)}%</span></div>
+          <div className="mon-row"><span>Positive PnL</span><span>{positivePnlCount}/{metrics.length || 0}</span></div>
+          <div className="optimizer-live-reasons">
+            <span className={`optimizer-live-chip ${blockedCount > 0 ? "warn" : "subtle"}`}>blocked {blockedCount}</span>
+            <span className={`optimizer-live-chip ${reducedCount > 0 ? "subtle" : "good"}`}>reduced {reducedCount}</span>
+            <span className={`optimizer-live-chip ${delayedCount > 0 ? "subtle" : "good"}`}>delayed {delayedCount}</span>
+          </div>
+        </div>
+      </div>
+      <div className="optimizer-live-section">
+        <div className="subtle mini">PnL par posture d'execution</div>
+        {postureRows.map((row) => (
+          <div key={`posture-${row.posture}`} className="mon-row">
+            <span>{row.posture}</span>
+            <span className="subtle mini">score {(row.avgScore * 100).toFixed(0)}%</span>
+            <span className={row.pnlUsd >= 0 ? "good" : "warn"}>{formatSignedCompactUsd(row.pnlUsd)} · {row.count}</span>
+          </div>
+        ))}
+      </div>
+      <div className="optimizer-live-section">
+        <div className="subtle mini">Evenements recents</div>
+        {metrics.length === 0 ? <p className="subtle mini">Aucun echantillon execution smart.</p> : null}
+        {metrics.slice(0, 6).map((item, index) => (
+          <div key={`smart-tracker-${index}-${item.timestamp || item.status}`} className="mon-row">
+            <span>{item.timestamp ? formatCompactClock(item.timestamp, formatClock) : "--:--:--"}</span>
+            <span className="subtle mini">{item.status || item.posture}</span>
+            <span>{(item.executionScore * 100).toFixed(0)}% · x{item.sizeMultiplier.toFixed(2)} · {item.delayMs.toFixed(0)}ms</span>
+          </div>
+        ))}
+      </div>
     </MonitoringPanelCard>
   );
 }

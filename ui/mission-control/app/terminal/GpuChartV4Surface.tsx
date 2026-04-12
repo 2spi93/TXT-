@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
 
 import InstitutionalChart from "./InstitutionalChart";
+import { preFilterTicks } from "./preCandleFilter";
 import type { DenseLegibilityMode, GpuPerceptualTelemetry, PerceptualContinuityTelemetry } from "./chartPerceptual";
 import { applyPerceptionPipeline, resolvePerceptionDensity } from "./perceptionEngine";
 import { createLatestFrameScheduler } from "./frameEngine";
@@ -77,6 +78,11 @@ type GpuMetrics = {
   batchSize: number;
   renderer: string | null;
   overlayIntervalMs: number;
+};
+
+type NormalizedTradeBubbleState = {
+  bubbles: TradeBubblePoint[];
+  noiseRatio: number;
 };
 
 function createGpuContinuityTelemetry(): PerceptualContinuityTelemetry {
@@ -657,6 +663,8 @@ export default function GpuChartV4Surface({
   const continuityRef = useRef<PerceptualContinuityTelemetry>(createGpuContinuityTelemetry());
   const liveFrameMetaRef = useRef<LiveChartFrameMeta | null>(null);
   const previousRenderedBarRef = useRef<OhlcBar | null>(null);
+  const microstructureNoiseRatioRef = useRef(0);
+  const frozenRef = useRef(Boolean(rest.frozen));
   const cameraDatasetRef = useRef<{ timeframe: string; liveFeedKey: string | null; count: number }>({
     timeframe,
     liveFeedKey: liveFeedKey ?? null,
@@ -677,10 +685,14 @@ export default function GpuChartV4Surface({
   const [gpuRecoveryEpoch, setGpuRecoveryEpoch] = useState(0);
   const [liveFrameMeta, setLiveFrameMeta] = useState<LiveChartFrameMeta | null>(null);
 
-  const gpuBars = useMemo(() => toGpuBars(candles, timeframe, visualProfile), [candles, timeframe, visualProfile]);
+  const gpuTradeBubbleState = useMemo(() => normalizeTradeBubbles(tradeBubbles), [tradeBubbles]);
+  const gpuTradeBubbles = gpuTradeBubbleState.bubbles;
+  const gpuBars = useMemo(
+    () => toGpuBars(candles, timeframe, visualProfile, gpuTradeBubbleState.noiseRatio),
+    [candles, timeframe, visualProfile, gpuTradeBubbleState.noiseRatio],
+  );
   const gpuHeatmapLevels = useMemo(() => normalizeHeatmapLevels(heatmapLevels), [heatmapLevels]);
   const gpuDomHistory = useMemo(() => normalizeDomHistory(domHistory), [domHistory]);
-  const gpuTradeBubbles = useMemo(() => normalizeTradeBubbles(tradeBubbles), [tradeBubbles]);
   const gpuPriceSignalBands = useMemo(() => normalizePriceSignalBands(priceSignalBands), [priceSignalBands]);
 
   const secondarySourceFeeds = useMemo(() => {
@@ -722,6 +734,10 @@ export default function GpuChartV4Surface({
     }
     return 1;
   }, [fallbackFeedBars.length, viewportGrid]);
+
+  useEffect(() => {
+    microstructureNoiseRatioRef.current = gpuTradeBubbleState.noiseRatio;
+  }, [gpuTradeBubbleState.noiseRatio]);
 
   useEffect(() => {
     barsRef.current = gpuBars;
@@ -804,6 +820,10 @@ export default function GpuChartV4Surface({
   }, [timeframe, visualProfile]);
 
   useEffect(() => {
+    frozenRef.current = Boolean(rest.frozen);
+  }, [rest.frozen]);
+
+  useEffect(() => {
     if (!liveFeedKey) {
       subscribedLiveFeedKeyRef.current = null;
       return undefined;
@@ -813,6 +833,9 @@ export default function GpuChartV4Surface({
     }
     subscribedLiveFeedKeyRef.current = liveFeedKey;
     const unsubscribe = subscribeChartFrame(liveFeedKey, (frame) => {
+      if (frozenRef.current) {
+        return;
+      }
       if (!isLiveFrameCompatibleWithProps(frame.candles, propCandlesRef.current, timeframeRef.current)) {
         return;
       }
@@ -834,7 +857,12 @@ export default function GpuChartV4Surface({
       onViewportFrameMetaChangeRef.current?.({ ...viewportMetaRef.current });
       setLiveFrameMeta(frame.meta);
       liveFrameSchedulerRef.current.schedule(frame.candles, (nextCandles) => {
-        const nextPrimaryBars = toGpuBars(nextCandles, timeframeRef.current, visualProfileRef.current);
+        const nextPrimaryBars = toGpuBars(
+          nextCandles,
+          timeframeRef.current,
+          visualProfileRef.current,
+          microstructureNoiseRatioRef.current,
+        );
         continuityRef.current.renderedFrames += 1;
         const jumpPx = measureGpuLastBarJumpPx(
           previousRenderedBarRef.current,
@@ -1125,7 +1153,20 @@ export default function GpuChartV4Surface({
         }
 
         // ── Camera boot: init on first frame that has bars ────────────────
-        const allBars = barsRef.current;
+        const frameSnapshot = {
+          bars: barsRef.current,
+          feeds: feedBarsRef.current,
+          heatmapLevels: gpuHeatmapLevels,
+          domHistory: gpuDomHistory,
+          tradeBubbles: gpuTradeBubbles,
+          priceSignalBands: gpuPriceSignalBands,
+          liveFrameMeta: liveFrameMetaRef.current,
+          viewportMetaMap: { ...viewportMetaRef.current },
+          timeframe: timeframeRef.current,
+          mode: rest.mode,
+          symbol: rest.symbol,
+        };
+        const allBars = frameSnapshot.bars;
         if (cameraRef.current === null && allBars.length > 0) {
           const densityVisible = resolveDefaultVisibleBarsForTimeframe(
             timeframeRef.current,
@@ -1177,16 +1218,16 @@ export default function GpuChartV4Surface({
           width,
           height,
           grid: targetGridRef.current,
-          primarySymbol: rest.symbol,
+          primarySymbol: frameSnapshot.symbol,
           primaryBars,
-          renderCandles: rest.mode !== "footprint",
-          primaryHeatmapLevels: gpuHeatmapLevels,
-          primaryDomHistory: gpuDomHistory,
-          primaryTradeBubbles: gpuTradeBubbles,
-          primaryPriceSignalBands: gpuPriceSignalBands,
+          renderCandles: frameSnapshot.mode !== "footprint",
+          primaryHeatmapLevels: frameSnapshot.heatmapLevels,
+          primaryDomHistory: frameSnapshot.domHistory,
+          primaryTradeBubbles: frameSnapshot.tradeBubbles,
+          primaryPriceSignalBands: frameSnapshot.priceSignalBands,
           heatIntensity,
           heatmapDiscardThreshold,
-          feeds: feedBarsRef.current,
+          feeds: frameSnapshot.feeds,
         });
         viewportLayoutRef.current = nextViewports.map((viewport) => ({
           id: viewport.id,
@@ -1217,10 +1258,10 @@ export default function GpuChartV4Surface({
               bars: primaryBars,
               width: overlayWidthCss,
               height: overlayHeightCss,
-              timeframe,
-              liveFrameMeta: liveFrameMetaRef.current,
+              timeframe: frameSnapshot.timeframe,
+              liveFrameMeta: frameSnapshot.liveFrameMeta,
               viewports: viewportLayoutRef.current,
-              viewportMetaMap: viewportMetaRef.current,
+              viewportMetaMap: frameSnapshot.viewportMetaMap,
             });
           }
         }
@@ -1251,20 +1292,26 @@ export default function GpuChartV4Surface({
         const canvasWidth = host.clientWidth || canvas.clientWidth || 0;
         const canvasHeight = host.clientHeight || canvas.clientHeight || 0;
         const pixelRatio = canvasWidth > 0 ? canvas.width / canvasWidth : Math.max(1, window.devicePixelRatio || 1);
+        const telemetrySnapshot = {
+          timeframe: timeframeRef.current,
+          symbol: rest.symbol,
+          mode: rest.mode,
+          liveFrameMeta: liveFrameMetaRef.current,
+        };
         const visibleBars = Math.max(0, Math.round(cameraRef.current ? (cameraRef.current.to - cameraRef.current.from) : barsRef.current.length));
         const candleStepPx = visibleBars > 0 && canvasWidth > 0 ? canvasWidth / visibleBars : 0;
         const densityVisibleBars = resolveDefaultVisibleBarsForTimeframe(
-          timeframe,
+          telemetrySnapshot.timeframe,
           Math.max(visibleBars, barsRef.current.length),
           canvasWidth,
           canvasHeight,
           targetGridRef.current,
         );
-        const authoritativeTargetBars = resolveAuthoritativeSpanTarget(timeframe, Math.max(visibleBars, barsRef.current.length), spanAuthorityMode);
+        const authoritativeTargetBars = resolveAuthoritativeSpanTarget(telemetrySnapshot.timeframe, Math.max(visibleBars, barsRef.current.length), spanAuthorityMode);
         const recommendedVisibleBars = authoritativeTargetBars ?? densityVisibleBars;
         const spacing = resolveGpuSpacingTelemetry(candleStepPx, visibleBars, recommendedVisibleBars);
         const diagnosis = resolveGpuDiagnosis({
-          timeframe,
+          timeframe: telemetrySnapshot.timeframe,
           visibleBars,
           targetVisibleBars: recommendedVisibleBars,
           candleStepPx,
@@ -1273,7 +1320,7 @@ export default function GpuChartV4Surface({
         });
         const camera = cameraRef.current;
 
-        host.setAttribute("data-gpu-timeframe", timeframe);
+        host.setAttribute("data-gpu-timeframe", telemetrySnapshot.timeframe);
         host.setAttribute("data-gpu-pan-mode", "left-drag");
         host.setAttribute("data-gpu-visible-bars", String(visibleBars));
         host.setAttribute("data-gpu-target-visible-bars", String(recommendedVisibleBars));
@@ -1293,9 +1340,9 @@ export default function GpuChartV4Surface({
 
         onPerceptualTelemetry({
           engine: "v4",
-          symbol: rest.symbol,
-          timeframe,
-          mode: rest.mode,
+          symbol: telemetrySnapshot.symbol,
+          timeframe: telemetrySnapshot.timeframe,
+          mode: telemetrySnapshot.mode,
           renderer: nextMetrics.renderer,
           viewportWidth: canvasWidth,
           viewportHeight: canvasHeight,
@@ -1307,14 +1354,14 @@ export default function GpuChartV4Surface({
             label: targetGridRef.current === 16 ? "4x4" : targetGridRef.current === 4 ? "2x2" : "1x1",
             viewportCount: Math.max(1, feedBarsRef.current.length + 1),
           },
-          sync: liveFrameMetaRef.current
+          sync: telemetrySnapshot.liveFrameMeta
             ? {
-              status: liveFrameMetaRef.current.syncStatus,
-              confidence: liveFrameMetaRef.current.confidence,
-              partial: liveFrameMetaRef.current.partial,
-              coalesced: liveFrameMetaRef.current.coalesced,
-              stallAgeMs: liveFrameMetaRef.current.stallAgeMs,
-              dynamicBufferMs: liveFrameMetaRef.current.dynamicBufferMs,
+              status: telemetrySnapshot.liveFrameMeta.syncStatus,
+              confidence: telemetrySnapshot.liveFrameMeta.confidence,
+              partial: telemetrySnapshot.liveFrameMeta.partial,
+              coalesced: telemetrySnapshot.liveFrameMeta.coalesced,
+              stallAgeMs: telemetrySnapshot.liveFrameMeta.stallAgeMs,
+              dynamicBufferMs: telemetrySnapshot.liveFrameMeta.dynamicBufferMs,
             }
             : {
               status: "unavailable",
@@ -1594,7 +1641,12 @@ function resolveGpuSpacingTelemetry(candleStepPx: number, visibleBars: number, t
   };
 }
 
-function toGpuBars(candles: CandleLike[], timeframe: string, visualProfile: VisualProfileName): OhlcBar[] {
+function toGpuBars(
+  candles: CandleLike[],
+  timeframe: string,
+  visualProfile: VisualProfileName,
+  microstructureNoiseRatio = 0,
+): OhlcBar[] {
   const rawBars = candles.map((candle, index) => {
     const parsed = Date.parse(candle.label);
     return {
@@ -1608,7 +1660,13 @@ function toGpuBars(candles: CandleLike[], timeframe: string, visualProfile: Visu
   });
 
   const density = resolvePerceptionDensity({ visibleBars: rawBars.length });
-  return applyPerceptionPipeline(rawBars, { density, timeframe, volatility: 0, visualProfile }).map((bar, index) => {
+  return applyPerceptionPipeline(rawBars, {
+    density,
+    timeframe,
+    volatility: 0,
+    visualProfile,
+    microstructureNoiseRatio,
+  }).map((bar, index) => {
     const source = candles[index];
     const footprint = source?.executionFootprint || null;
     const dom = source?.domSnapshot || null;
@@ -1693,12 +1751,12 @@ function normalizeDomHistory(history: DomHistoryFrame[] | undefined): DomHistory
     .slice(-64);
 }
 
-function normalizeTradeBubbles(bubbles: TradeBubblePoint[] | undefined): TradeBubblePoint[] {
+function normalizeTradeBubbles(bubbles: TradeBubblePoint[] | undefined): NormalizedTradeBubbleState {
   if (!Array.isArray(bubbles) || bubbles.length === 0) {
-    return [];
+    return { bubbles: [], noiseRatio: 0 };
   }
 
-  return bubbles
+  const normalized = bubbles
     .filter((bubble) => Number.isFinite(bubble.time) && bubble.time > 0 && Number.isFinite(bubble.price) && bubble.price > 0 && Number.isFinite(bubble.volume) && bubble.volume > 0)
     .map((bubble) => ({
       time: Number(bubble.time),
@@ -1710,6 +1768,32 @@ function normalizeTradeBubbles(bubbles: TradeBubblePoint[] | undefined): TradeBu
     }))
     .sort((left, right) => left.time - right.time)
     .slice(-320);
+
+  const referenceTickSize = resolveTradeBubbleTickSize(normalized);
+  const filtered = preFilterTicks(normalized.map((bubble, index, array) => ({
+    ...bubble,
+    deltaPrice: index > 0 ? bubble.price - array[index - 1].price : 0,
+  })), {
+    minPriceIncrement: referenceTickSize,
+    minRelativeMoveRatio: 0.5,
+    alternatingLookback: 3,
+  });
+
+  return {
+    bubbles: filtered.filtered.map(({ deltaPrice: _deltaPrice, ...bubble }) => bubble),
+    noiseRatio: filtered.telemetry.droppedRatio,
+  };
+}
+
+function resolveTradeBubbleTickSize(bubbles: TradeBubblePoint[]): number {
+  let minPositiveDelta = Number.POSITIVE_INFINITY;
+  for (let index = 1; index < bubbles.length; index += 1) {
+    const delta = Math.abs(bubbles[index].price - bubbles[index - 1].price);
+    if (delta > 0 && delta < minPositiveDelta) {
+      minPositiveDelta = delta;
+    }
+  }
+  return Number.isFinite(minPositiveDelta) ? minPositiveDelta : 0;
 }
 
 function normalizePriceSignalBands(signals: PriceSignalBand[] | undefined): PriceSignalBand[] {

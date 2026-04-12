@@ -630,6 +630,7 @@ export default function LiveOpsPage() {
             payload={executionPnlAnalyzerPayload}
             liveOpsPayload={liveOpsPayload}
             executionAiV6Payload={executionAiV6Payload}
+            journalContext={LIVE_OPS_JOURNAL_CONTEXT}
             formatClock={formatClock}
           />
         </div>

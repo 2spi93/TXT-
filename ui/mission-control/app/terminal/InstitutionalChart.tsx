@@ -47,19 +47,10 @@ import type { MarketSimulation } from "./marketSimulationEngine";
 import { applyPerceptionPipeline, resolvePerceptionDensity, shouldConflatePerceptualUpdate, type PerceptionVisualMetadata } from "./perceptionEngine";
 import { createLatestFrameScheduler } from "./frameEngine";
 import { applyVisualProfile, DEFAULT_VISUAL_PROFILE, mixColors, withAlpha, type VisualProfile, type VisualProfileName } from "./visualProfiles";
+import type { ChartLiquidityZone as LiquidityZone, ChartOverlayZone as OverlayZone } from "./chartOverlayTypes";
 import type { PriceSignalBand } from "../../lib/engine/gpu-chart/PriceSignalLayer";
 
 type CandlePoint = { label: string; open: number; high: number; low: number; close: number; volume: number };
-type OverlayZone = {
-  kind: "fvg" | "ob";
-  label: string;
-  x1: number;
-  x2: number;
-  low: number;
-  high: number;
-  tone: string;
-};
-type LiquidityZone = { level: number; label: string };
 type ChartMotionPreset = "stable" | "balanced" | "aggressive" | "scalping" | "swing" | "auto";
 type ChartVisualMode = "auto" | "clean" | "full";
 
@@ -348,7 +339,6 @@ function applyPerceptualRenderPipeline(
     volatility: number;
     visualProfile: VisualProfileName;
     domImbalanceRatio?: number;
-    precision?: number;
   },
 ): CandleSeriesPoint[] {
   if (source.length === 0) {
@@ -379,17 +369,17 @@ function applyPerceptualRenderPipeline(
   );
 
   return transformed.map((bar) => {
-    const open = input.precision !== undefined ? roundRenderPrice(bar.open, input.precision) : bar.open;
-    const close = input.precision !== undefined ? roundRenderPrice(bar.close, input.precision) : bar.close;
-    const high = input.precision !== undefined ? roundRenderPrice(bar.high, input.precision) : bar.high;
-    const low = input.precision !== undefined ? roundRenderPrice(bar.low, input.precision) : bar.low;
+    const open = Number(bar.open);
+    const close = Number(bar.close);
+    const high = Number(bar.high);
+    const low = Number(bar.low);
     const colors = resolvePerBarCandleColors(profile, bar.__visual, input.domImbalanceRatio ?? 0);
     const sourceBar = source.find((candidate) => Number(candidate.time) === Number(bar.time));
     return {
       time: Number(bar.time) as UTCTimestamp,
-      open,
       high: Math.max(high, open, close),
       low: Math.min(low, open, close),
+      open,
       close,
       timeKey: sourceBar?.timeKey,
       color: colors.color,
@@ -408,46 +398,7 @@ function resolveViewportVisibleBars(currentVisibleBars: number, fallbackVisibleB
   if (current > 0) {
     return current;
   }
-  return Math.max(1, Math.round(fallbackVisibleBars || 1));
-}
-
-function resolveStableLogicalWidthFromSpacing(input: {
-  containerWidth: number;
-  requestedVisibleBars: number;
-  spacingPolicy: PerceptualSpacingPolicy;
-}): number {
-  const safeContainerWidth = Math.max(1, input.containerWidth || 1);
-  const safeVisibleBars = clamp(
-    input.requestedVisibleBars,
-    input.spacingPolicy.minVisibleBars,
-    input.spacingPolicy.maxVisibleBars,
-  );
-  const stableSpacing = quantizePerceptualBarSpacing(clamp(safeContainerWidth / safeVisibleBars, 2, 80));
-  return clamp(safeContainerWidth / stableSpacing, input.spacingPolicy.minVisibleBars, input.spacingPolicy.maxVisibleBars);
-}
-
-function resolvePixelAlignedBodyAndWickWidths(input: {
-  spacingPx: number;
-  densityLevel: DensityLevel;
-}): { bodyWidthPx: number; wickWidthPx: number } {
-  const pixelRatio = typeof window === "undefined" ? 1 : Math.max(1, window.devicePixelRatio || 1);
-  const stableSpacingPx = quantizePerceptualBarSpacing(clamp(input.spacingPx, 2, 80));
-  const physicalSpacingPx = Math.max(2, Math.round(stableSpacingPx * pixelRatio));
-  const minimumBodyPx = input.densityLevel === "micro" ? 2 : 2;
-  let physicalBodyWidthPx = Math.max(minimumBodyPx, Math.floor(physicalSpacingPx * 0.72));
-  const physicalWickWidthPx = Math.max(1, Math.floor(Math.max(pixelRatio, physicalSpacingPx * 0.12)));
-
-  if (physicalBodyWidthPx % 2 !== physicalWickWidthPx % 2) {
-    physicalBodyWidthPx = Math.max(minimumBodyPx, physicalBodyWidthPx - 1);
-  }
-  if (physicalBodyWidthPx <= physicalWickWidthPx) {
-    physicalBodyWidthPx = physicalWickWidthPx + (physicalWickWidthPx % 2 === 0 ? 2 : 1);
-  }
-
-  return {
-    bodyWidthPx: physicalBodyWidthPx / pixelRatio,
-    wickWidthPx: physicalWickWidthPx / pixelRatio,
-  };
+  return Math.max(1, Math.round(fallbackVisibleBars || 0));
 }
 
 function classifySpacingZone(spacingPx: number): "micro" | "normal" | "macro" {
@@ -889,6 +840,37 @@ function resolveDynamicCandlePresentation(input: {
   };
 }
 
+function resolveStableLogicalWidthFromSpacing(input: {
+  containerWidth: number;
+  requestedVisibleBars: number;
+  spacingPolicy: PerceptualSpacingPolicy;
+}): number {
+  const containerWidth = Math.max(1, Number.isFinite(input.containerWidth) ? input.containerWidth : 1);
+  const requestedVisibleBars = Number.isFinite(input.requestedVisibleBars) && input.requestedVisibleBars > 0
+    ? input.requestedVisibleBars
+    : input.spacingPolicy.targetVisibleBars;
+  const boundedVisibleBars = clamp(
+    requestedVisibleBars,
+    input.spacingPolicy.minVisibleBars,
+    input.spacingPolicy.maxVisibleBars,
+  );
+  const rawSpacingPx = clamp(
+    containerWidth / boundedVisibleBars,
+    input.spacingPolicy.minBarSpacing,
+    80,
+  );
+  const stableSpacingPx = clamp(
+    quantizePerceptualBarSpacing(rawSpacingPx),
+    input.spacingPolicy.minBarSpacing,
+    80,
+  );
+  return clamp(
+    containerWidth / stableSpacingPx,
+    input.spacingPolicy.minVisibleBars,
+    input.spacingPolicy.maxVisibleBars,
+  );
+}
+
 type AutoscaleTelemetryState = {
   signature: string;
   reframeCount: number;
@@ -1255,35 +1237,6 @@ function drawCanvasLivePriceHud(
   ctx.restore();
 }
 
-function inferRenderPricePrecision(symbol: string, referencePrice: number): number {
-  const assetClass = inferAssetContrastClass(symbol);
-  const absPrice = Math.abs(referencePrice);
-  if (assetClass === "fx") {
-    if (absPrice >= 100) {
-      return 3;
-    }
-    return 5;
-  }
-  if (absPrice >= 1000) {
-    return 2;
-  }
-  if (absPrice >= 100) {
-    return 2;
-  }
-  if (absPrice >= 10) {
-    return 3;
-  }
-  return 4;
-}
-
-function roundRenderPrice(value: number, precision: number): number {
-  if (!Number.isFinite(value)) {
-    return value;
-  }
-  const factor = 10 ** precision;
-  return Math.round(value * factor) / factor;
-}
-
 function formatCompactDuration(seconds: number): string {
   const total = Math.max(0, Math.round(seconds));
   if (total < 60) {
@@ -1319,7 +1272,7 @@ function normalizeTimes(labels: string[], timeframe: string): UTCTimestamp[] {
   });
 }
 
-function sanitizeLiveFeedCandles(candles: CandlePoint[], timeframe: string, precision: number): Array<{ time: UTCTimestamp; open: number; high: number; low: number; close: number }> {
+function sanitizeLiveFeedCandles(candles: CandlePoint[], timeframe: string): Array<{ time: UTCTimestamp; open: number; high: number; low: number; close: number }> {
   if (candles.length === 0) {
     return [];
   }
@@ -1331,10 +1284,10 @@ function sanitizeLiveFeedCandles(candles: CandlePoint[], timeframe: string, prec
   for (let index = 0; index < candles.length; index += 1) {
     const candle = candles[index];
     const time = Number(times[index] ?? 0);
-    const open = roundRenderPrice(Number(candle.open), precision);
-    const close = roundRenderPrice(Number(candle.close), precision);
-    const high = roundRenderPrice(Math.max(Number(candle.high), open, close), precision);
-    const low = roundRenderPrice(Math.min(Number(candle.low), open, close), precision);
+    const open = Number(candle.open);
+    const close = Number(candle.close);
+    const high = Math.max(Number(candle.high), open, close);
+    const low = Math.min(Number(candle.low), open, close);
     if (!Number.isFinite(time) || !Number.isFinite(open) || !Number.isFinite(high) || !Number.isFinite(low) || !Number.isFinite(close)) {
       continue;
     }
@@ -2221,10 +2174,6 @@ export default function InstitutionalChart({
     autoMotionModeRef.current = { key: autoKey, mode: nextMode };
     return nextMode;
   }, [candles, chartMotionPreset, symbol, timeframe]);
-  const renderPricePrecision = useMemo(() => {
-    const referencePrice = candles[candles.length - 1]?.close ?? candles[candles.length - 1]?.open ?? 0;
-    return inferRenderPricePrecision(symbol, referencePrice);
-  }, [candles, symbol]);
   const motionTuning = useMemo(() => getChartMotionTuning(resolvedMotionPreset), [resolvedMotionPreset]);
   const microTimeframeLock = useMemo(() => timeframeToMs(timeframe) <= 5_000, [timeframe]);
   const marketVolatility = useMemo(() => estimateRecentVolatility(candles), [candles]);
@@ -2510,6 +2459,7 @@ export default function InstitutionalChart({
     minFrameMs: resolvedVisualProfile.frame.minFrameMs,
     strictBucketAlignment: resolvedVisualProfile.perception.strictBucketAlignment,
   }));
+  const frozenRef = useRef(frozen);
   const liveRenderContinuityRef = useRef<LiveRenderContinuityStats>(createLiveRenderContinuityStats());
   const intraCandleContinuityModeRef = useRef<ContinuityMode>("idle");
   const lastCommittedCandleRef = useRef<CandleRenderPoint | null>(null);
@@ -3181,6 +3131,10 @@ export default function InstitutionalChart({
   const domLockStorageKey = `${DOM_LOCK_STORAGE_PREFIX}.${symbol}.${timeframe}`;
 
   useEffect(() => {
+    frozenRef.current = frozen;
+  }, [frozen]);
+
+  useEffect(() => {
     volatilityRef.current = marketVolatility;
   }, [marketVolatility]);
 
@@ -3244,6 +3198,9 @@ export default function InstitutionalChart({
 
     const flushLiveFrame = () => {
       liveFrameRafRef.current = null;
+      if (frozenRef.current) {
+        return;
+      }
       const frame = liveFrameRef.current;
       const candleSeries = candleSeriesRef.current;
       if (!frame || !candleSeries || mode === "line") {
@@ -3265,7 +3222,7 @@ export default function InstitutionalChart({
       liveRenderContinuityRef.current.renderedFrames += 1;
 
       const candleData = applyPerceptualRenderPipeline(
-        sanitizeLiveFeedCandles(frame.candles, timeframe, renderPricePrecision).map((bar) => ({
+        sanitizeLiveFeedCandles(frame.candles, timeframe).map((bar) => ({
           ...bar,
           volume: 0,
         })),
@@ -3276,7 +3233,6 @@ export default function InstitutionalChart({
           volatility: volatilityRef.current,
           visualProfile,
           domImbalanceRatio,
-          precision: renderPricePrecision,
         },
       );
       if (candleData.length === 0) {
@@ -3438,6 +3394,9 @@ export default function InstitutionalChart({
         liveRenderContinuityRef.current.looseSyncFrames += 1;
       }
       liveFrameSchedulerRef.current.schedule(frame, (latestFrame) => {
+        if (frozenRef.current) {
+          return;
+        }
         if (latestFrame.signature && latestFrame.signature === pendingLiveFrameSignatureRef.current) {
           liveRenderContinuityRef.current.duplicateFrameSkips += 1;
           return;
@@ -3467,7 +3426,7 @@ export default function InstitutionalChart({
       pendingLiveFrameSignatureRef.current = "";
       lastAppliedLiveFrameSignatureRef.current = "";
     };
-  }, [captureGhostWick, customV3RendererEnabled, liveFeedKey, mode, renderPricePrecision, scheduleCustomV3CandleOverlayDraw, timeframe, visualProfile]);
+  }, [captureGhostWick, customV3RendererEnabled, liveFeedKey, mode, scheduleCustomV3CandleOverlayDraw, timeframe, visualProfile]);
 
   useEffect(() => {
     if (typeof window === "undefined" || isLiteMode || frozen) {
@@ -5305,10 +5264,10 @@ export default function InstitutionalChart({
 
     const rawBarsForRender = rawCandleSource.map((c, i) => ({
       time: Number(candleTimes[i]),
-      open: roundRenderPrice(Number.isFinite(c.open) ? c.open : c.close ?? 0, renderPricePrecision),
-      high: roundRenderPrice(Number.isFinite(c.high) ? c.high : c.close ?? 0, renderPricePrecision),
-      low: roundRenderPrice(Number.isFinite(c.low) ? c.low : c.close ?? 0, renderPricePrecision),
-      close: roundRenderPrice(Number.isFinite(c.close) ? c.close : 0, renderPricePrecision),
+      open: Number.isFinite(c.open) ? c.open : c.close ?? 0,
+      high: Number.isFinite(c.high) ? c.high : c.close ?? 0,
+      low: Number.isFinite(c.low) ? c.low : c.close ?? 0,
+      close: Number.isFinite(c.close) ? c.close : 0,
       volume: Number.isFinite(c.volume) ? c.volume : 0,
     }));
 
@@ -5739,7 +5698,6 @@ export default function InstitutionalChart({
           volatility: marketVolatility,
           visualProfile,
           domImbalanceRatio,
-          precision: renderPricePrecision,
         },
       );
     } else {
@@ -5754,7 +5712,6 @@ export default function InstitutionalChart({
         volatility: marketVolatility,
         visualProfile,
         domImbalanceRatio,
-        precision: renderPricePrecision,
       });
     }
 

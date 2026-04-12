@@ -43,28 +43,6 @@ const frameListeners = new Map<string, Set<LiveChartFrameListener>>();
 const batchListeners = new Set<LiveChartFrameBatchListener>();
 const latestFrames = new Map<string, LiveChartFrame>();
 let latestBatch: LiveChartFrameBatch | null = null;
-const FRAME_POOL_SIZE = 32;
-const framePool: LiveChartFrame[] = Array.from({ length: FRAME_POOL_SIZE }, () => ({
-  feedKey: "",
-  candles: [],
-  publishedAt: 0,
-  signature: "0",
-  meta: {
-    syncStatus: "atomic",
-    partial: false,
-    coalesced: false,
-    confidence: 1,
-    dynamicBufferMs: 50,
-    stallAgeMs: 0,
-    depthSequence: null,
-    depthEventTs: null,
-    tradeEventTs: null,
-    batchSkewMs: null,
-    batchPublishedAt: null,
-    batchFrameCount: null,
-  },
-}));
-let framePoolIndex = 0;
 
 function normalizeFrameMeta(meta?: Partial<LiveChartFrameMeta>): LiveChartFrameMeta {
   return {
@@ -83,10 +61,42 @@ function normalizeFrameMeta(meta?: Partial<LiveChartFrameMeta>): LiveChartFrameM
   };
 }
 
-function allocateFrame(): LiveChartFrame {
-  const frame = framePool[framePoolIndex] || framePool[0];
-  framePoolIndex = (framePoolIndex + 1) % FRAME_POOL_SIZE;
-  return frame;
+function cloneCandleSnapshot(candles: LiveChartCandle[]): LiveChartCandle[] {
+  const next: LiveChartCandle[] = [];
+  for (const candle of candles) {
+    if (!candle) {
+      continue;
+    }
+    const open = Number(candle.open);
+    const high = Number(candle.high);
+    const low = Number(candle.low);
+    const close = Number(candle.close);
+    const volume = Number(candle.volume);
+    if (!Number.isFinite(open) || !Number.isFinite(high) || !Number.isFinite(low) || !Number.isFinite(close) || !Number.isFinite(volume)) {
+      continue;
+    }
+    next.push({
+      label: String(candle.label || ""),
+      open,
+      high: Math.max(high, open, close),
+      low: Math.min(low, open, close),
+      close,
+      volume,
+    });
+  }
+  return next;
+}
+
+function buildFrameSnapshot(feedKey: string, candles: LiveChartCandle[], publishedAt: number, meta: LiveChartFrameMeta): LiveChartFrame {
+  const candleSnapshot = cloneCandleSnapshot(candles);
+  const metaSnapshot = normalizeFrameMeta(meta);
+  return {
+    feedKey,
+    candles: candleSnapshot,
+    publishedAt,
+    signature: frameSignature(candleSnapshot, metaSnapshot),
+    meta: metaSnapshot,
+  };
 }
 
 function cloneFrameFromLatest(feedKey: string): LiveChartFrame | null {
@@ -94,24 +104,7 @@ function cloneFrameFromLatest(feedKey: string): LiveChartFrame | null {
   if (!latest) {
     return null;
   }
-  const frame = allocateFrame();
-  frame.feedKey = latest.feedKey;
-  frame.candles = latest.candles;
-  frame.publishedAt = latest.publishedAt;
-  frame.signature = latest.signature;
-  frame.meta.syncStatus = latest.meta.syncStatus;
-  frame.meta.partial = latest.meta.partial;
-  frame.meta.coalesced = latest.meta.coalesced;
-  frame.meta.confidence = latest.meta.confidence;
-  frame.meta.dynamicBufferMs = latest.meta.dynamicBufferMs;
-  frame.meta.stallAgeMs = latest.meta.stallAgeMs;
-  frame.meta.depthSequence = latest.meta.depthSequence;
-  frame.meta.depthEventTs = latest.meta.depthEventTs;
-  frame.meta.tradeEventTs = latest.meta.tradeEventTs;
-  frame.meta.batchSkewMs = latest.meta.batchSkewMs;
-  frame.meta.batchPublishedAt = latest.meta.batchPublishedAt;
-  frame.meta.batchFrameCount = latest.meta.batchFrameCount;
-  return frame;
+  return buildFrameSnapshot(latest.feedKey, latest.candles, latest.publishedAt, latest.meta);
 }
 
 function frameSignature(candles: LiveChartCandle[], meta: LiveChartFrameMeta): string {
@@ -143,28 +136,15 @@ export function publishChartFrame(feedKey: string, candles: LiveChartCandle[], m
     return;
   }
   const normalizedMeta = normalizeFrameMeta(meta);
-  const signature = frameSignature(candles, normalizedMeta);
+  const frame = buildFrameSnapshot(feedKey, candles, Date.now(), normalizedMeta);
+  if (frame.candles.length === 0) {
+    return;
+  }
+  const signature = frame.signature;
   const previous = latestFrames.get(feedKey);
   if (previous?.signature === signature) {
     return;
   }
-  const frame = allocateFrame();
-  frame.feedKey = feedKey;
-  frame.candles = candles;
-  frame.publishedAt = Date.now();
-  frame.signature = signature;
-  frame.meta.syncStatus = normalizedMeta.syncStatus;
-  frame.meta.partial = normalizedMeta.partial;
-  frame.meta.coalesced = normalizedMeta.coalesced;
-  frame.meta.confidence = normalizedMeta.confidence;
-  frame.meta.dynamicBufferMs = normalizedMeta.dynamicBufferMs;
-  frame.meta.stallAgeMs = normalizedMeta.stallAgeMs;
-  frame.meta.depthSequence = normalizedMeta.depthSequence;
-  frame.meta.depthEventTs = normalizedMeta.depthEventTs;
-  frame.meta.tradeEventTs = normalizedMeta.tradeEventTs;
-  frame.meta.batchSkewMs = normalizedMeta.batchSkewMs;
-  frame.meta.batchPublishedAt = normalizedMeta.batchPublishedAt;
-  frame.meta.batchFrameCount = normalizedMeta.batchFrameCount;
   latestFrames.set(feedKey, frame);
   const listeners = frameListeners.get(feedKey);
   if (!listeners || listeners.size === 0) {

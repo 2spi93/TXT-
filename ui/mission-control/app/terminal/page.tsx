@@ -108,6 +108,7 @@ import {
   type TerminalLayoutConfig,
   type TerminalWorkspaceBundle,
 } from "./terminalLayoutWorkspace";
+import { collapseReplayEventMarkers, type ReplayEventMarker } from "./replayEventMarkers";
 import {
   fetchTerminalAuthStatus,
   isGtixPublicHost,
@@ -137,6 +138,18 @@ import { buildExecutionEngineSnapshot, type ExecutionEngineSnapshot } from "../.
 import { buildBrokerAwareSchedulerSnapshot, type BrokerAwareSchedulerInput } from "./executionSchedulerEngine";
 import { computeBetaExposure, computeCorrelations, crossAssetHedge } from "../../lib/crossAssetEngine";
 import { averageVenueLatency, executionWarfareEngine, type WarfareVenueCandidate } from "./executionWarfareEngine";
+import {
+  buildExecutionV7LiteContext,
+  buildExecutionV7LiteAttempt,
+  buildExecutionV7LitePlan,
+  buildExecutionV7LiteVenueLearningProfile,
+  createExecutionV7LiteIntent,
+  evaluateExecutionV7LiteSmartGate,
+  evaluateExecutionV7LiteContinuation,
+  finalizeExecutionV7LiteResult,
+  type ExecutionFollowUpAttempt,
+  type ExecutionVenueLearningProfile,
+} from "./executionV7LiteEngine";
 import { buildInstitutionalSnapshot, buildSelfHealingSnapshot } from "./institutionalEngine";
 import {
   buildFlowState as buildMarketSimulationFlowState,
@@ -167,6 +180,7 @@ import { isWebGL2Available } from "../../lib/engine/gpu-chart/context";
 import {
   ControlRoomMonitoringPanel,
   ExecutionPnlTruthMonitoringPanel,
+  ExecutionSmartTrackerPanel,
   ExecutionContextMonitoringPanel,
   ExecutionAiV6ObservabilityPanel,
   ExecutionOptimizerMonitoringPanel,
@@ -185,6 +199,10 @@ import {
   AlertsMonitoringPanel,
   VenueTelemetryMonitoringPanel,
 } from "./TerminalSecondaryPanels";
+import TerminalCoachOverlay from "./TerminalCoachOverlay";
+import type { SmartDecisionHudShape } from "./chartHudTypes";
+import { buildFeedbackSummary } from "./feedbackEngine";
+import { buildTerminalAdaptiveGuide, type TerminalAdaptiveGuideMode, type TerminalAdaptiveGuideTargetId } from "./terminalAdaptiveGuide";
 import { barArrayHash, type Bar } from "../../lib/dataEngine";
 import { indicatorWorkerAdapter } from "../../lib/indicators/workerAdapter";
 import type { ActiveIndicator, IndicatorSeriesData } from "../../lib/indicators/engine";
@@ -211,7 +229,7 @@ import { riskGate } from "../../lib/riskAI";
 import { routeOrder } from "../../lib/smartRouter";
 import { SelfLearningSchedulerController, type ShadowSchedulerSnapshot } from "../../lib/selfLearningScheduler";
 import { createMarketDataBus, type MarketDataBusKernelTelemetry, type OhlcvBar } from "../../lib/marketDataBus";
-import { subscribeChartFrameBatch, type LiveChartFrameMeta } from "../../lib/chartFrameFeed";
+import { clearChartFrame, subscribeChartFrameBatch, type LiveChartFrameMeta } from "../../lib/chartFrameFeed";
 import { DomHistoryBuffer, type DomHistoryFrame } from "../../lib/domHistoryBuffer";
 import type { SyncedMarketFrame } from "../../lib/syncedMarketFrame";
 import type { OrderflowDomSnapshot as RuntimeOrderflowDomSnapshot, OrderflowFootprintSnapshot as RuntimeOrderflowFootprintSnapshot, OrderflowRuntimeSnapshot } from "../../lib/orderflowRuntimeEngine";
@@ -233,6 +251,10 @@ type LockedDatasetRuntime = {
   integrity: "validated" | "unchecked";
   error: string | null;
 };
+
+function isGuideJournalPayloadEntry(value: unknown): value is JsonMap {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
 
 const V8_PREDICTOR_STORAGE_KEY = "gtixt.terminal.v8.predictor.v1";
 const TERMINAL_DATA_MODE_QUERY_KEY = "dataMode";
@@ -774,15 +796,6 @@ type InvestorReportItem = {
   summary: JsonMap;
   created_at: string | null;
   published_at: string | null;
-};
-type ReplayEventMarker = {
-  id: string;
-  label: string;
-  kind: "intent" | "approval" | "fill" | "incident" | "routing" | "outcome" | "latent" | "other";
-  timeKey: string;
-  frameIndex: number;
-  critical: boolean;
-  detail: string;
 };
 type BrainReplayAttributionFamily = {
   family: string;
@@ -4313,6 +4326,7 @@ function TradingTerminalPageHydrated() {
   const [browserLongTaskTelemetry, setBrowserLongTaskTelemetry] = useState<BrowserLongTaskTelemetry>(DEFAULT_BROWSER_LONG_TASK_TELEMETRY);
   const [chartPerceptualTelemetry, setChartPerceptualTelemetry] = useState<ChartPerceptualTelemetry | null>(null);
   const [gpuPerceptualTelemetry, setGpuPerceptualTelemetry] = useState<GpuPerceptualTelemetry | null>(null);
+  const [smartDecisionHud, setSmartDecisionHud] = useState<SmartDecisionHudShape | null>(null);
 
   const [gpuViewportFrameMeta, setGpuViewportFrameMeta] = useState<Record<string, LiveChartFrameMeta>>({});
   const [gpuGlobalGridBatch, setGpuGlobalGridBatch] = useState<GlobalGridBatchState | null>(null);
@@ -4367,6 +4381,10 @@ function TradingTerminalPageHydrated() {
   const [terminalOnboardingFirstVisit, setTerminalOnboardingFirstVisit] = useState(false);
   const [terminalOnboardingPinned, setTerminalOnboardingPinned] = useState(false);
   const [terminalOnboardingExpanded, setTerminalOnboardingExpanded] = useState(false);
+  const [terminalAdaptiveGuideMode, setTerminalAdaptiveGuideMode] = useState<TerminalAdaptiveGuideMode | null>(null);
+  const [terminalAdaptiveGuideStepIndex, setTerminalAdaptiveGuideStepIndex] = useState(0);
+  const [guidedCoachTargetId, setGuidedCoachTargetId] = useState<TerminalAdaptiveGuideTargetId | null>(null);
+  const [coachOverlayVisible, setCoachOverlayVisible] = useState(false);
   const [focusDecks, setFocusDecks] = useState<TerminalFocusDeckId[]>([]);
   const [layoutWorkspaceName, setLayoutWorkspaceName] = useState(DEFAULT_LAYOUT_WORKSPACE_NAME);
 
@@ -4422,6 +4440,18 @@ function TradingTerminalPageHydrated() {
       setTerminalOnboardingExpanded(false);
     }
   }, [terminalOnboardingPinned]);
+  const focusAdaptiveGuideTarget = useCallback((targetId: TerminalAdaptiveGuideTargetId) => {
+    if (typeof document === "undefined") {
+      return;
+    }
+    const target = document.getElementById(targetId);
+    if (!target) {
+      return;
+    }
+    setGuidedCoachTargetId(targetId);
+    setCoachOverlayVisible(true);
+    target.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, []);
   const [layoutWorkspaceOptions, setLayoutWorkspaceOptions] = useState<string[]>(DEFAULT_LAYOUT_WORKSPACE_OPTIONS);
   const [workspaceHintBadge, setWorkspaceHintBadge] = useState<string | null>(null);
   const [localFeedFallbackSuggestion, setLocalFeedFallbackSuggestion] = useState<LocalFeedFallbackSuggestion | null>(null);
@@ -4508,6 +4538,8 @@ function TradingTerminalPageHydrated() {
   const [chartBarConstructionMode, setChartBarConstructionMode] = useState<ChartBarConstructionMode>("time");
   const [chartDeskViewMode, setChartDeskViewMode] = useState<TerminalDeskViewModePreference>("auto");
   const [chartTimeframe, setChartTimeframe] = useState("1m");
+  const [chartTimeframeSwitchPending, setChartTimeframeSwitchPending] = useState(false);
+  const [chartRenderEpoch, setChartRenderEpoch] = useState(0);
   const chartMicroTimeframeLocked = timeframeToMs(chartTimeframe) <= 5_000;
   const effectiveChartSmoothingMs: 0 | 80 | 140 | 220 = chartMicroTimeframeLocked ? 0 : chartSmoothingMs;
   const deskRenderProfile = resolveDeskRenderProfile(chartTimeframe, chartDeskViewMode, chartBarConstructionMode);
@@ -4531,6 +4563,7 @@ function TradingTerminalPageHydrated() {
   // enforce authoritative span targets without an upstream bar-count cap.
   const chartViewportRef = useRef<{ window: number }>({ window: 80 });
   const [chartLoading, setChartLoading] = useState(false);
+  const chartTimeframeSwitchTimerRef = useRef<number | null>(null);
   const [chartOrderTicket, setChartOrderTicket] = useState<ChartOrderTicket>({
     side: "buy",
     preset: "scalp",
@@ -4540,6 +4573,117 @@ function TradingTerminalPageHydrated() {
     oco: true,
     active: true,
   });
+  const terminalGuideJournalContext = useMemo(() => ({
+    symbol: String(selectedChartSymbol || "BTCUSD"),
+    timeframe: String(chartTimeframe || "1m"),
+    strategy: String(chartOrderTicket.preset || "terminal"),
+  }), [chartOrderTicket.preset, chartTimeframe, selectedChartSymbol]);
+  const [terminalGuideJournalEntries, setTerminalGuideJournalEntries] = useState<JsonMap[]>([]);
+  const [terminalGuideJournalError, setTerminalGuideJournalError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const symbolKey = terminalGuideJournalContext.symbol.trim().toUpperCase();
+    const timeframeKey = terminalGuideJournalContext.timeframe.trim();
+    const strategyKey = terminalGuideJournalContext.strategy.trim();
+    if (!symbolKey || !timeframeKey || !strategyKey) {
+      setTerminalGuideJournalEntries([]);
+      setTerminalGuideJournalError(null);
+      return;
+    }
+    let cancelled = false;
+    const loadJournal = async () => {
+      const query = new URLSearchParams();
+      query.set("symbol", symbolKey);
+      query.set("timeframe", timeframeKey);
+      query.set("strategy", strategyKey);
+      query.set("limit", "80");
+      const response = await fetch(`/api/terminal/v2-risk-journal?${query.toString()}`, { cache: "no-store" }).catch(() => null);
+      const payload = response ? await response.json().catch(() => null) : null;
+      if (cancelled) {
+        return;
+      }
+      if (!response || !response.ok || !payload || !Array.isArray(payload.entries)) {
+        setTerminalGuideJournalError("journal guide indisponible");
+        return;
+      }
+      setTerminalGuideJournalEntries(payload.entries.filter(isGuideJournalPayloadEntry));
+      setTerminalGuideJournalError(null);
+    };
+    void loadJournal();
+    const timer = window.setInterval(() => {
+      void loadJournal();
+    }, 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [terminalGuideJournalContext]);
+
+  const terminalFeedbackSummary = useMemo(() => buildFeedbackSummary({
+    executionPnlPayload: executionPnlAnalyzerPayload,
+    liveOpsPayload,
+    executionAiV6Payload,
+    journalEntries: terminalGuideJournalEntries,
+  }), [executionAiV6Payload, executionPnlAnalyzerPayload, liveOpsPayload, terminalGuideJournalEntries]);
+  const terminalAdaptiveGuide = useMemo(() => buildTerminalAdaptiveGuide({
+    smartDecision: smartDecisionHud,
+    feedbackSummary: terminalFeedbackSummary,
+    journalEntries: terminalGuideJournalEntries,
+  }), [smartDecisionHud, terminalFeedbackSummary, terminalGuideJournalEntries]);
+  const activeAdaptiveGuideMode = terminalAdaptiveGuideMode || terminalAdaptiveGuide.recommendedMode;
+  const activeAdaptiveGuidePlan = terminalAdaptiveGuide.plans.find((plan) => plan.mode === activeAdaptiveGuideMode) || terminalAdaptiveGuide.plans[0];
+  const activeAdaptiveGuideStep = activeAdaptiveGuidePlan.steps[Math.min(terminalAdaptiveGuideStepIndex, Math.max(activeAdaptiveGuidePlan.steps.length - 1, 0))] || activeAdaptiveGuidePlan.steps[0] || null;
+
+  useEffect(() => {
+    setTerminalAdaptiveGuideStepIndex(0);
+  }, [activeAdaptiveGuideMode]);
+
+  useEffect(() => {
+    if (!terminalOnboardingLoaded) {
+      return;
+    }
+    if (terminalAdaptiveGuide.assistanceLevel === "HIGH" || terminalAdaptiveGuide.disciplineLock) {
+      setTerminalOnboardingExpanded(true);
+      setGuidedCoachTargetId(activeAdaptiveGuideStep?.targetId || "terminal-onboarding");
+      setCoachOverlayVisible(true);
+      return;
+    }
+    if (!terminalOnboardingExpanded || !activeAdaptiveGuideStep) {
+      setCoachOverlayVisible(false);
+      return;
+    }
+    setGuidedCoachTargetId(activeAdaptiveGuideStep.targetId);
+    setCoachOverlayVisible(terminalAdaptiveGuide.assistanceLevel !== "LOW");
+  }, [
+    activeAdaptiveGuideStep,
+    terminalAdaptiveGuide.assistanceLevel,
+    terminalAdaptiveGuide.disciplineLock,
+    terminalOnboardingExpanded,
+    terminalOnboardingLoaded,
+  ]);
+
+  const advanceAdaptiveGuideStep = useCallback(() => {
+    if (!activeAdaptiveGuidePlan) {
+      return;
+    }
+    const lastIndex = Math.max(activeAdaptiveGuidePlan.steps.length - 1, 0);
+    setTerminalAdaptiveGuideStepIndex((current) => {
+      const next = Math.min(current + 1, lastIndex);
+      return next;
+    });
+    if (terminalAdaptiveGuideStepIndex >= lastIndex) {
+      setCoachOverlayVisible(false);
+      completeTerminalOnboardingAction();
+    }
+  }, [activeAdaptiveGuidePlan, completeTerminalOnboardingAction, terminalAdaptiveGuideStepIndex]);
+
+  const openAdaptiveGuideCommand = useCallback((mode: TerminalAdaptiveGuideMode) => {
+    const plan = terminalAdaptiveGuide.plans.find((candidate) => candidate.mode === mode);
+    if (!plan) {
+      return;
+    }
+    openOpsCopilotPrompt({ message: plan.commandPrompt, autoSend: true });
+  }, [terminalAdaptiveGuide.plans]);
   const [chartSnapState, setChartSnapState] = useState<ChartSnapState>(null);
   const [chartActiveSnapLine, setChartActiveSnapLine] = useState<ChartOrderLineKey | null>(null);
   const [chartSnapPulseLine, setChartSnapPulseLine] = useState<ChartOrderLineKey | null>(null);
@@ -5326,6 +5470,8 @@ function TradingTerminalPageHydrated() {
 
   const selectedChartVenue = String(selectedChartQuote?.venue || "binance-public");
   const selectedChartInstrument = normalizeInstrument(String(selectedChartQuote?.instrument || selectedChartSymbol || "BTCUSD"));
+  const chartLiveFeedKey = `${selectedChartInstrument}|${selectedChartVenue}|${chartTimeframe}`;
+  const chartSurfaceFrozen = chartLoading || chartTimeframeSwitchPending;
   const selectedChartMetricSymbol = selectedChartQuote ? instrumentLabel(selectedChartQuote) : selectedChartInstrument;
   const selectedChartMetricCandidates = useMemo(() => {
     const candidates = new Set<string>();
@@ -6303,6 +6449,22 @@ function TradingTerminalPageHydrated() {
     }
   };
 
+  const activateAdaptiveGuide = useCallback((mode: TerminalAdaptiveGuideMode) => {
+    const plan = terminalAdaptiveGuide.plans.find((candidate) => candidate.mode === mode);
+    setTerminalAdaptiveGuideMode(mode);
+    setTerminalAdaptiveGuideStepIndex(0);
+    if (!plan) {
+      return;
+    }
+    setUiMode(plan.uiMode);
+    setTerminalDensityMode(plan.densityMode);
+    applyLayoutPreset(plan.layoutPreset);
+    setTerminalOnboardingExpanded(true);
+    setGuidedCoachTargetId(plan.steps[0]?.targetId || "terminal-onboarding");
+    setCoachOverlayVisible(true);
+    focusAdaptiveGuideTarget("terminal-onboarding");
+  }, [applyLayoutPreset, focusAdaptiveGuideTarget, setUiMode, terminalAdaptiveGuide.plans]);
+
   useEffect(() => {
     if (terminalDensityMode !== "focus") {
       return;
@@ -6542,11 +6704,55 @@ function TradingTerminalPageHydrated() {
     setChartVenueOverride(venueValue ? venueValue.trim() : null);
   };
 
-  const setActiveChartTimeframe = (timeframeValue: string) => {
-    if (isTimeframeSupported(timeframeValue) && CHART_TIMEFRAMES.includes(timeframeValue)) {
-      setChartTimeframe(timeframeValue);
+  const setActiveChartTimeframe = useCallback((timeframeValue: string) => {
+    if (!isTimeframeSupported(timeframeValue) || !CHART_TIMEFRAMES.includes(timeframeValue) || timeframeValue === chartTimeframe) {
+      return;
     }
-  };
+
+    if (typeof window !== "undefined" && chartTimeframeSwitchTimerRef.current !== null) {
+      window.clearTimeout(chartTimeframeSwitchTimerRef.current);
+      chartTimeframeSwitchTimerRef.current = null;
+    }
+
+    setCrosshair(null);
+    setChartLoading(true);
+    setChartTimeframeSwitchPending(true);
+    setChartPerceptualTelemetry(null);
+    setGpuPerceptualTelemetry(null);
+    setGpuViewportFrameMeta({});
+    setGpuGlobalGridBatch(null);
+
+    const nextFeedKey = `${selectedChartInstrument}|${selectedChartVenue}|${timeframeValue}`;
+    clearChartFrame(chartLiveFeedKey);
+    clearChartFrame(nextFeedKey);
+
+    const commitSwitch = () => {
+      setChartTimeframe(timeframeValue);
+      setChartRenderEpoch((current) => current + 1);
+      window.requestAnimationFrame(() => {
+        setChartTimeframeSwitchPending(false);
+      });
+    };
+
+    if (typeof window === "undefined") {
+      commitSwitch();
+      return;
+    }
+
+    chartTimeframeSwitchTimerRef.current = window.setTimeout(() => {
+      chartTimeframeSwitchTimerRef.current = null;
+      commitSwitch();
+    }, 80);
+  }, [chartLiveFeedKey, chartTimeframe, selectedChartInstrument, selectedChartVenue]);
+
+  useEffect(() => {
+    return () => {
+      if (chartTimeframeSwitchTimerRef.current !== null) {
+        window.clearTimeout(chartTimeframeSwitchTimerRef.current);
+        chartTimeframeSwitchTimerRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     restoreSavedLayout();
@@ -7976,6 +8182,61 @@ function TradingTerminalPageHydrated() {
     );
   }
 
+  function resolveExecutionLearningVenue(payload: JsonMap): string {
+    const routedExecution = payload.routed_execution && typeof payload.routed_execution === "object"
+      ? payload.routed_execution as JsonMap
+      : {};
+    return String(
+      payload.route_chosen
+      || payload.route
+      || payload.venue
+      || routedExecution.venue
+      || payload.provider
+      || routedExecution.provider
+      || "",
+    ).trim().toLowerCase();
+  }
+
+  function buildExecutionV7SmartVenueProfile(venueHint: string, symbolHint: string): ExecutionVenueLearningProfile | null {
+    const normalizedVenue = String(venueHint || "").trim().toLowerCase();
+    if (!normalizedVenue) {
+      return null;
+    }
+    const symbolKey = normalizeInstrument(symbolHint);
+    const samples = [...executionTelemetry, ...outcomes.slice(0, 40)]
+      .filter((item) => {
+        const venue = resolveExecutionLearningVenue(item);
+        if (venue !== normalizedVenue) {
+          return false;
+        }
+        const rowSymbol = normalizeInstrument(String(item.symbol || item.instrument || ""));
+        return !symbolKey || !rowSymbol || rowSymbol === symbolKey;
+      })
+      .slice(0, 32);
+    if (samples.length === 0) {
+      return null;
+    }
+    const avgLatencyMs = average(samples.map((item) => Math.max(0, toNumber(item.latency_e2e_ms ?? item.latency_ms ?? item.execution_latency_ms, 0))));
+    const avgSlippageBps = average(samples.map((item) => Math.abs(toNumber(item.realized_slippage_bps ?? item.slippage_real_bps ?? item.slippage_bps, 0))));
+    const fillRatio = average(samples.map((item) => {
+      const status = String(item.status || item.execution_status || item.order_status || "").toLowerCase();
+      return clamp(
+        toNumber(item.fill_ratio ?? item.executed_ratio, /fill|done|complete|closed/.test(status) ? 1 : /partial/.test(status) ? 0.5 : 0),
+        0,
+        1,
+      );
+    }));
+    const rejectRate = average(samples.map((item) => /reject|error|fail|cancel|block/.test(String(item.status || item.execution_status || item.order_status || "").toLowerCase()) ? 1 : 0));
+    return buildExecutionV7LiteVenueLearningProfile({
+      venue: normalizedVenue,
+      samples: samples.length,
+      avgLatencyMs,
+      avgSlippageBps,
+      fillRatio,
+      rejectRate,
+    });
+  }
+
   function extractLiveOrderReference(payload: JsonMap, fallbackSymbol: string, fallbackSide: "buy" | "sell"): JsonMap | null {
     const routedExecution = payload.routed_execution && typeof payload.routed_execution === "object"
       ? payload.routed_execution as JsonMap
@@ -8109,18 +8370,63 @@ function TradingTerminalPageHydrated() {
       ? pnlAnalyticsSnapshot.autoOptimization.sizeMultiplier
       : 1;
     const totalNotionalUsd = (aiSizingAlreadyApplied ? requestedNotionalUsd : applyRiskAiLiveSizing(requestedNotionalUsd)) * autoOptimizationMultiplier;
+    const preGateVenue = overrides?.preferredVenue || executionEngineSnapshot.entry.venue || executionWarfareV85Snapshot.plan.venue || String((routingScore?.best as JsonMap | undefined)?.venue || "");
+    const maxSpreadBase = Number.isFinite(overrides?.maxSpread) ? Number(overrides?.maxSpread) : maxSpread;
+    const smartMaxSpreadBudget = Math.max(
+      1,
+      Math.min(maxSpreadBase * executionWarfareV85Snapshot.plan.maxSpreadMultiplier, executionEngineSnapshot.slippage.budgetBps),
+    );
+    const preGateIntent = createExecutionV7LiteIntent({
+      symbol: String(overrides?.symbol || selectedChartSymbol),
+      side: requestedSide,
+      requestedNotionalUsd,
+      effectiveNotionalUsd: totalNotionalUsd,
+      requestedLots: Number.isFinite(overrides?.lots) ? Number(overrides?.lots) : undefined,
+      preferredVenue: preGateVenue,
+      rationale: overrides?.rationale || rationale,
+      maxSpreadBps: smartMaxSpreadBudget,
+      slippageBudgetBps: executionEngineSnapshot.slippage.budgetBps,
+      expectedSlippageBps: executionEngineSnapshot.slippage.expectedBps,
+      latencyGuardMs: executionEngineSnapshot.latency.guardMs,
+      requestedSlices: Math.max(1, executionWarfareV85Snapshot.plan.slices),
+      maxSlices: 8,
+      minSliceNotionalUsd: 25,
+      initialDelayMs: executionEngineSnapshot.entry.initialDelayMs,
+      baseSliceDelayMs: executionWarfareV85Snapshot.plan.delayMs,
+      repriceStepBps: executionEngineSnapshot.repricing.stepBps,
+      maxRetries: executionEngineSnapshot.repricing.maxAttempts,
+      partialFillAction: executionEngineSnapshot.partialFillHandling.action,
+      partialFillTargetRatio: executionEngineSnapshot.partialFillHandling.targetFillRatio,
+      expectedFillRatio: executionEngineSnapshot.partialFillHandling.expectedFillRatio,
+      resliceDelayMs: executionEngineSnapshot.partialFillHandling.resliceDelayMs,
+      riskSizingMultiplier: riskAiLiveSizeMultiplier * volatilityRegimeRiskMultiplier,
+      autoOptimizationMultiplier,
+      metadata: overrides?.metadata,
+      orderIntent: overrides?.orderIntent,
+    });
+    const executionV7VenueLearning = buildExecutionV7SmartVenueProfile(preGateVenue, String(overrides?.symbol || selectedChartSymbol));
+    const executionV7SmartGate = evaluateExecutionV7LiteSmartGate({
+      intent: preGateIntent,
+      context: executionV7SmartContext,
+      venueLearning: executionV7VenueLearning,
+    });
+    if (!executionV7SmartGate.allow) {
+      throw new Error(`Execution smart gate blocked: ${executionV7SmartGate.reasons.join(", ") || "microstructure unfavorable"}`);
+    }
+    const smartSizedNotionalUsd = totalNotionalUsd > 0
+      ? Number(Math.max(25, totalNotionalUsd * executionV7SmartGate.sizeMultiplier).toFixed(2))
+      : 0;
     const liveSmartRoutingPlan = routeOrder({
       side: requestedSide,
-      notionalUsd: Math.max(25, totalNotionalUsd),
+      notionalUsd: Math.max(25, smartSizedNotionalUsd),
       aggregatedBook: aggregatedMultiVenueBook,
       maxOrders: 4,
       minOrderNotionalUsd: 25,
     });
     const effectiveVenue = overrides?.preferredVenue || liveSmartRoutingPlan.primaryVenue || executionEngineSnapshot.entry.venue || executionWarfareV85Snapshot.plan.venue || undefined;
-    const maxSpreadBase = Number.isFinite(overrides?.maxSpread) ? Number(overrides?.maxSpread) : maxSpread;
     const maxSpreadEffective = Math.max(
       1,
-      Math.min(maxSpreadBase * executionWarfareV85Snapshot.plan.maxSpreadMultiplier, executionEngineSnapshot.slippage.budgetBps),
+      Math.min(smartMaxSpreadBudget * (executionV7VenueLearning && executionV7VenueLearning.score < 0.5 ? 0.94 : 1), executionEngineSnapshot.slippage.budgetBps),
     );
     const smartRoutingChildren = liveSmartRoutingPlan.orders.length > 0 && liveSmartRoutingPlan.coverageRatio >= 0.55
       ? liveSmartRoutingPlan.orders.map((order, index) => ({
@@ -8139,8 +8445,8 @@ function TradingTerminalPageHydrated() {
       : brokerAwareSchedulerV851Snapshot.childOrders.length > 0
       ? brokerAwareSchedulerV851Snapshot.childOrders
       : splitTradeTicketNotional(
-        totalNotionalUsd,
-        totalNotionalUsd >= 300 ? Math.max(executionWarfareV85Snapshot.plan.slices, executionEngineSnapshot.entry.slices) : 1,
+        smartSizedNotionalUsd,
+        smartSizedNotionalUsd >= 300 ? Math.max(executionWarfareV85Snapshot.plan.slices, executionEngineSnapshot.entry.slices) : 1,
       ).map((sliceNotionalUsd, index) => ({
         id: `${selectedChartSymbol}-${index + 1}`,
         venue: effectiveVenue || "",
@@ -8151,13 +8457,55 @@ function TradingTerminalPageHydrated() {
         fillRatio: 0,
         resliceEligible: false,
       }));
+    const executionV7LiteIntent = createExecutionV7LiteIntent({
+      symbol: String(overrides?.symbol || selectedChartSymbol),
+      side: requestedSide,
+      requestedNotionalUsd,
+      effectiveNotionalUsd: smartSizedNotionalUsd,
+      requestedLots: Number.isFinite(overrides?.lots) ? Number(overrides?.lots) : undefined,
+      preferredVenue: effectiveVenue,
+      rationale: overrides?.rationale || rationale,
+      maxSpreadBps: maxSpreadEffective,
+      slippageBudgetBps: executionEngineSnapshot.slippage.budgetBps,
+      expectedSlippageBps: executionEngineSnapshot.slippage.expectedBps,
+      latencyGuardMs: executionEngineSnapshot.latency.guardMs,
+      requestedSlices: schedulerChildren.length,
+      maxSlices: 8,
+      minSliceNotionalUsd: 25,
+      initialDelayMs: executionEngineSnapshot.entry.initialDelayMs + executionV7SmartGate.recommendedDelayMs,
+      baseSliceDelayMs: executionWarfareV85Snapshot.plan.delayMs + Math.round(executionV7SmartGate.recommendedDelayMs * 0.35),
+      repriceStepBps: executionEngineSnapshot.repricing.stepBps,
+      maxRetries: executionEngineSnapshot.repricing.maxAttempts,
+      partialFillAction: executionEngineSnapshot.partialFillHandling.action,
+      partialFillTargetRatio: executionEngineSnapshot.partialFillHandling.targetFillRatio,
+      expectedFillRatio: executionEngineSnapshot.partialFillHandling.expectedFillRatio,
+      resliceDelayMs: executionEngineSnapshot.partialFillHandling.resliceDelayMs,
+      riskSizingMultiplier: riskAiLiveSizeMultiplier * volatilityRegimeRiskMultiplier,
+      autoOptimizationMultiplier,
+      metadata: overrides?.metadata,
+      orderIntent: overrides?.orderIntent,
+    });
+    const executionV7LitePlan = buildExecutionV7LitePlan({
+      intent: executionV7LiteIntent,
+      slices: schedulerChildren.map((childOrder) => ({
+        id: childOrder.id,
+        venue: childOrder.venue || effectiveVenue || "",
+        notionalUsd: childOrder.notionalUsd,
+        plannedDelayMs: childOrder.plannedDelayMs,
+        state: childOrder.state,
+        replaceCount: childOrder.replaceCount,
+        resliceEligible: childOrder.resliceEligible,
+      })),
+    });
     const payloads: JsonMap[] = [];
+    const executionV7LiteAttempts = [] as ReturnType<typeof buildExecutionV7LiteAttempt>[];
+    let executionV7LiteStopReason = "";
 
-    if (executionEngineSnapshot.entry.initialDelayMs > 0) {
-      await waitForExecutionSlice(executionEngineSnapshot.entry.initialDelayMs);
+    if (executionV7LitePlan.initialDelayMs > 0) {
+      await waitForExecutionSlice(executionV7LitePlan.initialDelayMs);
     }
 
-    for (const [sliceIndex, childOrder] of schedulerChildren.entries()) {
+    for (const [sliceIndex, childOrder] of executionV7LitePlan.slices.entries()) {
       if (sliceIndex > 0) {
         await waitForExecutionSlice(childOrder.plannedDelayMs);
       }
@@ -8172,6 +8520,15 @@ function TradingTerminalPageHydrated() {
         execution_warfare_delay_ms: childOrder.plannedDelayMs,
         execution_warfare_score: Number(executionWarfareV85Snapshot.executionScore.toFixed(3)),
         execution_warfare_adversarial_state: executionWarfareV85Snapshot.adversarialState,
+        execution_v7_smart_gate_allow: executionV7SmartGate.allow,
+        execution_v7_smart_gate_reasons: executionV7SmartGate.reasons,
+        execution_v7_smart_gate_delay_ms: executionV7SmartGate.recommendedDelayMs,
+        execution_v7_smart_gate_size_multiplier: Number(executionV7SmartGate.sizeMultiplier.toFixed(3)),
+        execution_v7_smart_context_score: Number(executionV7SmartGate.contextScore.toFixed(3)),
+        execution_v7_smart_venue_score: Number(executionV7SmartGate.venueScore.toFixed(3)),
+        execution_v7_smart_execution_score: Number(executionV7SmartGate.executionScore.toFixed(3)),
+        execution_v7_context: executionV7SmartContext,
+        execution_v7_venue_learning: executionV7VenueLearning,
         broker_scheduler_mode: brokerAwareSchedulerV851Snapshot.mode,
         broker_scheduler_action: brokerAwareSchedulerV851Snapshot.action,
         broker_scheduler_provider: brokerAwareSchedulerV851Snapshot.provider,
@@ -8240,6 +8597,17 @@ function TradingTerminalPageHydrated() {
           adversarial_state: executionWarfareV85Snapshot.adversarialState,
           trap_state: executionWarfareV85Snapshot.liquidity.trapState,
         },
+        execution_v7_smart_gate: {
+          allow: executionV7SmartGate.allow,
+          reasons: executionV7SmartGate.reasons,
+          recommended_delay_ms: executionV7SmartGate.recommendedDelayMs,
+          size_multiplier: Number(executionV7SmartGate.sizeMultiplier.toFixed(3)),
+          context_score: Number(executionV7SmartGate.contextScore.toFixed(3)),
+          venue_score: Number(executionV7SmartGate.venueScore.toFixed(3)),
+          execution_score: Number(executionV7SmartGate.executionScore.toFixed(3)),
+        },
+        execution_v7_context: executionV7SmartContext,
+        execution_v7_venue_learning: executionV7VenueLearning,
         broker_aware_scheduler: {
           mode: brokerAwareSchedulerV851Snapshot.mode,
           action: brokerAwareSchedulerV851Snapshot.action,
@@ -8338,13 +8706,15 @@ function TradingTerminalPageHydrated() {
         ...overrides,
         notional: sliceNotionalUsd,
         preferredVenue: childOrder.venue || effectiveVenue,
-        maxSpread: maxSpreadEffective,
+        maxSpread: childOrder.maxSpreadBps,
         metadata: warfareMetadata,
         orderIntent: warfareIntent,
       });
       const payloadStatus = extractExecutionStatus(payload);
       const fillRatio = extractExecutionFillRatio(payload);
       const remainingNotionalUsd = Number((sliceNotionalUsd * Math.max(0, 1 - fillRatio)).toFixed(2));
+      const slicePayloads: JsonMap[] = [payload];
+      const followUps: ExecutionFollowUpAttempt[] = [];
       const orderReference = extractLiveOrderReference(
         payload,
         String(overrides?.symbol || selectedChartSymbol),
@@ -8353,6 +8723,7 @@ function TradingTerminalPageHydrated() {
       const shouldCancelReplace = remainingNotionalUsd >= 25
         && orderReference
         && !isFinalExecutionStatus(payloadStatus)
+        && childOrder.retryBudget > 0
         && (brokerAwareSchedulerV851Snapshot.action === "CANCEL_REPLACE"
           || executionEngineSnapshot.repricing.action === "reprice"
           || executionEngineSnapshot.partialFillHandling.action === "cancel_replace");
@@ -8363,7 +8734,7 @@ function TradingTerminalPageHydrated() {
             ...overrides,
             notional: remainingNotionalUsd,
             preferredVenue: childOrder.venue || effectiveVenue,
-            maxSpread: Math.max(1, maxSpreadEffective + executionEngineSnapshot.repricing.stepBps),
+            maxSpread: Math.max(1, childOrder.maxSpreadBps + executionV7LiteIntent.repriceStepBps),
             metadata: {
               ...warfareMetadata,
               execution_engine_follow_up: "cancel_replace",
@@ -8388,9 +8759,14 @@ function TradingTerminalPageHydrated() {
             replacement_status: extractExecutionStatus(replacementPayload),
             replacement_fill_ratio: extractExecutionFillRatio(replacementPayload),
           };
-          payloads.push(payload);
-          payloads.push(replacementPayload);
-          continue;
+          followUps.push({
+            type: "cancel_replace",
+            status: extractExecutionStatus(replacementPayload),
+            fillRatio: extractExecutionFillRatio(replacementPayload),
+            latencyMs: toNumber(replacementPayload.latency_ms ?? replacementPayload.latency_e2e_ms, 0),
+            realizedSlippageBps: toNumber(replacementPayload.realized_slippage_bps, 0),
+          });
+          slicePayloads.push(replacementPayload);
         } catch (error) {
           payload.cancel_replace = {
             status: "replace_failed",
@@ -8403,6 +8779,7 @@ function TradingTerminalPageHydrated() {
         remainingNotionalUsd >= 25
         && fillRatio > 0
         && fillRatio < executionEngineSnapshot.partialFillHandling.targetFillRatio
+        && childOrder.resliceEligible
         && executionEngineSnapshot.partialFillHandling.action === "reslice"
       ) {
         try {
@@ -8434,9 +8811,14 @@ function TradingTerminalPageHydrated() {
             follow_up_status: extractExecutionStatus(reslicePayload),
             follow_up_fill_ratio: extractExecutionFillRatio(reslicePayload),
           };
-          payloads.push(payload);
-          payloads.push(reslicePayload);
-          continue;
+          followUps.push({
+            type: "reslice",
+            status: extractExecutionStatus(reslicePayload),
+            fillRatio: extractExecutionFillRatio(reslicePayload),
+            latencyMs: toNumber(reslicePayload.latency_ms ?? reslicePayload.latency_e2e_ms, 0),
+            realizedSlippageBps: toNumber(reslicePayload.realized_slippage_bps, 0),
+          });
+          slicePayloads.push(reslicePayload);
         } catch (error) {
           payload.partial_fill_follow_up = {
             status: "reslice_failed",
@@ -8445,28 +8827,52 @@ function TradingTerminalPageHydrated() {
           };
         }
       }
-      payloads.push(payload);
+      payloads.push(...slicePayloads);
+      executionV7LiteAttempts.push(buildExecutionV7LiteAttempt({
+        slice: childOrder,
+        venue: childOrder.venue || effectiveVenue || String(((payload.routed_execution as JsonMap | undefined)?.venue) || ""),
+        status: payloadStatus,
+        fillRatio,
+        latencyMs: toNumber(payload.latency_ms ?? payload.latency_e2e_ms, 0),
+        realizedSlippageBps: toNumber(payload.realized_slippage_bps, 0),
+        followUps,
+      }));
+      if (sliceIndex < executionV7LitePlan.slices.length - 1) {
+        const continuationDecision = evaluateExecutionV7LiteContinuation({
+          plan: executionV7LitePlan,
+          attempts: executionV7LiteAttempts,
+        });
+        if (!continuationDecision.shouldContinue) {
+          executionV7LiteStopReason = continuationDecision.reason;
+          break;
+        }
+      }
     }
-
-    const averageLatencyMs = payloads.length > 0
-      ? average(payloads.map((payload) => toNumber(payload.latency_ms ?? payload.latency_e2e_ms, 0)))
-      : 0;
-    const averageSlippageBps = payloads.length > 0
-      ? average(payloads.map((payload) => toNumber(payload.realized_slippage_bps, 0)))
-      : 0;
-    const averageFillRatio = payloads.length > 0
-      ? average(payloads.map((payload) => extractExecutionFillRatio(payload)))
-      : 0;
+    const executionV7LiteResult = finalizeExecutionV7LiteResult({
+      plan: executionV7LitePlan,
+      attempts: executionV7LiteAttempts,
+      stopReason: executionV7LiteStopReason,
+      context: executionV7SmartContext,
+      venueLearning: executionV7VenueLearning,
+      smartGate: executionV7SmartGate,
+    });
     const finalPayload = payloads[payloads.length - 1] || {};
+    const brokerStatus = String(finalPayload.status || finalPayload.execution_status || finalPayload.order_status || "");
 
     return {
       ...finalPayload,
-      latency_ms: averageLatencyMs,
-      latency_e2e_ms: averageLatencyMs,
-      realized_slippage_bps: averageSlippageBps,
+      latency_ms: executionV7LiteResult.avgLatencyMs,
+      latency_e2e_ms: executionV7LiteResult.avgLatencyMs,
+      realized_slippage_bps: executionV7LiteResult.avgSlippageBps,
+      fill_ratio: executionV7LiteResult.fillRatio,
+      executed_ratio: executionV7LiteResult.fillRatio,
+      fill_probability: executionV7LiteResult.feedback.fillProbability,
+      failure_source: executionV7LiteResult.feedback.failureSource,
+      execution_status: executionV7LiteResult.status,
+      broker_status: brokerStatus,
       routed_execution: {
         ...((finalPayload.routed_execution as JsonMap | undefined) || {}),
-        venue: effectiveVenue || String(((finalPayload.routed_execution as JsonMap | undefined)?.venue) || ""),
+        venue: executionV7LiteResult.venue || effectiveVenue || String(((finalPayload.routed_execution as JsonMap | undefined)?.venue) || ""),
       },
       execution_engine: {
         mode: executionEngineSnapshot.mode,
@@ -8485,11 +8891,11 @@ function TradingTerminalPageHydrated() {
         action: executionEngineSnapshot.action,
         activation: executionEngineSnapshot.activation,
         expected_slippage_bps: Number(executionEngineSnapshot.slippage.expectedBps.toFixed(2)),
-        realized_slippage_bps: averageSlippageBps,
+        realized_slippage_bps: executionV7LiteResult.avgSlippageBps,
         expected_fill_ratio: Number(executionEngineSnapshot.partialFillHandling.expectedFillRatio.toFixed(3)),
-        realized_fill_ratio: Number(averageFillRatio.toFixed(3)),
+        realized_fill_ratio: Number(executionV7LiteResult.fillRatio.toFixed(3)),
         latency_guard_ms: Number(executionEngineSnapshot.latency.guardMs.toFixed(0)),
-        latency_e2e_ms: averageLatencyMs,
+        latency_e2e_ms: executionV7LiteResult.avgLatencyMs,
         entry_delay_ms: executionEngineSnapshot.entry.initialDelayMs,
         repricing_attempts: executionEngineSnapshot.repricing.maxAttempts,
         partial_fill_action: executionEngineSnapshot.partialFillHandling.action,
@@ -8497,6 +8903,11 @@ function TradingTerminalPageHydrated() {
         shadow_confidence: Number(executionEngineSnapshot.shadow.confidence.toFixed(3)),
         reason_pills: executionEngineSnapshot.reasons,
       },
+      execution_v7_lite: executionV7LiteResult,
+      execution_feedback: executionV7LiteResult.feedback,
+      execution_v7_smart_gate: executionV7LiteResult.smartGate,
+      execution_v7_context: executionV7LiteResult.context,
+      execution_v7_venue_learning: executionV7LiteResult.venueLearning,
       smart_router: {
         primary_venue: liveSmartRoutingPlan.primaryVenue,
         requested_notional_usd: Number(liveSmartRoutingPlan.requestedNotionalUsd.toFixed(2)),
@@ -8526,10 +8937,10 @@ function TradingTerminalPageHydrated() {
       },
       pnl_analytics: pnlAnalyticsSnapshot,
       warfare_execution: {
-        venue: effectiveVenue || "",
+        venue: executionV7LiteResult.venue || effectiveVenue || "",
         mode: executionWarfareV85Snapshot.plan.mode,
-        slices: schedulerChildren.length,
-        slice_notional_usd: Number((totalNotionalUsd / Math.max(1, schedulerChildren.length)).toFixed(2)),
+        slices: executionV7LitePlan.slices.length,
+        slice_notional_usd: Number((smartSizedNotionalUsd / Math.max(1, executionV7LitePlan.slices.length)).toFixed(2)),
         delay_ms: executionWarfareV85Snapshot.plan.delayMs,
         score: Number(executionWarfareV85Snapshot.executionScore.toFixed(3)),
         guard: executionWarfareV85Snapshot.guard.action,
@@ -8541,8 +8952,8 @@ function TradingTerminalPageHydrated() {
         mode: brokerAwareSchedulerV851Snapshot.mode,
         action: brokerAwareSchedulerV851Snapshot.action,
         provider: brokerAwareSchedulerV851Snapshot.provider,
-        venue: effectiveVenue || "",
-        child_count: schedulerChildren.length,
+        venue: executionV7LiteResult.venue || effectiveVenue || "",
+        child_count: executionV7LitePlan.slices.length,
         average_fill_ratio: Number(brokerAwareSchedulerV851Snapshot.averageFillRatio.toFixed(3)),
         partial_fill_ratio: Number(brokerAwareSchedulerV851Snapshot.partialFillRatio.toFixed(3)),
         schedule_score: Number(brokerAwareSchedulerV851Snapshot.scheduleScore.toFixed(3)),
@@ -8588,6 +8999,12 @@ function TradingTerminalPageHydrated() {
       const executionEngineTelemetry = payload.execution_engine_telemetry && typeof payload.execution_engine_telemetry === "object"
         ? payload.execution_engine_telemetry as JsonMap
         : null;
+      const executionV7Lite = payload.execution_v7_lite && typeof payload.execution_v7_lite === "object"
+        ? payload.execution_v7_lite as JsonMap
+        : null;
+      const executionFeedback = payload.execution_feedback && typeof payload.execution_feedback === "object"
+        ? payload.execution_feedback as JsonMap
+        : null;
       if (executionEngineTelemetry) {
         startTransition(() => {
           setExecutionTelemetry((current) => ([
@@ -8595,14 +9012,22 @@ function TradingTerminalPageHydrated() {
               decision_id: `local-execution-${Date.now()}`,
               symbol: String(payload.symbol || overrides?.symbol || selectedChartSymbol),
               side: String(payload.side || overrides?.side || side),
-              status: String(payload.status || payload.execution_status || payload.order_status || "submitted"),
-              latency_e2e_ms: toNumber(payload.latency_e2e_ms ?? payload.latency_ms, toNumber(executionEngineTelemetry.latency_e2e_ms, 0)),
-              realized_slippage_bps: toNumber(payload.realized_slippage_bps, toNumber(executionEngineTelemetry.realized_slippage_bps, 0)),
+              status: String(executionV7Lite?.status || payload.execution_status || payload.status || payload.order_status || "submitted"),
+              latency_e2e_ms: toNumber(executionV7Lite?.avgLatencyMs ?? payload.latency_e2e_ms ?? payload.latency_ms, toNumber(executionEngineTelemetry.latency_e2e_ms, 0)),
+              realized_slippage_bps: toNumber(executionV7Lite?.avgSlippageBps ?? payload.realized_slippage_bps, toNumber(executionEngineTelemetry.realized_slippage_bps, 0)),
               fill_ratio: clamp(
-                toNumber(payload.fill_ratio ?? payload.executed_ratio, toNumber(executionEngineTelemetry.realized_fill_ratio, 0)),
+                toNumber(executionV7Lite?.fillRatio ?? payload.fill_ratio ?? payload.executed_ratio, toNumber(executionEngineTelemetry.realized_fill_ratio, 0)),
                 0,
                 1,
               ),
+              fill_probability: clamp(toNumber(executionFeedback?.fillProbability ?? payload.fill_probability, 0), 0, 1),
+              failure_source: String(executionFeedback?.failureSource || payload.failure_source || ""),
+              execution_score: clamp(toNumber(executionFeedback?.executionScore, 0), 0, 1),
+              execution_v7_lite_status: String(executionV7Lite?.status || ""),
+              execution_v7_lite_stop_reason: String(executionV7Lite?.stopReason || ""),
+              execution_v7_lite_ok: Boolean(executionV7Lite?.ok),
+              execution_v7_smart_execution_score: clamp(toNumber((payload.execution_v7_smart_gate as JsonMap | undefined)?.executionScore ?? (payload.execution_v7_smart_gate as JsonMap | undefined)?.execution_score, 0), 0, 1),
+              execution_v7_smart_size_multiplier: clamp(toNumber((payload.execution_v7_smart_gate as JsonMap | undefined)?.sizeMultiplier ?? (payload.execution_v7_smart_gate as JsonMap | undefined)?.size_multiplier, 1), 0, 1),
               liquidity_ai: payload.liquidity_ai,
               execution_engine_mode: executionEngineTelemetry.mode,
               execution_engine_action: executionEngineTelemetry.action,
@@ -8840,10 +9265,13 @@ function TradingTerminalPageHydrated() {
               metadata: order.metadata,
             });
             const routed = (payload.routed_execution && typeof payload.routed_execution === "object") ? (payload.routed_execution as JsonMap) : {};
+            const executionV7Lite = payload.execution_v7_lite && typeof payload.execution_v7_lite === "object"
+              ? payload.execution_v7_lite as JsonMap
+              : null;
             executionEngineV7Ref.current.updateFeedback({
               venue: order.venue || String(routed.venue || ""),
-              latencyMs: toNumber(payload.latency_ms ?? payload.latency_e2e_ms, 0),
-              realizedSlippageBps: toNumber(payload.realized_slippage_bps, 0),
+              latencyMs: toNumber(executionV7Lite?.avgLatencyMs ?? payload.latency_ms ?? payload.latency_e2e_ms, 0),
+              realizedSlippageBps: toNumber(executionV7Lite?.avgSlippageBps ?? payload.realized_slippage_bps, 0),
             });
             return { ok: true, venue: order.venue || "", payload };
           } catch (error) {
@@ -9895,6 +10323,49 @@ function TradingTerminalPageHydrated() {
   const effectiveLiquidityScore = useMemo(() => {
     return clamp(liquidityAiSnapshot.liquidityScore * (0.74 + reconstructedOrderflowSnapshot.reliability * 0.26), 0, 1);
   }, [liquidityAiSnapshot.liquidityScore, reconstructedOrderflowSnapshot.reliability]);
+  const executionV7SmartContext = useMemo(() => {
+    const trendSignal = predictorOrderflowSnapshot.vwapSlopeBps + predictorOrderflowSnapshot.imbalance * 7 + liquidityAiSnapshot.directionalBias * 5;
+    const microTrend = trendSignal >= 1.25 ? "up" : trendSignal <= -1.25 ? "down" : "flat";
+    return buildExecutionV7LiteContext({
+      spreadBps: Math.max(0, toNumber(marketMicro?.spread_bps, reconstructedOrderflowSnapshot.spreadBps)),
+      volatilityBps: Math.abs(toNumber(marketMicro?.fusion_deviation_bps, reconstructedOrderflowSnapshot.microNoiseScore * 100)),
+      liquidityScore: effectiveLiquidityScore,
+      microTrend,
+      flowImbalance: predictorOrderflowSnapshot.imbalance,
+      spoofingScore: predictorOrderflowSnapshot.spoofingScore,
+      expectedLatencyMs: Math.max(
+        avgExecutionLatencyForPredictor,
+        toNumber(marketMicro?.avg_latency_ms, 0),
+        marketBusKernelTelemetry.tickLatencyMs,
+      ),
+      queuePressure: clamp(
+        Math.max(
+          liquidityAiSnapshot.earlyExitRisk / 0.3,
+          liquidityAiSnapshot.liquidityVacuumProbability,
+          liquidityAiSnapshot.absorptionFailureProbability * 0.92,
+          Math.abs(predictorOrderflowSnapshot.spoofingScore) * 0.5,
+        ),
+        0,
+        1,
+      ),
+      marketPressure: liquidityAiSnapshot.predictedPressure,
+    });
+  }, [
+    avgExecutionLatencyForPredictor,
+    effectiveLiquidityScore,
+    liquidityAiSnapshot.absorptionFailureProbability,
+    liquidityAiSnapshot.directionalBias,
+    liquidityAiSnapshot.earlyExitRisk,
+    liquidityAiSnapshot.liquidityVacuumProbability,
+    liquidityAiSnapshot.predictedPressure,
+    marketBusKernelTelemetry.tickLatencyMs,
+    marketMicro,
+    predictorOrderflowSnapshot.imbalance,
+    predictorOrderflowSnapshot.spoofingScore,
+    predictorOrderflowSnapshot.vwapSlopeBps,
+    reconstructedOrderflowSnapshot.microNoiseScore,
+    reconstructedOrderflowSnapshot.spreadBps,
+  ]);
   useEffect(() => {
     if (typeof window === "undefined") {
       return;
@@ -12785,8 +13256,8 @@ function TradingTerminalPageHydrated() {
       }
     }
 
-    return markers
-      .filter((marker, index, rows) => rows.findIndex((candidate) => candidate.id === marker.id) === index)
+    return collapseReplayEventMarkers(markers
+      .filter((marker, index, rows) => rows.findIndex((candidate) => candidate.id === marker.id) === index))
       .sort((left, right) => left.frameIndex - right.frameIndex)
       .slice(0, 60);
   })();
@@ -15115,6 +15586,74 @@ function TradingTerminalPageHydrated() {
     selectedChartSymbol,
     side,
   ]);
+  const executionSmartTrackerPreview = useMemo(() => {
+    const venueHint = String((preferredRoute as JsonMap | null)?.venue || executionEngineSnapshot.entry.venue || executionWarfareV85Snapshot.plan.venue || "").trim().toLowerCase();
+    const requestedNotionalUsd = autoExecutionMode === "full-auto" ? aiAdjustedAutoNotionalUsd : notional;
+    const autoOptimizationMultiplier = pnlAnalyticsSnapshot.autoOptimization.action === "reduce"
+      ? pnlAnalyticsSnapshot.autoOptimization.sizeMultiplier
+      : 1;
+    const effectiveNotionalUsd = applyRiskAiLiveSizing(Math.max(0, requestedNotionalUsd)) * autoOptimizationMultiplier;
+    const venueLearning = buildExecutionV7SmartVenueProfile(venueHint, selectedChartSymbol);
+    const previewIntent = createExecutionV7LiteIntent({
+      symbol: selectedChartSymbol,
+      side: side === "sell" ? "sell" : "buy",
+      requestedNotionalUsd,
+      effectiveNotionalUsd,
+      preferredVenue: venueHint,
+      rationale,
+      maxSpreadBps: Math.max(1, Math.min(maxSpread * executionWarfareV85Snapshot.plan.maxSpreadMultiplier, executionEngineSnapshot.slippage.budgetBps)),
+      slippageBudgetBps: executionEngineSnapshot.slippage.budgetBps,
+      expectedSlippageBps: executionEngineSnapshot.slippage.expectedBps,
+      latencyGuardMs: executionEngineSnapshot.latency.guardMs,
+      requestedSlices: Math.max(1, executionWarfareV85Snapshot.plan.slices),
+      maxSlices: 8,
+      minSliceNotionalUsd: 25,
+      initialDelayMs: executionEngineSnapshot.entry.initialDelayMs,
+      baseSliceDelayMs: executionWarfareV85Snapshot.plan.delayMs,
+      repriceStepBps: executionEngineSnapshot.repricing.stepBps,
+      maxRetries: executionEngineSnapshot.repricing.maxAttempts,
+      partialFillAction: executionEngineSnapshot.partialFillHandling.action,
+      partialFillTargetRatio: executionEngineSnapshot.partialFillHandling.targetFillRatio,
+      expectedFillRatio: executionEngineSnapshot.partialFillHandling.expectedFillRatio,
+      resliceDelayMs: executionEngineSnapshot.partialFillHandling.resliceDelayMs,
+      riskSizingMultiplier: riskAiLiveSizeMultiplier * volatilityRegimeRiskMultiplier,
+      autoOptimizationMultiplier,
+    });
+    const gate = evaluateExecutionV7LiteSmartGate({
+      intent: previewIntent,
+      context: executionV7SmartContext,
+      venueLearning,
+    });
+    return {
+      venue: venueHint,
+      allow: gate.allow,
+      reasons: gate.reasons,
+      delay_ms: gate.recommendedDelayMs,
+      size_multiplier: gate.sizeMultiplier,
+      venue_score: gate.venueScore,
+      execution_score: gate.executionScore,
+      context_score: gate.contextScore,
+      requested_notional_usd: Number(requestedNotionalUsd.toFixed(2)),
+      projected_notional_usd: Number(Math.max(25, effectiveNotionalUsd * gate.sizeMultiplier).toFixed(2)),
+      learning_samples: venueLearning?.samples || 0,
+    };
+  }, [
+    aiAdjustedAutoNotionalUsd,
+    autoExecutionMode,
+    executionEngineSnapshot,
+    executionV7SmartContext,
+    executionWarfareV85Snapshot,
+    maxSpread,
+    notional,
+    pnlAnalyticsSnapshot.autoOptimization.action,
+    pnlAnalyticsSnapshot.autoOptimization.sizeMultiplier,
+    preferredRoute,
+    rationale,
+    riskAiLiveSizeMultiplier,
+    selectedChartSymbol,
+    side,
+    volatilityRegimeRiskMultiplier,
+  ]);
   const buildBrokerAwareSchedulerInput = (overrides?: TradeTicketOverrides): BrokerAwareSchedulerInput => ({
     symbol: overrides?.symbol || selectedChartSymbol,
     side: overrides?.side === "sell" || side === "sell" ? "sell" : "buy",
@@ -15638,6 +16177,7 @@ function TradingTerminalPageHydrated() {
     brainConfidencePct: clamp(backendBrainConfidence * 100, 0, 100),
     brainRegime: backendBrainRegime,
     reasonLabel: backendPredictorReasonsLabel || backendBrainReason,
+    smartDecision: smartDecisionHud,
   };
   const chartExecutionSignals = useMemo<PerceptualExecutionSignal[]>(() => {
     if (!replayState.enabled && !hasLiveOrderflowRuntime) {
@@ -19850,11 +20390,13 @@ function TradingTerminalPageHydrated() {
       case "controlroom":
         return <ControlRoomMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} liveOpsPayload={liveOpsPayload} executionAiV6Payload={executionAiV6Payload} emergencyStopBusy={emergencyStopBusy} emergencyStopFeedback={emergencyStopFeedback} onEmergencyStop={() => { void triggerEmergencyStop(); }} formatClock={formatClock} />;
       case "pnltruth":
-        return <ExecutionPnlTruthMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} payload={executionPnlAnalyzerPayload} liveOpsPayload={liveOpsPayload} executionAiV6Payload={executionAiV6Payload} formatClock={formatClock} />;
+        return <ExecutionPnlTruthMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} payload={executionPnlAnalyzerPayload} liveOpsPayload={liveOpsPayload} executionAiV6Payload={executionAiV6Payload} journalContext={terminalGuideJournalContext} formatClock={formatClock} />;
       case "optimizer":
         return <ExecutionOptimizerMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} payload={executionOptimizerLivePayload} routingPayload={routingScore} formatClock={formatClock} />;
+      case "execsmart":
+        return <ExecutionSmartTrackerPanel badge={null} layoutEditMode={false} onDetach={() => {}} telemetry={executionTelemetry} outcomes={filteredOutcomes} preview={executionSmartTrackerPreview} symbol={selectedChartSymbol} formatClock={formatClock} />;
       case "marketcontext":
-        return <ExecutionContextMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} routingPayload={routingScore} optimizerPayload={executionOptimizerLivePayload} formatClock={formatClock} />;
+        return <ExecutionContextMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} routingPayload={routingScore} optimizerPayload={executionOptimizerLivePayload} smartDecision={smartDecisionHud} formatClock={formatClock} />;
       case "v6observability":
         return <ExecutionAiV6ObservabilityPanel badge={null} layoutEditMode={false} onDetach={() => {}} payload={executionAiV6Payload} formatClock={formatClock} />;
       case "venues":
@@ -20143,8 +20685,10 @@ function TradingTerminalPageHydrated() {
       </header>
       {terminalOnboardingLoaded ? (
         <section
+          id="terminal-onboarding"
           className={[
-            "gtix-panel-shell terminal-onboarding",
+            "gtix-panel-shell terminal-onboarding terminal-guide-anchor",
+            guidedCoachTargetId === "terminal-onboarding" ? "is-guided-target" : "",
             terminalOnboardingExpanded ? "" : "is-collapsed",
             terminalOnboardingPinned ? "is-pinned" : "",
           ].filter(Boolean).join(" ")}
@@ -20156,7 +20700,7 @@ function TradingTerminalPageHydrated() {
               <h2 className="terminal-onboarding-title">Prends le terminal en main sans chercher partout</h2>
               {terminalOnboardingExpanded ? (
                 <p className="subtle terminal-onboarding-copy">
-                  Choisis ce que tu veux faire et le terminal se règle tout de suite sur le bon mode, le bon niveau de détail et la bonne vue.
+                  Le guide choisit maintenant entre lecture, exécution et calibration selon la décision live, le Bloc 5 et la discipline du desk.
                 </p>
               ) : (
                 <p className="terminal-onboarding-summary">
@@ -20174,8 +20718,16 @@ function TradingTerminalPageHydrated() {
                 <span className="terminal-onboarding-pill">Vue {terminalDensityMode === "focus" ? "Focus" : "Full Surface"}</span>
                 <span className="terminal-onboarding-pill">Boot {terminalBootProfile === "light" ? `Light/${terminalBootStage}` : "Full"}</span>
                 <span className="terminal-onboarding-pill">Preset {layoutPreset}</span>
+                <span className={`terminal-onboarding-pill ${terminalAdaptiveGuide.tone}`}>Assist {terminalAdaptiveGuide.assistanceLevel}</span>
               </div>
               <div className="terminal-onboarding-toolbar">
+                <button
+                  type="button"
+                  className={`terminal-onboarding-toggle${terminalAdaptiveGuide.tone === "warn" ? " active" : ""}`}
+                  onClick={() => activateAdaptiveGuide(terminalAdaptiveGuide.recommendedMode)}
+                >
+                  Guide {terminalAdaptiveGuide.recommendedMode.replace(/_/g, " ")}
+                </button>
                 <button
                   type="button"
                   className="terminal-onboarding-toggle"
@@ -20195,62 +20747,49 @@ function TradingTerminalPageHydrated() {
           </div>
           {terminalOnboardingExpanded ? (
             <div className="terminal-onboarding-body">
+              <div className="terminal-onboarding-status" style={{ marginBottom: 14 }}>
+                <span className={`terminal-onboarding-pill ${terminalAdaptiveGuide.tone}`}>Reco {terminalAdaptiveGuide.recommendedMode.replace(/_/g, " ")}</span>
+                <span className={`terminal-onboarding-pill ${terminalFeedbackSummary.modelHealth === "BROKEN" || terminalFeedbackSummary.modelHealth === "DEGRADING" ? "warn" : terminalFeedbackSummary.modelHealth === "ADAPTING" ? "subtle" : "good"}`}>Health {terminalFeedbackSummary.modelHealth}</span>
+                <span className={`terminal-onboarding-pill ${terminalFeedbackSummary.driftState === "LOCK" || terminalFeedbackSummary.driftState === "DRIFT" ? "warn" : terminalFeedbackSummary.driftState === "WATCH" ? "subtle" : "good"}`}>Drift {terminalFeedbackSummary.driftState}</span>
+                <span className={`terminal-onboarding-pill ${terminalAdaptiveGuide.disciplineLock ? "warn" : "good"}`}>{terminalAdaptiveGuide.disciplineLock ? `Discipline lock ${terminalAdaptiveGuide.disciplineReason || "active"}` : "Discipline open"}</span>
+              </div>
+              <div className="txt-page-guide-note" style={{ marginBottom: 14 }}>
+                <strong>{terminalAdaptiveGuide.headline}</strong>
+                <div>{terminalAdaptiveGuide.summary}</div>
+                <div style={{ marginTop: 6 }}>Assistance: {terminalAdaptiveGuide.assistanceReason}</div>
+                {terminalGuideJournalError ? <div className="warn" style={{ marginTop: 6 }}>{terminalGuideJournalError}</div> : null}
+              </div>
               <div className="terminal-onboarding-grid">
+                {terminalAdaptiveGuide.plans.map((plan, index) => {
+                  const completedSteps = plan.steps.filter((step) => step.completed).length;
+                  const isActive = plan.mode === activeAdaptiveGuideMode;
+                  const isRecommended = plan.mode === terminalAdaptiveGuide.recommendedMode;
+                  return (
+                    <article key={plan.mode} className="terminal-onboarding-card" style={isActive ? { borderColor: "rgba(56,189,248,0.45)", boxShadow: "0 0 0 1px rgba(56,189,248,0.28) inset" } : undefined}>
+                      <div className="terminal-onboarding-card-label">{index + 1}. {plan.title}</div>
+                      <h3>{plan.headline}</h3>
+                      <p>{plan.summary}</p>
+                      <div className="terminal-onboarding-status" style={{ marginBottom: 10 }}>
+                        <span className={`terminal-onboarding-pill ${plan.tone}`}>{completedSteps}/{plan.steps.length} etapes</span>
+                        <span className="terminal-onboarding-pill">{plan.uiMode} / {plan.densityMode}</span>
+                        {isRecommended ? <span className="terminal-onboarding-pill">recommande</span> : null}
+                        {isActive ? <span className="terminal-onboarding-pill">actif</span> : null}
+                      </div>
+                      <div className="terminal-onboarding-links" style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                        <button type="button" className={plan.mode === "EXECUTE_SAFE" ? "btn btn-primary" : "btn"} onClick={() => activateAdaptiveGuide(plan.mode)}>
+                          Activer ce guide
+                        </button>
+                        <button type="button" className="btn" onClick={() => openAdaptiveGuideCommand(plan.mode)}>
+                          Mode commandant
+                        </button>
+                      </div>
+                    </article>
+                  );
+                })}
                 <article className="terminal-onboarding-card">
-                  <div className="terminal-onboarding-card-label">1. Je découvre</div>
-                  <h3>Voir l'essentiel</h3>
-                  <p>Affiche une vue simple pour lire le marché sans se noyer dans tous les modules.</p>
-                  <button
-                    type="button"
-                    className="btn"
-                    onClick={() => {
-                      setUiMode("novice");
-                      setTerminalDensityMode("focus");
-                      applyLayoutPreset("scalp");
-                      completeTerminalOnboardingAction();
-                    }}
-                  >
-                    Activer le mode découverte
-                  </button>
-                </article>
-                <article className="terminal-onboarding-card">
-                  <div className="terminal-onboarding-card-label">2. Je trade</div>
-                  <h3>Préparer une entrée</h3>
-                  <p>Met le terminal sur une vue rapide pour lire le prix, le flux et la décision plus vite.</p>
-                  <button
-                    type="button"
-                    className="btn btn-primary"
-                    onClick={() => {
-                      setUiMode("expert");
-                      setTerminalDensityMode("focus");
-                      applyLayoutPreset("scalp");
-                      completeTerminalOnboardingAction();
-                    }}
-                  >
-                    Passer en mode trade
-                  </button>
-                </article>
-                <article className="terminal-onboarding-card">
-                  <div className="terminal-onboarding-card-label">3. Je surveille</div>
-                  <h3>Suivre les risques</h3>
-                  <p>Ouvre une vue plus large pour surveiller les alertes, la santé système et les incidents en parallèle.</p>
-                  <button
-                    type="button"
-                    className="btn"
-                    onClick={() => {
-                      setUiMode("novice");
-                      setTerminalDensityMode("full");
-                      applyLayoutPreset("monitoring");
-                      completeTerminalOnboardingAction();
-                    }}
-                  >
-                    Ouvrir la vue monitoring
-                  </button>
-                </article>
-                <article className="terminal-onboarding-card">
-                  <div className="terminal-onboarding-card-label">4. J'ai besoin d'aide</div>
+                  <div className="terminal-onboarding-card-label">4. Aide contextuelle</div>
                   <h3>Aller au bon écran</h3>
-                  <p>Utilise les guides si tu hésites entre apprentissage, suivi live ou traitement d'un problème.</p>
+                  <p>Utilise les guides dédiés si tu bascules en apprentissage, audit live ou traitement d'incident.</p>
                   <div className="terminal-onboarding-links">
                     <Link href="/learn" onClick={completeTerminalOnboardingAction}>Ouvrir Learn</Link>
                     <Link href="/live-ops" onClick={completeTerminalOnboardingAction}>Ouvrir Live Ops</Link>
@@ -20258,10 +20797,62 @@ function TradingTerminalPageHydrated() {
                   </div>
                 </article>
               </div>
+              {activeAdaptiveGuideStep ? (
+                <div className="gtix-module-guide" style={{ marginTop: 14 }}>
+                  <div className="gtix-module-guide-title">Guide actif: {activeAdaptiveGuidePlan.title}</div>
+                  <div className="gtix-module-guide-row">
+                    <span className="gtix-module-guide-label">Etape en cours</span>
+                    <span className="gtix-module-guide-text">{activeAdaptiveGuideStep.title}</span>
+                  </div>
+                  <div className="gtix-module-guide-row">
+                    <span className="gtix-module-guide-label">Pourquoi</span>
+                    <span className="gtix-module-guide-text">{activeAdaptiveGuideStep.explanation}</span>
+                  </div>
+                  <div className="gtix-module-guide-row">
+                    <span className="gtix-module-guide-label">Validation</span>
+                    <span className="gtix-module-guide-text">{activeAdaptiveGuideStep.validationLabel}</span>
+                  </div>
+                  <div className="terminal-onboarding-links" style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
+                    <button type="button" className="btn" onClick={() => focusAdaptiveGuideTarget(activeAdaptiveGuideStep.targetId)}>
+                      Aller a la zone
+                    </button>
+                    <button type="button" className="btn" onClick={() => openAdaptiveGuideCommand(activeAdaptiveGuidePlan.mode)}>
+                      Demander au commandant
+                    </button>
+                    <button type="button" className="btn btn-primary" onClick={advanceAdaptiveGuideStep}>
+                      Etape suivante
+                    </button>
+                  </div>
+                  <div style={{ display: "grid", gap: 8, marginTop: 12 }}>
+                    {activeAdaptiveGuidePlan.steps.map((step, index) => (
+                      <div key={step.id} className="operator-action-reason-row" style={index === terminalAdaptiveGuideStepIndex ? { background: "rgba(15,23,42,0.45)", borderRadius: 10, padding: "8px 10px" } : undefined}>
+                        <span className={`operator-action-dot ${step.completed ? "good" : index === terminalAdaptiveGuideStepIndex ? "subtle" : "warn"}`} />
+                        <span>{index + 1}. {step.title} · {step.validationLabel}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
             </div>
           ) : null}
         </section>
       ) : null}
+
+      <TerminalCoachOverlay
+        visible={coachOverlayVisible && Boolean(activeAdaptiveGuideStep)}
+        step={activeAdaptiveGuideStep}
+        tone={terminalAdaptiveGuide.tone}
+        assistanceLevel={terminalAdaptiveGuide.assistanceLevel}
+        disciplineLock={terminalAdaptiveGuide.disciplineLock}
+        onDismiss={() => setCoachOverlayVisible(false)}
+        onFocusTarget={() => {
+          if (activeAdaptiveGuideStep) {
+            focusAdaptiveGuideTarget(activeAdaptiveGuideStep.targetId);
+          }
+        }}
+        onCommand={() => openAdaptiveGuideCommand(activeAdaptiveGuidePlan.mode)}
+        onNext={advanceAdaptiveGuideStep}
+      />
 
       {error ? <div className="term-error-bar warn">{error}</div> : null}
 
@@ -20279,7 +20870,7 @@ function TradingTerminalPageHydrated() {
         </div>
       </section>
 
-      <section className="term-decision-layer">
+      <section id="terminal-decision-layer" className={`term-decision-layer terminal-guide-anchor${guidedCoachTargetId === "terminal-decision-layer" ? " is-guided-target" : ""}`}>
         <article className={`term-decision-card tone-${decisionGateTone}`}>
           <div className="term-decision-card-head">
             <div>
@@ -21124,6 +21715,7 @@ function TradingTerminalPageHydrated() {
               chartSmoothingMs={effectiveChartSmoothingMs}
               onChartPerceptualTelemetry={chartPerceptionEnabled ? setChartPerceptualTelemetry : undefined}
               onGpuPerceptualTelemetry={chartPerceptionEnabled ? setGpuPerceptualTelemetry : undefined}
+              onSmartDecisionHudChange={setSmartDecisionHud}
             />
           ) : (
             <div className={`chart-shell chart-shell-premium chart-shell-${chartMotionClass} chart-shell-signal-mode-${signalDisplayMode}`}>
@@ -21287,12 +21879,13 @@ function TradingTerminalPageHydrated() {
               {chartLoading ? <div className="chart-loader">Switching symbol…</div> : null}
               {chartEngineMode === "v4" ? (
                 <GpuChartV4Surface
-                  key={`${selectedChartInstrument}|${selectedChartVenue}|${chartTimeframe}|v4|${effectiveChartMode}|${effectiveChartBarConstructionMode}`}
+                  key={`${selectedChartInstrument}|${selectedChartVenue}|${chartTimeframe}|v4|${effectiveChartMode}|${effectiveChartBarConstructionMode}|${chartRenderEpoch}`}
                   className={`chart-stage-premium ${chartActiveSnapLine ? "execution-focus" : ""} ${marketSignalV1.focusMode ? "signal-focus" : ""}`}
                   symbol={selectedChartSymbol}
                   timeframe={chartTimeframe}
-                  liveFeedKey={`${selectedChartInstrument}|${selectedChartVenue}|${chartTimeframe}`}
+                  liveFeedKey={chartLiveFeedKey}
                   mode={effectiveChartMode}
+                  frozen={chartSurfaceFrozen}
                   chartMotionPreset={chartMotionPreset}
                   visualMode={chartVisualMode}
                   candles={chartDisplayCandlesWithMicrostructure}
@@ -21323,12 +21916,13 @@ function TradingTerminalPageHydrated() {
                 />
               ) : (
                 <InstitutionalChart
-                  key={`${selectedChartInstrument}|${selectedChartVenue}|${chartTimeframe}|v3|${effectiveChartMode}|${effectiveChartBarConstructionMode}`}
+                  key={`${selectedChartInstrument}|${selectedChartVenue}|${chartTimeframe}|v3|${effectiveChartMode}|${effectiveChartBarConstructionMode}|${chartRenderEpoch}`}
                   className={`chart-stage-premium ${chartActiveSnapLine ? "execution-focus" : ""} ${marketSignalV1.focusMode ? "signal-focus" : ""}`}
                   symbol={selectedChartSymbol}
                   timeframe={chartTimeframe}
-                  liveFeedKey={`${selectedChartInstrument}|${selectedChartVenue}|${chartTimeframe}`}
+                  liveFeedKey={chartLiveFeedKey}
                   mode={effectiveChartMode}
+                  frozen={chartSurfaceFrozen}
                   chartMotionPreset={chartMotionPreset}
                   visualMode={chartVisualMode}
                   candles={chartDisplayCandlesWithMicrostructure}
@@ -22527,6 +23121,8 @@ function TradingTerminalPageHydrated() {
             </div>
             <div className="brokers-section">
               <div className="chart-stat-label" style={{ marginBottom: 6 }}>AI Execution Bridge</div>
+              {smartDecisionHud ? <div className="row"><span>Smart state</span><span className={smartDecisionHud.tone}>{smartDecisionHud.displayStateLabel} | {smartDecisionHud.confidenceBand}</span></div> : null}
+              {smartDecisionHud ? <div className="row"><span>Decision gate</span><span className={smartDecisionHud.qualityGate === "pass" ? "good" : smartDecisionHud.qualityGate === "warn" ? "subtle" : "warn"}>{smartDecisionHud.qualityGateLabel} | {smartDecisionHud.stability.statusLabel}</span></div> : null}
               <div className="row"><span>V7 gate</span><span className={aiBridgeSummary.v7Tone === "good" ? "good" : aiBridgeSummary.v7Tone === "warn" ? "warn" : "subtle"}>{aiBridgeSummary.v7Label}</span></div>
               <div className="row"><span>Route</span><span>{aiBridgeSummary.routeLabel} | {aiBridgeSummary.routeScore.toFixed(2)}</span></div>
               <div className="row"><span>Final edge</span><span className={aiBridgeSummary.edgeBps >= 0 ? "good" : "warn"}>{aiBridgeSummary.edgeBps.toFixed(1)} bps</span></div>
@@ -22538,7 +23134,8 @@ function TradingTerminalPageHydrated() {
           <div style={{ marginTop: 10, borderTop: "1px solid var(--line)", paddingTop: 8, fontSize: 12 }}>
             <div className="row"><span className="chart-stat-label">Last OMS event</span><span>{omsLifecycleSummary.lastEventIso ? formatClock(omsLifecycleSummary.lastEventIso) : "–"}</span></div>
             <div className="row"><span className="chart-stat-label">Dominant book</span><span className="gtix-ellipsis">{portfolioOverlaySummary.dominantBookLabel}</span></div>
-            <div className="row"><span className="chart-stat-label">Predictor rationale</span><span className="gtix-ellipsis">{aiBridgeSummary.reasonLabel || "–"}</span></div>
+            <div className="row"><span className="chart-stat-label">Predictor rationale</span><span className="gtix-ellipsis">{smartDecisionHud?.headline || aiBridgeSummary.reasonLabel || "–"}</span></div>
+            {smartDecisionHud ? <div className="row"><span className="chart-stat-label">Smart reason</span><span className="gtix-ellipsis">{smartDecisionHud.reason}</span></div> : null}
           </div>
         </PanelShell>
         </div>
@@ -22547,18 +23144,15 @@ function TradingTerminalPageHydrated() {
 
       {showMonitoringDeck ? (
       <>
-      <section className="panel term-operator-action-shell">
+      <section id="terminal-operator-action" className={`panel term-operator-action-shell terminal-guide-anchor${guidedCoachTargetId === "terminal-operator-action" ? " is-guided-target" : ""}`}>
         <OperatorActionSummary
           badge={publicOpsPanelBadge}
           executionPnlPayload={executionPnlAnalyzerPayload}
           liveOpsPayload={liveOpsPayload}
           executionAiV6Payload={executionAiV6Payload}
           routingPayload={routingScore}
-          journalContext={{
-            symbol: String(selectedChartSymbol || "BTCUSD"),
-            timeframe: String(chartTimeframe || "1m"),
-            strategy: String(chartOrderTicket.preset || "terminal"),
-          }}
+          smartDecision={smartDecisionHud}
+          journalContext={terminalGuideJournalContext}
           formatClock={formatClock}
           footer={(
             <>
@@ -22619,7 +23213,8 @@ function TradingTerminalPageHydrated() {
             />
             </div>
             <div
-              className={`layout-draggable-card${layoutEditMode ? " is-edit" : ""}${layoutDropPreview?.zone === "monitoring" && layoutDropPreview.targetId === "pnltruth" ? " is-drop-target" : ""}`}
+              id="terminal-pnl-truth"
+              className={`layout-draggable-card terminal-guide-anchor${guidedCoachTargetId === "terminal-pnl-truth" ? " is-guided-target" : ""}${layoutEditMode ? " is-edit" : ""}${layoutDropPreview?.zone === "monitoring" && layoutDropPreview.targetId === "pnltruth" ? " is-drop-target" : ""}`}
               draggable={layoutEditMode}
               onDragStart={() => { layoutDragRef.current = { zone: "monitoring", id: "pnltruth" }; setLayoutDropPreview({ zone: "monitoring", targetId: "pnltruth", mode: "panel" }); }}
               onDragEnd={() => { layoutDragRef.current = null; setLayoutDropPreview(null); }}
@@ -22634,6 +23229,7 @@ function TradingTerminalPageHydrated() {
               payload={executionPnlAnalyzerPayload}
               liveOpsPayload={liveOpsPayload}
               executionAiV6Payload={executionAiV6Payload}
+              journalContext={terminalGuideJournalContext}
               formatClock={formatClock}
             />
             </div>
@@ -22656,13 +23252,33 @@ function TradingTerminalPageHydrated() {
             />
             </div>
             <div
+              className={`layout-draggable-card${layoutEditMode ? " is-edit" : ""}${layoutDropPreview?.zone === "monitoring" && layoutDropPreview.targetId === "execsmart" ? " is-drop-target" : ""}`}
+              draggable={layoutEditMode}
+              onDragStart={() => { layoutDragRef.current = { zone: "monitoring", id: "execsmart" }; setLayoutDropPreview({ zone: "monitoring", targetId: "execsmart", mode: "panel" }); }}
+              onDragEnd={() => { layoutDragRef.current = null; setLayoutDropPreview(null); }}
+              onDragOver={(event) => { if (layoutEditMode) { event.preventDefault(); setLayoutDropPreview({ zone: "monitoring", targetId: "execsmart", mode: "panel" }); } }}
+              onDrop={() => handleLayoutDrop("monitoring", "execsmart")}
+              style={{ order: monitoringOrderById.execsmart ?? 3, display: floatingPanels.some((fp) => fp.id === "execsmart") ? "none" : undefined }}
+            >
+            <ExecutionSmartTrackerPanel
+              badge={publicOpsPanelBadge}
+              layoutEditMode={layoutEditMode}
+              onDetach={() => detachPanel("execsmart", "monitoring")}
+              telemetry={executionTelemetry}
+              outcomes={filteredOutcomes}
+              preview={executionSmartTrackerPreview}
+              symbol={selectedChartSymbol}
+              formatClock={formatClock}
+            />
+            </div>
+            <div
               className={`layout-draggable-card${layoutEditMode ? " is-edit" : ""}${layoutDropPreview?.zone === "monitoring" && layoutDropPreview.targetId === "marketcontext" ? " is-drop-target" : ""}`}
               draggable={layoutEditMode}
               onDragStart={() => { layoutDragRef.current = { zone: "monitoring", id: "marketcontext" }; setLayoutDropPreview({ zone: "monitoring", targetId: "marketcontext", mode: "panel" }); }}
               onDragEnd={() => { layoutDragRef.current = null; setLayoutDropPreview(null); }}
               onDragOver={(event) => { if (layoutEditMode) { event.preventDefault(); setLayoutDropPreview({ zone: "monitoring", targetId: "marketcontext", mode: "panel" }); } }}
               onDrop={() => handleLayoutDrop("monitoring", "marketcontext")}
-              style={{ order: monitoringOrderById.marketcontext ?? 3, display: floatingPanels.some((fp) => fp.id === "marketcontext") ? "none" : undefined }}
+              style={{ order: monitoringOrderById.marketcontext ?? 4, display: floatingPanels.some((fp) => fp.id === "marketcontext") ? "none" : undefined }}
             >
             <ExecutionContextMonitoringPanel
               badge={publicOpsPanelBadge}
@@ -22670,6 +23286,7 @@ function TradingTerminalPageHydrated() {
               onDetach={() => detachPanel("marketcontext", "monitoring")}
               routingPayload={routingScore}
               optimizerPayload={executionOptimizerLivePayload}
+              smartDecision={smartDecisionHud}
               formatClock={formatClock}
             />
             </div>

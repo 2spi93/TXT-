@@ -56,6 +56,41 @@ function isMacroExtendedTimeframeHint(timeframeHint: string): boolean {
   return /^(4h|8h|1d|1w|1M)$/i.test(String(timeframeHint || "").trim());
 }
 
+function timeframeHintToSeconds(timeframeHint: string): number {
+  const match = /^([0-9]+)(s|m|h|d|w|M)$/i.exec(String(timeframeHint || "").trim());
+  if (!match) {
+    return 0;
+  }
+  const amount = Number(match[1]);
+  const unit = match[2].toLowerCase();
+  if (unit === "s") return amount;
+  if (unit === "m") return amount * 60;
+  if (unit === "h") return amount * 60 * 60;
+  if (unit === "d") return amount * 60 * 60 * 24;
+  if (unit === "w") return amount * 60 * 60 * 24 * 7;
+  return amount * 60 * 60 * 24 * 30;
+}
+
+function resolvePerceptualRangeTimeframeSeconds(bars: OhlcBar[], count: number): number {
+  const hinted = timeframeHintToSeconds(String(bars[Math.max(0, count - 1)]?.__visual?.timeframeHint || ""));
+  if (hinted > 0) {
+    return hinted;
+  }
+
+  let smallestDelta = Number.POSITIVE_INFINITY;
+  const start = Math.max(1, count - 24);
+  for (let index = start; index < count; index += 1) {
+    const current = Number(bars[index]?.time);
+    const previous = Number(bars[index - 1]?.time);
+    const delta = current - previous;
+    if (Number.isFinite(delta) && delta > 0 && delta < smallestDelta) {
+      smallestDelta = delta;
+    }
+  }
+
+  return Number.isFinite(smallestDelta) ? smallestDelta : 300;
+}
+
 function resolveBodyDominanceRatio(density: number, timeframeHint: string): number {
   let ratio = 0.8;
 
@@ -196,6 +231,7 @@ export function resolvePerceptualRange(bars: OhlcBar[], count: number): { minPri
     return { minPrice: 0, maxPrice: 1 };
   }
 
+  const timeframeSeconds = resolvePerceptualRangeTimeframeSeconds(bars, count);
   const lows: number[] = [];
   const highs: number[] = [];
   const recentLows: number[] = [];
@@ -244,12 +280,26 @@ export function resolvePerceptualRange(bars: OhlcBar[], count: number): { minPri
   const latestHigh = latest?.high ?? latestBodyHigh;
   const latestLow = latest?.low ?? latestBodyLow;
   const latestRange = Math.max(0, latestHigh - latestLow);
-  const activeShockCap = Math.max(medianRecentRange * 2.1, Math.abs(latestClose || latestOpen || 1) * 0.00032);
+  const microShockMultiplier = timeframeSeconds <= 5
+    ? 1.35
+    : timeframeSeconds <= 30
+      ? 1.55
+      : timeframeSeconds <= 60
+        ? 1.75
+        : 2.1;
+  const latestWickWeight = timeframeSeconds <= 5
+    ? 0.22
+    : timeframeSeconds <= 30
+      ? 0.28
+      : timeframeSeconds <= 60
+        ? 0.32
+        : 0.35;
+  const activeShockCap = Math.max(medianRecentRange * microShockMultiplier, Math.abs(latestClose || latestOpen || 1) * 0.00032);
   const dominantLatestHigh = latestRange > activeShockCap
-    ? latestBodyHigh + Math.min(latestHigh - latestBodyHigh, activeShockCap * 0.35)
+    ? latestBodyHigh + Math.min(latestHigh - latestBodyHigh, activeShockCap * latestWickWeight)
     : latestHigh;
   const dominantLatestLow = latestRange > activeShockCap
-    ? latestBodyLow - Math.min(latestBodyLow - latestLow, activeShockCap * 0.35)
+    ? latestBodyLow - Math.min(latestBodyLow - latestLow, activeShockCap * latestWickWeight)
     : latestLow;
 
   let minPrice = Math.min(trimmed.min, dominantLatestLow, latestOpen, latestClose);
@@ -261,13 +311,27 @@ export function resolvePerceptualRange(bars: OhlcBar[], count: number): { minPri
 
   const span = Math.max(1e-6, maxPrice - minPrice);
   const anchor = Math.max(Math.abs(latestClose), Math.abs(latestOpen), 1);
-  const padding = Math.max(span * 0.035, medianRecentRange * 0.26, anchor * 0.00008);
+  const paddingMultiplier = timeframeSeconds <= 5
+    ? 1.35
+    : timeframeSeconds <= 30
+      ? 1.2
+      : timeframeSeconds <= 60
+        ? 1.1
+        : 1;
+  const padding = Math.max(span * 0.035, medianRecentRange * 0.26 * paddingMultiplier, anchor * 0.00008 * paddingMultiplier);
 
   minPrice -= padding;
   maxPrice += padding;
 
-  if (maxPrice - minPrice < Math.max(anchor * 0.00045, medianRecentRange * 1.85)) {
-    const minVisibleSpan = Math.max(anchor * 0.00045, medianRecentRange * 1.85);
+  const minVisibleRangeMultiplier = timeframeSeconds <= 5
+    ? 2.65
+    : timeframeSeconds <= 30
+      ? 2.35
+      : timeframeSeconds <= 60
+        ? 2.1
+        : 1.85;
+  if (maxPrice - minPrice < Math.max(anchor * 0.00045, medianRecentRange * minVisibleRangeMultiplier)) {
+    const minVisibleSpan = Math.max(anchor * 0.00045, medianRecentRange * minVisibleRangeMultiplier);
     const mid = (minPrice + maxPrice) * 0.5;
     minPrice = mid - minVisibleSpan * 0.5;
     maxPrice = mid + minVisibleSpan * 0.5;

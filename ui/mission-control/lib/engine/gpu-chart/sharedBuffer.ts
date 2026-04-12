@@ -13,6 +13,11 @@ export type GpuVisualMetadata = {
   footprintHeat?: number;
   liquidityScore?: number;
   timeframeHint?: string;
+  absorptionScore?: number;
+  qualityScore?: number;
+  candleRole?: "noise" | "context" | "trigger";
+  noiseClass?: "noise" | "weak" | "valid";
+  microstructureNoise?: number;
 };
 
 export type OhlcBar = {

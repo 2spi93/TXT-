@@ -50,6 +50,9 @@ for (let index = 0; index < sourceCandles.length; index += 1) {
   assert.ok(next.high >= Math.max(next.open, next.close), "high should remain above body");
   assert.ok(next.low <= Math.min(next.open, next.close), "low should remain below body");
   assert.ok(next.__visual, "visual metadata should still be attached");
+  assert.ok(next.__smart, "smart metrics should be attached");
+  assert.ok((next.__smart?.qualityScore ?? -1) >= 0 && (next.__smart?.qualityScore ?? 2) <= 1, "quality score should be normalized");
+  assert.ok(next.__smart?.noiseClass === "noise" || next.__smart?.noiseClass === "weak" || next.__smart?.noiseClass === "valid", "noise class should be resolved");
 }
 
 assert.ok(

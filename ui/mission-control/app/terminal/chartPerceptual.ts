@@ -261,6 +261,59 @@ function timeframeToSeconds(timeframe: string): number {
   return amount * 60 * 60 * 24 * 30;
 }
 
+function resolveAutoscaleTimeframeProfile(timeframe: string): {
+  minimumSpanMultiplier: number;
+  comfortBoostPct: number;
+  holdShiftPct: number;
+  envelopeSlackPct: number;
+  softShiftPct: number;
+} {
+  const seconds = timeframeToSeconds(timeframe);
+  if (seconds <= 5) {
+    return {
+      minimumSpanMultiplier: 1.35,
+      comfortBoostPct: 0.09,
+      holdShiftPct: 0.008,
+      envelopeSlackPct: 0.045,
+      softShiftPct: 0.18,
+    };
+  }
+  if (seconds <= 30) {
+    return {
+      minimumSpanMultiplier: 1.22,
+      comfortBoostPct: 0.07,
+      holdShiftPct: 0.006,
+      envelopeSlackPct: 0.036,
+      softShiftPct: 0.16,
+    };
+  }
+  if (seconds <= 60) {
+    return {
+      minimumSpanMultiplier: 1.12,
+      comfortBoostPct: 0.05,
+      holdShiftPct: 0.004,
+      envelopeSlackPct: 0.028,
+      softShiftPct: 0.14,
+    };
+  }
+  if (seconds <= 5 * 60) {
+    return {
+      minimumSpanMultiplier: 1.05,
+      comfortBoostPct: 0.02,
+      holdShiftPct: 0.0022,
+      envelopeSlackPct: 0.018,
+      softShiftPct: 0.13,
+    };
+  }
+  return {
+    minimumSpanMultiplier: 1,
+    comfortBoostPct: 0,
+    holdShiftPct: 0.0005,
+    envelopeSlackPct: 0.012,
+    softShiftPct: 0.12,
+  };
+}
+
 export function inferPerceptualProfile(
   mode: "line" | "candles" | "footprint",
   timeframe: string,
@@ -385,20 +438,22 @@ export function resolvePerceptualAutoscaleRange(
   const density = options?.density ?? "balanced";
   const visualProfile = applyVisualProfile(options?.visualProfile ?? DEFAULT_VISUAL_PROFILE);
   const comfortBase = visualProfile.perception.comfortZonePct;
-  const comfortZonePct = density === "compressed"
+  const timeframeProfile = resolveAutoscaleTimeframeProfile(options?.timeframe ?? "5m");
+  const comfortZonePct = clamp((density === "compressed"
     ? clamp(comfortBase - 0.04, 0.16, 0.66)
     : density === "expanded"
       ? clamp(comfortBase + 0.02, 0.16, 0.68)
-      : comfortBase;
+      : comfortBase) + timeframeProfile.comfortBoostPct, 0.16, 0.76);
 
   const rawSpan = Math.max(0, range.max - range.min);
   const midpoint = (range.max + range.min) * 0.5;
   const baseline = Math.max(Math.abs(midpoint), Math.abs(range.max), Math.abs(range.min), 1);
-  const minimumVisualSpan = Math.max(
+  const minimumVisualFloor = Math.max(
     rawSpan,
     baseline >= 1000 ? baseline * 0.00012 : baseline >= 100 ? baseline * 0.00035 : baseline * 0.0012,
     baseline >= 1000 ? 1.5 : baseline >= 100 ? 0.35 : 0.02,
   );
+  const minimumVisualSpan = Math.max(rawSpan, minimumVisualFloor * timeframeProfile.minimumSpanMultiplier);
   const expandedSpan = Math.max(rawSpan, minimumVisualSpan);
   const effectiveMin = rawSpan > 0 ? Math.min(range.min, midpoint - expandedSpan * 0.5) : midpoint - expandedSpan * 0.5;
   const effectiveMax = rawSpan > 0 ? Math.max(range.max, midpoint + expandedSpan * 0.5) : midpoint + expandedSpan * 0.5;
@@ -458,8 +513,17 @@ export function resolvePerceptualAutoscaleRange(
   const lastPriceInsideComfort = Number.isFinite(lastPrice)
     ? lastPrice >= relaxedComfortMin && lastPrice <= relaxedComfortMax
     : true;
+  const envelopeSlack = previousSpan * timeframeProfile.envelopeSlackPct;
+  const withinPreviousEnvelope = candidate.min >= previous.min - envelopeSlack && candidate.max <= previous.max + envelopeSlack;
+  const previousInset = previousSpan * Math.max(0.04, comfortZonePct * 0.22);
+  const lastPriceInsidePreviousEnvelope = Number.isFinite(lastPrice)
+    ? lastPrice >= previous.min + previousInset && lastPrice <= previous.max - previousInset
+    : true;
 
-  if (withinComfort && lastPriceInsideComfort) {
+  if (
+    (withinComfort && lastPriceInsideComfort)
+    || (withinPreviousEnvelope && lastPriceInsidePreviousEnvelope && centerShiftPct <= timeframeProfile.holdShiftPct * 1.35)
+  ) {
     return {
       ...previous,
       rawMin: range.min,
@@ -481,9 +545,9 @@ export function resolvePerceptualAutoscaleRange(
   const nextMin = smoothed.min;
   const nextMax = smoothed.max;
   const shiftPct = Math.max(Math.abs(nextMin - previous.min), Math.abs(nextMax - previous.max)) / previousSpan;
-  const transitionMode: PerceptualTransitionMode = shiftPct <= 0.0005
+  const transitionMode: PerceptualTransitionMode = shiftPct <= timeframeProfile.holdShiftPct
     ? "hold"
-    : shiftPct <= 0.12
+    : shiftPct <= timeframeProfile.softShiftPct
       ? "soft"
       : "hard";
 

@@ -3,7 +3,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import GpuChartV4Surface from "./GpuChartV4Surface";
+import type { SmartDecisionHudShape } from "./chartHudTypes";
+import { applyDecisionStability, createDecisionStabilityEngine } from "./decisionStabilityEngine";
+import { resolveSmartDecision } from "./decisionEngine";
 import InstitutionalChart from "./InstitutionalChart";
+import { buildLiquidityOverlayZones, detectLiquidity } from "./liquidityEngine";
+import { buildRegimeSnapshot } from "./regimeEngine";
+import SmartDecisionSummary from "./SmartDecisionSummary";
+import { buildSmartDecisionHud } from "./smartDecisionHud";
+import { buildStructureOverlayZones, detectStructure } from "./structureEngine";
 import type { ChartPerceptualTelemetry, GpuPerceptualTelemetry } from "./chartPerceptual";
 import type { PerceptualExecutionSignal } from "./chartPerceptualEngine";
 import type { MarketSimulation } from "./marketSimulationEngine";
@@ -161,6 +169,7 @@ type Props = {
   chartSmoothingMs?: ChartSmoothingMs;
   onChartPerceptualTelemetry?: (payload: ChartPerceptualTelemetry) => void;
   onGpuPerceptualTelemetry?: (payload: GpuPerceptualTelemetry) => void;
+  onSmartDecisionHudChange?: (payload: SmartDecisionHudShape) => void;
 };
 
 function ensureVisibleCandles(candles: CandlePoint[], _fallbackPrice: number): CandlePoint[] {
@@ -305,6 +314,7 @@ export default function TerminalChartV2(props: Props) {
     chartSmoothingMs = 140,
     onChartPerceptualTelemetry,
     onGpuPerceptualTelemetry,
+    onSmartDecisionHudChange,
   } = props;
 
   const analyticsCandlesInput = props.analyticsCandles ?? props.candles;
@@ -323,8 +333,10 @@ export default function TerminalChartV2(props: Props) {
   const [assistantAnchor, setAssistantAnchor] = useState<{ type: AnchorType; label: string; detail: string } | null>(null);
   const [assistantInput, setAssistantInput] = useState("");
   const [assistantMessages, setAssistantMessages] = useState<Array<{ role: "user" | "assistant"; text: string }>>([]);
+  const [decisionClockMs, setDecisionClockMs] = useState(() => Date.now());
   const lastStableRenderCandlesRef = useRef<CandlePoint[]>([]);
   const lastStableAnalyticsCandlesRef = useRef<CandlePoint[]>([]);
+  const decisionStabilityEngineRef = useRef(createDecisionStabilityEngine());
 
   const handleCrosshairMove = useCallback((payload: { price: number; timeLabel: string; timeKey: string } | null) => {
     if (!payload) {
@@ -350,6 +362,13 @@ export default function TerminalChartV2(props: Props) {
       }
     }, 600);
     return () => clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setDecisionClockMs(Date.now());
+    }, 350);
+    return () => window.clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -396,6 +415,30 @@ export default function TerminalChartV2(props: Props) {
   }, [analyticsCandlesInput, fallbackPrice, isPreviewMode]);
   const analyticsEligibleCandles = isPreviewMode ? [] : safeAnalyticsCandles;
   const analyticsReady = analyticsEligibleCandles.length >= MIN_RENDER_CANDLES;
+  const structureSourceCandles = useMemo(
+    () => (analyticsReady ? analyticsEligibleCandles : isPreviewMode ? [] : safeRenderCandles),
+    [analyticsEligibleCandles, analyticsReady, isPreviewMode, safeRenderCandles],
+  );
+  const structureSnapshot = useMemo(
+    () => detectStructure(structureSourceCandles),
+    [structureSourceCandles],
+  );
+  const liquiditySnapshot = useMemo(
+    () => detectLiquidity(structureSourceCandles, structureSnapshot),
+    [structureSnapshot, structureSourceCandles],
+  );
+  const structureOverlayZones = useMemo(
+    () => buildStructureOverlayZones(structureSnapshot),
+    [structureSnapshot],
+  );
+  const liquidityOverlayZones = useMemo(
+    () => buildLiquidityOverlayZones(liquiditySnapshot),
+    [liquiditySnapshot],
+  );
+  const regimeSnapshot = useMemo(
+    () => buildRegimeSnapshot(structureSourceCandles),
+    [structureSourceCandles],
+  );
   const effectiveRouteScore = deriveRouteScorePct(routeScorePct, depthState);
   const simulationTone = useMemo(() => {
     if (!marketSimulation) {
@@ -518,13 +561,47 @@ export default function TerminalChartV2(props: Props) {
     }));
   }, [analyticsEligibleCandles]);
 
+  const decisionLatencyMs = useMemo(() => {
+    const lastLabel = structureSourceCandles[structureSourceCandles.length - 1]?.label;
+    const lastTimestamp = lastLabel ? parseHistoryLabelMs(lastLabel) : null;
+    if (!lastTimestamp) {
+      return null;
+    }
+    return Math.max(0, Date.now() - lastTimestamp);
+  }, [structureSourceCandles]);
+  const smartDecision = useMemo(() => resolveSmartDecision({
+    regime: regimeSnapshot,
+    structure: structureSnapshot,
+    liquidity: liquiditySnapshot,
+    predictionDirection: predictionV5.direction,
+    predictionProbability: predictionV5.probability,
+    predictionTrigger: predictionV5.trigger,
+    predictionInvalidation: predictionV5.invalidation,
+    lowFlowEdgeBlocked,
+    routeScorePct: effectiveRouteScore,
+    domImbalance: domStats.imbalance,
+    decisionLatencyMs,
+    suspended: isPreviewMode || !analyticsReady,
+  }), [analyticsReady, decisionLatencyMs, domStats.imbalance, effectiveRouteScore, isPreviewMode, liquiditySnapshot, lowFlowEdgeBlocked, predictionV5.direction, predictionV5.invalidation, predictionV5.probability, predictionV5.trigger, regimeSnapshot, structureSnapshot]);
+  const stableSmartDecision = useMemo(
+    () => applyDecisionStability(smartDecision, decisionStabilityEngineRef.current.update(smartDecision.state, decisionClockMs)),
+    [decisionClockMs, smartDecision],
+  );
+  const smartDecisionHud = useMemo(() => buildSmartDecisionHud(stableSmartDecision), [stableSmartDecision]);
+
+  useEffect(() => {
+    if (onSmartDecisionHudChange) {
+      onSmartDecisionHudChange(smartDecisionHud);
+    }
+  }, [onSmartDecisionHudChange, smartDecisionHud]);
+
   const assistantContext = useMemo(() => {
-    const base = `${aiExplanation} | DOM imbalance ${(domStats.imbalance * 100).toFixed(1)}%, route ${routeVenue || "--"}, confidence ${aiConfidencePct.toFixed(0)}%.`;
+    const base = `${smartDecisionHud.assistantSummary} ${aiExplanation} | DOM imbalance ${(domStats.imbalance * 100).toFixed(1)}%, route ${routeVenue || "--"}, confidence ${aiConfidencePct.toFixed(0)}%.`;
     if (!assistantAnchor) {
       return base;
     }
     return `${base} Anchor ${assistantAnchor.type}: ${assistantAnchor.label} (${assistantAnchor.detail}).`;
-  }, [aiConfidencePct, aiExplanation, assistantAnchor, domStats.imbalance, routeVenue]);
+  }, [aiConfidencePct, aiExplanation, assistantAnchor, domStats.imbalance, routeVenue, smartDecisionHud.assistantSummary]);
 
   // ── Auto Trader V5 — machine d'état ────────────────────────────────────────
   const updateAT = useCallback((updater: (s: AutoTraderV5State) => AutoTraderV5State) => {
@@ -784,8 +861,8 @@ export default function TerminalChartV2(props: Props) {
               visualMode="clean"
               liveFeedKey={liveFeedKey}
               candles={safeRenderCandles}
-              overlayZones={[]}
-              liquidityZones={[]}
+              overlayZones={structureOverlayZones}
+              liquidityZones={liquidityOverlayZones}
               domLevels={domLevels}
               heatmapLevels={heatmapLevels}
               domHistory={domHistory}
@@ -816,8 +893,8 @@ export default function TerminalChartV2(props: Props) {
               visualMode="clean"
               liveFeedKey={liveFeedKey}
               candles={safeRenderCandles}
-              overlayZones={[]}
-              liquidityZones={[]}
+              overlayZones={structureOverlayZones}
+              liquidityZones={liquidityOverlayZones}
               domLevels={domLevels}
               heatmapLevels={heatmapLevels}
               domHistory={domHistory}
@@ -839,6 +916,11 @@ export default function TerminalChartV2(props: Props) {
         </div>
 
         <aside className="terminal-v2-ai-hud" aria-label="AI perception HUD">
+          <div className="terminal-v2-card terminal-v2-card-decision" data-testid="terminal-v2-decision-state">
+            <span className="terminal-v2-card-kicker">Decision Engine V2</span>
+            <SmartDecisionSummary decision={smartDecisionHud} variant="hero" />
+          </div>
+
           {/* ── PERCEPTION ENGINE V5 — prédictif ── */}
           <div className={`terminal-v2-card terminal-v2-card-perception${
             predictionV5.probability >= 70 ? " perception-focus" : ""
@@ -933,8 +1015,8 @@ export default function TerminalChartV2(props: Props) {
           <div className="terminal-v2-card terminal-v2-card-ai">
             <span className="terminal-v2-card-kicker">IA contextuelle</span>
             <strong>{aiHeadline}</strong>
-            <span className="terminal-v2-meta">{aiScenario}</span>
-            <span className="terminal-v2-meta">confidence {aiConfidencePct.toFixed(0)}%</span>
+            <span className="terminal-v2-meta">{smartDecisionHud.displayStateLabel} · {smartDecisionHud.confidenceBand} · {aiScenario}</span>
+            <span className="terminal-v2-meta">confidence {aiConfidencePct.toFixed(0)}% · regime {regimeSnapshot.state}</span>
             <p className="terminal-v2-ai-copy">{assistantContext}</p>
             <div className="terminal-v2-chat-row">
               <input
