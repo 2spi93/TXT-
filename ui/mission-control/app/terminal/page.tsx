@@ -1047,6 +1047,8 @@ const TERMINAL_COMPUTE_PERF_STORAGE_KEY = "txt.terminal.compute-perf";
 const TERMINAL_ONBOARDING_SEEN_STORAGE_KEY = "txt.terminal.onboarding.seen";
 const TERMINAL_ONBOARDING_PINNED_STORAGE_KEY = "txt.terminal.onboarding.pinned";
 const TERMINAL_ONBOARDING_WALKTHROUGH_DONE_STORAGE_KEY = "txt.terminal.onboarding.walkthrough.done";
+const TERMINAL_ONBOARDING_WALKTHROUGH_VERSION_STORAGE_KEY = "txt.terminal.onboarding.walkthrough.version";
+const TERMINAL_ONBOARDING_WALKTHROUGH_VERSION = "2";
 const TERMINAL_BOOT_PROFILE_STORAGE_KEY = "txt.terminal.boot-profile";
 const TERMINAL_LIGHT_BOOT_CHART_DELAY_MS = 140;
 const TERMINAL_LIGHT_BOOT_DECKS_DELAY_MS = 900;
@@ -4421,6 +4423,7 @@ function TradingTerminalPageHydrated() {
       return;
     }
     try {
+      window.localStorage.setItem(TERMINAL_ONBOARDING_WALKTHROUGH_VERSION_STORAGE_KEY, TERMINAL_ONBOARDING_WALKTHROUGH_VERSION);
       window.localStorage.setItem(TERMINAL_ONBOARDING_WALKTHROUGH_DONE_STORAGE_KEY, nextDone ? "1" : "0");
     } catch {
       // noop
@@ -5089,9 +5092,15 @@ function TradingTerminalPageHydrated() {
     try {
       const persistedSeen = window.localStorage.getItem(TERMINAL_ONBOARDING_SEEN_STORAGE_KEY) === "1";
       const persistedPinned = window.localStorage.getItem(TERMINAL_ONBOARDING_PINNED_STORAGE_KEY) === "1";
-      const persistedWalkthroughDone = window.localStorage.getItem(TERMINAL_ONBOARDING_WALKTHROUGH_DONE_STORAGE_KEY) === "1";
+      const persistedWalkthroughVersion = window.localStorage.getItem(TERMINAL_ONBOARDING_WALKTHROUGH_VERSION_STORAGE_KEY);
+      const persistedWalkthroughDone = persistedWalkthroughVersion === TERMINAL_ONBOARDING_WALKTHROUGH_VERSION
+        && window.localStorage.getItem(TERMINAL_ONBOARDING_WALKTHROUGH_DONE_STORAGE_KEY) === "1";
       if (!persistedSeen) {
         window.localStorage.setItem(TERMINAL_ONBOARDING_SEEN_STORAGE_KEY, "1");
+      }
+      if (persistedWalkthroughVersion !== TERMINAL_ONBOARDING_WALKTHROUGH_VERSION) {
+        window.localStorage.setItem(TERMINAL_ONBOARDING_WALKTHROUGH_VERSION_STORAGE_KEY, TERMINAL_ONBOARDING_WALKTHROUGH_VERSION);
+        window.localStorage.setItem(TERMINAL_ONBOARDING_WALKTHROUGH_DONE_STORAGE_KEY, "0");
       }
       setTerminalOnboardingFirstVisit(!persistedSeen);
       setTerminalOnboardingPinned(persistedPinned);
@@ -20885,6 +20894,18 @@ function TradingTerminalPageHydrated() {
                     <span className="gtix-module-guide-label">Progression</span>
                     <span className="gtix-module-guide-text">Etape {Math.min(terminalAdaptiveGuideStepIndex + 1, activeAdaptiveGuidePlan.steps.length)}/{activeAdaptiveGuidePlan.steps.length} · {activeAdaptiveGuideStepValidated ? "validee" : "en attente de clic sur la zone guidee"}</span>
                   </div>
+                  <div className="terminal-onboarding-inline-guide" role="status" aria-live="polite">
+                    <span className="terminal-onboarding-inline-pointer" aria-hidden="true">
+                      <svg viewBox="0 0 48 48" role="presentation">
+                        <path d="M9 6L31 25H21L27 42L20 45L14 28L7 35Z" />
+                      </svg>
+                    </span>
+                    <span>
+                      {activeAdaptiveGuideStepValidated
+                        ? "Etape validee. Le bouton Suivant est maintenant disponible."
+                        : "Walkthrough actif: suis le pointeur, clique la zone guidee ou valide explicitement cette etape pour debloquer Suivant."}
+                    </span>
+                  </div>
                   <div className="terminal-onboarding-links" style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
                     <button type="button" className="btn" onClick={() => focusAdaptiveGuideTarget(activeAdaptiveGuideStep.targetId)}>
                       Aller a la zone
@@ -20915,7 +20936,7 @@ function TradingTerminalPageHydrated() {
       ) : null}
 
       <TerminalCoachOverlay
-        visible={coachOverlayVisible && Boolean(activeAdaptiveGuideStep)}
+        visible={(coachOverlayVisible || terminalWalkthroughForcedVisible) && Boolean(activeAdaptiveGuideStep)}
         step={activeAdaptiveGuideStep}
         stepIndex={terminalAdaptiveGuideStepIndex}
         stepCount={activeAdaptiveGuidePlan.steps.length}

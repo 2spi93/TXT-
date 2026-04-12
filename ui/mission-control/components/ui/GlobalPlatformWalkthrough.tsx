@@ -29,7 +29,9 @@ type OverlayRect = {
 const GLOBAL_WALKTHROUGH_DONE_STORAGE_KEY = "txt.global.walkthrough.done";
 const GLOBAL_WALKTHROUGH_INDEX_STORAGE_KEY = "txt.global.walkthrough.index";
 const GLOBAL_WALKTHROUGH_VISIBLE_STORAGE_KEY = "txt.global.walkthrough.visible";
+const GLOBAL_WALKTHROUGH_VERSION_STORAGE_KEY = "txt.global.walkthrough.version";
 const GLOBAL_WALKTHROUGH_START_EVENT = "txt-global-walkthrough-start";
+const GLOBAL_WALKTHROUGH_VERSION = "2";
 
 const INTERNAL_STEPS: WalkthroughStep[] = [
   {
@@ -202,6 +204,7 @@ export default function GlobalPlatformWalkthrough({ roleGroup = "unknown" }: { r
       return;
     }
     try {
+      window.localStorage.setItem(GLOBAL_WALKTHROUGH_VERSION_STORAGE_KEY, GLOBAL_WALKTHROUGH_VERSION);
       if (typeof next.done === "boolean") {
         window.localStorage.setItem(GLOBAL_WALKTHROUGH_DONE_STORAGE_KEY, next.done ? "1" : "0");
       }
@@ -252,12 +255,21 @@ export default function GlobalPlatformWalkthrough({ roleGroup = "unknown" }: { r
       return;
     }
     try {
+      const persistedVersion = window.localStorage.getItem(GLOBAL_WALKTHROUGH_VERSION_STORAGE_KEY);
+      const versionMismatch = persistedVersion !== GLOBAL_WALKTHROUGH_VERSION;
       const persistedDone = window.localStorage.getItem(GLOBAL_WALKTHROUGH_DONE_STORAGE_KEY) === "1";
       const persistedVisible = window.localStorage.getItem(GLOBAL_WALKTHROUGH_VISIBLE_STORAGE_KEY);
       const persistedIndex = Number(window.localStorage.getItem(GLOBAL_WALKTHROUGH_INDEX_STORAGE_KEY) || "0");
-      setDone(persistedDone);
-      setVisible(persistedDone ? persistedVisible === "1" : true);
-      setStepIndex(Number.isFinite(persistedIndex) ? clamp(Math.floor(persistedIndex), 0, Math.max(steps.length - 1, 0)) : 0);
+      if (versionMismatch) {
+        setDone(false);
+        setVisible(true);
+        setStepIndex(0);
+        persistState({ done: false, visible: true, stepIndex: 0 });
+      } else {
+        setDone(persistedDone);
+        setVisible(persistedDone ? persistedVisible === "1" : true);
+        setStepIndex(Number.isFinite(persistedIndex) ? clamp(Math.floor(persistedIndex), 0, Math.max(steps.length - 1, 0)) : 0);
+      }
     } catch {
       setDone(false);
       setVisible(true);

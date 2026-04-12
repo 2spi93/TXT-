@@ -1297,6 +1297,41 @@ form {
   gap: 8px;
 }
 
+.terminal-onboarding-inline-guide {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 201, 107, 0.22);
+  background: linear-gradient(180deg, rgba(255, 201, 107, 0.08), rgba(15, 23, 42, 0.28));
+  color: rgba(226, 232, 240, 0.94);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.terminal-onboarding-inline-pointer {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  animation: terminal-coach-pointer-float 1.05s ease-in-out infinite;
+  filter: drop-shadow(0 8px 14px rgba(2, 8, 23, 0.28));
+}
+
+.terminal-onboarding-inline-pointer svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.terminal-onboarding-inline-pointer path {
+  fill: rgba(255, 255, 255, 0.98);
+  stroke: rgba(255, 201, 107, 0.9);
+  stroke-width: 2.4;
+  stroke-linejoin: round;
+}
+
 .txt-global-walkthrough-backdrop {
   position: fixed;
   inset: 0;

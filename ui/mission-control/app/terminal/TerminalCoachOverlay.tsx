@@ -48,6 +48,23 @@ function resolveOverlayRect(targetId: string): OverlayRect | null {
   };
 }
 
+function resolveOverlayRectWithFallback(targetId: string, fallbackTargetId = "terminal-onboarding"): OverlayRect | null {
+  const resolved = resolveOverlayRect(targetId) || (fallbackTargetId !== targetId ? resolveOverlayRect(fallbackTargetId) : null);
+  if (resolved || typeof window === "undefined") {
+    return resolved;
+  }
+  const overlayWidth = Math.min(340, Math.max(280, window.innerWidth - 28));
+  const left = Math.max(12, window.innerWidth - overlayWidth - 16);
+  return {
+    top: 96,
+    left,
+    dotTop: 78,
+    dotLeft: left + 24,
+    pointerTop: 52,
+    pointerLeft: left + 6,
+  };
+}
+
 export default function TerminalCoachOverlay({
   visible,
   step,
@@ -85,7 +102,7 @@ export default function TerminalCoachOverlay({
       return;
     }
     const update = () => {
-      setRect(resolveOverlayRect(step.targetId));
+      setRect(resolveOverlayRectWithFallback(step.targetId));
     };
     update();
     window.addEventListener("resize", update);
