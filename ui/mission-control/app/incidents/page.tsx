@@ -134,7 +134,7 @@ export default function IncidentsPage() {
   return (
     <main className="shell txt-page-shell">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.4fr 1fr" }}>
-        <div className="panel txt-page-hero">
+        <div id="global-guide-incidents-hero" className="panel txt-page-hero">
           <div className="eyebrow">Incident Desk</div>
           <h1 className="title" style={{ fontSize: 34 }}>Incidents Operations</h1>
           <p className="subtle">Pilote les incidents ouverts par le chatbot et les operateurs.</p>

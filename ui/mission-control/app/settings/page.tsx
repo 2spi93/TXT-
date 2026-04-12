@@ -232,7 +232,7 @@ export default function SettingsPage() {
 
   return (
     <main className="shell txt-page-shell">
-      <section className="panel txt-page-hero">
+      <section id="global-guide-settings-hero" className="panel txt-page-hero">
         <div className="eyebrow">TXT Settings</div>
         <h1 className="title" style={{ fontSize: 34 }}>Parametres globaux</h1>
         <p className="subtle">Personnalise l'experience TXT: densite, mode novice/expert et preferences d'interface.</p>

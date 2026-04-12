@@ -98,7 +98,7 @@ export default async function Page() {
   return (
     <main className="shell txt-page-shell">
       <section className="hero txt-page-hero-grid">
-        <div className="panel txt-page-hero">
+        <div id="global-guide-dashboard-hero" className="panel txt-page-hero">
           <div className="eyebrow">TXT Dashboard</div>
           <h1 className="title">Trader eXelle Terminal</h1>
           <p className="subtle">Plateforme de trading humaine: lisible pour debutants, puissante pour experts.</p>

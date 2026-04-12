@@ -554,7 +554,7 @@ export default function ConnectorsPage() {
   return (
     <main className="shell txt-page-shell" data-testid="mission-control-connectors-page">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.4fr 1fr" }}>
-        <div className="panel txt-page-hero">
+        <div id="global-guide-connectors-hero" className="panel txt-page-hero">
           <div className="eyebrow">Horizon Quantique</div>
           <h1 className="title" style={{ fontSize: 34 }}>Connecteurs trading augmentes</h1>
           <p className="subtle txt-page-hero-copy">

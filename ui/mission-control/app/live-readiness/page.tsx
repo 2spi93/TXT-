@@ -165,7 +165,7 @@ export default function LiveReadinessPage() {
   return (
     <main className="shell txt-page-shell">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.4fr 1fr" }}>
-        <div className="panel txt-page-hero">
+        <div id="global-guide-readiness-hero" className="panel txt-page-hero">
           <div className="eyebrow">Live Readiness Center</div>
           <h1 className="title" style={{ fontSize: 34 }}>Pret pour le live, derive et test memoire</h1>
           <p className="subtle txt-page-hero-copy">Cette page dit si les strategies restent assez propres pour continuer le live ou s'il faut freiner, suspendre et revalider.</p>

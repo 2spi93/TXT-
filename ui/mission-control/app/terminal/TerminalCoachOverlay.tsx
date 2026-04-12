@@ -14,6 +14,8 @@ type OverlayRect = {
   left: number;
   dotTop: number;
   dotLeft: number;
+  pointerTop: number;
+  pointerLeft: number;
 };
 
 function resolveOverlayRect(targetId: string): OverlayRect | null {
@@ -36,28 +38,43 @@ function resolveOverlayRect(targetId: string): OverlayRect | null {
     ? Math.min(window.innerWidth - overlayWidth - 12, rect.right + 18)
     : Math.max(12, rect.left - overlayWidth - 18);
   const top = Math.max(12, Math.min(window.innerHeight - 220, rect.top + 8));
-  return { top, left, dotTop, dotLeft };
+  return {
+    top,
+    left,
+    dotTop,
+    dotLeft,
+    pointerTop: Math.max(16, dotTop - 24),
+    pointerLeft: Math.max(16, dotLeft - 22),
+  };
 }
 
 export default function TerminalCoachOverlay({
   visible,
   step,
+  stepIndex,
+  stepCount,
+  validated,
   tone,
   assistanceLevel,
   disciplineLock,
   onDismiss,
   onFocusTarget,
   onCommand,
+  onValidate,
   onNext,
 }: {
   visible: boolean;
   step: TerminalAdaptiveGuideStep | null;
+  stepIndex: number;
+  stepCount: number;
+  validated: boolean;
   tone: TerminalAdaptiveGuideTone;
   assistanceLevel: TerminalAdaptiveGuideAssistanceLevel;
   disciplineLock: boolean;
   onDismiss: () => void;
   onFocusTarget: () => void;
   onCommand: () => void;
+  onValidate: () => void;
   onNext: () => void;
 }) {
   const [rect, setRect] = useState<OverlayRect | null>(null);
@@ -86,6 +103,11 @@ export default function TerminalCoachOverlay({
     return (
       <>
         <div className={`terminal-coach-overlay-dot ${tone}`} style={{ top: rect.dotTop, left: rect.dotLeft }} />
+        <div className={`terminal-coach-overlay-pointer ${tone}`} style={{ top: rect.pointerTop, left: rect.pointerLeft }} aria-hidden="true">
+          <svg viewBox="0 0 48 48" role="presentation">
+            <path d="M9 6L31 25H21L27 42L20 45L14 28L7 35Z" />
+          </svg>
+        </div>
         <div className={`terminal-coach-overlay ${tone}`} style={{ top: rect.top, left: rect.left }} role="dialog" aria-label="Coach overlay terminal">
           <div className="terminal-coach-overlay-card">
             <div className="terminal-coach-overlay-head">
@@ -96,21 +118,29 @@ export default function TerminalCoachOverlay({
               <button type="button" className="terminal-coach-overlay-close" onClick={onDismiss} aria-label="Masquer le coach overlay">×</button>
             </div>
             <div className="terminal-coach-overlay-pills">
+              <span className="terminal-coach-overlay-pill">etape {Math.min(stepIndex + 1, Math.max(stepCount, 1))}/{Math.max(stepCount, 1)}</span>
               <span className={`terminal-coach-overlay-pill ${tone}`}>assistance {assistanceLevel}</span>
               {disciplineLock ? <span className="terminal-coach-overlay-pill warn">discipline lock</span> : null}
               <span className="terminal-coach-overlay-pill subtle">{step.validationLabel}</span>
+              <span className={`terminal-coach-overlay-pill ${validated ? "good" : "warn"}`}>{validated ? "validee" : "clic requis"}</span>
             </div>
             <p className="terminal-coach-overlay-copy">{step.explanation}</p>
+            <div className={`terminal-coach-overlay-validation ${validated ? "good" : "warn"}`}>
+              {validated
+                ? "Etape validee. Tu peux passer a la suite."
+                : "Clique la zone surlignee ou valide l'etape explicitement avant de continuer."}
+            </div>
             <div className="terminal-coach-overlay-actions">
               <button type="button" className="btn" onClick={onFocusTarget}>Pointer la zone</button>
+              <button type="button" className={`btn${validated ? " btn-primary" : ""}`} onClick={onValidate}>Valider l'etape</button>
               <button type="button" className="btn" onClick={onCommand}>Commandant</button>
-              <button type="button" className="btn btn-primary" onClick={onNext}>Suivant</button>
+              <button type="button" className="btn btn-primary" onClick={onNext} disabled={!validated}>Suivant</button>
             </div>
           </div>
         </div>
       </>
     );
-  }, [assistanceLevel, disciplineLock, onCommand, onDismiss, onFocusTarget, onNext, rect, step, tone, visible]);
+  }, [assistanceLevel, disciplineLock, onCommand, onDismiss, onFocusTarget, onNext, onValidate, rect, step, stepCount, stepIndex, tone, validated, visible]);
 
   if (!body || typeof document === "undefined" || !document.body) {
     return null;

@@ -16,7 +16,7 @@ const TOPICS = [
 export default function LearnPage() {
   return (
     <main className="shell txt-page-shell">
-      <section className="panel txt-page-hero">
+      <section id="global-guide-learn-hero" className="panel txt-page-hero">
         <div className="eyebrow">TXT Learn</div>
         <h1 className="title" style={{ fontSize: 34 }}>Apprendre le trading de facon claire</h1>
         <p className="subtle">Parcours pedagogique concu pour les debutants avec exemples, schemas et vocabulaire simple.</p>

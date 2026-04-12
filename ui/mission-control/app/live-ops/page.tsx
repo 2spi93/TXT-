@@ -521,7 +521,7 @@ export default function LiveOpsPage() {
   return (
     <main className="shell txt-page-shell" data-testid="mission-control-live-ops-page">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.25fr 1fr" }}>
-        <div className="panel txt-page-hero">
+        <div id="global-guide-liveops-hero" className="panel txt-page-hero">
           <div className="eyebrow">Live Ops Control Room</div>
           <h1 className="title" style={{ fontSize: 34 }}>H24 Control Room</h1>
           <p className="subtle">Route dediee au pilotage live des gardes systeme, de la recovery et de la warfare logic. Le menu global pointe maintenant vers une vraie page, plus vers une route manquante.</p>

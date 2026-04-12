@@ -1046,6 +1046,7 @@ const DEBUG_TIME_SYNC = process.env.NEXT_PUBLIC_DEBUG_TIME_SYNC === "1";
 const TERMINAL_COMPUTE_PERF_STORAGE_KEY = "txt.terminal.compute-perf";
 const TERMINAL_ONBOARDING_SEEN_STORAGE_KEY = "txt.terminal.onboarding.seen";
 const TERMINAL_ONBOARDING_PINNED_STORAGE_KEY = "txt.terminal.onboarding.pinned";
+const TERMINAL_ONBOARDING_WALKTHROUGH_DONE_STORAGE_KEY = "txt.terminal.onboarding.walkthrough.done";
 const TERMINAL_BOOT_PROFILE_STORAGE_KEY = "txt.terminal.boot-profile";
 const TERMINAL_LIGHT_BOOT_CHART_DELAY_MS = 140;
 const TERMINAL_LIGHT_BOOT_DECKS_DELAY_MS = 900;
@@ -4381,8 +4382,10 @@ function TradingTerminalPageHydrated() {
   const [terminalOnboardingFirstVisit, setTerminalOnboardingFirstVisit] = useState(false);
   const [terminalOnboardingPinned, setTerminalOnboardingPinned] = useState(false);
   const [terminalOnboardingExpanded, setTerminalOnboardingExpanded] = useState(false);
+  const [terminalOnboardingWalkthroughDone, setTerminalOnboardingWalkthroughDone] = useState(false);
   const [terminalAdaptiveGuideMode, setTerminalAdaptiveGuideMode] = useState<TerminalAdaptiveGuideMode | null>(null);
   const [terminalAdaptiveGuideStepIndex, setTerminalAdaptiveGuideStepIndex] = useState(0);
+  const [terminalAdaptiveGuideValidatedSteps, setTerminalAdaptiveGuideValidatedSteps] = useState<string[]>([]);
   const [guidedCoachTargetId, setGuidedCoachTargetId] = useState<TerminalAdaptiveGuideTargetId | null>(null);
   const [coachOverlayVisible, setCoachOverlayVisible] = useState(false);
   const [focusDecks, setFocusDecks] = useState<TerminalFocusDeckId[]>([]);
@@ -4412,9 +4415,22 @@ function TradingTerminalPageHydrated() {
     }
   }, []);
 
+  const setTerminalOnboardingWalkthroughDonePreference = useCallback((nextDone: boolean) => {
+    setTerminalOnboardingWalkthroughDone(nextDone);
+    if (typeof window === "undefined") {
+      return;
+    }
+    try {
+      window.localStorage.setItem(TERMINAL_ONBOARDING_WALKTHROUGH_DONE_STORAGE_KEY, nextDone ? "1" : "0");
+    } catch {
+      // noop
+    }
+  }, []);
+
   const collapseTerminalOnboarding = useCallback(() => {
     setTerminalOnboardingFirstVisit(false);
     setTerminalOnboardingExpanded(false);
+    setCoachOverlayVisible(false);
     if (terminalOnboardingPinned) {
       setTerminalOnboardingPinnedPreference(false);
     }
@@ -4423,6 +4439,7 @@ function TradingTerminalPageHydrated() {
   const expandTerminalOnboarding = useCallback(() => {
     setTerminalOnboardingFirstVisit(false);
     setTerminalOnboardingExpanded(true);
+    setCoachOverlayVisible(true);
   }, []);
 
   const toggleTerminalOnboardingPinned = useCallback(() => {
@@ -4633,16 +4650,45 @@ function TradingTerminalPageHydrated() {
   const activeAdaptiveGuideMode = terminalAdaptiveGuideMode || terminalAdaptiveGuide.recommendedMode;
   const activeAdaptiveGuidePlan = terminalAdaptiveGuide.plans.find((plan) => plan.mode === activeAdaptiveGuideMode) || terminalAdaptiveGuide.plans[0];
   const activeAdaptiveGuideStep = activeAdaptiveGuidePlan.steps[Math.min(terminalAdaptiveGuideStepIndex, Math.max(activeAdaptiveGuidePlan.steps.length - 1, 0))] || activeAdaptiveGuidePlan.steps[0] || null;
+  const activeAdaptiveGuideStepKey = activeAdaptiveGuideStep ? `${activeAdaptiveGuidePlan.mode}:${activeAdaptiveGuideStep.id}` : "";
+  const activeAdaptiveGuideStepValidated = activeAdaptiveGuideStepKey ? terminalAdaptiveGuideValidatedSteps.includes(activeAdaptiveGuideStepKey) : false;
+  const terminalWalkthroughForcedVisible = terminalOnboardingFirstVisit || !terminalOnboardingWalkthroughDone;
+
+  const validateAdaptiveGuideStep = useCallback((stepKey?: string) => {
+    const effectiveStepKey = stepKey || activeAdaptiveGuideStepKey;
+    if (!effectiveStepKey) {
+      return;
+    }
+    setTerminalAdaptiveGuideValidatedSteps((current) => current.includes(effectiveStepKey) ? current : [...current, effectiveStepKey]);
+  }, [activeAdaptiveGuideStepKey]);
 
   useEffect(() => {
     setTerminalAdaptiveGuideStepIndex(0);
+    setTerminalAdaptiveGuideValidatedSteps([]);
   }, [activeAdaptiveGuideMode]);
+
+  useEffect(() => {
+    if (!coachOverlayVisible || !activeAdaptiveGuideStep || !activeAdaptiveGuideStepKey || typeof document === "undefined") {
+      return;
+    }
+    const target = document.getElementById(activeAdaptiveGuideStep.targetId);
+    if (!target) {
+      return;
+    }
+    const handleValidate = () => {
+      validateAdaptiveGuideStep(activeAdaptiveGuideStepKey);
+    };
+    target.addEventListener("pointerdown", handleValidate, true);
+    return () => {
+      target.removeEventListener("pointerdown", handleValidate, true);
+    };
+  }, [activeAdaptiveGuideStep, activeAdaptiveGuideStepKey, coachOverlayVisible, validateAdaptiveGuideStep]);
 
   useEffect(() => {
     if (!terminalOnboardingLoaded) {
       return;
     }
-    if (terminalAdaptiveGuide.assistanceLevel === "HIGH" || terminalAdaptiveGuide.disciplineLock) {
+    if (terminalAdaptiveGuide.assistanceLevel === "HIGH" || terminalAdaptiveGuide.disciplineLock || terminalWalkthroughForcedVisible) {
       setTerminalOnboardingExpanded(true);
       setGuidedCoachTargetId(activeAdaptiveGuideStep?.targetId || "terminal-onboarding");
       setCoachOverlayVisible(true);
@@ -4658,24 +4704,29 @@ function TradingTerminalPageHydrated() {
     activeAdaptiveGuideStep,
     terminalAdaptiveGuide.assistanceLevel,
     terminalAdaptiveGuide.disciplineLock,
+    terminalWalkthroughForcedVisible,
     terminalOnboardingExpanded,
     terminalOnboardingLoaded,
   ]);
 
   const advanceAdaptiveGuideStep = useCallback(() => {
-    if (!activeAdaptiveGuidePlan) {
+    if (!activeAdaptiveGuidePlan || !activeAdaptiveGuideStepValidated) {
       return;
     }
     const lastIndex = Math.max(activeAdaptiveGuidePlan.steps.length - 1, 0);
-    setTerminalAdaptiveGuideStepIndex((current) => {
-      const next = Math.min(current + 1, lastIndex);
-      return next;
-    });
     if (terminalAdaptiveGuideStepIndex >= lastIndex) {
+      setTerminalOnboardingWalkthroughDonePreference(true);
       setCoachOverlayVisible(false);
       completeTerminalOnboardingAction();
+      return;
     }
-  }, [activeAdaptiveGuidePlan, completeTerminalOnboardingAction, terminalAdaptiveGuideStepIndex]);
+    const nextIndex = Math.min(terminalAdaptiveGuideStepIndex + 1, lastIndex);
+    setTerminalAdaptiveGuideStepIndex(nextIndex);
+    const nextStep = activeAdaptiveGuidePlan.steps[nextIndex] || null;
+    if (nextStep) {
+      focusAdaptiveGuideTarget(nextStep.targetId);
+    }
+  }, [activeAdaptiveGuidePlan, activeAdaptiveGuideStepValidated, completeTerminalOnboardingAction, focusAdaptiveGuideTarget, setTerminalOnboardingWalkthroughDonePreference, terminalAdaptiveGuideStepIndex]);
 
   const openAdaptiveGuideCommand = useCallback((mode: TerminalAdaptiveGuideMode) => {
     const plan = terminalAdaptiveGuide.plans.find((candidate) => candidate.mode === mode);
@@ -5038,15 +5089,18 @@ function TradingTerminalPageHydrated() {
     try {
       const persistedSeen = window.localStorage.getItem(TERMINAL_ONBOARDING_SEEN_STORAGE_KEY) === "1";
       const persistedPinned = window.localStorage.getItem(TERMINAL_ONBOARDING_PINNED_STORAGE_KEY) === "1";
+      const persistedWalkthroughDone = window.localStorage.getItem(TERMINAL_ONBOARDING_WALKTHROUGH_DONE_STORAGE_KEY) === "1";
       if (!persistedSeen) {
         window.localStorage.setItem(TERMINAL_ONBOARDING_SEEN_STORAGE_KEY, "1");
       }
       setTerminalOnboardingFirstVisit(!persistedSeen);
       setTerminalOnboardingPinned(persistedPinned);
-      setTerminalOnboardingExpanded(persistedPinned || !persistedSeen);
+      setTerminalOnboardingWalkthroughDone(persistedWalkthroughDone);
+      setTerminalOnboardingExpanded(persistedPinned || !persistedSeen || !persistedWalkthroughDone);
     } catch {
       setTerminalOnboardingFirstVisit(true);
       setTerminalOnboardingExpanded(true);
+      setTerminalOnboardingWalkthroughDone(false);
     } finally {
       setTerminalOnboardingLoaded(true);
     }
@@ -6453,6 +6507,7 @@ function TradingTerminalPageHydrated() {
     const plan = terminalAdaptiveGuide.plans.find((candidate) => candidate.mode === mode);
     setTerminalAdaptiveGuideMode(mode);
     setTerminalAdaptiveGuideStepIndex(0);
+    setTerminalAdaptiveGuideValidatedSteps([]);
     if (!plan) {
       return;
     }
@@ -20730,6 +20785,20 @@ function TradingTerminalPageHydrated() {
                 </button>
                 <button
                   type="button"
+                  className={`terminal-onboarding-toggle${terminalWalkthroughForcedVisible ? " active" : ""}`}
+                  onClick={() => {
+                    setTerminalOnboardingWalkthroughDonePreference(false);
+                    setTerminalOnboardingExpanded(true);
+                    setCoachOverlayVisible(true);
+                    if (activeAdaptiveGuideStep) {
+                      focusAdaptiveGuideTarget(activeAdaptiveGuideStep.targetId);
+                    }
+                  }}
+                >
+                  Walkthrough interactif
+                </button>
+                <button
+                  type="button"
                   className="terminal-onboarding-toggle"
                   onClick={terminalOnboardingExpanded ? collapseTerminalOnboarding : expandTerminalOnboarding}
                 >
@@ -20812,14 +20881,21 @@ function TradingTerminalPageHydrated() {
                     <span className="gtix-module-guide-label">Validation</span>
                     <span className="gtix-module-guide-text">{activeAdaptiveGuideStep.validationLabel}</span>
                   </div>
+                  <div className="gtix-module-guide-row">
+                    <span className="gtix-module-guide-label">Progression</span>
+                    <span className="gtix-module-guide-text">Etape {Math.min(terminalAdaptiveGuideStepIndex + 1, activeAdaptiveGuidePlan.steps.length)}/{activeAdaptiveGuidePlan.steps.length} · {activeAdaptiveGuideStepValidated ? "validee" : "en attente de clic sur la zone guidee"}</span>
+                  </div>
                   <div className="terminal-onboarding-links" style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
                     <button type="button" className="btn" onClick={() => focusAdaptiveGuideTarget(activeAdaptiveGuideStep.targetId)}>
                       Aller a la zone
                     </button>
+                    <button type="button" className={`btn${activeAdaptiveGuideStepValidated ? " btn-primary" : ""}`} onClick={() => validateAdaptiveGuideStep()}>
+                      Valider cette etape
+                    </button>
                     <button type="button" className="btn" onClick={() => openAdaptiveGuideCommand(activeAdaptiveGuidePlan.mode)}>
                       Demander au commandant
                     </button>
-                    <button type="button" className="btn btn-primary" onClick={advanceAdaptiveGuideStep}>
+                    <button type="button" className="btn btn-primary" onClick={advanceAdaptiveGuideStep} disabled={!activeAdaptiveGuideStepValidated}>
                       Etape suivante
                     </button>
                   </div>
@@ -20841,6 +20917,9 @@ function TradingTerminalPageHydrated() {
       <TerminalCoachOverlay
         visible={coachOverlayVisible && Boolean(activeAdaptiveGuideStep)}
         step={activeAdaptiveGuideStep}
+        stepIndex={terminalAdaptiveGuideStepIndex}
+        stepCount={activeAdaptiveGuidePlan.steps.length}
+        validated={activeAdaptiveGuideStepValidated}
         tone={terminalAdaptiveGuide.tone}
         assistanceLevel={terminalAdaptiveGuide.assistanceLevel}
         disciplineLock={terminalAdaptiveGuide.disciplineLock}
@@ -20851,6 +20930,7 @@ function TradingTerminalPageHydrated() {
           }
         }}
         onCommand={() => openAdaptiveGuideCommand(activeAdaptiveGuidePlan.mode)}
+        onValidate={() => validateAdaptiveGuideStep()}
         onNext={advanceAdaptiveGuideStep}
       />
 
