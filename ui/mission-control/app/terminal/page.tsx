@@ -4716,7 +4716,8 @@ function TradingTerminalPageHydrated() {
   );
   const activeAdaptiveGuideStepKey = activeAdaptiveGuideStep ? `${activeAdaptiveGuidePlan.mode}:${activeAdaptiveGuideStep.id}` : "";
   const activeAdaptiveGuideStepValidated = activeAdaptiveGuideStepKey ? terminalAdaptiveGuideValidatedSteps.includes(activeAdaptiveGuideStepKey) : false;
-  const terminalWalkthroughForcedVisible = terminalOnboardingFirstVisit || !terminalOnboardingWalkthroughDone;
+  const terminalWalkthroughForcedVisible = terminalOnboardingFirstVisit && !terminalOnboardingWalkthroughDone;
+  const terminalOnboardingAutoVisible = terminalOnboardingFirstVisit || terminalOnboardingPinned;
 
   const validateAdaptiveGuideStep = useCallback((stepKey?: string) => {
     const effectiveStepKey = stepKey || activeAdaptiveGuideStepKey;
@@ -4752,7 +4753,7 @@ function TradingTerminalPageHydrated() {
     if (!terminalOnboardingLoaded) {
       return;
     }
-    if (terminalAdaptiveGuide.assistanceLevel === "HIGH" || terminalAdaptiveGuide.disciplineLock || terminalWalkthroughForcedVisible) {
+    if (terminalOnboardingAutoVisible) {
       setTerminalOnboardingExpanded(true);
       setGuidedCoachTargetId(activeAdaptiveGuideStep?.targetId || "terminal-onboarding");
       setCoachOverlayVisible(true);
@@ -4767,8 +4768,8 @@ function TradingTerminalPageHydrated() {
   }, [
     activeAdaptiveGuideStep,
     terminalAdaptiveGuide.assistanceLevel,
-    terminalAdaptiveGuide.disciplineLock,
     terminalWalkthroughForcedVisible,
+    terminalOnboardingAutoVisible,
     terminalOnboardingExpanded,
     terminalOnboardingLoaded,
   ]);
@@ -5166,7 +5167,7 @@ function TradingTerminalPageHydrated() {
       setTerminalOnboardingFirstVisit(!persistedSeen);
       setTerminalOnboardingPinned(persistedPinned);
       setTerminalOnboardingWalkthroughDone(persistedWalkthroughDone);
-      setTerminalOnboardingExpanded(persistedPinned || !persistedSeen || !persistedWalkthroughDone);
+      setTerminalOnboardingExpanded(persistedPinned || !persistedSeen);
     } catch {
       setTerminalOnboardingFirstVisit(true);
       setTerminalOnboardingExpanded(true);
