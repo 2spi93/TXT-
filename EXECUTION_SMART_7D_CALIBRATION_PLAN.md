@@ -22,10 +22,11 @@ This is the current operator order to follow.
 6. Strategy clustering
 7. Capital flow adaptatif
 8. Portfolio allocator multi-strategies
+9. Vrai LLM dans Ops Copilot
 
 Interpretation for daily work:
 - phases 1 to 4 are the active execution order now
-- phases 5 to 8 are explicitly downstream and must not start before phases 1 to 4 are stable and measured
+- phases 5 to 9 are explicitly downstream and must not start before phases 1 to 4 are stable and measured
 
 Reference split:
 - phases 1 to 4 = live calibration / operator loop
@@ -33,9 +34,10 @@ Reference split:
 - phase 6 = strategy organization layer
 - phase 7 = adaptive capital routing layer
 - phase 8 = portfolio allocator layer
+- phase 9 = Ops Copilot LLM layer
 
 Operational rule:
-- if the daily review is still producing new findings on phases 1 to 4, do not promote work on phases 5 to 8
+- if the daily review is still producing new findings on phases 1 to 4, do not promote work on phases 5 to 9
 - if phases 1 to 4 are stable over the validation window, then phase 5 becomes the next active track
 
 Simple meaning of each active phase:
@@ -43,6 +45,38 @@ Simple meaning of each active phase:
 - phase 2 = compare the last 7 days and 14 days to see what is working or failing
 - phase 3 = make the attention logic react to the real market context instead of fixed weights
 - phase 4 = confirm with evidence that the behavior is stable before moving forward
+
+## Ops Copilot LLM Gate
+
+The real LLM for Ops Copilot is not the next step.
+
+It is phase 9.
+
+Do not add a true conversational LLM to Ops Copilot before phases 1 to 8 are validated enough to explain the system clearly.
+
+What must be true first:
+- the system must be measurable
+- the operator must be able to say which layer is producing or destroying PnL
+- the operator must be able to explain why a trade was allowed, reduced, delayed, or blocked
+- the core no-trade rules must already be explicit and stable
+
+Minimum validation before phase 9:
+- 100 to 300 real decisions reviewed
+- a full 7 to 14 day validation window
+- stable behavior across the active attention and execution layers
+- no major confusion in the journal about why the system acted
+
+Rule for decision logic:
+- prefer explicit rules such as: if desync + weak execution quality then NO TRADE
+- do not let an LLM decide trade entry, trade exit, or risk override on its own
+- the LLM may help explain, summarize, guide, and operate later, but it must not replace the calibrated decision rules
+
+Future role of the LLM in Ops Copilot after phase 9 opens:
+- persona: stable style, tone, role, and behavior
+- context engine: short memory, long memory, history, and user state
+- domain adapter: trading knowledge, TXT terminal knowledge, V6, RL, JEPA, and business rules
+- tool layer: APIs, actions, requests, calculations, and execution helpers
+- safety layer: guardrails, limits, consistency, and stability
 
 ## Freeze Rules
 
