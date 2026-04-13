@@ -12,12 +12,15 @@ function toNumber(value: unknown, fallback = NaN): number {
 
 function timeframeToMs(timeframe: string): number {
   const normalized = String(timeframe || "1m").trim().toLowerCase();
-  const match = normalized.match(/^(\d+)([mhd])$/);
+  const match = normalized.match(/^(\d+)([smhd])$/);
   if (!match) {
     return 60_000;
   }
   const value = Math.max(1, Number(match[1] || "1"));
   const unit = match[2];
+  if (unit === "s") {
+    return value * 1_000;
+  }
   if (unit === "m") {
     return value * 60_000;
   }
@@ -29,18 +32,32 @@ function timeframeToMs(timeframe: string): number {
 
 function resolveBarTimeMs(row: unknown): number {
   const entry = (row && typeof row === "object") ? row as JsonMap : {};
-  const numeric = toNumber(entry.time ?? entry.timestamp ?? entry.ts, NaN);
+  const numeric = toNumber(entry.t ?? entry.bucket_start ?? entry.time ?? entry.timestamp ?? entry.ts, NaN);
   if (Number.isFinite(numeric) && numeric > 0) {
     return numeric > 1e12 ? numeric : numeric * 1000;
   }
-  const text = String(entry.label || entry.timeLabel || "").trim();
+  const text = String(entry.t ?? entry.bucket_start ?? entry.label ?? entry.timeLabel ?? "").trim();
   const parsed = Date.parse(text);
   return Number.isFinite(parsed) ? parsed : NaN;
 }
 
+function resolveBarSeq(row: unknown): number | null {
+  const entry = (row && typeof row === "object") ? row as JsonMap : {};
+  const seq = toNumber(entry.seq, NaN);
+  if (!Number.isFinite(seq)) {
+    return null;
+  }
+  return Math.max(1, Math.trunc(seq));
+}
+
 function computeOhlcvSequencing(rows: unknown[], timeframeMs: number): { contiguous: boolean; latestSeq: number | null } {
+  const latestSeq = Array.isArray(rows)
+    ? rows.reduce<number | null>((latest, row, index) => {
+      const candidate = resolveBarSeq(row) ?? (index + 1);
+      return latest === null ? candidate : Math.max(latest, candidate);
+    }, null)
+    : null;
   if (!Array.isArray(rows) || rows.length < 2) {
-    const latestSeq = rows.length > 0 ? rows.length : null;
     return { contiguous: rows.length <= 1, latestSeq };
   }
   const times = rows
@@ -48,7 +65,7 @@ function computeOhlcvSequencing(rows: unknown[], timeframeMs: number): { contigu
     .filter((value) => Number.isFinite(value))
     .sort((left, right) => left - right);
   if (times.length < 2) {
-    return { contiguous: false, latestSeq: rows.length };
+    return { contiguous: false, latestSeq };
   }
   const toleranceMs = Math.max(1_000, Math.round(timeframeMs * 0.25));
   let contiguous = true;
@@ -59,7 +76,7 @@ function computeOhlcvSequencing(rows: unknown[], timeframeMs: number): { contigu
       break;
     }
   }
-  return { contiguous, latestSeq: rows.length };
+  return { contiguous, latestSeq };
 }
 
 export async function GET(request: NextRequest): Promise<NextResponse> {

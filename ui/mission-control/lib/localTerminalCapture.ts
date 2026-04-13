@@ -104,6 +104,62 @@ export type LocalTerminalRuntimeCapture = {
       syntheticHeartbeatOpens: number;
       lastUpdateAge: string;
     };
+    attention?: {
+      state: "stable" | "degraded" | "fragile" | "blocked";
+      dominantLayer: string;
+      reliabilityScore: number;
+      coherenceScore: number;
+      tone: LocalHealthTone;
+      renderable: boolean;
+      shouldBlockTrading: boolean;
+      preferredRenderSource: "ohlcv" | "bus";
+      summary: string;
+      detail: string;
+      weights: Record<string, number>;
+    };
+    temporal?: {
+      aligned: boolean;
+      degraded: boolean;
+      driftMs: number;
+      seqGap: number;
+      freshnessScore: number;
+      dominantSource: string;
+      sourceCount: number;
+      bufferedSourceCount: number;
+      bufferWindowMs: number;
+      summary: string;
+      detail: string;
+    };
+    smartState?: {
+      state: "VALID" | "WAIT" | "NO_TRADE";
+      reason: string;
+      confidence: number;
+      tone: LocalHealthTone;
+      summary: string;
+      detail: string;
+    };
+    desync?: {
+      type: "NONE" | "FAKE_MOVE" | "ABSORPTION" | "BREAKOUT" | "LIQUIDITY_TRAP";
+      state: "aligned" | "opportunity" | "risk";
+      tradeBias: "long" | "short" | "neutral";
+      strength: number;
+      confidence: number;
+      shouldBlockTrading: boolean;
+      summary: string;
+      detail: string;
+    };
+    intent?: {
+      type: "NONE" | "ACCUMULATION" | "DISTRIBUTION" | "LIQUIDITY_HUNT" | "FAKE_ACTIVITY";
+      state: "neutral" | "alpha" | "risk";
+      tradeBias: "buy" | "sell" | "neutral";
+      confidence: number;
+      persistence: number;
+      aggressiveness: number;
+      isInstitutional: boolean;
+      shouldBlockTrading: boolean;
+      summary: string;
+      detail: string;
+    };
     perceptual: LocalTerminalPerceptualRuntime | null;
     compactAlertLabel: string;
     alertText: string;
@@ -164,6 +220,52 @@ export type BuildLocalTerminalRuntimeCaptureInput = {
   ohlcvFreshnessState: LocalFreshnessState;
   depthFreshnessState: LocalFreshnessState;
   tradesFreshnessState: LocalFreshnessState;
+  crossLayerAttentionState: "stable" | "degraded" | "fragile" | "blocked";
+  crossLayerAttentionTone: LocalHealthTone;
+  crossLayerAttentionDominantLayer: string;
+  crossLayerAttentionReliabilityScore: number;
+  crossLayerAttentionCoherenceScore: number;
+  crossLayerAttentionRenderable: boolean;
+  crossLayerAttentionShouldBlockTrading: boolean;
+  crossLayerAttentionPreferredRenderSource: "ohlcv" | "bus";
+  crossLayerAttentionSummaryLabel: string;
+  crossLayerAttentionDetailLabel: string;
+  crossLayerAttentionWeights: Record<string, number>;
+  temporalSyncAligned: boolean;
+  temporalSyncDegraded: boolean;
+  temporalSyncDriftMs: number;
+  temporalSyncSeqGap: number;
+  temporalSyncFreshnessScore: number;
+  temporalSyncDominantSource: string;
+  temporalSyncSourceCount: number;
+  temporalSyncBufferedSourceCount: number;
+  temporalSyncBufferWindowMs: number;
+  temporalSyncSummaryLabel: string;
+  temporalSyncDetailLabel: string;
+  smartMarketState: "VALID" | "WAIT" | "NO_TRADE";
+  smartMarketReason: string;
+  smartMarketConfidence: number;
+  smartMarketTone: LocalHealthTone;
+  smartMarketSummaryLabel: string;
+  smartMarketDetailLabel: string;
+  desyncType: "NONE" | "FAKE_MOVE" | "ABSORPTION" | "BREAKOUT" | "LIQUIDITY_TRAP";
+  desyncState: "aligned" | "opportunity" | "risk";
+  desyncTradeBias: "long" | "short" | "neutral";
+  desyncStrength: number;
+  desyncConfidence: number;
+  desyncShouldBlockTrading: boolean;
+  desyncSummaryLabel: string;
+  desyncDetailLabel: string;
+  intentType: "NONE" | "ACCUMULATION" | "DISTRIBUTION" | "LIQUIDITY_HUNT" | "FAKE_ACTIVITY";
+  intentState: "neutral" | "alpha" | "risk";
+  intentTradeBias: "buy" | "sell" | "neutral";
+  intentConfidence: number;
+  intentPersistence: number;
+  intentAggressiveness: number;
+  intentIsInstitutional: boolean;
+  intentShouldBlockTrading: boolean;
+  intentSummaryLabel: string;
+  intentDetailLabel: string;
   barsAge: string;
   depthAge: string;
   tradesAge: string;
@@ -207,6 +309,32 @@ export function buildLocalTerminalIncidentSignature(capture: LocalTerminalRuntim
     signal: capture.localFeed.signal,
     state: capture.runtime.exactStateVector,
     blocked: capture.runtime.blockedByFiveStateFailure,
+    attention: capture.runtime.attention
+      ? {
+        state: capture.runtime.attention.state,
+        dominantLayer: capture.runtime.attention.dominantLayer,
+        shouldBlockTrading: capture.runtime.attention.shouldBlockTrading,
+      }
+      : null,
+    smartState: capture.runtime.smartState
+      ? {
+        state: capture.runtime.smartState.state,
+        reason: capture.runtime.smartState.reason,
+      }
+      : null,
+    desync: capture.runtime.desync
+      ? {
+        type: capture.runtime.desync.type,
+        state: capture.runtime.desync.state,
+      }
+      : null,
+    intent: capture.runtime.intent
+      ? {
+        type: capture.runtime.intent.type,
+        state: capture.runtime.intent.state,
+        tradeBias: capture.runtime.intent.tradeBias,
+      }
+      : null,
   });
 }
 
@@ -217,16 +345,26 @@ export function buildLocalTerminalRuntimeCapture(input: BuildLocalTerminalRuntim
     `BARS ${input.ohlcvFreshnessState.toUpperCase()} ${input.barsAge}`,
     `DEPTH ${input.depthFreshnessState.toUpperCase()} ${input.depthAge}`,
     `TRADES ${input.tradesFreshnessState.toUpperCase()} ${input.tradesAge}`,
+    input.crossLayerAttentionSummaryLabel,
+    input.temporalSyncSummaryLabel,
+    input.desyncSummaryLabel,
+    input.intentSummaryLabel,
+    input.smartMarketSummaryLabel,
   ];
-  const blockedByFiveStateFailure = String(input.marketBusHealthStatus || "offline") !== "ok"
+  const hasRenderableRestFeed = input.localFeedSignal === "OHLCV_RENDERABLE"
+    && input.renderableRows > 0;
+  const hasValidBusState = input.ohlcvStreamState === "live"
+    && input.marketBusOhlcvContiguous
+    && input.marketBusOhlcvLatestSeq > 0
+    && input.ohlcvFreshnessState !== "hard-fail";
+  const blockedByFiveStateFailure = input.crossLayerAttentionShouldBlockTrading
+    && !hasRenderableRestFeed
+    && String(input.marketBusHealthStatus || "offline") !== "ok"
     && input.ohlcvStreamState !== "live"
     && input.ohlcvFreshnessState === "hard-fail"
     && input.depthFreshnessState === "hard-fail"
     && input.tradesFreshnessState === "hard-fail";
-  const noCandlesExpected = blockedByFiveStateFailure
-    || input.localFeedSignal === "OHLCV_UNUSABLE"
-    || input.ohlcvStreamState !== "live"
-    || input.ohlcvFreshnessState === "hard-fail";
+  const noCandlesExpected = !input.crossLayerAttentionRenderable && !hasValidBusState;
 
   return {
     version: 1,
@@ -302,6 +440,62 @@ export function buildLocalTerminalRuntimeCapture(input: BuildLocalTerminalRuntim
         candleUpdates: input.candleUpdates,
         syntheticHeartbeatOpens: input.syntheticHeartbeatOpens,
         lastUpdateAge: input.candleLastUpdateAge,
+      },
+      attention: {
+        state: input.crossLayerAttentionState,
+        dominantLayer: input.crossLayerAttentionDominantLayer,
+        reliabilityScore: input.crossLayerAttentionReliabilityScore,
+        coherenceScore: input.crossLayerAttentionCoherenceScore,
+        tone: input.crossLayerAttentionTone,
+        renderable: input.crossLayerAttentionRenderable,
+        shouldBlockTrading: input.crossLayerAttentionShouldBlockTrading,
+        preferredRenderSource: input.crossLayerAttentionPreferredRenderSource,
+        summary: input.crossLayerAttentionSummaryLabel,
+        detail: input.crossLayerAttentionDetailLabel,
+        weights: input.crossLayerAttentionWeights,
+      },
+      temporal: {
+        aligned: input.temporalSyncAligned,
+        degraded: input.temporalSyncDegraded,
+        driftMs: input.temporalSyncDriftMs,
+        seqGap: input.temporalSyncSeqGap,
+        freshnessScore: input.temporalSyncFreshnessScore,
+        dominantSource: input.temporalSyncDominantSource,
+        sourceCount: input.temporalSyncSourceCount,
+        bufferedSourceCount: input.temporalSyncBufferedSourceCount,
+        bufferWindowMs: input.temporalSyncBufferWindowMs,
+        summary: input.temporalSyncSummaryLabel,
+        detail: input.temporalSyncDetailLabel,
+      },
+      smartState: {
+        state: input.smartMarketState,
+        reason: input.smartMarketReason,
+        confidence: input.smartMarketConfidence,
+        tone: input.smartMarketTone,
+        summary: input.smartMarketSummaryLabel,
+        detail: input.smartMarketDetailLabel,
+      },
+      desync: {
+        type: input.desyncType,
+        state: input.desyncState,
+        tradeBias: input.desyncTradeBias,
+        strength: input.desyncStrength,
+        confidence: input.desyncConfidence,
+        shouldBlockTrading: input.desyncShouldBlockTrading,
+        summary: input.desyncSummaryLabel,
+        detail: input.desyncDetailLabel,
+      },
+      intent: {
+        type: input.intentType,
+        state: input.intentState,
+        tradeBias: input.intentTradeBias,
+        confidence: input.intentConfidence,
+        persistence: input.intentPersistence,
+        aggressiveness: input.intentAggressiveness,
+        isInstitutional: input.intentIsInstitutional,
+        shouldBlockTrading: input.intentShouldBlockTrading,
+        summary: input.intentSummaryLabel,
+        detail: input.intentDetailLabel,
       },
       perceptual: input.perceptual || null,
       compactAlertLabel: input.chartCompactAlertLabel,

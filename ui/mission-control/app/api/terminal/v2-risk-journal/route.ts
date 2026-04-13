@@ -16,9 +16,11 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   const symbol = request.nextUrl.searchParams.get("symbol") || "";
   const timeframe = request.nextUrl.searchParams.get("timeframe") || "";
   const strategy = request.nextUrl.searchParams.get("strategy") || "";
+  const action = request.nextUrl.searchParams.get("action") || "";
   const limit = Number(request.nextUrl.searchParams.get("limit") || 40);
+  const sinceDays = Number(request.nextUrl.searchParams.get("sinceDays") || 0);
 
-  const entries = await readV2RiskJournalEntries({ symbol, timeframe, strategy, limit });
+  const entries = await readV2RiskJournalEntries({ symbol, timeframe, strategy, action, limit, sinceDays });
   return NextResponse.json({ entries });
 }
 

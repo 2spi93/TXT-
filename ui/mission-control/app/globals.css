@@ -4260,6 +4260,10 @@ html[data-ui-mode="novice"] .decision-overlay-panel {
   overflow: hidden;
 }
 
+.terminal-v2-core.has-sidecar {
+  grid-template-columns: minmax(0, 1fr) 240px 216px;
+}
+
 .terminal-v2-chart-col {
   min-width: 0;
   position: relative;
@@ -4323,6 +4327,17 @@ html[data-ui-mode="novice"] .decision-overlay-panel {
   z-index: 2;
   background: linear-gradient(180deg, rgba(7, 16, 27, 0.96), rgba(5, 11, 20, 0.98));
   border-left: 1px solid rgba(126, 215, 255, 0.1);
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(126, 215, 255, 0.12) transparent;
+}
+
+.terminal-v2-sidecar-stack {
+  width: auto;
+  min-width: 0;
+  padding: 8px;
+  border-left: 1px solid rgba(126, 215, 255, 0.1);
+  background: linear-gradient(180deg, rgba(7, 16, 27, 0.96), rgba(5, 11, 20, 0.98));
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: rgba(126, 215, 255, 0.12) transparent;
@@ -11838,6 +11853,10 @@ a[href*="tradingview"] {
     min-height: 0;
   }
 
+  .terminal-v2-core.has-sidecar {
+    grid-template-columns: 1fr;
+  }
+
   .terminal-v2-chart-col {
     min-height: 340px;
   }
@@ -11851,6 +11870,12 @@ a[href*="tradingview"] {
     border-left: none;
     border-top: 1px solid rgba(126, 215, 255, 0.1);
     max-height: 240px;
+  }
+
+  .terminal-v2-sidecar-stack {
+    width: 100%;
+    border-left: none;
+    border-top: 1px solid rgba(126, 215, 255, 0.1);
   }
 
   .chart-timezone-pill {
@@ -11979,6 +12004,10 @@ a[href*="tradingview"] {
     grid-template-columns: 1fr;
   }
 
+  .terminal-v2-core.has-sidecar {
+    grid-template-columns: 1fr;
+  }
+
   .terminal-v2-chart-col {
     min-height: 280px;
   }
@@ -11989,6 +12018,10 @@ a[href*="tradingview"] {
   }
 
   .terminal-v2-ai-hud {
+    display: none;
+  }
+
+  .terminal-v2-sidecar-stack {
     display: none;
   }
 

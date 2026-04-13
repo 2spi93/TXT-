@@ -30,11 +30,16 @@ export async function readV2RiskJournalEntries(options?: {
   timeframe?: string;
   strategy?: string;
   limit?: number;
+  sinceDays?: number;
+  action?: string;
 }): Promise<V2RiskJournalEntry[]> {
   const symbol = String(options?.symbol || "").trim().toUpperCase();
   const timeframe = String(options?.timeframe || "").trim();
   const strategy = String(options?.strategy || "").trim().toLowerCase();
-  const limit = Math.max(1, Math.min(200, Math.round(Number(options?.limit || 40))));
+  const limit = Math.max(1, Math.min(2_000, Math.round(Number(options?.limit || 40))));
+  const sinceDays = Math.max(0, Math.min(90, Number(options?.sinceDays || 0)));
+  const action = String(options?.action || "").trim().toLowerCase();
+  const cutoffMs = sinceDays > 0 ? Date.now() - sinceDays * 24 * 60 * 60 * 1000 : 0;
 
   try {
     const content = await readFile(filePath(), "utf-8");
@@ -53,6 +58,11 @@ export async function readV2RiskJournalEntries(options?: {
         if (symbol && String(row.symbol || "").toUpperCase() !== symbol) return false;
         if (timeframe && String(row.timeframe || "") !== timeframe) return false;
         if (strategy && String(row.strategy || "").toLowerCase() !== strategy) return false;
+        if (action && String(row.action || "").toLowerCase() !== action) return false;
+        if (cutoffMs > 0) {
+          const createdAtMs = Date.parse(String(row.createdAtIso || ""));
+          if (Number.isFinite(createdAtMs) && createdAtMs < cutoffMs) return false;
+        }
         return true;
       });
 

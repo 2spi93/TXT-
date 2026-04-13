@@ -2829,6 +2829,283 @@ export function ExecutionContextMonitoringPanel({
   );
 }
 
+type AttentionCalibrationRow = {
+  layer: string;
+  count: number;
+  alphaSharePct: number;
+  blockedSharePct: number;
+  executionQualityPct: number;
+  topReason: string;
+};
+
+function parseAttentionCalibrationRows(entries: OperatorJournalEntry[], sinceDays: number): AttentionCalibrationRow[] {
+  const cutoffMs = Date.now() - sinceDays * 24 * 60 * 60 * 1000;
+  const grouped = new Map<string, {
+    count: number;
+    alphaCount: number;
+    blockedCount: number;
+    executionQualitySum: number;
+    executionQualityCount: number;
+    reasons: Map<string, number>;
+  }>();
+
+  for (const entry of entries) {
+    const createdAtMs = Date.parse(entry.createdAtIso);
+    if (!Number.isFinite(createdAtMs) || createdAtMs < cutoffMs) {
+      continue;
+    }
+    const action = String(entry.action || "").trim().toLowerCase();
+    if (!action.startsWith("execution-v7-")) {
+      continue;
+    }
+    const meta = safeRecord(entry.meta);
+    const attention = safeRecord(meta.attention_context);
+    const layer = String(attention.dominant_layer || attention.dominantLayer || "").trim().toUpperCase();
+    if (!layer) {
+      continue;
+    }
+    const outcomeMatch = action.match(/^execution-v7-outcome-([a-z-]+)$/i);
+    const outcomeClass = outcomeMatch?.[1] || String(safeRecord(meta.execution_microstructure_control).classification || "neutral").trim().toLowerCase();
+    const blocked = action === "execution-v7-blocked";
+    const context = safeRecord(attention.context);
+    const executionFeedback = safeRecord(meta.execution_feedback);
+    const executionQuality = safeNumber(
+      executionFeedback.executionScore,
+      safeNumber(context.execution_quality_score, safeNumber(context.executionQualityScore, Number.NaN)),
+    );
+    const reason = String(attention.dominant_reason || attention.dominantReason || "context balanced").trim();
+    const bucket = grouped.get(layer) || {
+      count: 0,
+      alphaCount: 0,
+      blockedCount: 0,
+      executionQualitySum: 0,
+      executionQualityCount: 0,
+      reasons: new Map<string, number>(),
+    };
+    bucket.count += 1;
+    if (outcomeClass === "alpha") {
+      bucket.alphaCount += 1;
+    }
+    if (blocked) {
+      bucket.blockedCount += 1;
+    }
+    if (Number.isFinite(executionQuality)) {
+      bucket.executionQualitySum += executionQuality;
+      bucket.executionQualityCount += 1;
+    }
+    bucket.reasons.set(reason, (bucket.reasons.get(reason) || 0) + 1);
+    grouped.set(layer, bucket);
+  }
+
+  return [...grouped.entries()]
+    .map(([layer, bucket]) => ({
+      layer,
+      count: bucket.count,
+      alphaSharePct: bucket.count > 0 ? (bucket.alphaCount / bucket.count) * 100 : 0,
+      blockedSharePct: bucket.count > 0 ? (bucket.blockedCount / bucket.count) * 100 : 0,
+      executionQualityPct: bucket.executionQualityCount > 0 ? (bucket.executionQualitySum / bucket.executionQualityCount) * 100 : 0,
+      topReason: [...bucket.reasons.entries()].sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))[0]?.[0] || "context balanced",
+    }))
+    .sort((left, right) => right.count - left.count || right.alphaSharePct - left.alphaSharePct || left.layer.localeCompare(right.layer))
+    .slice(0, 4);
+}
+
+export function AttentionContextMonitoringPanel({
+  badge,
+  layoutEditMode,
+  onDetach,
+  liveAttention,
+  journalContext,
+  formatClock,
+}: {
+  badge: ReactNode;
+  layoutEditMode: boolean;
+  onDetach: () => void;
+  liveAttention: Record<string, unknown> | null;
+  journalContext?: {
+    symbol: string;
+    timeframe: string;
+    strategy: string;
+  };
+  formatClock: (value: string) => string;
+}) {
+  const journalSymbol = String(journalContext?.symbol || "").trim().toUpperCase();
+  const journalTimeframe = String(journalContext?.timeframe || "").trim();
+  const journalStrategy = String(journalContext?.strategy || "").trim();
+  const journalEnabled = Boolean(journalSymbol && journalTimeframe && journalStrategy);
+  const [journalEntries, setJournalEntries] = useState<OperatorJournalEntry[]>([]);
+  const [journalBusy, setJournalBusy] = useState(false);
+  const [journalError, setJournalError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!journalEnabled) {
+      setJournalEntries([]);
+      setJournalBusy(false);
+      setJournalError(null);
+      return;
+    }
+    let cancelled = false;
+    const loadJournal = async () => {
+      setJournalBusy(true);
+      const query = new URLSearchParams();
+      query.set("symbol", journalSymbol);
+      query.set("timeframe", journalTimeframe);
+      query.set("strategy", journalStrategy);
+      query.set("limit", "400");
+      query.set("sinceDays", "14");
+      const response = await fetch(`/api/terminal/v2-risk-journal?${query.toString()}`, { cache: "no-store" }).catch(() => null);
+      const responsePayload = response ? await response.json().catch(() => null) : null;
+      if (cancelled) {
+        return;
+      }
+      if (!response || !response.ok || !responsePayload || !Array.isArray(responsePayload.entries)) {
+        setJournalError("Journal attention indisponible");
+        setJournalBusy(false);
+        return;
+      }
+      setJournalEntries(responsePayload.entries.filter(isOperatorJournalEntry));
+      setJournalError(null);
+      setJournalBusy(false);
+    };
+    void loadJournal();
+    const timer = window.setInterval(() => {
+      void loadJournal();
+    }, 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [journalEnabled, journalStrategy, journalSymbol, journalTimeframe]);
+
+  const snapshot = safeRecord(liveAttention);
+  const liveContext = safeRecord(snapshot.context);
+  const liveWeights = Object.entries(safeRecord(snapshot.weights))
+    .map(([layer, weight]) => ({ layer: layer.toUpperCase(), weight: safeNumber(weight, 0) }))
+    .sort((left, right) => right.weight - left.weight);
+  const recentDecisions = useMemo(
+    () => journalEntries.filter((entry) => String(entry.action || "").trim().toLowerCase() === "attention-context-decision").slice(0, 6),
+    [journalEntries],
+  );
+  const linkedOutcomes = useMemo(
+    () => journalEntries.filter((entry) => String(entry.action || "").trim().toLowerCase().startsWith("execution-v7-")).slice(0, 6),
+    [journalEntries],
+  );
+  const calibration7d = useMemo(() => parseAttentionCalibrationRows(journalEntries, 7), [journalEntries]);
+  const calibration14d = useMemo(() => parseAttentionCalibrationRows(journalEntries, 14), [journalEntries]);
+
+  return (
+    <MonitoringPanelCard title="Attention Context" badge={badge} layoutEditMode={layoutEditMode} onDetach={onDetach}>
+      {!liveAttention ? <p className="subtle mini">Attention contextuelle indisponible.</p> : null}
+      {liveAttention ? (
+        <>
+          <div className="venue-telemetry-summary">
+            <span className={`venue-telemetry-pill ${String(snapshot.tone || "subtle") === "good" ? "" : "warn"}`}>{String(snapshot.state || "stable")}</span>
+            <span className="venue-telemetry-pill">dom {String(snapshot.dominantLayer || "ohlcv").toUpperCase()}</span>
+            <span className="venue-telemetry-pill">rel {(safeNumber(snapshot.reliabilityScore, 0) * 100).toFixed(0)}%</span>
+            <span className="venue-telemetry-pill">exec {(safeNumber(liveContext.execution_quality_score, safeNumber(liveContext.executionQualityScore, 0)) * 100).toFixed(0)}%</span>
+          </div>
+          <div className="subtle mini" style={{ marginBottom: 8 }}>{String(snapshot.dominantReason || "Context balanced.")}</div>
+          <div className="optimizer-live-grid">
+            <div className={`venue-telemetry-item ${safeNumber(snapshot.reliabilityScore, 0) >= 0.65 ? "good" : safeNumber(snapshot.reliabilityScore, 0) >= 0.5 ? "subtle" : "warn"}`}>
+              <div className="venue-telemetry-head">
+                <span className="venue-telemetry-venue">Live weights</span>
+                <span className={`venue-telemetry-state ${safeNumber(snapshot.reliabilityScore, 0) >= 0.65 ? "good" : safeNumber(snapshot.reliabilityScore, 0) >= 0.5 ? "subtle" : "warn"}`}>{String(snapshot.summaryLabel || "ATTN")}</span>
+              </div>
+              {liveWeights.map((item) => (
+                <div key={`attn-live-${item.layer}`} className="mon-row">
+                  <span>{item.layer}</span>
+                  <span className="subtle mini">weight</span>
+                  <span className={item.weight >= 0.3 ? "good" : item.weight >= 0.2 ? "subtle" : "warn"}>{(item.weight * 100).toFixed(0)}%</span>
+                </div>
+              ))}
+            </div>
+            <div className="venue-telemetry-item subtle">
+              <div className="venue-telemetry-head">
+                <span className="venue-telemetry-venue">Context drivers</span>
+                <span className="venue-telemetry-state subtle">{String(liveContext.volatilityRegime || liveContext.volatility_regime || "normal")}</span>
+              </div>
+              <div className="mon-row"><span>Flow agreement</span><span>{(safeNumber(liveContext.flowAgreementScore, safeNumber(liveContext.flow_agreement_score, 0)) * 100).toFixed(0)}%</span></div>
+              <div className="mon-row"><span>Manipulation risk</span><span className={safeNumber(liveContext.manipulationRisk, safeNumber(liveContext.manipulation_risk, 0)) >= 0.55 ? "warn" : "subtle"}>{(safeNumber(liveContext.manipulationRisk, safeNumber(liveContext.manipulation_risk, 0)) * 100).toFixed(0)}%</span></div>
+              <div className="mon-row"><span>Velocity / drift</span><span>{(safeNumber(liveContext.priceVelocityScore, safeNumber(liveContext.price_velocity_score, 0)) * 100).toFixed(0)}% · {safeNumber(liveContext.temporalDriftMs, safeNumber(liveContext.temporal_drift_ms, 0)).toFixed(0)}ms</span></div>
+              <div className="mon-row"><span>Intent / desync</span><span>{String(liveContext.intent || "NONE")} · {String(liveContext.desync_classification || "neutral")}</span></div>
+            </div>
+          </div>
+          {journalBusy ? <div className="subtle mini">sync journal attention...</div> : null}
+          {journalError ? <div className="warn mini">{journalError}</div> : null}
+          <div className="optimizer-live-section">
+            <div className="subtle mini">Recent attention decisions</div>
+            {recentDecisions.length === 0 ? <p className="subtle mini">Aucune decision contextuelle recente.</p> : null}
+            {recentDecisions.map((entry) => {
+              const meta = safeRecord(entry.meta);
+              const attention = safeRecord(meta.attention_context);
+              return (
+                <div key={entry.id} className="mon-row">
+                  <span>{formatCompactClock(entry.createdAtIso, formatClock)}</span>
+                  <span className="subtle mini">{String(attention.dominant_layer || attention.dominantLayer || "OHLcv").toUpperCase()}</span>
+                  <span className={String(attention.state || "stable") === "stable" ? "good" : String(attention.state || "stable") === "degraded" ? "subtle" : "warn"}>{String(attention.state || "stable")}</span>
+                </div>
+              );
+            })}
+            <div className="optimizer-live-reasons">
+              {recentDecisions.map((entry) => {
+                const attention = safeRecord(safeRecord(entry.meta).attention_context);
+                const reason = String(attention.dominant_reason || attention.dominantReason || entry.detail || "context balanced").trim();
+                return <span key={`${entry.id}-reason`} className="optimizer-live-chip subtle">{reason}</span>;
+              })}
+            </div>
+          </div>
+          <div className="optimizer-live-section">
+            <div className="subtle mini">Outcome-linked attention</div>
+            {linkedOutcomes.length === 0 ? <p className="subtle mini">Aucun outcome V7 lie a l'attention.</p> : null}
+            {linkedOutcomes.map((entry) => {
+              const meta = safeRecord(entry.meta);
+              const attention = safeRecord(meta.attention_context);
+              const executionFeedback = safeRecord(meta.execution_feedback);
+              const action = String(entry.action || "").trim().toLowerCase();
+              const outcomeClass = action.startsWith("execution-v7-outcome-") ? action.replace("execution-v7-outcome-", "") : "blocked";
+              return (
+                <div key={`${entry.id}-outcome`} className="mon-row">
+                  <span>{String(attention.dominant_layer || attention.dominantLayer || "OHLcv").toUpperCase()}</span>
+                  <span className="subtle mini">{outcomeClass}</span>
+                  <span className={safeNumber(executionFeedback.executionScore, 0) >= 0.65 ? "good" : safeNumber(executionFeedback.executionScore, 0) >= 0.45 ? "subtle" : "warn"}>{(safeNumber(executionFeedback.executionScore, 0) * 100).toFixed(0)}%</span>
+                </div>
+              );
+            })}
+          </div>
+          <div className="optimizer-live-grid">
+            {[
+              { label: "7j", rows: calibration7d },
+              { label: "14j", rows: calibration14d },
+            ].map((window) => (
+              <div key={`attn-cal-${window.label}`} className="venue-telemetry-item subtle">
+                <div className="venue-telemetry-head">
+                  <span className="venue-telemetry-venue">Calibration {window.label}</span>
+                  <span className="venue-telemetry-state subtle">dom layer vs alpha</span>
+                </div>
+                {window.rows.length === 0 ? <p className="subtle mini">Pas assez d'outcomes lies.</p> : null}
+                {window.rows.map((row) => (
+                  <div key={`${window.label}-${row.layer}`} style={{ marginBottom: 8 }}>
+                    <div className="mon-row">
+                      <span>{row.layer}</span>
+                      <span className="subtle mini">n={row.count}</span>
+                      <span className={row.alphaSharePct >= 50 ? "good" : row.alphaSharePct >= 30 ? "subtle" : "warn"}>{row.alphaSharePct.toFixed(0)}% alpha</span>
+                    </div>
+                    <div className="mon-row">
+                      <span className="subtle mini">exec q {row.executionQualityPct.toFixed(0)}%</span>
+                      <span className="subtle mini">blocked {row.blockedSharePct.toFixed(0)}%</span>
+                      <span className="subtle mini gtix-ellipsis">{row.topReason}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+        </>
+      ) : null}
+    </MonitoringPanelCard>
+  );
+}
+
 export function VenueTelemetryMonitoringPanel({
   badge,
   layoutEditMode,

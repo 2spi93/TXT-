@@ -54,11 +54,21 @@ export type ExecutionVenueLearningProfile = {
 export type ExecutionSmartGateDecision = {
   allow: boolean;
   reasons: string[];
+  adjustments: string[];
   recommendedDelayMs: number;
   sizeMultiplier: number;
   contextScore: number;
   venueScore: number;
   executionScore: number;
+};
+
+export type ExecutionExternalControl = {
+  block?: boolean;
+  blockReasons?: string[];
+  adjustmentReasons?: string[];
+  delayMs?: number;
+  sizeMultiplier?: number;
+  executionScoreCap?: number;
 };
 
 export type ExecutionPlanSliceDraft = {
@@ -349,6 +359,7 @@ export function evaluateExecutionV7LiteSmartGate(input: {
   intent: ExecutionIntent;
   context: ExecutionContext;
   venueLearning?: ExecutionVenueLearningProfile | null;
+  externalControl?: ExecutionExternalControl | null;
 }): ExecutionSmartGateDecision {
   const context = input.context;
   const spreadPressure = context.spreadBps / Math.max(0.25, input.intent.maxSpreadBps);
@@ -379,8 +390,9 @@ export function evaluateExecutionV7LiteSmartGate(input: {
     0,
     1,
   );
-  const executionScore = clamp(contextScore * 0.72 + venueScore * 0.28, 0, 1);
+  let executionScore = clamp(contextScore * 0.72 + venueScore * 0.28, 0, 1);
   const reasons: string[] = [];
+  const adjustments: string[] = [];
   if (spreadPressure > 1.08) {
     reasons.push("spread_expanding");
   }
@@ -406,7 +418,7 @@ export function evaluateExecutionV7LiteSmartGate(input: {
     reasons.push("venue_quality_degraded");
   }
 
-  const allow = reasons.length === 0;
+  let allow = reasons.length === 0;
   let sizeMultiplier = 1;
   if (allow) {
     sizeMultiplier = executionScore >= 0.78
@@ -442,10 +454,37 @@ export function evaluateExecutionV7LiteSmartGate(input: {
     ))
     : Math.round(clamp(input.intent.baseSliceDelayMs + 60, 60, 240));
 
+  let finalDelayMs = recommendedDelayMs;
+  if (input.externalControl) {
+    if (Array.isArray(input.externalControl.adjustmentReasons)) {
+      adjustments.push(...input.externalControl.adjustmentReasons.filter(Boolean));
+    }
+    if (input.externalControl.block) {
+      allow = false;
+      reasons.push(...(input.externalControl.blockReasons || []).filter(Boolean));
+    }
+    if (typeof input.externalControl.executionScoreCap === "number" && Number.isFinite(input.externalControl.executionScoreCap)) {
+      executionScore = Math.min(executionScore, input.externalControl.executionScoreCap);
+    }
+    if (allow) {
+      if (typeof input.externalControl.sizeMultiplier === "number" && Number.isFinite(input.externalControl.sizeMultiplier)) {
+        sizeMultiplier = clamp(sizeMultiplier * input.externalControl.sizeMultiplier, 0.1, 1.4);
+      }
+      if (typeof input.externalControl.delayMs === "number" && Number.isFinite(input.externalControl.delayMs)) {
+        finalDelayMs = Math.round(clamp(finalDelayMs + input.externalControl.delayMs, 0, 320));
+      }
+    }
+  }
+
+  if (!allow) {
+    sizeMultiplier = 0;
+  }
+
   return {
     allow,
     reasons,
-    recommendedDelayMs,
+    adjustments,
+    recommendedDelayMs: finalDelayMs,
     sizeMultiplier: round(sizeMultiplier, 6),
     contextScore: round(contextScore, 6),
     venueScore: round(venueScore, 6),

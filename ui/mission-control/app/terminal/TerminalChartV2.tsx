@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import GpuChartV4Surface from "./GpuChartV4Surface";
 import type { SmartDecisionHudShape } from "./chartHudTypes";
@@ -98,6 +98,8 @@ const INIT_AUTO_TRADER: AutoTraderV5State = {
 type Props = {
   enabled: boolean;
   onToggleEnabled: () => void;
+  hasSidecar?: boolean;
+  sidecarStack?: ReactNode;
   symbol: string;
   timeframe: string;
   onTimeframeChange: (timeframe: string) => void;
@@ -162,6 +164,18 @@ type Props = {
   aiScenario: string;
   aiConfidencePct: number;
   aiExplanation: string;
+  marketSyncGate?: {
+    state: "VALID" | "WAIT" | "NO_TRADE";
+    reason: string;
+    confidence: number;
+    summaryLabel: string;
+    detailLabel: string;
+    temporalSummaryLabel: string;
+    attentionSummaryLabel: string;
+    desyncSummaryLabel: string;
+    intentSummaryLabel: string;
+    executionSummaryLabel: string;
+  } | null;
   flowInsight?: FlowInsight | null;
   indicatorSeries?: IndicatorSeries[];
   chartEngineMode?: ChartEngineMode;
@@ -245,6 +259,8 @@ export default function TerminalChartV2(props: Props) {
   const {
     enabled,
     onToggleEnabled,
+    hasSidecar = false,
+    sidecarStack = null,
     symbol,
     timeframe,
     onTimeframeChange,
@@ -307,6 +323,7 @@ export default function TerminalChartV2(props: Props) {
     aiScenario,
     aiConfidencePct,
     aiExplanation,
+    marketSyncGate,
     flowInsight,
     indicatorSeries: indicatorSeriesProp = [],
     chartEngineMode = "v3",
@@ -582,7 +599,14 @@ export default function TerminalChartV2(props: Props) {
     domImbalance: domStats.imbalance,
     decisionLatencyMs,
     suspended: isPreviewMode || !analyticsReady,
-  }), [analyticsReady, decisionLatencyMs, domStats.imbalance, effectiveRouteScore, isPreviewMode, liquiditySnapshot, lowFlowEdgeBlocked, predictionV5.direction, predictionV5.invalidation, predictionV5.probability, predictionV5.trigger, regimeSnapshot, structureSnapshot]);
+    suspendedReason: isPreviewMode || !analyticsReady
+      ? "Preview or degraded feed blocks the decision layer"
+      : null,
+    externalGate: marketSyncGate ? {
+      state: marketSyncGate.state,
+      reason: marketSyncGate.detailLabel,
+    } : null,
+  }), [analyticsReady, decisionLatencyMs, domStats.imbalance, effectiveRouteScore, isPreviewMode, liquiditySnapshot, lowFlowEdgeBlocked, marketSyncGate, predictionV5.direction, predictionV5.invalidation, predictionV5.probability, predictionV5.trigger, regimeSnapshot, structureSnapshot]);
   const stableSmartDecision = useMemo(
     () => applyDecisionStability(smartDecision, decisionStabilityEngineRef.current.update(smartDecision.state, decisionClockMs)),
     [decisionClockMs, smartDecision],
@@ -848,7 +872,7 @@ export default function TerminalChartV2(props: Props) {
       </div>
 
       {/* ─── ROW 2: CHART CORE + AI HUD ─── */}
-      <div className="terminal-v2-core">
+      <div className={`terminal-v2-core${hasSidecar ? " has-sidecar" : ""}`}>
         <div className={`terminal-v2-chart-col${aiConfidencePct >= 70 ? " chart-focus-mode" : ""}${lowFlowEdgeBlocked ? " is-flow-confidence-low" : ""}`}>
           {loading ? <div className="chart-loader">Switching symbol…</div> : null}
           {chartEngineMode === "v4" ? (
@@ -919,6 +943,9 @@ export default function TerminalChartV2(props: Props) {
           <div className="terminal-v2-card terminal-v2-card-decision" data-testid="terminal-v2-decision-state">
             <span className="terminal-v2-card-kicker">Decision Engine V2</span>
             <SmartDecisionSummary decision={smartDecisionHud} variant="hero" />
+            {marketSyncGate && marketSyncGate.state !== "VALID" ? (
+              <div className="terminal-v2-alert">{marketSyncGate.summaryLabel} · {marketSyncGate.temporalSummaryLabel} · {marketSyncGate.desyncSummaryLabel} · {marketSyncGate.intentSummaryLabel}</div>
+            ) : null}
           </div>
 
           {/* ── PERCEPTION ENGINE V5 — prédictif ── */}
@@ -1017,6 +1044,7 @@ export default function TerminalChartV2(props: Props) {
             <strong>{aiHeadline}</strong>
             <span className="terminal-v2-meta">{smartDecisionHud.displayStateLabel} · {smartDecisionHud.confidenceBand} · {aiScenario}</span>
             <span className="terminal-v2-meta">confidence {aiConfidencePct.toFixed(0)}% · regime {regimeSnapshot.state}</span>
+            {marketSyncGate ? <span className="terminal-v2-meta">{marketSyncGate.summaryLabel} · {marketSyncGate.attentionSummaryLabel} · {marketSyncGate.intentSummaryLabel} · {marketSyncGate.executionSummaryLabel}</span> : null}
             <p className="terminal-v2-ai-copy">{assistantContext}</p>
             <div className="terminal-v2-chat-row">
               <input
@@ -1062,6 +1090,7 @@ export default function TerminalChartV2(props: Props) {
             </div>
           </div>
         </aside>
+        {sidecarStack}
       </div>
 
       {/* ─── ROW 3: EXECUTION / DOM / ACTION ─── */}

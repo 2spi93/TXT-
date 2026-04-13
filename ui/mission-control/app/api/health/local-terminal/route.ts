@@ -65,8 +65,33 @@ async function findActiveMatchingLocalTerminalIncidents(capture: {
 
 function isDurablyHealthyCapture(capture: {
   localFeed: { signal: string };
-  runtime: { blockedByFiveStateFailure: boolean; noCandlesExpected: boolean; bus: { status: string }; ohlcv: { status: string } };
+  runtime: {
+    blockedByFiveStateFailure: boolean;
+    noCandlesExpected: boolean;
+    bus: { status: string };
+    ohlcv: { status: string };
+    attention?: { renderable: boolean; shouldBlockTrading: boolean; state: string };
+    temporal?: { aligned: boolean; degraded: boolean };
+    smartState?: { state: string };
+  };
 }): boolean {
+  if (capture.runtime.smartState && capture.runtime.temporal) {
+    return capture.localFeed.signal === "OHLCV_RENDERABLE"
+      && !capture.runtime.blockedByFiveStateFailure
+      && !capture.runtime.noCandlesExpected
+      && capture.runtime.smartState.state === "VALID"
+      && capture.runtime.temporal.aligned
+      && !capture.runtime.temporal.degraded;
+  }
+  const attention = capture.runtime.attention;
+  if (attention) {
+    return capture.localFeed.signal === "OHLCV_RENDERABLE"
+      && !capture.runtime.blockedByFiveStateFailure
+      && !capture.runtime.noCandlesExpected
+      && attention.renderable
+      && !attention.shouldBlockTrading
+      && attention.state !== "blocked";
+  }
   return capture.localFeed.signal === "OHLCV_RENDERABLE"
     && !capture.runtime.blockedByFiveStateFailure
     && !capture.runtime.noCandlesExpected
@@ -78,7 +103,15 @@ function hasHealthyCaptureSince(
   history: Array<{
     capturedAt: string;
     localFeed: { signal: string };
-    runtime: { blockedByFiveStateFailure: boolean; noCandlesExpected: boolean; bus: { status: string }; ohlcv: { status: string } };
+    runtime: {
+      blockedByFiveStateFailure: boolean;
+      noCandlesExpected: boolean;
+      bus: { status: string };
+      ohlcv: { status: string };
+      attention?: { renderable: boolean; shouldBlockTrading: boolean; state: string };
+      temporal?: { aligned: boolean; degraded: boolean };
+      smartState?: { state: string };
+    };
   }>,
   timestamp: string | null | undefined,
 ): boolean {
@@ -92,7 +125,14 @@ function summarizeTransitionPayload(current: {
   clientId: string;
   chart: { instrument: string; timeframe: string; venue: string; feedLabel: string };
   localFeed: { signal: string; message: string; renderableRows: number; fetchedRows: number };
-  runtime: { exactStateVector: string[]; bars: { state: string }; blockedByFiveStateFailure: boolean };
+  runtime: {
+    exactStateVector: string[];
+    bars: { state: string };
+    blockedByFiveStateFailure: boolean;
+    attention?: { state: string; summary: string; detail: string };
+    temporal?: { driftMs: number; seqGap: number; summary: string };
+    smartState?: { state: string; reason: string; summary: string };
+  };
 }, previous: {
   localFeed?: { signal?: string };
   runtime?: { bars?: { state?: string } };
@@ -111,6 +151,13 @@ function summarizeTransitionPayload(current: {
     bars_state: current.runtime.bars.state,
     blocked_by_five_state_failure: current.runtime.blockedByFiveStateFailure,
     exact_state_vector: current.runtime.exactStateVector,
+    attention_state: current.runtime.attention?.state || null,
+    attention_summary: current.runtime.attention?.summary || null,
+    temporal_drift_ms: current.runtime.temporal?.driftMs ?? null,
+    temporal_seq_gap: current.runtime.temporal?.seqGap ?? null,
+    temporal_summary: current.runtime.temporal?.summary || null,
+    smart_state: current.runtime.smartState?.state || null,
+    smart_reason: current.runtime.smartState?.reason || null,
     previous_signal: previous?.localFeed?.signal || null,
     previous_bars_state: previous?.runtime?.bars?.state || null,
   };

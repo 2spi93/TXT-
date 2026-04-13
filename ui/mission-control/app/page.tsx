@@ -193,10 +193,15 @@ export default async function Page() {
           <div className="eyebrow">Local Terminal Capture <HelpHint text="Snapshot persiste de l'onglet terminal actif. C'est la source de verite pour verifier les pills exactes d'une instance locale." examples={["Si tu vois BUS OFFLINE dans l'onglet, ce bloc doit montrer la meme chose ici si cette instance publie encore ses captures.", "Le client id permet de distinguer plusieurs onglets ou postes de travail si necessaire."]} /></div>
           {latestLocalTerminalCapture ? (
             <>
-              <div className={`metric ${latestLocalTerminalCapture.runtime.noCandlesExpected ? "warn" : "good"}`}>{latestLocalTerminalCapture.runtime.noCandlesExpected ? "No candles expected" : "Flowing"}</div>
+              <div className={`metric ${latestLocalTerminalCapture.runtime.attention?.shouldBlockTrading || latestLocalTerminalCapture.runtime.noCandlesExpected ? "warn" : "good"}`}>{latestLocalTerminalCapture.runtime.attention?.shouldBlockTrading || latestLocalTerminalCapture.runtime.noCandlesExpected ? "Attention required" : "Flowing"}</div>
               <div className="row"><span>Client id</span><span>{latestLocalTerminalCapture.clientId.slice(0, 8)}</span></div>
               <div className="row"><span>Feed</span><span>{latestLocalTerminalCapture.chart.feedLabel}</span></div>
               <div className="row"><span>Signal</span><span>{latestLocalTerminalCapture.localFeed.signal}</span></div>
+              <div className="row"><span>Attention</span><span>{latestLocalTerminalCapture.runtime.attention?.summary || "n/a"}</span></div>
+              <div className="row"><span>Temporal</span><span>{latestLocalTerminalCapture.runtime.temporal?.summary || "n/a"}</span></div>
+              <div className="row"><span>Desync</span><span>{latestLocalTerminalCapture.runtime.desync?.summary || "n/a"}</span></div>
+              <div className="row"><span>Intent</span><span>{latestLocalTerminalCapture.runtime.intent?.summary || "n/a"}</span></div>
+              <div className="row"><span>Smart state</span><span>{latestLocalTerminalCapture.runtime.smartState?.summary || "n/a"}</span></div>
               <div className="row"><span>Persisted</span><span>{latestLocalTerminalCapture.capturedAt.slice(11, 19)}</span></div>
               {latestLocalTerminalCapture.runtime.exactStateVector.map((item) => (
                 <div className="row" key={item}>

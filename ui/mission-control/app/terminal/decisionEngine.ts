@@ -37,6 +37,11 @@ type ResolveDecisionInput = {
   domImbalance: number;
   decisionLatencyMs?: number | null;
   suspended?: boolean;
+  suspendedReason?: string | null;
+  externalGate?: {
+    state: "VALID" | "WAIT" | "NO_TRADE";
+    reason: string;
+  } | null;
 };
 
 function clamp(value: number, min: number, max: number): number {
@@ -109,7 +114,9 @@ export function resolveSmartDecision(input: ResolveDecisionInput): SmartDecision
       stateLabel: resolveStateLabel("NO_TRADE"),
       confidence,
       headline: "Execution suspended",
-      reason: input.suspended ? "Preview or degraded feed blocks the decision layer" : "Low flow edge blocks execution quality",
+      reason: input.suspended
+        ? (input.suspendedReason || "Preview or degraded feed blocks the decision layer")
+        : "Low flow edge blocks execution quality",
       triggerSide,
       trigger: input.predictionTrigger,
       invalidation: input.predictionInvalidation,
@@ -117,6 +124,42 @@ export function resolveSmartDecision(input: ResolveDecisionInput): SmartDecision
       structureLabel,
       liquidityLabel,
       qualityGate: "fail",
+      decisionLatencyMs: input.decisionLatencyMs ?? null,
+    };
+  }
+
+  if (input.externalGate?.state === "NO_TRADE") {
+    return {
+      state: "NO_TRADE",
+      stateLabel: resolveStateLabel("NO_TRADE"),
+      confidence: clamp(confidence * 0.2, 0, 0.25),
+      headline: "Market sync invalidated",
+      reason: input.externalGate.reason,
+      triggerSide,
+      trigger: input.predictionTrigger,
+      invalidation: input.predictionInvalidation,
+      regimeLabel,
+      structureLabel,
+      liquidityLabel,
+      qualityGate: "fail",
+      decisionLatencyMs: input.decisionLatencyMs ?? null,
+    };
+  }
+
+  if (input.externalGate?.state === "WAIT") {
+    return {
+      state: "WAIT_CONFIRMATION",
+      stateLabel: resolveStateLabel("WAIT_CONFIRMATION"),
+      confidence: clamp(confidence * 0.7, 0.2, 0.7),
+      headline: "Market sync still warming up",
+      reason: input.externalGate.reason,
+      triggerSide,
+      trigger: input.predictionTrigger,
+      invalidation: input.predictionInvalidation,
+      regimeLabel,
+      structureLabel,
+      liquidityLabel,
+      qualityGate: qualityGate === "pass" ? "warn" : qualityGate,
       decisionLatencyMs: input.decisionLatencyMs ?? null,
     };
   }

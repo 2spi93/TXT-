@@ -4,6 +4,12 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 
 import OperatorPanelGuide from "../../../components/ui/OperatorPanelGuide";
+import {
+  buildIntentCalibrationSummary,
+  type CalibrationJournalEntry,
+  type IntentCalibrationIntentStats,
+  type IntentCalibrationWindowSummary,
+} from "../../../lib/intentCalibrationEngine";
 
 type JsonMap = Record<string, unknown>;
 
@@ -52,6 +58,10 @@ type CalibrationPayload = {
   history: CalibrationHistoryEntry[];
 };
 
+type JournalCalibrationPayload = {
+  entries: CalibrationJournalEntry[];
+};
+
 const WINDOW_LABELS: Record<string, string> = {
   "24h": "24h",
   "7d": "7 jours",
@@ -88,6 +98,10 @@ function formatWindowLabel(value: string): string {
 function formatSigned(value: number, digits = 2, suffix = ""): string {
   const normalized = Number.isFinite(value) ? value : 0;
   return `${normalized >= 0 ? "+" : ""}${normalized.toFixed(digits)}${suffix}`;
+}
+
+function formatTierLabel(value: string): string {
+  return value.replace(/_/g, " ");
 }
 
 function buildSparklinePath(values: number[], width: number, height: number): string {
@@ -179,10 +193,14 @@ function normalizePayload(raw: unknown): CalibrationPayload {
 
 export default function PredictorCalibrationClient() {
   const [payload, setPayload] = useState<CalibrationPayload | null>(null);
+  const [journalEntries, setJournalEntries] = useState<CalibrationJournalEntry[]>([]);
   const [selectedSource, setSelectedSource] = useState("infra");
   const [error, setError] = useState<string | null>(null);
+  const [journalError, setJournalError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [journalLoading, setJournalLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [journalRefreshing, setJournalRefreshing] = useState(false);
 
   async function loadPayload(refresh = false): Promise<void> {
     try {
@@ -206,8 +224,34 @@ export default function PredictorCalibrationClient() {
     }
   }
 
+  async function loadJournal(refresh = false): Promise<void> {
+    try {
+      if (refresh) {
+        setJournalRefreshing(true);
+      } else {
+        setJournalLoading(true);
+      }
+      setJournalError(null);
+      const query = new URLSearchParams();
+      query.set("limit", "1200");
+      query.set("sinceDays", "14");
+      const response = await fetch(`/api/terminal/v2-risk-journal?${query.toString()}`, { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error(`Impossible de charger le journal de calibration (${response.status})`);
+      }
+      const body = await response.json().catch(() => ({ entries: [] })) as JournalCalibrationPayload;
+      setJournalEntries(Array.isArray(body.entries) ? body.entries : []);
+    } catch (fetchError) {
+      setJournalError(fetchError instanceof Error ? fetchError.message : "Impossible de charger le journal de calibration");
+    } finally {
+      setJournalLoading(false);
+      setJournalRefreshing(false);
+    }
+  }
+
   useEffect(() => {
     void loadPayload();
+    void loadJournal();
   }, []);
 
   const selectedSourceHistory = useMemo(() => {
@@ -249,6 +293,13 @@ export default function PredictorCalibrationClient() {
         : 0,
     }));
   }, [payload, selectedSource]);
+
+  const journalCalibration = useMemo(() => buildIntentCalibrationSummary(journalEntries, { windowDaysList: [7, 14] }), [journalEntries]);
+  const journalWindows = useMemo(() => (["7d", "14d"]
+    .map((label) => journalCalibration.windows[label])
+    .filter((window): window is IntentCalibrationWindowSummary => Boolean(window))), [journalCalibration.windows]);
+  const journalTopIntentRows = useMemo(() => journalWindows.flatMap((window) =>
+    window.intents.map((intent) => ({ windowLabel: window.label, intent }))), [journalWindows]);
 
   return (
     <main className="shell txt-page-shell">
@@ -310,6 +361,9 @@ export default function PredictorCalibrationClient() {
                   {refreshing ? "Rebuilding..." : "Rebuild now"}
                 </button>
                 <button type="button" onClick={() => void loadPayload(false)} disabled={loading || refreshing}>Refresh view</button>
+                <button type="button" onClick={() => void loadJournal(true)} disabled={journalRefreshing}>
+                  {journalRefreshing ? "Journal..." : "Refresh journal 14j"}
+                </button>
               </div>
             </div>
           ) : null}
@@ -398,6 +452,85 @@ export default function PredictorCalibrationClient() {
           </div>
         </article>
       </section>
+
+      <section className="grid" style={{ gridTemplateColumns: "1fr 1fr", gap: 16, marginTop: 16, alignItems: "start" }}>
+        <article className="panel">
+          <div className="eyebrow">Journal Calibration</div>
+          <h2 style={{ margin: "4px 0 10px", fontSize: 22 }}>Windows 7j / 14j</h2>
+          <p className="subtle" style={{ marginBottom: 10 }}>Agrégation réelle des entrées market-intent, trap, capital scaling et execution V7 outcome.</p>
+          <OperatorPanelGuide
+            title="Guide Journal"
+            what="Lit le journal V2 des 14 derniers jours et recompose une vue 7j/14j par intent et par outcome."
+            why="Vérifier si l’intention détectée produit réellement des issues alpha ou si elle dérive vers des outcomes risk."
+            example="Un journal PRESS à 14j mais CAUTIOUS à 7j signale une edge encore rentable, mais en décélération récente."
+            terms={["alpha share", "capital tier", "threshold floor"]}
+          />
+          {journalLoading ? <p className="subtle">Chargement du journal...</p> : null}
+          {journalError ? <p className="warn">{journalError}</p> : null}
+          {!journalLoading ? (
+            <div style={{ display: "grid", gap: 12 }}>
+              <div className="row"><span>Journal rows</span><span>{journalCalibration.totalEntries}</span></div>
+              <div className="row"><span>Generated</span><span>{formatDateTime(journalCalibration.generatedAt)}</span></div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 12 }}>
+                {journalWindows.map((window) => (
+                  <div key={window.label} style={{ border: "1px solid rgba(148,163,184,0.18)", borderRadius: 12, padding: 12, background: "rgba(15,23,42,0.22)", display: "grid", gap: 8 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                      <strong>{window.label}</strong>
+                      <span style={{ color: window.liveScaling.multiplier >= 1 ? "#cfe9b9" : window.liveScaling.tier === "LOCKED" ? "#fca5a5" : "#efc28f" }}>
+                        {formatTierLabel(window.liveScaling.tier)} x{window.liveScaling.multiplier.toFixed(2)}
+                      </span>
+                    </div>
+                    <div className="row"><span>Intent / trap</span><span>{window.intentEntryCount} / {window.trapEntryCount}</span></div>
+                    <div className="row"><span>Outcomes</span><span>{window.outcomeEntryCount} · alpha {window.alphaOutcomeCount} · risk {window.riskOutcomeCount}</span></div>
+                    <div className="row"><span>Capital rows</span><span>{window.capitalEntryCount}</span></div>
+                    <div className="row"><span>Avg capital</span><span>x{window.avgCapitalMultiplier.toFixed(2)}</span></div>
+                    <div className="row"><span>Avg exec score</span><span>{(window.avgExecutionScore * 100).toFixed(0)}%</span></div>
+                    <div className="row"><span>Thresholds</span><span>c {(window.thresholds.confidenceFloor * 100).toFixed(0)}% · p {(window.thresholds.persistenceFloor * 100).toFixed(0)}%</span></div>
+                    <div className="subtle mini">{window.liveScaling.reason}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </article>
+
+        <article className="panel">
+          <div className="eyebrow">Intent Breakdown</div>
+          <div className="subtle" style={{ marginBottom: 10 }}>Seuils recalibrés et paliers live dérivés des outcomes réels execution-v7-outcome-alpha/risk.</div>
+          <div style={{ display: "grid", gap: 8 }}>
+            {journalTopIntentRows.length === 0 && !journalLoading ? <p className="subtle">Aucun intent exploitable trouvé sur 14 jours.</p> : null}
+            {journalTopIntentRows.map(({ windowLabel, intent }) => (
+              <JournalIntentCard key={`${windowLabel}-${intent.intent}`} windowLabel={windowLabel} intent={intent} />
+            ))}
+          </div>
+        </article>
+      </section>
     </main>
+  );
+}
+
+function JournalIntentCard({ intent, windowLabel }: { intent: IntentCalibrationIntentStats; windowLabel: string }) {
+  return (
+    <div style={{ borderTop: "1px solid rgba(255,255,255,0.05)", paddingTop: 8, display: "grid", gap: 6 }}>
+      <div className="row"><strong>{windowLabel} · {intent.intent.replace(/_/g, " ")}</strong><span>{(intent.alphaShare * 100).toFixed(0)}% alpha share</span></div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 8 }}>
+        <div style={{ borderRadius: 10, padding: "8px 10px", background: "rgba(15,23,42,0.18)" }}>
+          <div className="row"><span>Detections</span><span>{intent.detections}</span></div>
+          <div className="subtle mini">Outcomes {intent.outcomeCount} · alpha {intent.alphaCount} · risk {intent.riskCount}</div>
+        </div>
+        <div style={{ borderRadius: 10, padding: "8px 10px", background: "rgba(15,23,42,0.18)" }}>
+          <div className="row"><span>Thresholds</span><span>c {(intent.thresholds.confidenceFloor * 100).toFixed(0)}% · p {(intent.thresholds.persistenceFloor * 100).toFixed(0)}%</span></div>
+          <div className="subtle mini">agg {(intent.thresholds.aggressivenessFloor * 100).toFixed(0)}% · sample {intent.thresholds.sampleCount}</div>
+        </div>
+        <div style={{ borderRadius: 10, padding: "8px 10px", background: "rgba(15,23,42,0.18)" }}>
+          <div className="row"><span>Quality</span><span>{(intent.avgExecutionScore * 100).toFixed(0)}% exec · x{intent.avgCapitalMultiplier.toFixed(2)}</span></div>
+          <div className="subtle mini">conf {(intent.avgConfidence * 100).toFixed(0)}% · pers {(intent.avgPersistence * 100).toFixed(0)}%</div>
+        </div>
+        <div style={{ borderRadius: 10, padding: "8px 10px", background: "rgba(15,23,42,0.18)" }}>
+          <div className="row"><span>Live tier</span><span>{formatTierLabel(intent.scaling.tier)} x{intent.scaling.multiplier.toFixed(2)}</span></div>
+          <div className="subtle mini">{intent.scaling.reason}</div>
+        </div>
+      </div>
+    </div>
   );
 }

@@ -127,6 +127,17 @@ import {
   formatFreshness,
   streamStateTone,
 } from "./terminalMarketHealth";
+import {
+  buildDesyncWindowSignal,
+  computeDesyncAlpha,
+  computeExecutionQualityScore,
+  computeTripleValidationGate,
+} from "./desyncEngine";
+import { buildExecutionMicrostructureControl } from "./executionMicrostructureControl";
+import { buildPersistentIntentSignal, detectMarketIntent } from "./intentEngine";
+import { applyIntentTargetToBracket, buildIntentTargetSignal } from "./intentTargetEngine";
+import { detectLiquidityTrap } from "./liquidityTrapEngine";
+import { detectPredictiveTrap } from "./predictiveTrapEngine";
 import { buildLocalTerminalRuntimeCapture, type LocalTerminalRuntimeCapture } from "../../lib/localTerminalCapture";
 import ChartExecutionHud from "./ChartExecutionHud";
 import { buildChartOrderTicketPriceLabels, buildChartSnapEnabledLabel } from "./chartHudHelpers";
@@ -178,6 +189,7 @@ import {
 } from "./terminalComputePerf";
 import { isWebGL2Available } from "../../lib/engine/gpu-chart/context";
 import {
+  AttentionContextMonitoringPanel,
   ControlRoomMonitoringPanel,
   ExecutionPnlTruthMonitoringPanel,
   ExecutionSmartTrackerPanel,
@@ -204,6 +216,12 @@ import type { SmartDecisionHudShape } from "./chartHudTypes";
 import { buildFeedbackSummary } from "./feedbackEngine";
 import { buildTerminalAdaptiveGuide, type TerminalAdaptiveGuideMode, type TerminalAdaptiveGuideTargetId } from "./terminalAdaptiveGuide";
 import { barArrayHash, type Bar } from "../../lib/dataEngine";
+import { computeCapitalScalingDecision } from "../../lib/capitalScalingEngine";
+import {
+  buildIntentCalibrationSummary,
+  resolveIntentCalibrationThresholds,
+  resolveJournalScalingRecommendation,
+} from "../../lib/intentCalibrationEngine";
 import { indicatorWorkerAdapter } from "../../lib/indicators/workerAdapter";
 import type { ActiveIndicator, IndicatorSeriesData } from "../../lib/indicators/engine";
 import { ExecutionEngineV7, type V7Decision } from "../../lib/executionEngineV7";
@@ -4599,7 +4617,11 @@ function TradingTerminalPageHydrated() {
     strategy: String(chartOrderTicket.preset || "terminal"),
   }), [chartOrderTicket.preset, chartTimeframe, selectedChartSymbol]);
   const [terminalGuideJournalEntries, setTerminalGuideJournalEntries] = useState<JsonMap[]>([]);
+  const [terminalCalibrationEntries, setTerminalCalibrationEntries] = useState<JsonMap[]>([]);
   const [terminalGuideJournalError, setTerminalGuideJournalError] = useState<string | null>(null);
+  const attentionJournalSignatureRef = useRef("");
+  const microstructureJournalSignatureRef = useRef("");
+  const capitalScalingJournalSignatureRef = useRef("");
 
   useEffect(() => {
     const symbolKey = terminalGuideJournalContext.symbol.trim().toUpperCase();
@@ -4607,6 +4629,7 @@ function TradingTerminalPageHydrated() {
     const strategyKey = terminalGuideJournalContext.strategy.trim();
     if (!symbolKey || !timeframeKey || !strategyKey) {
       setTerminalGuideJournalEntries([]);
+      setTerminalCalibrationEntries([]);
       setTerminalGuideJournalError(null);
       return;
     }
@@ -4616,7 +4639,8 @@ function TradingTerminalPageHydrated() {
       query.set("symbol", symbolKey);
       query.set("timeframe", timeframeKey);
       query.set("strategy", strategyKey);
-      query.set("limit", "80");
+      query.set("limit", "600");
+      query.set("sinceDays", "14");
       const response = await fetch(`/api/terminal/v2-risk-journal?${query.toString()}`, { cache: "no-store" }).catch(() => null);
       const payload = response ? await response.json().catch(() => null) : null;
       if (cancelled) {
@@ -4626,7 +4650,9 @@ function TradingTerminalPageHydrated() {
         setTerminalGuideJournalError("journal guide indisponible");
         return;
       }
-      setTerminalGuideJournalEntries(payload.entries.filter(isGuideJournalPayloadEntry));
+      const entries = payload.entries.filter(isGuideJournalPayloadEntry);
+      setTerminalCalibrationEntries(entries);
+      setTerminalGuideJournalEntries(entries.slice(0, 80));
       setTerminalGuideJournalError(null);
     };
     void loadJournal();
@@ -4637,6 +4663,35 @@ function TradingTerminalPageHydrated() {
       cancelled = true;
       window.clearInterval(timer);
     };
+  }, [terminalGuideJournalContext]);
+
+  const appendTerminalGuideJournalEntry = useCallback(async (action: string, detail: string, meta?: JsonMap): Promise<void> => {
+    const symbolKey = terminalGuideJournalContext.symbol.trim().toUpperCase();
+    const timeframeKey = terminalGuideJournalContext.timeframe.trim();
+    const strategyKey = terminalGuideJournalContext.strategy.trim();
+    if (!symbolKey || !timeframeKey || !strategyKey || !action.trim() || !detail.trim()) {
+      return;
+    }
+    const response = await fetch("/api/terminal/v2-risk-journal", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        symbol: symbolKey,
+        timeframe: timeframeKey,
+        strategy: strategyKey,
+        action,
+        detail,
+        meta: meta || {},
+      }),
+    }).catch(() => null);
+    const payload = response ? await response.json().catch(() => null) : null;
+    if (!response || !response.ok || !payload || !isGuideJournalPayloadEntry(payload.entry)) {
+      setTerminalGuideJournalError("journal guide indisponible");
+      return;
+    }
+    setTerminalGuideJournalEntries((current) => [payload.entry as JsonMap, ...current].slice(0, 80));
+    setTerminalCalibrationEntries((current) => [payload.entry as JsonMap, ...current].slice(0, 600));
+    setTerminalGuideJournalError(null);
   }, [terminalGuideJournalContext]);
 
   const terminalFeedbackSummary = useMemo(() => buildFeedbackSummary({
@@ -4653,6 +4708,12 @@ function TradingTerminalPageHydrated() {
   const activeAdaptiveGuideMode = terminalAdaptiveGuideMode || terminalAdaptiveGuide.recommendedMode;
   const activeAdaptiveGuidePlan = terminalAdaptiveGuide.plans.find((plan) => plan.mode === activeAdaptiveGuideMode) || terminalAdaptiveGuide.plans[0];
   const activeAdaptiveGuideStep = activeAdaptiveGuidePlan.steps[Math.min(terminalAdaptiveGuideStepIndex, Math.max(activeAdaptiveGuidePlan.steps.length - 1, 0))] || activeAdaptiveGuidePlan.steps[0] || null;
+  const terminalJournalCalibration = useMemo(() => buildIntentCalibrationSummary(terminalCalibrationEntries, { windowDaysList: [7, 14] }), [terminalCalibrationEntries]);
+  const activeIntentCalibrationWindow = terminalJournalCalibration.windows["14d"] || terminalJournalCalibration.windows["7d"] || null;
+  const journalWindowScalingRecommendation = useMemo(
+    () => resolveJournalScalingRecommendation(activeIntentCalibrationWindow, "GLOBAL"),
+    [activeIntentCalibrationWindow],
+  );
   const activeAdaptiveGuideStepKey = activeAdaptiveGuideStep ? `${activeAdaptiveGuidePlan.mode}:${activeAdaptiveGuideStep.id}` : "";
   const activeAdaptiveGuideStepValidated = activeAdaptiveGuideStepKey ? terminalAdaptiveGuideValidatedSteps.includes(activeAdaptiveGuideStepKey) : false;
   const terminalWalkthroughForcedVisible = terminalOnboardingFirstVisit || !terminalOnboardingWalkthroughDone;
@@ -7512,7 +7573,6 @@ function TradingTerminalPageHydrated() {
         || allowSlowDepthFeed
         || allowFastMarketMicroFeed
         || allowSlowMarketMicroFeed;
-      const allowOpsFeed = shouldCommitFocusDeckFeed(["monitoring", "capital", "metaRisk", "correlation", "calibration"]);
       setOhlcvBars((current) => {
         const activeConfig = activeChartConfigRef.current;
         if (snapshot.ohlcvBars.length > 0) {
@@ -7578,14 +7638,12 @@ function TradingTerminalPageHydrated() {
           setMarketOrderflowRuntime(snapshot.orderflowRuntime);
         });
       }
-      if (allowOpsFeed) {
-        startTransition(() => {
-          setMarketBusMeta(snapshot.busMeta);
-          setMarketBusKernelTelemetry(snapshot.kernelTelemetry);
-          setMarketBusLastSyncAt(snapshot.lastSyncAt);
-          setRoutingScore(snapshot.routingScore);
-        });
-      }
+      startTransition(() => {
+        setMarketBusMeta(snapshot.busMeta);
+        setMarketBusKernelTelemetry(snapshot.kernelTelemetry);
+        setMarketBusLastSyncAt(snapshot.lastSyncAt);
+        setRoutingScore(snapshot.routingScore);
+      });
       setOhlcvStreamState(snapshot.ohlcvStreamState);
       setChartLoading(snapshot.chartLoading);
       if (snapshot.ohlcvBars.length > 0) {
@@ -8385,10 +8443,22 @@ function TradingTerminalPageHydrated() {
     if (!(notionalUsd > 0)) {
       return 0;
     }
+    if (journalWindowScalingLiveBlocked) {
+      return 0;
+    }
+    if (riskAiMode === "live" && !capitalScalingDecision.allow) {
+      return 0;
+    }
     return Number((Math.max(50, notionalUsd * riskAiLiveSizeMultiplier * volatilityRegimeRiskMultiplier)).toFixed(2));
   }
 
   function getProfitRiskExecutionBlockReason(sideHint?: "buy" | "sell"): string | null {
+    if (journalWindowScalingLiveBlocked) {
+      return `Journal scaling blocked: ${journalWindowScalingRecommendation.reason}`;
+    }
+    if (riskAiMode === "live" && !capitalScalingDecision.allow) {
+      return `Capital engine blocked: ${capitalScalingDecision.reasons.join(", ") || capitalScalingDecision.status}`;
+    }
     if (riskAiLiveBlocked) {
       return `Risk AI blocked: ${riskAiDecision.blockers.join(", ") || riskAiDecision.reason}`;
     }
@@ -8407,6 +8477,7 @@ function TradingTerminalPageHydrated() {
 
   async function executeWarfareTradeTicket(overrides?: TradeTicketOverrides): Promise<JsonMap> {
     const requestedSide = overrides?.side === "sell" ? "sell" : overrides?.side === "buy" ? "buy" : side === "sell" ? "sell" : "buy";
+    const executionMicrostructureControl = buildExecutionMicrostructureControlForSide(requestedSide);
     const profitRiskBlockedReason = getProfitRiskExecutionBlockReason(requestedSide);
     if (profitRiskBlockedReason) {
       throw new Error(profitRiskBlockedReason);
@@ -8473,6 +8544,14 @@ function TradingTerminalPageHydrated() {
       intent: preGateIntent,
       context: executionV7SmartContext,
       venueLearning: executionV7VenueLearning,
+      externalControl: {
+        block: executionMicrostructureControl.block,
+        blockReasons: executionMicrostructureControl.blockReasons,
+        adjustmentReasons: executionMicrostructureControl.adjustmentReasons,
+        delayMs: executionMicrostructureControl.delayMs,
+        sizeMultiplier: executionMicrostructureControl.sizeMultiplier,
+        executionScoreCap: executionMicrostructureControl.executionScoreCap,
+      },
     });
     if (!executionV7SmartGate.allow) {
       throw new Error(`Execution smart gate blocked: ${executionV7SmartGate.reasons.join(", ") || "microstructure unfavorable"}`);
@@ -8586,6 +8665,7 @@ function TradingTerminalPageHydrated() {
         execution_warfare_adversarial_state: executionWarfareV85Snapshot.adversarialState,
         execution_v7_smart_gate_allow: executionV7SmartGate.allow,
         execution_v7_smart_gate_reasons: executionV7SmartGate.reasons,
+        execution_v7_smart_gate_adjustments: executionV7SmartGate.adjustments,
         execution_v7_smart_gate_delay_ms: executionV7SmartGate.recommendedDelayMs,
         execution_v7_smart_gate_size_multiplier: Number(executionV7SmartGate.sizeMultiplier.toFixed(3)),
         execution_v7_smart_context_score: Number(executionV7SmartGate.contextScore.toFixed(3)),
@@ -8593,6 +8673,17 @@ function TradingTerminalPageHydrated() {
         execution_v7_smart_execution_score: Number(executionV7SmartGate.executionScore.toFixed(3)),
         execution_v7_context: executionV7SmartContext,
         execution_v7_venue_learning: executionV7VenueLearning,
+        execution_microstructure_control: executionMicrostructureControl,
+        desync_window: desyncWindowSignal,
+        liquidity_trap: liquidityTrapSignal,
+        predictive_trap: predictiveTrapSignal,
+        market_intent: intentSignal,
+        intent_target: intentTargetSignal,
+        journal_calibration: {
+          window: activeIntentCalibrationWindow?.label || "none",
+          thresholds: activeIntentThresholds,
+          journal_scaling: journalIntentScalingRecommendation,
+        },
         broker_scheduler_mode: brokerAwareSchedulerV851Snapshot.mode,
         broker_scheduler_action: brokerAwareSchedulerV851Snapshot.action,
         broker_scheduler_provider: brokerAwareSchedulerV851Snapshot.provider,
@@ -8664,6 +8755,7 @@ function TradingTerminalPageHydrated() {
         execution_v7_smart_gate: {
           allow: executionV7SmartGate.allow,
           reasons: executionV7SmartGate.reasons,
+          adjustments: executionV7SmartGate.adjustments,
           recommended_delay_ms: executionV7SmartGate.recommendedDelayMs,
           size_multiplier: Number(executionV7SmartGate.sizeMultiplier.toFixed(3)),
           context_score: Number(executionV7SmartGate.contextScore.toFixed(3)),
@@ -8672,6 +8764,17 @@ function TradingTerminalPageHydrated() {
         },
         execution_v7_context: executionV7SmartContext,
         execution_v7_venue_learning: executionV7VenueLearning,
+        execution_microstructure_control: executionMicrostructureControl,
+        desync_window: desyncWindowSignal,
+        liquidity_trap: liquidityTrapSignal,
+        predictive_trap: predictiveTrapSignal,
+        market_intent: intentSignal,
+        intent_target: intentTargetSignal,
+        journal_calibration: {
+          window: activeIntentCalibrationWindow?.label || "none",
+          thresholds: activeIntentThresholds,
+          journal_scaling: journalIntentScalingRecommendation,
+        },
         broker_aware_scheduler: {
           mode: brokerAwareSchedulerV851Snapshot.mode,
           action: brokerAwareSchedulerV851Snapshot.action,
@@ -8972,6 +9075,17 @@ function TradingTerminalPageHydrated() {
       execution_v7_smart_gate: executionV7LiteResult.smartGate,
       execution_v7_context: executionV7LiteResult.context,
       execution_v7_venue_learning: executionV7LiteResult.venueLearning,
+      execution_microstructure_control: executionMicrostructureControl,
+      desync_window: desyncWindowSignal,
+      liquidity_trap: liquidityTrapSignal,
+      predictive_trap: predictiveTrapSignal,
+      market_intent: intentSignal,
+      intent_target: intentTargetSignal,
+      journal_calibration: {
+        window: activeIntentCalibrationWindow?.label || "none",
+        thresholds: activeIntentThresholds,
+        journal_scaling: journalIntentScalingRecommendation,
+      },
       smart_router: {
         primary_venue: liveSmartRoutingPlan.primaryVenue,
         requested_notional_usd: Number(liveSmartRoutingPlan.requestedNotionalUsd.toFixed(2)),
@@ -9092,6 +9206,12 @@ function TradingTerminalPageHydrated() {
               execution_v7_lite_ok: Boolean(executionV7Lite?.ok),
               execution_v7_smart_execution_score: clamp(toNumber((payload.execution_v7_smart_gate as JsonMap | undefined)?.executionScore ?? (payload.execution_v7_smart_gate as JsonMap | undefined)?.execution_score, 0), 0, 1),
               execution_v7_smart_size_multiplier: clamp(toNumber((payload.execution_v7_smart_gate as JsonMap | undefined)?.sizeMultiplier ?? (payload.execution_v7_smart_gate as JsonMap | undefined)?.size_multiplier, 1), 0, 1),
+              execution_v7_smart_adjustments: (payload.execution_v7_smart_gate as JsonMap | undefined)?.adjustments,
+              triple_validation_state: tripleValidationGate.state,
+              desync_window_classification: String((payload.desync_window as JsonMap | undefined)?.classification || desyncWindowSignal.classification),
+              liquidity_trap_type: String((payload.liquidity_trap as JsonMap | undefined)?.type || liquidityTrapSignal.type),
+              predictive_trap_phase: String((payload.predictive_trap as JsonMap | undefined)?.phase || predictiveTrapSignal.phase),
+              market_intent: String((payload.market_intent as JsonMap | undefined)?.intent || intentSignal.intent),
               liquidity_ai: payload.liquidity_ai,
               execution_engine_mode: executionEngineTelemetry.mode,
               execution_engine_action: executionEngineTelemetry.action,
@@ -9103,10 +9223,48 @@ function TradingTerminalPageHydrated() {
           ]).slice(0, 20));
         });
       }
+      const executionMicrostructurePayload = payload.execution_microstructure_control && typeof payload.execution_microstructure_control === "object"
+        ? payload.execution_microstructure_control as JsonMap
+        : null;
+      const journalClassification = String(executionMicrostructurePayload?.classification || "neutral");
+      await appendTerminalGuideJournalEntry(
+        `execution-v7-outcome-${journalClassification}`,
+        `V7 ${String(executionV7Lite?.status || payload.execution_status || "submitted")} · fill ${toNumber(executionV7Lite?.fillRatio ?? payload.fill_ratio, 0).toFixed(2)} · slip ${toNumber(executionV7Lite?.avgSlippageBps ?? payload.realized_slippage_bps, 0).toFixed(2)}bps.`,
+        {
+          attention_context: attentionMonitoringPayload,
+          execution_v7_lite: executionV7Lite,
+          execution_feedback: executionFeedback,
+          execution_microstructure_control: executionMicrostructurePayload,
+          liquidity_trap: payload.liquidity_trap,
+          predictive_trap: payload.predictive_trap,
+          market_intent: payload.market_intent,
+          intent_target: payload.intent_target,
+          desync_window: payload.desync_window,
+          journal_calibration: payload.journal_calibration,
+          trade_result: payload,
+        },
+      );
       await loadAll();
       return true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Erreur inconnue");
+      const detail = err instanceof Error ? err.message : "Erreur inconnue";
+      setError(detail);
+      if (/Execution smart gate blocked/i.test(detail)) {
+        await appendTerminalGuideJournalEntry("execution-v7-blocked", detail, {
+          attention_context: attentionMonitoringPayload,
+          triple_validation: tripleValidationGate,
+          desync_window: desyncWindowSignal,
+          liquidity_trap: liquidityTrapSignal,
+          predictive_trap: predictiveTrapSignal,
+          market_intent: intentSignal,
+          intent_target: intentTargetSignal,
+          journal_calibration: {
+            window: activeIntentCalibrationWindow?.label || "none",
+            thresholds: activeIntentThresholds,
+            journal_scaling: journalIntentScalingRecommendation,
+          },
+        });
+      }
       return false;
     } finally {
       setBusy(false);
@@ -10944,7 +11102,7 @@ function TradingTerminalPageHydrated() {
   };
 
   const approveAllAndSend = async (): Promise<void> => {
-    if (!marketDecisionV1.suggestedBracket) {
+    if (!activeSuggestedBracket) {
       return;
     }
     if (chartLowFlowEdgeBlocked) {
@@ -10953,7 +11111,7 @@ function TradingTerminalPageHydrated() {
       return;
     }
     setShowDecisionSecondary(false);
-    applySuggestedScenarioBracket(marketDecisionV1.suggestedBracket);
+    applySuggestedScenarioBracket(activeSuggestedBracket);
     applyExecutionAdaptationPlan(marketDecisionV1.executionPlan);
     setPendingExecutionAdaptation(null);
     if (chartEffectiveSendMode === "confirm-required" && !chartHudConfirmArmed) {
@@ -12274,7 +12432,7 @@ function TradingTerminalPageHydrated() {
     volatility: aiVolatilityScore,
     swarmConfidence: miroFishEffectiveConfidence,
   });
-  const riskAiLiveSizeMultiplier = riskAiMode === "live" ? positionSizingDecision.multiplier : 1;
+  const signalSizingMultiplier = positionSizingDecision.multiplier;
   const volatilityRegimeRiskMultiplier = volatilityRegimeSnapshot.riskMultiplier;
   const missionControlSharpe = (() => {
     const pnlSeries = filteredOutcomes
@@ -12293,6 +12451,72 @@ function TradingTerminalPageHydrated() {
     ? (filteredOutcomes.filter((item) => toNumber(item.pnl_usd, 0) >= 0).length / filteredOutcomes.length) * 100
     : 0;
   const missionControlPnlPct = accountFreeUsd > 0 ? (dailyPnLUsd / accountFreeUsd) * 100 : 0;
+  const recentExecutionPerformanceWindow = useMemo(() => {
+    const baseRecords = executionTelemetry.length > 0 ? executionTelemetry : filteredOutcomes;
+    const sample = baseRecords.slice(0, 20);
+    if (sample.length === 0) {
+      return 0.5;
+    }
+    const wins = sample.filter((item) => toNumber(item.pnl_usd, toNumber(item.net_result_usd, 0)) >= 0).length;
+    return wins / sample.length;
+  }, [executionTelemetry, filteredOutcomes]);
+  const executionQualityCapitalScore = clamp(
+    clamp(1 - avgExecutionLatencyForPredictor / 600, 0, 1) * 0.22
+      + clamp(1 - Math.abs(avgExecutionSlippageForPredictor) / 10, 0, 1) * 0.28
+      + clamp(toNumber(domSnapshot?.liquidityScore, effectiveLiquidityScore), 0, 1) * 0.22
+      + clamp(predictorOrderflowSnapshot.orderflowQuality, 0, 1) * 0.28,
+    0,
+    1,
+  );
+  const attentionCapitalScore = clamp(
+    (localOhlcvAnalysis.signal === "OHLCV_RENDERABLE" ? 0.35 : localOhlcvAnalysis.signal === "OHLCV_PARTIAL" ? 0.2 : 0.08)
+      + clamp(predictorOrderflowSnapshot.orderflowQuality, 0, 1) * 0.35
+      + clamp(toNumber(domSnapshot?.liquidityScore, effectiveLiquidityScore), 0, 1) * 0.3,
+    0,
+    1,
+  );
+  const temporalCapitalScore = clamp(
+    (localOhlcvAnalysis.renderableRows > 0 ? 0.38 : 0.14)
+      + clamp(1 - marketBusKernelTelemetry.tickLatencyMs / 500, 0, 1) * 0.32
+      + clamp(1 - marketBusKernelTelemetry.bufferBacklog / 10, 0, 1) * 0.3,
+    0,
+    1,
+  );
+  const intentRiskProxy = Math.max(Math.abs(predictorOrderflowSnapshot.liquidityTrapSignal), Math.abs(predictorOrderflowSnapshot.spoofingScore));
+  const intentCapitalScore = clamp(
+    Math.max(0, liveMlAbsorptionBridge.absorptionProb * 0.5 + predictorOrderflowSnapshot.orderflowQuality * 0.25 + Math.max(0, predictorOrderflowSnapshot.imbalance) * 0.25)
+      * clamp(1 - intentRiskProxy * 0.55, 0, 1),
+    0,
+    1,
+  );
+  const desyncAlphaCapitalScore = clamp(
+    Math.max(0, Math.abs(predictorOrderflowSnapshot.absorptionSignal)) * 0.42
+      + Math.max(0, 1 - Math.abs(predictorOrderflowSnapshot.liquidityTrapSignal)) * 0.16
+      + clamp(predictorOrderflowSnapshot.orderflowQuality, 0, 1) * 0.42,
+    0,
+    1,
+  );
+  const capitalScalingDecision = useMemo(() => computeCapitalScalingDecision({
+    accountEquity: accountFreeUsd,
+    intentScore: intentCapitalScore,
+    executionQuality: executionQualityCapitalScore,
+    attentionScore: attentionCapitalScore,
+    temporalStability: temporalCapitalScore,
+    desyncAlphaScore: desyncAlphaCapitalScore,
+    volatility: aiVolatilityScore,
+    drawdown: dailyDrawdownPct / 100,
+    currentPortfolioRisk: exposureRatio,
+    recentWinrate: recentExecutionPerformanceWindow,
+    openTradeCount: openTradesCount,
+    unrealizedPnlPct: activeExecutionPositionUnrealizedPnlPct / 100,
+    hardBlock: intentRiskProxy >= 0.85 || !riskAiDecision.allow,
+  }), [accountFreeUsd, activeExecutionPositionUnrealizedPnlPct, aiVolatilityScore, attentionCapitalScore, dailyDrawdownPct, desyncAlphaCapitalScore, executionQualityCapitalScore, exposureRatio, intentCapitalScore, intentRiskProxy, openTradesCount, recentExecutionPerformanceWindow, riskAiDecision.allow, temporalCapitalScore]);
+  const journalWindowScalingLiveBlocked = riskAiMode === "live"
+    && journalWindowScalingRecommendation.tier === "LOCKED"
+    && journalWindowScalingRecommendation.confidence >= 0.45;
+  const riskAiLiveSizeMultiplier = riskAiMode === "live"
+    ? signalSizingMultiplier * capitalScalingDecision.multiplier * journalWindowScalingRecommendation.multiplier
+    : 1;
   const pnlAnalyticsTrades = useMemo<PnlTrade[]>(() => {
     const baseRecords = filteredOutcomes.length > 0 ? filteredOutcomes : executionTelemetry;
     return baseRecords.slice(0, 120).map((item, index) => {
@@ -12504,7 +12728,9 @@ function TradingTerminalPageHydrated() {
       sizeUnits: confidenceSize,
     };
   })();
-  const aiAdjustedAutoNotionalUsd = Math.max(50, autoSizingV3.finalNotional * riskAiLiveSizeMultiplier * volatilityRegimeRiskMultiplier);
+  const aiAdjustedAutoNotionalUsd = capitalScalingDecision.allow || riskAiMode !== "live"
+    ? Math.max(50, autoSizingV3.finalNotional * riskAiLiveSizeMultiplier * volatilityRegimeRiskMultiplier)
+    : 0;
   const autoSessionGuard = (() => {
     const currentHour = new Date().getHours();
     const start = Math.max(0, Math.min(23, autoSessionStartHour));
@@ -12542,6 +12768,7 @@ function TradingTerminalPageHydrated() {
   })();
   const autoEntryReady = entryTimingV3.status === "READY" || entryTimingV3.status === "TRIGGER";
   const riskAiLiveBlocked = riskAiMode === "live" && !riskAiDecision.allow;
+  const capitalScalingLiveBlocked = riskAiMode === "live" && !capitalScalingDecision.allow;
   const profitOptimizerLiveExitBlocked = profitOptimizerMode === "live" && Boolean(activeExecutionPosition) && profitOptimizerDecision.action === "EXIT";
   const profitRiskAiTelemetry = {
     profit_optimizer: {
@@ -12572,15 +12799,40 @@ function TradingTerminalPageHydrated() {
     },
     position_sizing: {
       mode: riskAiMode,
-      multiplier: Number(positionSizingDecision.multiplier.toFixed(3)),
+      multiplier: Number(signalSizingMultiplier.toFixed(3)),
       reasons: positionSizingDecision.reasons,
+      composite_multiplier: Number(riskAiLiveSizeMultiplier.toFixed(3)),
       recommended_notional_usd: Number(aiAdjustedAutoNotionalUsd.toFixed(2)),
+    },
+    journal_scaling: {
+      window: activeIntentCalibrationWindow?.label || "none",
+      tier: journalWindowScalingRecommendation.tier,
+      multiplier: Number(journalWindowScalingRecommendation.multiplier.toFixed(3)),
+      confidence: Number(journalWindowScalingRecommendation.confidence.toFixed(3)),
+      sample_count: journalWindowScalingRecommendation.sampleCount,
+      reason: journalWindowScalingRecommendation.reason,
+      blocked: journalWindowScalingLiveBlocked,
+    },
+    capital_scaling: {
+      allow: capitalScalingDecision.allow,
+      status: capitalScalingDecision.status,
+      edge_score: Number(capitalScalingDecision.edgeScore.toFixed(3)),
+      edge_multiplier: Number(capitalScalingDecision.edgeMultiplier.toFixed(3)),
+      risk_factor: Number(capitalScalingDecision.riskFactor.toFixed(3)),
+      performance_factor: Number(capitalScalingDecision.performanceFactor.toFixed(3)),
+      portfolio_heat_factor: Number(capitalScalingDecision.portfolioHeatFactor.toFixed(3)),
+      scale_adjustment_factor: Number(capitalScalingDecision.scaleAdjustmentFactor.toFixed(3)),
+      multiplier: Number(capitalScalingDecision.multiplier.toFixed(3)),
+      recommended_risk_usd: Number(capitalScalingDecision.recommendedRiskUsd.toFixed(2)),
+      reasons: capitalScalingDecision.reasons,
     },
   };
   const autoExecutionGate = (() => {
     const ready = autoMetaFilter.pass
       && autoRiskEngine.hardPass
       && !riskAiLiveBlocked
+      && !capitalScalingLiveBlocked
+      && !journalWindowScalingLiveBlocked
       && !profitOptimizerLiveExitBlocked
       && !autoRiskEngine.killSwitchActive
       && autoSessionGuard.pass
@@ -12597,6 +12849,10 @@ function TradingTerminalPageHydrated() {
         : "BLOCKED";
     const ruleLabel = autoRiskEngine.killSwitchActive
       ? "kill switch"
+      : journalWindowScalingLiveBlocked
+        ? `journal ${journalWindowScalingRecommendation.tier.toLowerCase()}`
+      : capitalScalingLiveBlocked
+        ? `capital ${capitalScalingDecision.status.toLowerCase()}`
       : riskAiLiveBlocked
         ? `risk ai ${riskAiDecision.reason.toLowerCase()}`
         : profitOptimizerLiveExitBlocked
@@ -12619,7 +12875,7 @@ function TradingTerminalPageHydrated() {
     return {
       ready,
       autoState,
-      riskLabel: autoRiskEngine.hardPass && !riskAiLiveBlocked ? "OK" : "BLOCKED",
+      riskLabel: autoRiskEngine.hardPass && !riskAiLiveBlocked && !capitalScalingLiveBlocked && !journalWindowScalingLiveBlocked ? "OK" : "BLOCKED",
       sizeLabel: `${aiAdjustedAutoNotionalUsd.toFixed(0)} USD`,
       ruleLabel,
     };
@@ -14691,17 +14947,17 @@ function TradingTerminalPageHydrated() {
     if (replayState.enabled || autoExecutionMode === "assisted" || autoExecutionKillSwitch) {
       return;
     }
-    if (!marketDecisionV1.suggestedBracket) {
+    if (!activeSuggestedBracket) {
       return;
     }
     const baseSignature = [
       selectedChartSymbol,
       chartTimeframe,
       marketDecisionV1.scenario,
-      marketDecisionV1.suggestedBracket.side,
-      marketDecisionV1.suggestedBracket.entry.toFixed(chartPriceDigits),
-      marketDecisionV1.suggestedBracket.sl.toFixed(chartPriceDigits),
-      marketDecisionV1.suggestedBracket.tp.toFixed(chartPriceDigits),
+      activeSuggestedBracket.side,
+      activeSuggestedBracket.entry.toFixed(chartPriceDigits),
+      activeSuggestedBracket.sl.toFixed(chartPriceDigits),
+      activeSuggestedBracket.tp.toFixed(chartPriceDigits),
       autoExecutionGate.autoState,
       autoExecutionGate.ruleLabel,
     ].join(":");
@@ -14714,7 +14970,7 @@ function TradingTerminalPageHydrated() {
         return;
       }
       autoExecutionSignatureRef.current = baseSignature;
-      applySuggestedScenarioBracket(marketDecisionV1.suggestedBracket);
+      applySuggestedScenarioBracket(activeSuggestedBracket);
       applyExecutionAdaptationPlan(marketDecisionV1.executionPlan);
       return;
     }
@@ -14760,7 +15016,6 @@ function TradingTerminalPageHydrated() {
     executeV7ArbOpportunity,
     marketDecisionV1.executionPlan,
     marketDecisionV1.scenario,
-    marketDecisionV1.suggestedBracket,
     replayState.enabled,
     selectedChartSymbol,
     executionTelemetry,
@@ -15926,12 +16181,20 @@ function TradingTerminalPageHydrated() {
     ? (riskAiDecision.allow ? "good" : "bad")
     : riskAiDecision.allow ? "neutral" : "warn";
   const riskAiLabel = `RAI ${riskAiMode.toUpperCase()} ${riskAiDecision.allow ? "ALLOW" : riskAiDecision.reason}`;
-  const positionSizingTone = positionSizingDecision.multiplier >= 1
+  const capitalScalingTone = !capitalScalingDecision.allow
+    ? "bad"
+    : capitalScalingDecision.status === "AGGRESSIVE"
+      ? "good"
+      : capitalScalingDecision.status === "DEFENSIVE"
+        ? "warn"
+        : "neutral";
+  const capitalScalingLabel = `CAP ${capitalScalingDecision.status} x${capitalScalingDecision.multiplier.toFixed(2)}`;
+  const positionSizingTone = riskAiLiveSizeMultiplier >= 1
     ? "good"
-    : positionSizingDecision.multiplier < 0.75
+    : riskAiLiveSizeMultiplier < 0.75
       ? "warn"
       : "neutral";
-  const positionSizingLabel = `SIZE x${positionSizingDecision.multiplier.toFixed(2)}`;
+  const positionSizingLabel = `SIZE x${riskAiLiveSizeMultiplier.toFixed(2)}`;
   const v7StatusTone = v7ExecutionDecision.shouldExecute
     ? "good"
     : arbOpportunity
@@ -19091,6 +19354,54 @@ function TradingTerminalPageHydrated() {
     .filter((feed) => feed.candles.length >= 4)
   ), [chartTimeframe, gpuMatrixRows, quoteHistory]);
   const activeGpuMultiSymbolFeeds = renderExtendedTerminalModules ? gpuMultiSymbolFeeds : [];
+  const contextualAttentionInput = useMemo(() => {
+    const recentPrices = chartSeries.slice(-12).map((point) => toNumber(point.value, NaN)).filter((value) => Number.isFinite(value));
+    const recentMoves = recentPrices.slice(1).map((price, index) => {
+      const previous = recentPrices[index] ?? price;
+      return previous > 0 ? Math.abs(((price - previous) / previous) * 10_000) : 0;
+    });
+    const averageMoveBps = recentMoves.length > 0
+      ? recentMoves.reduce((sum, value) => sum + value, 0) / recentMoves.length
+      : 0;
+    const firstPrice = recentPrices[0] ?? activePrice ?? chartLastValue;
+    const lastPrice = recentPrices[recentPrices.length - 1] ?? activePrice ?? chartLastValue;
+    const priceVelocityScore = firstPrice > 0 ? clamp(Math.abs(((lastPrice - firstPrice) / firstPrice) * 10_000) / 24, 0, 1) : 0;
+    const flowImbalance = clamp(predictorOrderflowSnapshot.imbalance, -1, 1);
+    const depthImbalance = clamp(toNumber(marketMicro?.depth_imbalance, reconstructedOrderflowSnapshot.depthImbalance), -1, 1);
+    const tradeImbalance = clamp(toNumber(activeExecutionFootprint?.imbalance, predictorOrderflowSnapshot.imbalance), -1, 1);
+    const signalVotes = [flowImbalance, depthImbalance, tradeImbalance].filter((value) => Math.abs(value) >= 0.08);
+    const positiveVotes = signalVotes.filter((value) => value > 0).length;
+    const negativeVotes = signalVotes.filter((value) => value < 0).length;
+    const flowAgreementScore = signalVotes.length > 0 ? Math.max(positiveVotes, negativeVotes) / signalVotes.length : 0.5;
+    const volatilityRegime: "compressed" | "normal" | "expanding" | "extreme" = averageMoveBps >= 18
+      ? "extreme"
+      : averageMoveBps >= 8
+        ? "expanding"
+        : averageMoveBps <= 2.5
+          ? "compressed"
+          : "normal";
+    const executionQualityScore = chartMarketSimulation
+      ? computeExecutionQualityScore({
+        fillProb: chartMarketSimulation.execution.fillProb,
+        slippageBps: chartMarketSimulation.execution.slippage,
+        latencyMs: chartMarketSimulation.execution.latency,
+        confidence: chartMarketSimulation.confidence,
+      })
+      : clamp(0.72 - Math.max(0, reconstructedOrderflowSnapshot.spreadBps) / 8 - Math.max(0, predictorOrderbookSignals.quoteFadeRate) * 0.08, 0, 1);
+    const manipulationRisk = clamp(Math.max(
+      activeDomSnapshot?.spoofingRisk ?? predictorOrderflowSnapshot.spoofingScore,
+      Math.max(0, predictorOrderbookSignals.quoteFadeRate) / 3,
+    ), 0, 1);
+
+    return {
+      volatilityRegime,
+      manipulationRisk,
+      executionQualityScore,
+      flowAgreementScore,
+      priceVelocityScore,
+      eventKind: terminalFlowInsight?.eventKind || null,
+    };
+  }, [activeDomSnapshot?.spoofingRisk, activeExecutionFootprint?.imbalance, activePrice, chartLastValue, chartMarketSimulation, chartSeries, marketMicro?.depth_imbalance, predictorOrderbookSignals.quoteFadeRate, predictorOrderflowSnapshot.imbalance, predictorOrderflowSnapshot.spoofingScore, reconstructedOrderflowSnapshot.depthImbalance, reconstructedOrderflowSnapshot.spreadBps, terminalFlowInsight?.eventKind]);
   const {
     marketBusHealth,
     marketBusHealthComponents,
@@ -19104,6 +19415,36 @@ function TradingTerminalPageHydrated() {
     marketBusDepthUpdateId,
     marketBusOhlcvContiguous,
     marketBusSyncLabel,
+    crossLayerAttentionWeights,
+    crossLayerAttentionDominantReason,
+    crossLayerAttentionDominantLayer,
+    crossLayerAttentionReliabilityScore,
+    crossLayerAttentionCoherenceScore,
+    crossLayerAttentionContext,
+    crossLayerAttentionState,
+    crossLayerAttentionTone,
+    crossLayerAttentionRenderable,
+    crossLayerAttentionShouldBlockTrading,
+    crossLayerAttentionPreferredRenderSource,
+    crossLayerAttentionSummaryLabel,
+    crossLayerAttentionDetailLabel,
+    temporalSyncAligned,
+    temporalSyncDriftMs,
+    temporalSyncSeqGap,
+    temporalSyncFreshnessScore,
+    temporalSyncDominantSource,
+    temporalSyncDegraded,
+    temporalSyncSourceCount,
+    temporalSyncBufferedSourceCount,
+    temporalSyncBufferWindowMs,
+    temporalSyncSummaryLabel,
+    temporalSyncDetailLabel,
+    smartMarketState,
+    smartMarketReason,
+    smartMarketConfidence,
+    smartMarketTone,
+    smartMarketSummaryLabel,
+    smartMarketDetailLabel,
     ohlcvFreshnessState,
     depthFreshnessState,
     tradesFreshnessState,
@@ -19116,10 +19457,456 @@ function TradingTerminalPageHydrated() {
   } = deriveTerminalMarketHealth({
     marketBusMeta,
     marketBusLastSyncAt,
+    localFeedSignal: localOhlcvAnalysis.signal,
+    renderableRows: localOhlcvAnalysis.renderableRows,
     chartMode: effectiveChartMode,
     chartVisualMode,
     publicBrowserHost: isGtixPublicBrowserHost(),
+    attentionContext: contextualAttentionInput,
   });
+  const desyncSignal = useMemo(() => {
+    const recentPrices = chartSeries.slice(-8).map((point) => toNumber(point.value, NaN)).filter((value) => Number.isFinite(value));
+    const firstPrice = recentPrices[0] ?? activePrice ?? chartLastValue;
+    const lastPrice = recentPrices[recentPrices.length - 1] ?? activePrice ?? chartLastValue;
+    const priceDeltaBps = firstPrice > 0 ? ((lastPrice - firstPrice) / firstPrice) * 10_000 : 0;
+    const recentTradeVolume = activeFootprintRows.slice(-4).reduce((sum, row) => {
+      return sum + Math.max(0, toNumber(row.buyVolume, 0)) + Math.max(0, toNumber(row.sellVolume, 0));
+    }, 0);
+
+    return computeDesyncAlpha({
+      priceDeltaBps,
+      flowImbalance: predictorOrderflowSnapshot.imbalance,
+      depthImbalance: toNumber(marketMicro?.depth_imbalance, reconstructedOrderflowSnapshot.depthImbalance),
+      tradeImbalance: toNumber(activeExecutionFootprint?.imbalance, predictorOrderflowSnapshot.imbalance),
+      tradeVolume: recentTradeVolume,
+      temporalAligned: temporalSyncAligned,
+      temporalDriftMs: temporalSyncDriftMs,
+      spoofRisk: activeDomSnapshot?.spoofingRisk ?? predictorOrderflowSnapshot.spoofingScore,
+      eventKind: terminalFlowInsight?.eventKind || null,
+      sourceAgeMs: 0,
+    });
+  }, [activeDomSnapshot?.spoofingRisk, activeExecutionFootprint?.imbalance, activeFootprintRows, activePrice, chartLastValue, chartSeries, marketMicro?.depth_imbalance, predictorOrderflowSnapshot.imbalance, predictorOrderflowSnapshot.spoofingScore, reconstructedOrderflowSnapshot.depthImbalance, temporalSyncAligned, temporalSyncDriftMs, terminalFlowInsight?.eventKind]);
+  const executionQualityScore = contextualAttentionInput.executionQualityScore;
+  const executionQualityTone = executionQualityScore >= 0.65 ? "good" : executionQualityScore >= 0.5 ? "warn" : "bad";
+  const executionQualitySummaryLabel = `EXEC Q ${Math.round(executionQualityScore * 100)}%`;
+  const executionQualityDetailLabel = chartMarketSimulation
+    ? `Execution quality ${Math.round(executionQualityScore * 100)}%: fill ${(chartMarketSimulation.execution.fillProb * 100).toFixed(0)}%, slip ${chartMarketSimulation.execution.slippage.toFixed(1)}bps, latency ${chartMarketSimulation.execution.latency.toFixed(0)}ms.`
+    : "Execution quality unavailable while simulation is not populated.";
+  const desyncWindowSignal = useMemo(() => {
+    const recentPoints = chartSeries.slice(-6).map((point) => toNumber(point.value, NaN)).filter((value) => Number.isFinite(value));
+    const recentRows = activeFootprintRows.slice(-6);
+    const frames = recentPoints.slice(1).map((currentPrice, index) => {
+      const previousPrice = recentPoints[index] ?? currentPrice;
+      const row = recentRows[Math.min(index, Math.max(0, recentRows.length - 1))];
+      const tradeVolume = row
+        ? Math.max(0, toNumber(row.buyVolume, 0)) + Math.max(0, toNumber(row.sellVolume, 0))
+        : 0;
+      const tradeImbalance = row && tradeVolume > 0
+        ? clamp(toNumber(row.delta, 0) / Math.max(tradeVolume, 1), -1, 1)
+        : predictorOrderflowSnapshot.imbalance;
+      return {
+        atMs: Date.now() - (recentPoints.length - index - 2) * Math.max(1_000, timeframeToMs(chartTimeframe)),
+        signal: computeDesyncAlpha({
+          priceDeltaBps: previousPrice > 0 ? ((currentPrice - previousPrice) / previousPrice) * 10_000 : 0,
+          flowImbalance: predictorOrderflowSnapshot.imbalance,
+          depthImbalance: toNumber(marketMicro?.depth_imbalance, reconstructedOrderflowSnapshot.depthImbalance),
+          tradeImbalance,
+          tradeVolume,
+          temporalAligned: temporalSyncAligned,
+          temporalDriftMs: temporalSyncDriftMs,
+          spoofRisk: activeDomSnapshot?.spoofingRisk ?? predictorOrderflowSnapshot.spoofingScore,
+          eventKind: terminalFlowInsight?.eventKind || null,
+          sourceAgeMs: 0,
+        }),
+      };
+    });
+    return buildDesyncWindowSignal({ frames, halfLifeCandles: 3 });
+  }, [activeDomSnapshot?.spoofingRisk, activeFootprintRows, chartSeries, chartTimeframe, marketMicro?.depth_imbalance, predictorOrderflowSnapshot.imbalance, predictorOrderflowSnapshot.spoofingScore, reconstructedOrderflowSnapshot.depthImbalance, temporalSyncAligned, temporalSyncDriftMs, terminalFlowInsight?.eventKind]);
+  const microstructureTrapContext = useMemo(() => {
+    const recentPoints = chartSeries.slice(-6).map((point) => toNumber(point.value, NaN)).filter((value) => Number.isFinite(value));
+    const latestPrice = recentPoints[recentPoints.length - 1] ?? activePrice ?? chartLastValue;
+    const previousPrice = recentPoints[recentPoints.length - 2] ?? latestPrice;
+    const earlierPrice = recentPoints[recentPoints.length - 3] ?? previousPrice;
+    const priceDeltaBps = previousPrice > 0 ? ((latestPrice - previousPrice) / previousPrice) * 10_000 : 0;
+    const previousDeltaBps = earlierPrice > 0 ? ((previousPrice - earlierPrice) / earlierPrice) * 10_000 : 0;
+    const reversalSpeedBps = priceDeltaBps - previousDeltaBps;
+    const recentTradeVolume = activeFootprintRows.slice(-4).reduce((sum, row) => sum + Math.max(0, toNumber(row.buyVolume, 0)) + Math.max(0, toNumber(row.sellVolume, 0)), 0);
+    const previousTradeVolume = activeFootprintRows.slice(-8, -4).reduce((sum, row) => sum + Math.max(0, toNumber(row.buyVolume, 0)) + Math.max(0, toNumber(row.sellVolume, 0)), 0);
+    const volumeHigh = recentTradeVolume > Math.max(200, previousTradeVolume * 1.15);
+    const previousRange = recentPoints.slice(0, -1);
+    const priorHigh = previousRange.length > 0 ? Math.max(...previousRange) : latestPrice;
+    const priorLow = previousRange.length > 0 ? Math.min(...previousRange) : latestPrice;
+    const breakDirection = latestPrice > priorHigh * 1.00025
+      ? "up"
+      : latestPrice < priorLow * 0.99975
+        ? "down"
+        : "none";
+    const latestDelta = toNumber(activeExecutionFootprint?.delta, predictorOrderflowSnapshot.delta);
+    const deltaOpposite = Math.sign(latestDelta) !== 0 && Math.sign(priceDeltaBps) !== 0 && Math.sign(latestDelta) !== Math.sign(priceDeltaBps);
+    return {
+      priceBreak: breakDirection !== "none",
+      breakDirection: breakDirection as "up" | "down" | "none",
+      priceDeltaBps,
+      reversalSpeedBps,
+      volumeHigh,
+      deltaOpposite,
+      bias: (priceDeltaBps >= 0 ? "up" : "down") as "up" | "down",
+      cancelRate: clamp(toNumber(predictorOrderbookSignals.quoteFadeRate, 0) / 3, 0, 1),
+      depthDrop: clamp(Math.max(liquidityAiSnapshot.liquidityVacuumProbability, 1 - reconstructedOrderflowSnapshot.domDensity), 0, 1),
+      spreadVolatility: clamp(reconstructedOrderflowSnapshot.spreadBps / Math.max(1, preferredSpread || reconstructedOrderflowSnapshot.spreadBps || 1), 0, 1),
+    };
+  }, [activeExecutionFootprint?.delta, activeFootprintRows, activePrice, chartLastValue, chartSeries, liquidityAiSnapshot.liquidityVacuumProbability, preferredSpread, predictorOrderbookSignals.quoteFadeRate, predictorOrderflowSnapshot.delta, reconstructedOrderflowSnapshot.domDensity, reconstructedOrderflowSnapshot.spreadBps]);
+  const liquidityTrapSignal = useMemo(() => detectLiquidityTrap({
+    priceBreak: microstructureTrapContext.priceBreak,
+    breakDirection: microstructureTrapContext.breakDirection,
+    flowDelta: predictorOrderflowSnapshot.imbalance,
+    depthDelta: toNumber(marketMicro?.depth_imbalance, reconstructedOrderflowSnapshot.depthImbalance),
+    priceDeltaBps: microstructureTrapContext.priceDeltaBps,
+    reversalSpeedBps: microstructureTrapContext.reversalSpeedBps,
+    volumeHigh: microstructureTrapContext.volumeHigh,
+    absorption: liveMlAbsorptionBridge.absorptionProb >= 0.62,
+    deltaOpposite: microstructureTrapContext.deltaOpposite,
+    spoofingRisk: activeDomSnapshot?.spoofingRisk ?? predictorOrderflowSnapshot.spoofingScore,
+    desync: desyncSignal,
+    desyncWindow: desyncWindowSignal,
+    attentionState: crossLayerAttentionState,
+    temporalAligned: temporalSyncAligned,
+  }), [activeDomSnapshot?.spoofingRisk, crossLayerAttentionState, desyncSignal, desyncWindowSignal, liveMlAbsorptionBridge.absorptionProb, marketMicro?.depth_imbalance, microstructureTrapContext, predictorOrderflowSnapshot.imbalance, predictorOrderflowSnapshot.spoofingScore, reconstructedOrderflowSnapshot.depthImbalance, temporalSyncAligned]);
+  const predictiveTrapSignal = useMemo(() => detectPredictiveTrap({
+    cancelRate: microstructureTrapContext.cancelRate,
+    depthDrop: microstructureTrapContext.depthDrop,
+    spreadVolatility: microstructureTrapContext.spreadVolatility,
+    flowDelta: predictorOrderflowSnapshot.imbalance,
+    depthDelta: toNumber(marketMicro?.depth_imbalance, reconstructedOrderflowSnapshot.depthImbalance),
+    volumeHigh: microstructureTrapContext.volumeHigh,
+    priceDeltaBps: microstructureTrapContext.priceDeltaBps,
+    bias: microstructureTrapContext.bias,
+    attentionState: crossLayerAttentionState,
+    temporalAligned: temporalSyncAligned,
+    desyncWindow: desyncWindowSignal,
+    liquidityTrap: liquidityTrapSignal,
+  }), [crossLayerAttentionState, desyncWindowSignal, liquidityTrapSignal, marketMicro?.depth_imbalance, microstructureTrapContext, predictorOrderflowSnapshot.imbalance, reconstructedOrderflowSnapshot.depthImbalance, temporalSyncAligned]);
+  const intentSignalRaw = useMemo(() => {
+    const recentPoints = chartSeries.slice(-7).map((point) => toNumber(point.value, NaN)).filter((value) => Number.isFinite(value));
+    const recentRows = activeFootprintRows.slice(-7);
+    const recentVolumes = recentRows.map((row) => Math.max(0, toNumber(row.buyVolume, 0)) + Math.max(0, toNumber(row.sellVolume, 0)));
+    const averageRecentVolume = recentVolumes.length > 0
+      ? recentVolumes.reduce((sum, value) => sum + value, 0) / recentVolumes.length
+      : 0;
+    const frames = recentPoints.slice(2).map((currentPrice, index) => {
+      const earlierPrice = recentPoints[index] ?? currentPrice;
+      const previousPrice = recentPoints[index + 1] ?? currentPrice;
+      const row = recentRows[Math.min(index + 1, Math.max(0, recentRows.length - 1))];
+      const tradeVolume = row
+        ? Math.max(0, toNumber(row.buyVolume, 0)) + Math.max(0, toNumber(row.sellVolume, 0))
+        : 0;
+      const tradeImbalance = row && tradeVolume > 0
+        ? clamp(toNumber(row.delta, 0) / Math.max(tradeVolume, 1), -1, 1)
+        : predictorOrderflowSnapshot.imbalance;
+      const priceDeltaBps = previousPrice > 0 ? ((currentPrice - previousPrice) / previousPrice) * 10_000 : 0;
+      const previousDeltaBps = earlierPrice > 0 ? ((previousPrice - earlierPrice) / earlierPrice) * 10_000 : 0;
+      const priceBreak = Math.abs(priceDeltaBps) >= 4;
+      return {
+        atMs: Date.now() - (recentPoints.length - index - 3) * Math.max(1_000, timeframeToMs(chartTimeframe)),
+        signal: detectMarketIntent({
+          priceDeltaBps,
+          flowDelta: tradeImbalance,
+          depthImbalance: toNumber(marketMicro?.depth_imbalance, reconstructedOrderflowSnapshot.depthImbalance),
+          tradeImbalance,
+          tradeVolume,
+          volumeHigh: tradeVolume > Math.max(180, averageRecentVolume * 1.1),
+          absorption: Math.abs(tradeImbalance) >= 0.18 && Math.abs(priceDeltaBps) <= 2.5,
+          breakout: priceBreak,
+          reversalSpeedBps: priceDeltaBps - previousDeltaBps,
+          liquiditySweep: priceBreak && Math.abs(priceDeltaBps - previousDeltaBps) >= 4,
+          depthSpoofingRisk: activeDomSnapshot?.spoofingRisk ?? predictorOrderflowSnapshot.spoofingScore,
+          depthAdded: toNumber(marketMicro?.depth_imbalance, reconstructedOrderflowSnapshot.depthImbalance) >= 0.18,
+          depthRemoved: predictorOrderbookSignals.quoteFadeRate >= 1.1,
+          flowMismatch: Math.sign(priceDeltaBps) !== 0 && Math.sign(tradeImbalance) !== 0 && Math.sign(priceDeltaBps) !== Math.sign(tradeImbalance),
+          desyncWindow: desyncWindowSignal,
+          attentionState: crossLayerAttentionState,
+          temporalAligned: temporalSyncAligned,
+        }),
+      };
+    });
+    const fusedIntent = buildPersistentIntentSignal({ frames, halfLifeCandles: 4 });
+    return fusedIntent.intent === "NONE"
+      ? detectMarketIntent({
+        priceDeltaBps: microstructureTrapContext.priceDeltaBps,
+        flowDelta: predictorOrderflowSnapshot.imbalance,
+        depthImbalance: toNumber(marketMicro?.depth_imbalance, reconstructedOrderflowSnapshot.depthImbalance),
+        tradeImbalance: toNumber(activeExecutionFootprint?.imbalance, predictorOrderflowSnapshot.imbalance),
+        tradeVolume: activeFootprintRows.slice(-4).reduce((sum, row) => sum + Math.max(0, toNumber(row.buyVolume, 0)) + Math.max(0, toNumber(row.sellVolume, 0)), 0),
+        volumeHigh: microstructureTrapContext.volumeHigh,
+        absorption: liveMlAbsorptionBridge.absorptionProb >= 0.62,
+        breakout: microstructureTrapContext.priceBreak,
+        reversalSpeedBps: microstructureTrapContext.reversalSpeedBps,
+        liquiditySweep: liquidityTrapSignal.detected,
+        depthSpoofingRisk: activeDomSnapshot?.spoofingRisk ?? predictorOrderflowSnapshot.spoofingScore,
+        depthAdded: toNumber(marketMicro?.depth_imbalance, reconstructedOrderflowSnapshot.depthImbalance) >= 0.18,
+        depthRemoved: predictorOrderbookSignals.quoteFadeRate >= 1.1,
+        flowMismatch: microstructureTrapContext.deltaOpposite,
+        desyncWindow: desyncWindowSignal,
+        liquidityTrap: liquidityTrapSignal,
+        predictiveTrap: predictiveTrapSignal,
+        attentionState: crossLayerAttentionState,
+        temporalAligned: temporalSyncAligned,
+      })
+      : fusedIntent;
+  }, [activeDomSnapshot?.spoofingRisk, activeExecutionFootprint?.imbalance, activeFootprintRows, chartSeries, chartTimeframe, crossLayerAttentionState, desyncWindowSignal, liquidityTrapSignal, liveMlAbsorptionBridge.absorptionProb, marketMicro?.depth_imbalance, microstructureTrapContext, predictorOrderbookSignals.quoteFadeRate, predictorOrderflowSnapshot.imbalance, predictorOrderflowSnapshot.spoofingScore, predictiveTrapSignal, reconstructedOrderflowSnapshot.depthImbalance, temporalSyncAligned]);
+  const activeIntentThresholds = useMemo(
+    () => resolveIntentCalibrationThresholds(activeIntentCalibrationWindow, intentSignalRaw.intent),
+    [activeIntentCalibrationWindow, intentSignalRaw.intent],
+  );
+  const intentSignal = useMemo(() => {
+    if (intentSignalRaw.intent === "NONE") {
+      return intentSignalRaw;
+    }
+    if (activeIntentThresholds.sampleCount < 4 || activeIntentThresholds.sampleConfidence < 0.35) {
+      return intentSignalRaw;
+    }
+
+    const confidenceGap = intentSignalRaw.confidence - activeIntentThresholds.confidenceFloor;
+    const persistenceGap = intentSignalRaw.persistence - activeIntentThresholds.persistenceFloor;
+    const aggressivenessGap = intentSignalRaw.aggressiveness - activeIntentThresholds.aggressivenessFloor;
+    const calibratedConfidence = clamp(intentSignalRaw.confidence + Math.min(0, confidenceGap) * 0.35, 0, 1);
+    const calibratedPersistence = clamp(intentSignalRaw.persistence + Math.min(0, persistenceGap) * 0.35, 0, 1);
+    const belowFloor = confidenceGap < -0.02 || persistenceGap < -0.02 || (intentSignalRaw.intent === "LIQUIDITY_HUNT" && aggressivenessGap < -0.02);
+
+    if (!belowFloor) {
+      return {
+        ...intentSignalRaw,
+        summaryLabel: `${intentSignalRaw.summaryLabel} · CAL ${activeIntentCalibrationWindow?.label || "14d"}`,
+        detailLabel: `${intentSignalRaw.detailLabel} Journal floor c${Math.round(activeIntentThresholds.confidenceFloor * 100)} p${Math.round(activeIntentThresholds.persistenceFloor * 100)}.`,
+      };
+    }
+
+    return {
+      ...intentSignalRaw,
+      confidence: calibratedConfidence,
+      persistence: calibratedPersistence,
+      state: intentSignalRaw.state === "alpha" ? "risk" : intentSignalRaw.state,
+      shouldBlockTrading: intentSignalRaw.shouldBlockTrading || (confidenceGap < -0.08 && persistenceGap < -0.08),
+      summaryLabel: `${intentSignalRaw.summaryLabel} · CAL FILTER`,
+      detailLabel: `${intentSignalRaw.detailLabel} Journal floor failed: c${Math.round(activeIntentThresholds.confidenceFloor * 100)} p${Math.round(activeIntentThresholds.persistenceFloor * 100)} a${Math.round(activeIntentThresholds.aggressivenessFloor * 100)}.`,
+    };
+  }, [activeIntentCalibrationWindow?.label, activeIntentThresholds, intentSignalRaw]);
+  const intentTargetSignal = useMemo(() => buildIntentTargetSignal({
+    intent: intentSignal,
+    currentPrice: activePrice,
+    priceStep: chartPriceStep,
+    atrAbs: Math.max(chartPriceStep * 6, Math.max(activePrice * Math.max(chartAtrLocalPct, 0.0012), chartPriceStep * 10)),
+    liquidityZones: flowIntelligenceSnapshot?.liquidityZones || [],
+    suggestedBracket: marketDecisionV1.suggestedBracket,
+  }), [activePrice, chartAtrLocalPct, chartPriceStep, flowIntelligenceSnapshot?.liquidityZones, intentSignal, marketDecisionV1.suggestedBracket]);
+  const activeSuggestedBracket = useMemo(() => applyIntentTargetToBracket({
+    bracket: marketDecisionV1.suggestedBracket,
+    target: intentTargetSignal,
+    priceDigits: chartPriceDigits,
+    priceStep: chartPriceStep,
+  }), [chartPriceDigits, chartPriceStep, intentTargetSignal, marketDecisionV1.suggestedBracket]);
+  const journalIntentScalingRecommendation = useMemo(
+    () => resolveJournalScalingRecommendation(activeIntentCalibrationWindow, intentSignal.intent),
+    [activeIntentCalibrationWindow, intentSignal.intent],
+  );
+  const journalScalingTone = journalWindowScalingRecommendation.tier === "LOCKED"
+    ? "bad"
+    : journalWindowScalingRecommendation.multiplier >= 1
+      ? "good"
+      : "warn";
+  const journalScalingLabel = `JRNL ${journalWindowScalingRecommendation.tier} x${journalWindowScalingRecommendation.multiplier.toFixed(2)}`;
+  const intentTargetTone = !intentTargetSignal.allowTargeting
+    ? "neutral"
+    : intentTargetSignal.targetKind === "liquidity-pool"
+      ? "good"
+      : "warn";
+  const intentTargetLabel = intentTargetSignal.summaryLabel;
+  const tripleValidationGate = useMemo(() => computeTripleValidationGate({
+    marketState: smartMarketState,
+    marketReason: smartMarketDetailLabel,
+    marketConfidence: smartMarketConfidence,
+    attentionReliability: crossLayerAttentionReliabilityScore,
+    temporalAligned: temporalSyncAligned,
+    executionQualityScore,
+    desync: desyncSignal,
+    desyncWindow: desyncWindowSignal,
+  }), [crossLayerAttentionReliabilityScore, desyncSignal, desyncWindowSignal, executionQualityScore, smartMarketConfidence, smartMarketDetailLabel, smartMarketState, temporalSyncAligned]);
+  const buildExecutionMicrostructureControlForSide = useCallback((requestedSide: "buy" | "sell") => buildExecutionMicrostructureControl({
+    requestedSide,
+    tripleValidationGate,
+    desyncWindow: desyncWindowSignal,
+    liquidityTrap: liquidityTrapSignal,
+    predictiveTrap: predictiveTrapSignal,
+    intent: intentSignal,
+    attentionState: crossLayerAttentionState,
+    temporalAligned: temporalSyncAligned,
+  }), [crossLayerAttentionState, desyncWindowSignal, intentSignal, liquidityTrapSignal, predictiveTrapSignal, temporalSyncAligned, tripleValidationGate]);
+  const attentionMonitoringPayload = useMemo(() => ({
+    state: crossLayerAttentionState,
+    tone: crossLayerAttentionTone,
+    dominantLayer: crossLayerAttentionDominantLayer,
+    dominant_layer: crossLayerAttentionDominantLayer,
+    dominantReason: crossLayerAttentionDominantReason,
+    dominant_reason: crossLayerAttentionDominantReason,
+    reliabilityScore: crossLayerAttentionReliabilityScore,
+    reliability_score: crossLayerAttentionReliabilityScore,
+    coherenceScore: crossLayerAttentionCoherenceScore,
+    coherence_score: crossLayerAttentionCoherenceScore,
+    renderable: crossLayerAttentionRenderable,
+    shouldBlockTrading: crossLayerAttentionShouldBlockTrading,
+    should_block_trading: crossLayerAttentionShouldBlockTrading,
+    preferredRenderSource: crossLayerAttentionPreferredRenderSource,
+    preferred_render_source: crossLayerAttentionPreferredRenderSource,
+    summaryLabel: crossLayerAttentionSummaryLabel,
+    summary_label: crossLayerAttentionSummaryLabel,
+    detailLabel: crossLayerAttentionDetailLabel,
+    detail_label: crossLayerAttentionDetailLabel,
+    weights: crossLayerAttentionWeights,
+    context: {
+      ...crossLayerAttentionContext,
+      desync_classification: desyncWindowSignal.classification,
+      desync_persistence: desyncWindowSignal.persistenceScore,
+      intent: intentSignal.intent,
+      intent_state: intentSignal.state,
+      intent_persistence: intentSignal.persistence,
+      execution_quality_score: executionQualityScore,
+      triple_validation_state: tripleValidationGate.state,
+      triple_validation_confidence: tripleValidationGate.confidence,
+    },
+  }), [crossLayerAttentionCoherenceScore, crossLayerAttentionContext, crossLayerAttentionDetailLabel, crossLayerAttentionDominantLayer, crossLayerAttentionDominantReason, crossLayerAttentionPreferredRenderSource, crossLayerAttentionReliabilityScore, crossLayerAttentionRenderable, crossLayerAttentionShouldBlockTrading, crossLayerAttentionState, crossLayerAttentionSummaryLabel, crossLayerAttentionTone, crossLayerAttentionWeights, desyncWindowSignal.classification, desyncWindowSignal.persistenceScore, executionQualityScore, intentSignal.intent, intentSignal.persistence, intentSignal.state, tripleValidationGate.confidence, tripleValidationGate.state]);
+
+  useEffect(() => {
+    const shouldLog = crossLayerAttentionState !== "stable"
+      || crossLayerAttentionReliabilityScore >= 0.48
+      || desyncWindowSignal.classification !== "neutral"
+      || intentSignal.intent !== "NONE"
+      || tripleValidationGate.state !== "VALID";
+    if (!shouldLog) {
+      return;
+    }
+    const signature = JSON.stringify([
+      crossLayerAttentionDominantLayer,
+      crossLayerAttentionState,
+      Math.round(crossLayerAttentionReliabilityScore * 100),
+      crossLayerAttentionDominantReason,
+      desyncWindowSignal.classification,
+      intentSignal.intent,
+      tripleValidationGate.state,
+    ]);
+    if (signature === attentionJournalSignatureRef.current) {
+      return;
+    }
+    attentionJournalSignatureRef.current = signature;
+    void appendTerminalGuideJournalEntry(
+      "attention-context-decision",
+      `${crossLayerAttentionSummaryLabel} · ${crossLayerAttentionDominantReason}`,
+      {
+        attention_context: attentionMonitoringPayload,
+        desync_window: desyncWindowSignal,
+        liquidity_trap: liquidityTrapSignal,
+        predictive_trap: predictiveTrapSignal,
+        market_intent: intentSignal,
+        intent_target: intentTargetSignal,
+        triple_validation: tripleValidationGate,
+        journal_calibration: {
+          window: activeIntentCalibrationWindow?.label || "none",
+          thresholds: activeIntentThresholds,
+          journal_scaling: journalIntentScalingRecommendation,
+        },
+      },
+    );
+  }, [activeIntentCalibrationWindow?.label, activeIntentThresholds, appendTerminalGuideJournalEntry, attentionMonitoringPayload, crossLayerAttentionDominantLayer, crossLayerAttentionDominantReason, crossLayerAttentionReliabilityScore, crossLayerAttentionState, crossLayerAttentionSummaryLabel, desyncWindowSignal, intentSignal, intentTargetSignal, journalIntentScalingRecommendation, liquidityTrapSignal, predictiveTrapSignal, tripleValidationGate]);
+
+  useEffect(() => {
+    const shouldLog = liquidityTrapSignal.detected
+      || predictiveTrapSignal.imminent
+      || (desyncWindowSignal.classification !== "neutral" && desyncWindowSignal.persistenceScore >= 0.55)
+      || (intentSignal.intent !== "NONE" && intentSignal.persistence >= 0.55);
+    if (!shouldLog) {
+      return;
+    }
+    const signature = JSON.stringify([
+      liquidityTrapSignal.type,
+      liquidityTrapSignal.trapDirection,
+      predictiveTrapSignal.phase,
+      predictiveTrapSignal.trapSide,
+      desyncWindowSignal.classification,
+      Math.round(desyncWindowSignal.persistenceScore * 100),
+      intentSignal.intent,
+      Math.round(intentSignal.persistence * 100),
+      tripleValidationGate.state,
+    ]);
+    if (signature === microstructureJournalSignatureRef.current) {
+      return;
+    }
+    microstructureJournalSignatureRef.current = signature;
+    const action = liquidityTrapSignal.detected
+      ? "liquidity-trap-detected"
+      : predictiveTrapSignal.imminent
+        ? "predictive-trap-imminent"
+        : intentSignal.intent !== "NONE" && intentSignal.persistence >= 0.55
+          ? "market-intent-detected"
+        : desyncWindowSignal.classification === "alpha"
+          ? "desync-alpha-window"
+          : "desync-risk-window";
+    const detail = liquidityTrapSignal.detected
+      ? liquidityTrapSignal.detailLabel
+      : predictiveTrapSignal.imminent
+        ? predictiveTrapSignal.detailLabel
+        : intentSignal.intent !== "NONE" && intentSignal.persistence >= 0.55
+          ? intentSignal.detailLabel
+        : desyncWindowSignal.detailLabel;
+    void appendTerminalGuideJournalEntry(action, detail, {
+      attention_context: attentionMonitoringPayload,
+      desync_window: desyncWindowSignal,
+      liquidity_trap: liquidityTrapSignal,
+      predictive_trap: predictiveTrapSignal,
+      market_intent: intentSignal,
+      intent_target: intentTargetSignal,
+      journal_calibration: {
+        window: activeIntentCalibrationWindow?.label || "none",
+        thresholds: activeIntentThresholds,
+        journal_scaling: journalIntentScalingRecommendation,
+      },
+      triple_validation: tripleValidationGate,
+    });
+  }, [activeIntentCalibrationWindow?.label, activeIntentThresholds, appendTerminalGuideJournalEntry, attentionMonitoringPayload, desyncWindowSignal, intentSignal, intentTargetSignal, journalIntentScalingRecommendation, liquidityTrapSignal, predictiveTrapSignal, tripleValidationGate]);
+  useEffect(() => {
+    const shouldLog = journalWindowScalingRecommendation.sampleCount >= 3 || capitalScalingDecision.status !== "BALANCED" || !capitalScalingDecision.allow;
+    if (!shouldLog) {
+      return;
+    }
+    const signature = JSON.stringify([
+      capitalScalingDecision.status,
+      Math.round(capitalScalingDecision.multiplier * 100),
+      Math.round(journalWindowScalingRecommendation.multiplier * 100),
+      intentSignal.intent,
+      activeIntentCalibrationWindow?.label || "none",
+    ]);
+    if (signature === capitalScalingJournalSignatureRef.current) {
+      return;
+    }
+    capitalScalingJournalSignatureRef.current = signature;
+    void appendTerminalGuideJournalEntry(
+      "capital-scaling-updated",
+      `Capital ${capitalScalingDecision.status} x${capitalScalingDecision.multiplier.toFixed(2)} · journal ${journalWindowScalingRecommendation.tier} x${journalWindowScalingRecommendation.multiplier.toFixed(2)}.`,
+      {
+        capital_scaling: {
+          ...capitalScalingDecision,
+          journal_window_scaling: journalWindowScalingRecommendation,
+          intent_scaling: journalIntentScalingRecommendation,
+          blocked_by_journal: journalWindowScalingLiveBlocked,
+        },
+        attention_context: attentionMonitoringPayload,
+        market_intent: intentSignal,
+        intent_target: intentTargetSignal,
+        journal_calibration: {
+          window: activeIntentCalibrationWindow?.label || "none",
+          thresholds: activeIntentThresholds,
+        },
+      },
+    );
+  }, [activeIntentCalibrationWindow?.label, activeIntentThresholds, appendTerminalGuideJournalEntry, attentionMonitoringPayload, capitalScalingDecision, intentSignal, intentTargetSignal, journalIntentScalingRecommendation, journalWindowScalingLiveBlocked, journalWindowScalingRecommendation]);
   const expectedGpuGlobalBatchKey = useMemo(
     () => `${chartTimeframe}|${activeGpuMultiSymbolFeeds.map((feed) => feed.id).join(",")}`,
     [activeGpuMultiSymbolFeeds, chartTimeframe],
@@ -19344,6 +20131,52 @@ function TradingTerminalPageHydrated() {
       ohlcvFreshnessState,
       depthFreshnessState,
       tradesFreshnessState,
+      crossLayerAttentionState,
+      crossLayerAttentionTone,
+      crossLayerAttentionDominantLayer,
+      crossLayerAttentionReliabilityScore,
+      crossLayerAttentionCoherenceScore,
+      crossLayerAttentionRenderable,
+      crossLayerAttentionShouldBlockTrading,
+      crossLayerAttentionPreferredRenderSource,
+      crossLayerAttentionSummaryLabel,
+      crossLayerAttentionDetailLabel,
+      crossLayerAttentionWeights,
+      temporalSyncAligned,
+      temporalSyncDegraded,
+      temporalSyncDriftMs,
+      temporalSyncSeqGap,
+      temporalSyncFreshnessScore,
+      temporalSyncDominantSource,
+      temporalSyncSourceCount,
+      temporalSyncBufferedSourceCount,
+      temporalSyncBufferWindowMs,
+      temporalSyncSummaryLabel,
+      temporalSyncDetailLabel,
+      smartMarketState: tripleValidationGate.state,
+      smartMarketReason: tripleValidationGate.reason,
+      smartMarketConfidence: tripleValidationGate.confidence,
+      smartMarketTone: tripleValidationGate.tone,
+      smartMarketSummaryLabel: tripleValidationGate.summaryLabel,
+      smartMarketDetailLabel: tripleValidationGate.detailLabel,
+      desyncType: desyncSignal.type,
+      desyncState: desyncSignal.state,
+      desyncTradeBias: desyncSignal.tradeBias,
+      desyncStrength: desyncSignal.strength,
+      desyncConfidence: desyncSignal.decayConfidence,
+      desyncShouldBlockTrading: desyncSignal.shouldBlockTrading,
+      desyncSummaryLabel: desyncSignal.summaryLabel,
+      desyncDetailLabel: desyncSignal.detailLabel,
+      intentType: intentSignal.intent,
+      intentState: intentSignal.state,
+      intentTradeBias: intentSignal.tradeBias,
+      intentConfidence: intentSignal.confidence,
+      intentPersistence: intentSignal.persistence,
+      intentAggressiveness: intentSignal.aggressiveness,
+      intentIsInstitutional: intentSignal.isInstitutional,
+      intentShouldBlockTrading: intentSignal.shouldBlockTrading,
+      intentSummaryLabel: intentSignal.summaryLabel,
+      intentDetailLabel: intentSignal.detailLabel,
       barsAge: formatFreshness(marketBusOhlcvHealth?.freshness_ms),
       depthAge: formatFreshness(marketBusDepthHealth?.freshness_ms),
       tradesAge: formatFreshness(marketBusTradesHealth?.freshness_ms),
@@ -19923,6 +20756,12 @@ function TradingTerminalPageHydrated() {
   const chartSidecarLayoutMode = inferChartSidecarLayoutMode(chartSidecarProfile, detachedChartSidecars);
   const detachedChartSidecarIds = new Set(detachedChartSidecars.map((panel) => panel.id));
   const dockedChartSidecarIds = chartSidecarProfileConfig.cards.filter((id) => !detachedChartSidecarIds.has(id));
+  const effectiveDockedChartSidecarIds = dockedChartSidecarIds.length > 0
+    ? dockedChartSidecarIds
+    : chartSidecarProfileConfig.cards.includes("policy")
+      ? (["policy"] satisfies ChartSidecarId[])
+      : dockedChartSidecarIds;
+  const effectiveDetachedChartSidecars = detachedChartSidecars.filter((panel) => !effectiveDockedChartSidecarIds.includes(panel.id));
 
   useEffect(() => {
     const allowed = new Set(CHART_SIDECAR_PROFILE_LAYOUTS[chartSidecarProfile].cards);
@@ -20128,18 +20967,18 @@ function TradingTerminalPageHydrated() {
         chartMaxLossUsd={chartMaxLossUsd}
         chartRewardUsd={chartRewardUsd}
         chartTargetGainUsd={chartTargetGainUsd}
-        suggestedBracket={marketDecisionV1.suggestedBracket}
+        suggestedBracket={activeSuggestedBracket}
         suggestedLiquidityHighlight={suggestedLiquidityHighlight ? { level: suggestedLiquidityHighlight.level, exactTpMatch: suggestedLiquidityExactTpMatch } : null}
         onApplyBracket={() => {
-          if (marketDecisionV1.suggestedBracket) {
-            applySuggestedScenarioBracket(marketDecisionV1.suggestedBracket);
+          if (activeSuggestedBracket) {
+            applySuggestedScenarioBracket(activeSuggestedBracket);
           }
         }}
         onApproveAll={() => {
-          if (!marketDecisionV1.suggestedBracket) {
+          if (!activeSuggestedBracket) {
             return;
           }
-          applySuggestedScenarioBracket(marketDecisionV1.suggestedBracket);
+          applySuggestedScenarioBracket(activeSuggestedBracket);
           applyExecutionAdaptationPlan(marketDecisionV1.executionPlan);
           setPendingExecutionAdaptation(null);
         }}
@@ -20205,6 +21044,19 @@ function TradingTerminalPageHydrated() {
 
   const renderRiskTimelineBody = (rowLimit: number, keyPrefix: string): ReactNode => {
     return <RiskTimelineBody {...buildRiskTimelineBodyProps(rowLimit, keyPrefix)} />;
+  };
+
+  const renderDockedChartSidecarStack = (className = "chart-sidecar-stack"): ReactNode => {
+    if (!chartSidecarVisible) {
+      return null;
+    }
+    return (
+      <aside className={className} aria-label="Market structure sidecars">
+        {effectiveDockedChartSidecarIds.map((id) => (
+          <div key={`chart-sidecar-${id}`}>{renderChartSidecarCard(id)}</div>
+        ))}
+      </aside>
+    );
   };
 
   const chartExecutionHudPanel = (
@@ -20461,6 +21313,8 @@ function TradingTerminalPageHydrated() {
         return <ExecutionSmartTrackerPanel badge={null} layoutEditMode={false} onDetach={() => {}} telemetry={executionTelemetry} outcomes={filteredOutcomes} preview={executionSmartTrackerPreview} symbol={selectedChartSymbol} formatClock={formatClock} />;
       case "marketcontext":
         return <ExecutionContextMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} routingPayload={routingScore} optimizerPayload={executionOptimizerLivePayload} smartDecision={smartDecisionHud} formatClock={formatClock} />;
+      case "attentioncontext":
+        return <AttentionContextMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} liveAttention={attentionMonitoringPayload} journalContext={terminalGuideJournalContext} formatClock={formatClock} />;
       case "v6observability":
         return <ExecutionAiV6ObservabilityPanel badge={null} layoutEditMode={false} onDetach={() => {}} payload={executionAiV6Payload} formatClock={formatClock} />;
       case "venues":
@@ -20486,7 +21340,7 @@ function TradingTerminalPageHydrated() {
   const killSwitchActive = String(overview?.kill_switch_active) === "true";
   const mt5Healthy = String(mt5Health?.status || "") === "ok";
   const routeDeviationBps = toNumber(routingScore?.deviation_bps, 0);
-  const decisionBracket = marketDecisionV1.suggestedBracket;
+  const decisionBracket = activeSuggestedBracket;
   const topDecisionEvidence = [...marketDecisionV1.evidence]
     .sort((left, right) => right.scorePct - left.scorePct)
     .slice(0, 3);
@@ -21729,6 +22583,8 @@ function TradingTerminalPageHydrated() {
             <TerminalChartV2
               enabled={terminalV2Enabled}
               onToggleEnabled={toggleTerminalV2}
+              hasSidecar={chartSidecarVisible}
+              sidecarStack={renderDockedChartSidecarStack("chart-sidecar-stack terminal-v2-sidecar-stack")}
               symbol={selectedChartSymbol}
               timeframe={chartTimeframe}
               liveFeedKey={`${selectedChartInstrument}|${selectedChartVenue}|${chartTimeframe}`}
@@ -21810,7 +22666,19 @@ function TradingTerminalPageHydrated() {
               aiHeadline={marketSignalV1.headline}
               aiScenario={`${marketDecisionV1.scenarioLabel} ${marketDecisionV1.scenarioProbabilityPct}%`}
               aiConfidencePct={marketDecisionV1.globalConfidencePct}
-              aiExplanation={overlayDecisionRationale || marketSignalV1.signals[0]?.detail || "No contextual explanation available."}
+              aiExplanation={`${intentTargetSignal.detailLabel} · ${overlayDecisionRationale || marketSignalV1.signals[0]?.detail || "No contextual explanation available."}`}
+              marketSyncGate={{
+                state: tripleValidationGate.state,
+                reason: tripleValidationGate.reason,
+                confidence: tripleValidationGate.confidence,
+                summaryLabel: tripleValidationGate.summaryLabel,
+                detailLabel: tripleValidationGate.detailLabel,
+                temporalSummaryLabel: temporalSyncSummaryLabel,
+                attentionSummaryLabel: crossLayerAttentionSummaryLabel,
+                desyncSummaryLabel: desyncSignal.summaryLabel,
+                intentSummaryLabel: intentSignal.summaryLabel,
+                executionSummaryLabel: `${executionQualitySummaryLabel} · ${intentTargetLabel}`,
+              }}
               indicatorSeries={indicatorSeriesForChart}
               chartEngineMode={chartEngineMode}
               chartSmoothingMs={effectiveChartSmoothingMs}
@@ -21841,7 +22709,7 @@ function TradingTerminalPageHydrated() {
               </div>
               <div className="chart-mode-label">{modeUxProfile.shortLabel}</div>
               <div className="chart-action-pill">{modeUxProfile.summary}</div>
-              <div className="chart-tools-visual-note">{profitOptimizerLabel} · {riskAiLabel} · {positionSizingLabel}</div>
+              <div className="chart-tools-visual-note">{profitOptimizerLabel} · {riskAiLabel} · {capitalScalingLabel} · {journalScalingLabel} · {positionSizingLabel} · {intentTargetLabel}</div>
               <div className="chart-tools-visual-group" role="group" aria-label="Chart visual mode">
                 <button type="button" className={`chart-tool-btn ${chartVisualMode === "auto" ? "active" : ""}`} onClick={() => setChartVisualMode("auto")}>AUTO</button>
                 <button type="button" className={`chart-tool-btn ${chartVisualMode === "clean" ? "active" : ""}`} onClick={() => setChartVisualMode("clean")}>CLEAN</button>
@@ -21875,6 +22743,15 @@ function TradingTerminalPageHydrated() {
                   <span className={`chart-flow-pill tone-${marketBusHealthTone}`}>BUS {marketBusHealthStatus.toUpperCase()}</span>
                   <span className={`chart-flow-pill tone-${marketBusOhlcvContiguous ? "good" : "warn"}`}>{marketBusOhlcvContiguous ? "SEQ OK" : "SEQ GAP"} {marketBusOhlcvLatestSeq > 0 ? `#${marketBusOhlcvLatestSeq}` : "#-"}</span>
                   <span className={`chart-flow-pill tone-${marketFlowAlerts.length > 0 ? "warn" : "good"}`}>{chartCompactAlertLabel}</span>
+                  <span className={`chart-flow-pill tone-${crossLayerAttentionTone}`} title={crossLayerAttentionDetailLabel}>{crossLayerAttentionSummaryLabel}</span>
+                  <span className={`chart-flow-pill tone-${temporalSyncDegraded ? "bad" : temporalSyncAligned ? "good" : "warn"}`} title={temporalSyncDetailLabel}>{temporalSyncSummaryLabel}</span>
+                  <span className={`chart-flow-pill tone-${desyncSignal.state === "risk" ? "bad" : desyncSignal.state === "opportunity" ? "good" : "good"}`} title={desyncSignal.detailLabel}>{desyncSignal.summaryLabel}</span>
+                  <span className={`chart-flow-pill tone-${desyncWindowSignal.classification === "risk" ? "bad" : desyncWindowSignal.classification === "alpha" ? "good" : "neutral"}`} title={desyncWindowSignal.detailLabel}>{desyncWindowSignal.summaryLabel}</span>
+                  {liquidityTrapSignal.detected ? <span className={`chart-flow-pill tone-${liquidityTrapSignal.type === "ABSORPTION_TRAP" || liquidityTrapSignal.type === "STOP_HUNT" ? "good" : "bad"}`} title={liquidityTrapSignal.detailLabel}>{liquidityTrapSignal.summaryLabel}</span> : null}
+                  {predictiveTrapSignal.phase !== "none" ? <span className={`chart-flow-pill tone-${predictiveTrapSignal.imminent ? "warn" : "neutral"}`} title={predictiveTrapSignal.detailLabel}>{predictiveTrapSignal.summaryLabel}</span> : null}
+                  {intentSignal.intent !== "NONE" ? <span className={`chart-flow-pill tone-${intentSignal.state === "risk" ? "bad" : intentSignal.state === "alpha" ? "good" : "neutral"}`} title={intentSignal.detailLabel}>{intentSignal.summaryLabel}</span> : null}
+                  <span className={`chart-flow-pill tone-${executionQualityTone}`} title={executionQualityDetailLabel}>{executionQualitySummaryLabel}</span>
+                  <span className={`chart-flow-pill tone-${tripleValidationGate.tone}`} title={tripleValidationGate.detailLabel}>{tripleValidationGate.summaryLabel}</span>
                   <span className={`chart-flow-pill tone-${fusionChipTone}`}>FUSION {fusionPrice > 0 ? `${fusionPrice.toFixed(2)} · ${fusionVenueCount}V` : "OFF"}</span>
                   <span className={`chart-flow-pill tone-${predictedChipTone}`}>PRED {predictedPrice > 0 ? `${predictedPrice.toFixed(2)} ${predictedDeltaBps >= 0 ? "+" : ""}${predictedDeltaBps.toFixed(1)}bps` : "IDLE"}</span>
                   <span className={`chart-flow-pill tone-${arbChipTone}`}>ARB {arbOpportunity ? `${arbBuyVenue || "?"}→${arbSellVenue || "?"} ${arbNetSpread.toFixed(2)}` : "NONE"}</span>
@@ -21901,10 +22778,16 @@ function TradingTerminalPageHydrated() {
                   <span className={`chart-flow-pill tone-${mlAbsorptionTone}`}>{mlAbsorptionLabel}</span>
                   <span className={`chart-flow-pill tone-${profitOptimizerTone}`}>{profitOptimizerLabel}</span>
                   <span className={`chart-flow-pill tone-${riskAiTone}`}>{riskAiLabel}</span>
+                  <span className={`chart-flow-pill tone-${capitalScalingTone}`}>{capitalScalingLabel}</span>
+                  <span className={`chart-flow-pill tone-${journalScalingTone}`}>{journalScalingLabel}</span>
                   <span className={`chart-flow-pill tone-${positionSizingTone}`}>{positionSizingLabel}</span>
+                  <span className={`chart-flow-pill tone-${intentTargetTone}`} title={intentTargetSignal.detailLabel}>{intentTargetLabel}</span>
                   <span className={`chart-flow-pill tone-${profitOptimizerTone}`}>{profitOptimizerLabel}</span>
                   <span className={`chart-flow-pill tone-${riskAiTone}`}>{riskAiLabel}</span>
+                  <span className={`chart-flow-pill tone-${capitalScalingTone}`}>{capitalScalingLabel}</span>
+                  <span className={`chart-flow-pill tone-${journalScalingTone}`}>{journalScalingLabel}</span>
                   <span className={`chart-flow-pill tone-${positionSizingTone}`}>{positionSizingLabel}</span>
+                  <span className={`chart-flow-pill tone-${intentTargetTone}`} title={intentTargetSignal.detailLabel}>{intentTargetLabel}</span>
                   <span className={`chart-flow-pill tone-${routeChipTone}`}>ROUTE {preferredRoute ? `${preferredRouteLabel} ${preferredRouteScore.toFixed(2)}` : "NONE"}</span>
                 </div>
               ) : (
@@ -21912,6 +22795,16 @@ function TradingTerminalPageHydrated() {
                   <span className={`chart-flow-pill tone-${marketBusHealthTone}`}>BUS {marketBusHealthStatus.toUpperCase()}</span>
                   <span className={`chart-flow-pill tone-${streamStateTone(ohlcvStreamState)}`}>OHLCV {ohlcvStreamState.toUpperCase()}</span>
                   <span className={`chart-flow-pill tone-${localOhlcvSignalTone}`}>LOCAL {localOhlcvAnalysis.signal === "OHLCV_RENDERABLE" ? "RENDERABLE" : localOhlcvAnalysis.signal === "OHLCV_PARTIAL" ? "PARTIAL" : "UNUSABLE"} {localOhlcvAnalysis.renderableRows}/{localOhlcvAnalysis.fetchedRows}</span>
+                  <span className={`chart-flow-pill tone-${crossLayerAttentionTone}`} title={crossLayerAttentionDetailLabel}>{crossLayerAttentionSummaryLabel}</span>
+                  <span className={`chart-flow-pill tone-${temporalSyncDegraded ? "bad" : temporalSyncAligned ? "good" : "warn"}`} title={temporalSyncDetailLabel}>{temporalSyncSummaryLabel}</span>
+                  <span className={`chart-flow-pill tone-${desyncSignal.state === "risk" ? "bad" : desyncSignal.state === "opportunity" ? "good" : "good"}`} title={desyncSignal.detailLabel}>{desyncSignal.summaryLabel}</span>
+                  <span className={`chart-flow-pill tone-${desyncWindowSignal.classification === "risk" ? "bad" : desyncWindowSignal.classification === "alpha" ? "good" : "neutral"}`} title={desyncWindowSignal.detailLabel}>{desyncWindowSignal.summaryLabel}</span>
+                  {liquidityTrapSignal.detected ? <span className={`chart-flow-pill tone-${liquidityTrapSignal.type === "ABSORPTION_TRAP" || liquidityTrapSignal.type === "STOP_HUNT" ? "good" : "bad"}`} title={liquidityTrapSignal.detailLabel}>{liquidityTrapSignal.summaryLabel}</span> : null}
+                  {predictiveTrapSignal.phase !== "none" ? <span className={`chart-flow-pill tone-${predictiveTrapSignal.imminent ? "warn" : "neutral"}`} title={predictiveTrapSignal.detailLabel}>{predictiveTrapSignal.summaryLabel}</span> : null}
+                  {intentSignal.intent !== "NONE" ? <span className={`chart-flow-pill tone-${intentSignal.state === "risk" ? "bad" : intentSignal.state === "alpha" ? "good" : "neutral"}`} title={intentSignal.detailLabel}>{intentSignal.summaryLabel}</span> : null}
+                  <span className={`chart-flow-pill tone-${intentTargetTone}`} title={intentTargetSignal.detailLabel}>{intentTargetLabel}</span>
+                  <span className={`chart-flow-pill tone-${executionQualityTone}`} title={executionQualityDetailLabel}>{executionQualitySummaryLabel}</span>
+                  <span className={`chart-flow-pill tone-${tripleValidationGate.tone}`} title={tripleValidationGate.detailLabel}>{tripleValidationGate.summaryLabel}</span>
                   <span className={`chart-flow-pill tone-${marketBusOhlcvContiguous ? "good" : "warn"}`}>{marketBusOhlcvContiguous ? "SEQ OK" : "SEQ GAP"} {marketBusOhlcvLatestSeq > 0 ? `#${marketBusOhlcvLatestSeq}` : "#-"}</span>
                   <span className={`chart-flow-pill tone-${streamStateTone(displayDepthStreamState)}`}>DOM {displayDepthStreamState.toUpperCase()}</span>
                   <span className={`chart-flow-pill tone-${classifyFreshnessTone(ohlcvFreshnessState)}`}>BARS {ohlcvFreshnessState.toUpperCase()} {formatFreshness(marketBusOhlcvHealth?.freshness_ms)}</span>
@@ -21963,6 +22856,42 @@ function TradingTerminalPageHydrated() {
                 <div className={`chart-flow-alert chart-flow-alert-market ${chartOverlayCompactMode ? "chart-flow-alert-compact" : ""}`} aria-live="assertive">
                   <strong>{chartOverlayCompactMode ? "Data" : "Market data alert"}</strong>
                   <span>{chartFlowAlertText}</span>
+                </div>
+              ) : null}
+              {temporalSyncDegraded && !chartUltraCleanCandles ? (
+                <div className={`chart-flow-alert chart-flow-alert-market ${chartOverlayCompactMode ? "chart-flow-alert-compact" : ""}`} aria-live="assertive">
+                  <strong>Market desync</strong>
+                  <span>{temporalSyncDetailLabel}</span>
+                </div>
+              ) : null}
+              {desyncSignal.type !== "NONE" && !chartUltraCleanCandles ? (
+                <div className={`chart-flow-alert chart-flow-alert-market ${chartOverlayCompactMode ? "chart-flow-alert-compact" : ""}`} aria-live="assertive">
+                  <strong>{desyncSignal.summaryLabel}</strong>
+                  <span>{desyncSignal.detailLabel}</span>
+                </div>
+              ) : null}
+              {intentSignal.intent !== "NONE" && !chartUltraCleanCandles ? (
+                <div className={`chart-flow-alert ${intentSignal.state === "risk" ? "chart-flow-alert-local" : "chart-flow-alert-market"} ${chartOverlayCompactMode ? "chart-flow-alert-compact" : ""}`} aria-live="assertive">
+                  <strong>{intentSignal.summaryLabel}</strong>
+                  <span>{intentSignal.detailLabel}</span>
+                </div>
+              ) : null}
+              {liquidityTrapSignal.detected && !chartUltraCleanCandles ? (
+                <div className={`chart-flow-alert chart-flow-alert-market ${chartOverlayCompactMode ? "chart-flow-alert-compact" : ""}`} aria-live="assertive">
+                  <strong>{liquidityTrapSignal.summaryLabel}</strong>
+                  <span>{liquidityTrapSignal.detailLabel}</span>
+                </div>
+              ) : null}
+              {predictiveTrapSignal.imminent && !chartUltraCleanCandles ? (
+                <div className={`chart-flow-alert chart-flow-alert-local ${chartOverlayCompactMode ? "chart-flow-alert-compact" : ""}`} aria-live="assertive">
+                  <strong>{predictiveTrapSignal.summaryLabel}</strong>
+                  <span>{predictiveTrapSignal.detailLabel}</span>
+                </div>
+              ) : null}
+              {tripleValidationGate.state !== "VALID" && !chartUltraCleanCandles ? (
+                <div className={`chart-flow-alert chart-flow-alert-local ${chartOverlayCompactMode ? "chart-flow-alert-compact" : ""}`} aria-live="assertive">
+                  <strong>{tripleValidationGate.summaryLabel}</strong>
+                  <span>{tripleValidationGate.detailLabel}</span>
                 </div>
               ) : null}
               {localOhlcvAnalysis.signal !== "OHLCV_RENDERABLE" && !chartUltraCleanCandles && !chartAuthBlocked ? (
@@ -22220,13 +23149,7 @@ function TradingTerminalPageHydrated() {
               )}
             </div>
             {chartOverlayCompactMode ? chartExecutionHudPanel : null}
-            {chartSidecarVisible ? (
-              <aside className="chart-sidecar-stack" aria-label="Market structure sidecars">
-                {dockedChartSidecarIds.map((id) => (
-                  <div key={`chart-sidecar-${id}`}>{renderChartSidecarCard(id)}</div>
-                ))}
-              </aside>
-            ) : null}
+            {renderDockedChartSidecarStack()}
             {showDecisionOverlay && (
               <aside className="decision-overlay-panel" role="complementary" aria-label="AI Decision Analysis">
                 <div className="dov-header">
@@ -22924,7 +23847,7 @@ function TradingTerminalPageHydrated() {
             <div className="eyebrow" style={{ fontSize: 10, marginBottom: 8 }}>Ticket gouverné</div>
             {replayState.enabled ? <div className="replay-exec-guard">Replay Mode — execution disabled</div> : null}
             <div className="chart-tools-visual-note" style={{ marginBottom: 8 }}>
-              {profitOptimizerLabel} · {riskAiLabel} · {positionSizingLabel} · AUTO {autoExecutionGate.autoState}
+              {profitOptimizerLabel} · {riskAiLabel} · {capitalScalingLabel} · {journalScalingLabel} · {positionSizingLabel} · {intentTargetLabel} · AUTO {autoExecutionGate.autoState}
             </div>
             <div className="ticket-grid">
               <input value={accountId} onChange={(e) => setAccountId(e.target.value)} placeholder="account_id" disabled={replayState.enabled} />
@@ -23388,6 +24311,24 @@ function TradingTerminalPageHydrated() {
               routingPayload={routingScore}
               optimizerPayload={executionOptimizerLivePayload}
               smartDecision={smartDecisionHud}
+              formatClock={formatClock}
+            />
+            </div>
+            <div
+              className={`layout-draggable-card${layoutEditMode ? " is-edit" : ""}${layoutDropPreview?.zone === "monitoring" && layoutDropPreview.targetId === "attentioncontext" ? " is-drop-target" : ""}`}
+              draggable={layoutEditMode}
+              onDragStart={() => { layoutDragRef.current = { zone: "monitoring", id: "attentioncontext" }; setLayoutDropPreview({ zone: "monitoring", targetId: "attentioncontext", mode: "panel" }); }}
+              onDragEnd={() => { layoutDragRef.current = null; setLayoutDropPreview(null); }}
+              onDragOver={(event) => { if (layoutEditMode) { event.preventDefault(); setLayoutDropPreview({ zone: "monitoring", targetId: "attentioncontext", mode: "panel" }); } }}
+              onDrop={() => handleLayoutDrop("monitoring", "attentioncontext")}
+              style={{ order: monitoringOrderById.attentioncontext ?? 5, display: floatingPanels.some((fp) => fp.id === "attentioncontext") ? "none" : undefined }}
+            >
+            <AttentionContextMonitoringPanel
+              badge={publicOpsPanelBadge}
+              layoutEditMode={layoutEditMode}
+              onDetach={() => detachPanel("attentioncontext", "monitoring")}
+              liveAttention={attentionMonitoringPayload}
+              journalContext={terminalGuideJournalContext}
               formatClock={formatClock}
             />
             </div>
@@ -24965,7 +25906,7 @@ function TradingTerminalPageHydrated() {
           />
         </div>
       ))}
-      {detachedChartSidecars.map((panel) => (
+      {effectiveDetachedChartSidecars.map((panel) => (
         <div
           key={`chart-sidecar-float-${panel.id}`}
           className="floating-panel-window chart-sidecar-floating-window"
