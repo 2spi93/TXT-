@@ -21578,6 +21578,13 @@ function TradingTerminalPageHydrated() {
             <button type="button" className="th-mode-btn" onClick={exportLayoutsJson}>Export</button>
             <button type="button" className="th-mode-btn" onClick={() => layoutImportInputRef.current?.click()}>Import</button>
             <button type="button" className="th-mode-btn" onClick={() => cycleWorkspace(1)} title="Alt+Right">▶</button>
+            <button
+              type="button"
+              className="th-mode-btn"
+              onClick={terminalOnboardingExpanded ? collapseTerminalOnboarding : expandTerminalOnboarding}
+            >
+              {terminalOnboardingExpanded ? "Masquer guides" : "Guides"}
+            </button>
             {workspaceHintBadge ? <span className="layout-workspace-hint-badge">{workspaceHintBadge}</span> : null}
             <input
               ref={layoutImportInputRef}
@@ -21602,7 +21609,7 @@ function TradingTerminalPageHydrated() {
           <button type="button" onClick={() => void loadAll()} disabled={busy} className="chart-chip" style={{ fontSize: 11, padding: "4px 10px" }}>↻</button>
         </div>
       </header>
-      {terminalOnboardingLoaded ? (
+      {terminalOnboardingLoaded && (terminalOnboardingExpanded || terminalOnboardingPinned || terminalOnboardingFirstVisit) ? (
         <section
           id="terminal-onboarding"
           className={[
