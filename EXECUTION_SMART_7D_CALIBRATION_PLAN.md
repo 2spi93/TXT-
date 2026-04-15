@@ -132,6 +132,28 @@ Rule for daily notes:
 - avoid internal code names when a simpler expression exists
 - if a metric is weak, say clearly whether it means wait, reduce, block, or continue
 
+Ultra-simple operator rule:
+- before D5: no tuning
+- D5-D6: paper tuning only
+- after D7: micro-adjustment allowed
+- after D14: strong validation or freeze again
+
+What to do in the phase "Observe and understand":
+- watch without changing the logic
+- write down what the system saw at decision time
+- compare what the system expected with what the market really did
+- identify where the trade was helped, hurt, reduced, delayed, or blocked
+- look for repeated patterns before thinking about any adjustment
+
+Operator checklist for "Observe and understand":
+- check whether the live panel reflects the real market state
+- note the market context before each important decision
+- note the main reason when a trade is blocked
+- compare clean trades versus reduced trades versus delayed trades
+- identify the weakest venue or the weakest context of the day
+- say in one sentence what changed versus yesterday
+- end the note with one operator action only: continue, wait, reduce, block, or prepare a paper adjustment
+
 ### Day 1-2
 
 Goal:
