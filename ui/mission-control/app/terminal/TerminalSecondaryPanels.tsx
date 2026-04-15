@@ -1522,7 +1522,7 @@ export function OperatorActionSummary({
       query.set("symbol", journalSymbol);
       query.set("timeframe", journalTimeframe);
       query.set("strategy", journalStrategy);
-      query.set("limit", "120");
+      query.set("limit", "600");
       query.set("sinceDays", "7");
       query.set("samples", "1");
       const response = await fetch(`/api/system/runtime-decision?${query.toString()}`, { cache: "no-store" }).catch(() => null);

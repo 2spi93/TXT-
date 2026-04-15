@@ -39,7 +39,7 @@ export default async function Page() {
     getJson("/v1/connectors/status") as Promise<RecordItem | null>,
     readHealthwatchDashboard(),
     readLocalTerminalCaptureStore(),
-    getRuntimeDecisionAnalytics({ limit: 240, sinceDays: 7, samples: 2 }),
+    getRuntimeDecisionAnalytics({ limit: 1200, sinceDays: 7, samples: 2 }),
   ]);
 
   if (!me) {

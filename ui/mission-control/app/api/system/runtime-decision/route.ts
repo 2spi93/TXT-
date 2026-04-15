@@ -16,7 +16,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   const symbol = request.nextUrl.searchParams.get("symbol") || "";
   const timeframe = request.nextUrl.searchParams.get("timeframe") || "";
   const strategy = request.nextUrl.searchParams.get("strategy") || "";
-  const limit = Number(request.nextUrl.searchParams.get("limit") || 200);
+  const limit = Number(request.nextUrl.searchParams.get("limit") || 1200);
   const sinceDays = Number(request.nextUrl.searchParams.get("sinceDays") || 7);
   const samples = Number(request.nextUrl.searchParams.get("samples") || 3);
 
