@@ -8,6 +8,8 @@ import { readLocalTerminalCaptureStore } from "../lib/localTerminalCaptureStore"
 import { getConnectorHealthView } from "../lib/connectorHealth";
 import HelpHint from "../components/HelpHint";
 import OperatorPanelGuide from "../components/ui/OperatorPanelGuide";
+import RuntimeDecisionOverviewCard from "../components/ui/RuntimeDecisionOverviewCard";
+import { getRuntimeDecisionAnalytics } from "../lib/runtimeDecisionAnalytics";
 import { getRoleGroup, getRoleDisplayLabel, isClientRole } from "../lib/roleGroups";
 
 type RecordItem = Record<string, unknown>;
@@ -25,7 +27,7 @@ async function getJson(path: string): Promise<unknown> {
 }
 
 export default async function Page() {
-  const [me, overview, audit, positions, quotes, balances, pending, strategies, connectorsStatus, healthwatchDashboard, localTerminalCaptureStore] = await Promise.all([
+  const [me, overview, audit, positions, quotes, balances, pending, strategies, connectorsStatus, healthwatchDashboard, localTerminalCaptureStore, runtimeDecisionSummary] = await Promise.all([
     getJson("/v1/auth/me") as Promise<RecordItem | null>,
     getJson("/v1/dashboard/overview") as Promise<RecordItem | null>,
     getJson("/v1/audit") as Promise<RecordItem[] | null>,
@@ -37,6 +39,7 @@ export default async function Page() {
     getJson("/v1/connectors/status") as Promise<RecordItem | null>,
     readHealthwatchDashboard(),
     readLocalTerminalCaptureStore(),
+    getRuntimeDecisionAnalytics({ limit: 240, sinceDays: 7, samples: 2 }),
   ]);
 
   if (!me) {
@@ -141,6 +144,21 @@ export default async function Page() {
           <p className="subtle">Les approbations passent par bearer token, rôle et signature HMAC.</p>
           <div className="row"><span>Policy version</span><span>{String(safeOverview.policy_version)}</span></div>
           <div className="row"><span>Paper only</span><span className="warn">{String(safeOverview.paper_only)}</span></div>
+        </div>
+      </section>
+
+      <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1.1fr 0.9fr" }}>
+        <div className="panel runtime-decision-dashboard-panel" data-testid="runtime-decision-dashboard-panel">
+          <RuntimeDecisionOverviewCard summary={runtimeDecisionSummary} title="Runtime Decision Desk" />
+        </div>
+        <div className="panel">
+          <div className="eyebrow">Next Step Architecture <HelpHint text="Ordre de delivery valide niveau production: drift avant densite d'opportunite, puis dashboard, puis calibration lente." examples={["Ne calibre rien si la verite journal/runtime est encore confuse.", "Un dashboard sans drift engine observe juste des symptomes: il ne detecte pas les changements de comportement du systeme."]} /></div>
+          <div className="metric good">Drift → Opportunity → Dashboard → Calibration</div>
+          <p className="subtle">Le systeme est maintenant explicable. La couche suivante doit detecter les glissements de comportement avant d'ajuster les seuils.</p>
+          <div className="row"><span>Current dominant bucket</span><span>{runtimeDecisionSummary.dominant.bucket.label}</span></div>
+          <div className="row"><span>Observability status</span><span className="pill">decision-audit + backfill + note</span></div>
+          <div className="row"><span>Semantic hygiene</span><span>{runtimeDecisionSummary.semanticMismatchCandidates.sharePct}% mismatch</span></div>
+          <div className="row"><span>Calibration rule</span><span className="warn">lente, controlee, observable</span></div>
         </div>
       </section>
 

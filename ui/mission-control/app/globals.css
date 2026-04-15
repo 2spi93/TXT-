@@ -145,6 +145,122 @@ body {
   min-height: 100%;
 }
 
+.runtime-decision-dashboard-panel {
+  padding: 18px;
+}
+
+.runtime-decision-card {
+  display: grid;
+  gap: 14px;
+}
+
+.runtime-decision-card.compact {
+  gap: 10px;
+}
+
+.runtime-decision-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.runtime-decision-headline {
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1.1;
+}
+
+.runtime-decision-summary {
+  margin: 6px 0 0;
+  color: rgba(214, 222, 234, 0.78);
+  max-width: 64ch;
+}
+
+.runtime-decision-chip {
+  border-radius: 999px;
+  padding: 6px 10px;
+  border: 1px solid rgba(255,255,255,0.1);
+  background: rgba(255,255,255,0.04);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.runtime-decision-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.runtime-decision-metric {
+  border: 1px solid rgba(255,255,255,0.08);
+  background: rgba(255,255,255,0.03);
+  border-radius: 12px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 6px;
+}
+
+.runtime-decision-metric span {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(214, 222, 234, 0.58);
+}
+
+.runtime-decision-metric strong {
+  font-size: 15px;
+  line-height: 1.2;
+}
+
+.runtime-decision-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.runtime-decision-grid-bottom {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.runtime-decision-box {
+  border: 1px solid rgba(255,255,255,0.08);
+  background: rgba(255,255,255,0.025);
+  border-radius: 12px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 8px;
+}
+
+.runtime-decision-list {
+  display: grid;
+  gap: 8px;
+}
+
+.runtime-decision-row {
+  display: grid;
+  gap: 3px;
+}
+
+.runtime-decision-row strong {
+  font-size: 12px;
+  line-height: 1.25;
+}
+
+.runtime-decision-row span {
+  color: rgba(214, 222, 234, 0.74);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.runtime-decision-callout {
+  border-left: 3px solid rgba(245, 180, 65, 0.8);
+  padding: 8px 0 8px 12px;
+  color: rgba(244, 230, 192, 0.92);
+  background: linear-gradient(90deg, rgba(245,180,65,0.08), rgba(245,180,65,0));
+}
+
 .txt-page-hero-copy {
   max-width: 72ch;
 }
@@ -11818,6 +11934,12 @@ a[href*="tradingview"] {
     grid-template-columns: 1fr 1fr;
   }
 
+  .runtime-decision-metrics,
+  .runtime-decision-grid,
+  .runtime-decision-grid-bottom {
+    grid-template-columns: 1fr 1fr;
+  }
+
   .operator-heatmap-grid {
     grid-template-columns: minmax(120px, 1fr) repeat(3, minmax(0, 1fr));
   }
@@ -11919,7 +12041,10 @@ a[href*="tradingview"] {
   .operator-journal-grid,
   .operator-journal-kpi-grid,
   .operator-discipline-kpi-grid,
-  .operator-heatmap-grid {
+  .operator-heatmap-grid,
+  .runtime-decision-metrics,
+  .runtime-decision-grid,
+  .runtime-decision-grid-bottom {
     grid-template-columns: 1fr;
   }
 

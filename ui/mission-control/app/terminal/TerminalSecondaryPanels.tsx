@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 
 import HelpHint from "../../components/HelpHint";
 import PanelShell from "../../components/ui/PanelShell";
+import RuntimeDecisionOverviewCard from "../../components/ui/RuntimeDecisionOverviewCard";
 import type { SmartDecisionHudShape } from "./chartHudTypes";
 import { buildFeedbackSummary } from "./feedbackEngine";
 import {
@@ -12,6 +13,7 @@ import {
   validateExecutionDecisionAudit,
   type ExecutionDecisionAudit,
 } from "../../lib/executionDecisionSchema";
+import type { RuntimeDecisionAnalyticsSummary } from "../../lib/runtimeDecisionAnalytics";
 import SmartDecisionSummary from "./SmartDecisionSummary";
 
 type RiskTimelineFilter = "all" | "compliant" | "miss";
@@ -546,6 +548,8 @@ type ExecutionDecisionJournalAuditSummary = {
   latestIssueEntry: OperatorJournalEntry | null;
   latestIssueLabel: string;
 };
+
+type RuntimeDecisionApiSummary = RuntimeDecisionAnalyticsSummary;
 
 const OPERATOR_OVERRIDE_STORAGE_KEY = "txt.operator.override.v1";
 
@@ -1416,6 +1420,9 @@ export function OperatorActionSummary({
   const [journalEntries, setJournalEntries] = useState<OperatorJournalEntry[]>([]);
   const [journalBusy, setJournalBusy] = useState(false);
   const [journalError, setJournalError] = useState<string | null>(null);
+  const [runtimeDecisionSummary, setRuntimeDecisionSummary] = useState<RuntimeDecisionApiSummary | null>(null);
+  const [runtimeDecisionBusy, setRuntimeDecisionBusy] = useState(false);
+  const [runtimeDecisionError, setRuntimeDecisionError] = useState<string | null>(null);
   const [driftItems, setDriftItems] = useState<DriftItem[]>([]);
   const [driftBusy, setDriftBusy] = useState(false);
   const [driftError, setDriftError] = useState<string | null>(null);
@@ -1496,6 +1503,43 @@ export function OperatorActionSummary({
       setJournalBusy(false);
     };
     void loadJournal();
+    return () => {
+      cancelled = true;
+    };
+  }, [journalEnabled, journalStrategy, journalSymbol, journalTimeframe]);
+
+  useEffect(() => {
+    if (!journalEnabled) {
+      setRuntimeDecisionSummary(null);
+      setRuntimeDecisionBusy(false);
+      setRuntimeDecisionError(null);
+      return;
+    }
+    let cancelled = false;
+    const loadRuntimeDecision = async () => {
+      setRuntimeDecisionBusy(true);
+      const query = new URLSearchParams();
+      query.set("symbol", journalSymbol);
+      query.set("timeframe", journalTimeframe);
+      query.set("strategy", journalStrategy);
+      query.set("limit", "120");
+      query.set("sinceDays", "7");
+      query.set("samples", "1");
+      const response = await fetch(`/api/system/runtime-decision?${query.toString()}`, { cache: "no-store" }).catch(() => null);
+      const payload = response ? await response.json().catch(() => null) : null;
+      if (cancelled) {
+        return;
+      }
+      if (!response || !response.ok || !payload || !payload.totals || !Array.isArray(payload.topCodes)) {
+        setRuntimeDecisionError("Runtime decision summary indisponible");
+        setRuntimeDecisionBusy(false);
+        return;
+      }
+      setRuntimeDecisionSummary(payload as RuntimeDecisionApiSummary);
+      setRuntimeDecisionError(null);
+      setRuntimeDecisionBusy(false);
+    };
+    void loadRuntimeDecision();
     return () => {
       cancelled = true;
     };
@@ -1840,6 +1884,16 @@ export function OperatorActionSummary({
           ) : (
             <div className="subtle mini">Aucun signal journal recent sur ce contexte.</div>
           )}
+          <div className="operator-discipline-drift-box" data-testid="execution-runtime-decision-compact">
+            <div className="operator-feedback-head">
+              <div className="subtle mini">Runtime decision compact</div>
+              <div className={`operator-dominance-chip ${runtimeDecisionBusy ? "subtle" : runtimeDecisionSummary ? runtimeDecisionSummary.deskRead.tone : "warn"}`}>
+                {runtimeDecisionBusy ? "sync..." : runtimeDecisionSummary ? runtimeDecisionSummary.dominant.bucket.label : "indispo"}
+              </div>
+            </div>
+            {runtimeDecisionSummary ? <RuntimeDecisionOverviewCard summary={runtimeDecisionSummary} compact title="Decision desk" /> : null}
+            {runtimeDecisionError ? <div className="operator-journal-summary warn">{runtimeDecisionError}</div> : null}
+          </div>
         </div>
       </div>
       {journalEnabled ? (
