@@ -31,7 +31,11 @@ const GLOBAL_WALKTHROUGH_INDEX_STORAGE_KEY = "txt.global.walkthrough.index";
 const GLOBAL_WALKTHROUGH_VISIBLE_STORAGE_KEY = "txt.global.walkthrough.visible";
 const GLOBAL_WALKTHROUGH_VERSION_STORAGE_KEY = "txt.global.walkthrough.version";
 const GLOBAL_WALKTHROUGH_START_EVENT = "txt-global-walkthrough-start";
-const GLOBAL_WALKTHROUGH_VERSION = "2";
+const GLOBAL_WALKTHROUGH_VERSION = "3";
+
+function isStoredBoolean(value: string | null): value is "0" | "1" {
+  return value === "0" || value === "1";
+}
 
 const INTERNAL_STEPS: WalkthroughStep[] = [
   {
@@ -260,19 +264,27 @@ export default function GlobalPlatformWalkthrough({ roleGroup = "unknown" }: { r
       const persistedDone = window.localStorage.getItem(GLOBAL_WALKTHROUGH_DONE_STORAGE_KEY) === "1";
       const persistedVisible = window.localStorage.getItem(GLOBAL_WALKTHROUGH_VISIBLE_STORAGE_KEY);
       const persistedIndex = Number(window.localStorage.getItem(GLOBAL_WALKTHROUGH_INDEX_STORAGE_KEY) || "0");
+      const hasPersistedVisible = isStoredBoolean(persistedVisible);
+      const firstRun = persistedVersion === null && !persistedDone && !hasPersistedVisible;
+      const normalizedIndex = Number.isFinite(persistedIndex)
+        ? clamp(Math.floor(persistedIndex), 0, Math.max(steps.length - 1, 0))
+        : 0;
       if (versionMismatch) {
-        setDone(false);
-        setVisible(true);
-        setStepIndex(0);
-        persistState({ done: false, visible: true, stepIndex: 0 });
+        const nextDone = firstRun ? false : persistedDone;
+        const nextVisible = false;
+        const nextStepIndex = nextDone ? 0 : normalizedIndex;
+        setDone(nextDone);
+        setVisible(nextVisible);
+        setStepIndex(nextStepIndex);
+        persistState({ done: nextDone, visible: nextVisible, stepIndex: nextStepIndex });
       } else {
         setDone(persistedDone);
-        setVisible(persistedDone ? persistedVisible === "1" : true);
-        setStepIndex(Number.isFinite(persistedIndex) ? clamp(Math.floor(persistedIndex), 0, Math.max(steps.length - 1, 0)) : 0);
+        setVisible(hasPersistedVisible ? persistedVisible === "1" : false);
+        setStepIndex(normalizedIndex);
       }
     } catch {
       setDone(false);
-      setVisible(true);
+      setVisible(false);
       setStepIndex(0);
     } finally {
       setLoaded(true);

@@ -132,7 +132,7 @@ test("@chart terminal V4 keeps all visible timeframes renderable", async ({ page
     pageErrors.push(error.message);
   });
 
-  await loginIfRequired(page, "/terminal?v2=1&engine=v4", "terminal V4 timeframe pan zoom");
+  await loginIfRequired(page, "/terminal?engine=v4", "terminal V4 timeframe pan zoom");
 
   const chart = page.locator(".gpu-chart-v4-shell").first();
   const canvas = chart.locator(".gpu-chart-v4-canvas").first();
@@ -154,7 +154,7 @@ test("@chart terminal V4 keeps all visible timeframes renderable", async ({ page
 test("@chart terminal V4 supports toolbar zoom and representative left-drag pan", async ({ page }) => {
   test.setTimeout(180_000);
 
-  await loginIfRequired(page, "/terminal?v2=1&engine=v4", "terminal V4 representative pan zoom");
+  await loginIfRequired(page, "/terminal?engine=v4", "terminal V4 representative pan zoom");
 
   const chart = page.locator(".gpu-chart-v4-shell").first();
   const canvas = chart.locator(".gpu-chart-v4-canvas").first();

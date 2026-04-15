@@ -66,6 +66,7 @@ function resolveOperatorPassword(): string {
 async function injectLocalOperatorSession(page: Page): Promise<void> {
   await page.goto("/login", { waitUntil: "domcontentloaded" });
   const baseUrl = new URL(page.url());
+  const origin = baseUrl.origin;
   const payload = Buffer.from(JSON.stringify({ role: "operator", exp: Math.floor(Date.now() / 1000) + 3600 }), "utf8").toString("base64url");
   const token = `${payload}.signature`;
 
@@ -73,7 +74,7 @@ async function injectLocalOperatorSession(page: Page): Promise<void> {
     {
       name: "mc_token",
       value: token,
-      url: baseUrl.toString(),
+      url: origin,
       httpOnly: true,
       sameSite: "Lax",
       secure: baseUrl.protocol === "https:",
@@ -81,7 +82,7 @@ async function injectLocalOperatorSession(page: Page): Promise<void> {
     {
       name: "mc_token_compat",
       value: token,
-      url: baseUrl.toString(),
+      url: origin,
       httpOnly: true,
       sameSite: "Lax",
       secure: baseUrl.protocol === "https:",

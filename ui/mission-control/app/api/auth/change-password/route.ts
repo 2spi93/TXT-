@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 import { cpFetch } from "../../../../lib/controlPlane";
 import { buildAppUrl } from "../../../../lib/redirect";
 
-function resolveSafeNextPath(value: string, fallback = "/terminal?v2=1&password_changed=1"): string {
+function resolveSafeNextPath(value: string, fallback = "/?password_changed=1"): string {
   const nextPath = String(value || "").trim();
   if (!nextPath.startsWith("/")) {
     return fallback;

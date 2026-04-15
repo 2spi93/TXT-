@@ -17,7 +17,7 @@ test("terminal replay explainability renders without clearMarks runtime errors",
     pageErrors.push(String(error?.stack || error));
   });
 
-  await loginIfRequired(page, "/terminal?v2=1", "terminal replay explainability validation");
+  await loginIfRequired(page, "/terminal", "terminal replay explainability validation");
   await page.waitForLoadState("networkidle");
 
   const performanceCompat = await page.evaluate(() => {

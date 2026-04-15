@@ -340,7 +340,7 @@ test("runtime smoke covers terminal, live ops, connectors and connections", asyn
     await route.fulfill({ json: { ok: true, account_id: "wallet-smoke" } });
   });
 
-  await page.goto("/terminal?v2=1&boot=full", { waitUntil: "domcontentloaded" });
+  await page.goto("/terminal?boot=full", { waitUntil: "domcontentloaded" });
   await expect(page.getByTestId("mission-control-terminal-page")).toBeVisible();
   await expect(page.getByTestId("terminal-brain-stats")).toBeVisible({ timeout: 30_000 });
 

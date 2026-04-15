@@ -97,7 +97,7 @@ async function fetchRecentRealityGapRows(page: Page) {
 test("seeded Kairos runtime smoke populates reality gap and terminal perf telemetry", async ({ page }) => {
   test.setTimeout(120_000);
 
-  await loginIfRequired(page, "/terminal?v2=1&perfDebug=1", "seeded Kairos runtime smoke");
+  await loginIfRequired(page, "/terminal?perfDebug=1", "seeded Kairos runtime smoke");
 
   const seed = await seedKairosHarnessReplay(page);
   test.skip(seed.degraded, "Kairos harness seed requires a reachable control plane when MC_E2E_DEV_DEGRADED returns degraded responses");
@@ -113,7 +113,7 @@ test("seeded Kairos runtime smoke populates reality gap and terminal perf teleme
   await expect(page.locator("body")).toContainText("Kairos Harness");
   await expect(page.locator("body")).toContainText("Validation source");
 
-  await page.goto("/terminal?v2=1&perfDebug=1", { waitUntil: "domcontentloaded" });
+  await page.goto("/terminal?perfDebug=1", { waitUntil: "domcontentloaded" });
   await expect(page.getByText("Live Focus", { exact: false }).first()).toBeVisible({ timeout: 30_000 });
   await expect(page.getByTestId("terminal-compute-perf-toggle")).toContainText("CPU ON");
   await page.waitForTimeout(2500);

@@ -85,7 +85,7 @@ test("@chart terminal multi-timeframe visual smoke keeps x-scale stable across d
     pageErrors.push(error.message);
   });
 
-  await loginIfRequired(page, "/terminal?v2=1&engine=v3", "multi-timeframe visual smoke");
+  await loginIfRequired(page, "/terminal?engine=v3", "multi-timeframe visual smoke");
 
   const chart = page.locator(".chart-canvas-host").first();
   await chart.waitFor({ state: "visible", timeout: 45_000 });

@@ -5,7 +5,7 @@ import { loginIfRequired } from "./helpers/terminal";
 test("@chart terminal V2 state-first HUD visual remains locked", async ({ page }) => {
   test.setTimeout(180_000);
 
-  await loginIfRequired(page, "/terminal?v2=1&engine=v4&perfDebug=1", "terminal V2 decision HUD visual");
+  await loginIfRequired(page, "/terminal?engine=v4&perfDebug=1", "terminal V2 decision HUD visual");
 
   const v2Toggle = page.getByRole("button", { name: /^V2 Surface /i }).first();
   await expect(v2Toggle).toBeVisible({ timeout: 45_000 });

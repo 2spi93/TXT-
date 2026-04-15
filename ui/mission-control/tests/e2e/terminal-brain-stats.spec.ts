@@ -5,7 +5,7 @@ import { loginIfRequired } from "./helpers/terminal";
 test("terminal renders brain stats line for an authenticated operator session", async ({ page }) => {
   test.setTimeout(120_000);
 
-  await loginIfRequired(page, "/terminal?v2=1", "brain stats validation");
+  await loginIfRequired(page, "/terminal", "brain stats validation");
 
   const brainStats = page.getByTestId("terminal-brain-stats").first();
   await expect(brainStats).toBeVisible({ timeout: 30_000 });

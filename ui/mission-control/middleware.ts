@@ -66,6 +66,15 @@ function isPublicPath(pathname: string): boolean {
   );
 }
 
+function buildCanonicalTerminalRedirect(request: NextRequest): NextResponse | null {
+  const url = request.nextUrl.clone();
+  if (url.pathname !== "/terminal" || !url.searchParams.has("v2")) {
+    return null;
+  }
+  url.searchParams.delete("v2");
+  return NextResponse.redirect(url, 308);
+}
+
 export function middleware(request: NextRequest): NextResponse {
   const { pathname } = request.nextUrl;
 
@@ -76,6 +85,11 @@ export function middleware(request: NextRequest): NextResponse {
     pathname.startsWith("/favicon")
   ) {
     return NextResponse.next();
+  }
+
+  const canonicalTerminalRedirect = buildCanonicalTerminalRedirect(request);
+  if (canonicalTerminalRedirect) {
+    return canonicalTerminalRedirect;
   }
 
   // Always allow: public pages (login, change-password)
@@ -89,6 +103,7 @@ export function middleware(request: NextRequest): NextResponse {
   if (!token) {
     const url = request.nextUrl.clone();
     url.pathname = "/login";
+    url.search = "";
     if (pathname && pathname !== "/login") {
       url.searchParams.set("next", `${pathname}${request.nextUrl.search}`);
     }
@@ -101,6 +116,7 @@ export function middleware(request: NextRequest): NextResponse {
   if (!role) {
     const url = request.nextUrl.clone();
     url.pathname = "/login";
+    url.search = "";
     if (pathname && pathname !== "/login") {
       url.searchParams.set("next", `${pathname}${request.nextUrl.search}`);
     }
@@ -113,6 +129,7 @@ export function middleware(request: NextRequest): NextResponse {
   if (isClient && isInternalOnlyPath(pathname)) {
     const url = request.nextUrl.clone();
     url.pathname = "/terminal";
+    url.search = "";
     return NextResponse.redirect(url);
   }
 

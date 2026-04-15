@@ -4,23 +4,7 @@ import { NextResponse } from "next/server";
 import { getControlPlaneUrl, readJsonFromResponseSafe } from "../../../../lib/controlPlane";
 import { buildAppUrl, isHttpsRequest } from "../../../../lib/redirect";
 
-function parseTokenRole(token: string): string {
-  try {
-    const parts = token.split(".");
-    const payloadPart = parts.length === 2 ? parts[0] : parts[1];
-    if (!payloadPart) {
-      return "";
-    }
-    const padded = payloadPart + "=".repeat((4 - (payloadPart.length % 4)) % 4);
-    const decoded = Buffer.from(padded.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
-    const payload = JSON.parse(decoded) as { role?: string };
-    return String(payload.role || "").trim().toLowerCase();
-  } catch {
-    return "";
-  }
-}
-
-function resolveSafeNextPath(value: string, fallback = "/terminal?v2=1"): string {
+function resolveSafeNextPath(value: string, fallback = "/"): string {
   const nextPath = String(value || "").trim();
   if (!nextPath.startsWith("/")) {
     return fallback;
@@ -91,7 +75,5 @@ export async function POST(request: Request): Promise<NextResponse> {
     return NextResponse.redirect(buildAppUrl(request, `/change-password${nextSuffix}`));
   }
 
-  const role = parseTokenRole(payload.access_token);
-  const fallbackPath = role ? "/terminal?v2=1" : "/terminal?v2=1";
-  return NextResponse.redirect(buildAppUrl(request, resolveSafeNextPath(nextPath, fallbackPath)));
+  return NextResponse.redirect(buildAppUrl(request, resolveSafeNextPath(nextPath, "/")));
 }
