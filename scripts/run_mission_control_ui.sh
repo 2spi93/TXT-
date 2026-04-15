@@ -4,7 +4,7 @@ set -eu
 cd /workspace/ui/mission-control
 
 force_bootstrap="${FORCE_UI_BOOTSTRAP:-0}"
-force_rebuild_on_boot="${FORCE_UI_REBUILD_ON_BOOT:-1}"
+force_rebuild_on_boot="${FORCE_UI_REBUILD_ON_BOOT:-0}"
 dist_dir="${NEXT_DIST_DIR:-.next-runtime}"
 export NEXT_DIST_DIR="$dist_dir"
 install_chromium_on_boot="${INSTALL_PLAYWRIGHT_CHROMIUM_ON_BOOT:-1}"

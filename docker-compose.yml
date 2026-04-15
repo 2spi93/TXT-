@@ -353,10 +353,11 @@ services:
       - ./:/workspace
     environment:
       PORT: 3000
+      NEXT_DIST_DIR: .next-runtime
       CONTROL_PLANE_URL: http://control-plane:8000
       PREDICTOR_V8_URL: http://predictor-v8:8008
       CONTROL_PLANE_TOKEN:
-      FORCE_UI_REBUILD_ON_BOOT: 1
+      FORCE_UI_REBUILD_ON_BOOT: 0
     env_file:
       - ./.env
     command: >
