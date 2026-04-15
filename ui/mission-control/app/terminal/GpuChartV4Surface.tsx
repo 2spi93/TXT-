@@ -206,6 +206,22 @@ function timeframeSeconds(timeframe: string): number {
   }
 }
 
+const GPU_HUD_RIGHT_AXIS_WIDTH = 88;
+const GPU_HUD_BOTTOM_AXIS_HEIGHT = 26;
+
+function resolveLocalTimezoneLabel(): string {
+  if (typeof Intl === "undefined") {
+    return "LOCAL";
+  }
+  const zoneName = new Intl.DateTimeFormat(undefined, { timeZoneName: "short" })
+    .formatToParts(new Date())
+    .find((part) => part.type === "timeZoneName")?.value;
+  if (zoneName && zoneName.trim().length > 0) {
+    return zoneName.replace(/^GMT/i, "UTC").toUpperCase();
+  }
+  return Intl.DateTimeFormat().resolvedOptions().timeZone || "LOCAL";
+}
+
 
 function formatGpuHudPrice(value: number): string {
   if (!Number.isFinite(value)) {
@@ -225,11 +241,17 @@ function formatGpuHudTime(epochSeconds: number, timeframe: string): string {
     return "--:--";
   }
   const date = new Date(epochSeconds * 1000);
-  const hours = String(date.getUTCHours()).padStart(2, "0");
-  const minutes = String(date.getUTCMinutes()).padStart(2, "0");
-  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(date.getUTCDate()).padStart(2, "0");
-  return timeframeSeconds(timeframe) >= 86_400 ? `${month}/${day}` : `${hours}:${minutes}`;
+  if (timeframeSeconds(timeframe) >= 86_400) {
+    return date.toLocaleDateString(undefined, {
+      month: "2-digit",
+      day: "2-digit",
+    });
+  }
+  return date.toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
 }
 
 function resolveFeedCandleTimestampMs(candles: CandleLike[]): number | null {
@@ -280,8 +302,8 @@ function drawGpuCanvasHud(
     return;
   }
 
-  const rightAxisWidth = 88;
-  const bottomAxisHeight = 26;
+  const rightAxisWidth = GPU_HUD_RIGHT_AXIS_WIDTH;
+  const bottomAxisHeight = GPU_HUD_BOTTOM_AXIS_HEIGHT;
   const leftPad = 8;
   const topPad = 10;
   const plotLeft = leftPad;
@@ -473,6 +495,44 @@ function isLiveFrameCompatibleWithProps(liveCandles: CandleLike[], propCandles: 
   const deviationRatio = Math.abs(liveLastClose - propLastClose) / Math.max(propLastClose, 0.0000001);
   const allowedDeviationRatio = Math.max(0.02, (propRange / Math.max(propLastClose, 0.0000001)) * 2.5);
   return deviationRatio <= allowedDeviationRatio;
+}
+
+function mergeBarsByTimestamp(previousBars: OhlcBar[], nextBars: OhlcBar[]): OhlcBar[] {
+  if (previousBars.length === 0) {
+    return nextBars;
+  }
+  if (nextBars.length === 0) {
+    return previousBars;
+  }
+
+  const merged = new Map<number, OhlcBar>();
+  for (const bar of previousBars) {
+    merged.set(bar.time, bar);
+  }
+  for (const bar of nextBars) {
+    merged.set(bar.time, bar);
+  }
+
+  const mergedBars = [...merged.values()].sort((left, right) => left.time - right.time);
+  const targetCount = Math.max(previousBars.length, nextBars.length);
+  return mergedBars.length > targetCount ? mergedBars.slice(-targetCount) : mergedBars;
+}
+
+function countRecentTradeBubbles(bubbles: TradeBubblePoint[], latestBarTimeSec: number | null, timeframeMs: number): number {
+  if (!Array.isArray(bubbles) || bubbles.length === 0 || !Number.isFinite(latestBarTimeSec) || !(timeframeMs > 0)) {
+    return 0;
+  }
+
+  const latestBarTimeMs = Number(latestBarTimeSec) * 1000;
+  const lookbackMs = Math.max(timeframeMs * 6, 12_000);
+  const thresholdMs = latestBarTimeMs - lookbackMs;
+  let count = 0;
+  for (const bubble of bubbles) {
+    if (Number.isFinite(bubble.time) && bubble.time >= thresholdMs) {
+      count += 1;
+    }
+  }
+  return count;
 }
 
 function resolveDefaultVisibleBarsForTimeframe(
@@ -694,6 +754,32 @@ export default function GpuChartV4Surface({
   const gpuHeatmapLevels = useMemo(() => normalizeHeatmapLevels(heatmapLevels), [heatmapLevels]);
   const gpuDomHistory = useMemo(() => normalizeDomHistory(domHistory), [domHistory]);
   const gpuPriceSignalBands = useMemo(() => normalizePriceSignalBands(priceSignalBands), [priceSignalBands]);
+  const preserveVisibleRange = true;
+  const lowTimeframeGuard = useMemo(() => {
+    const timeframeMs = timeframeToMs(timeframe);
+    if (timeframeMs > 5_000) {
+      return {
+        active: false,
+        operatorFlag: "",
+        reason: "",
+        recentTrades: 0,
+        minimumTrades: 0,
+      };
+    }
+
+    const latestBarTime = gpuBars[gpuBars.length - 1]?.time ?? null;
+    const recentTrades = countRecentTradeBubbles(gpuTradeBubbles, latestBarTime, timeframeMs);
+    const minimumTrades = timeframeMs <= 1_000 ? 8 : 6;
+    const active = recentTrades < minimumTrades;
+
+    return {
+      active,
+      operatorFlag: active ? "LOW_TF_UNSTABLE" : "",
+      reason: active ? "microstructure incomplete" : "",
+      recentTrades,
+      minimumTrades,
+    };
+  }, [gpuBars, gpuTradeBubbles, timeframe]);
 
   const secondarySourceFeeds = useMemo(() => {
     return multiSymbolFeeds
@@ -778,8 +864,7 @@ export default function GpuChartV4Surface({
     const hardReset = !currentCamera
       || previous.timeframe !== timeframe
       || previous.liveFeedKey !== (liveFeedKey ?? null)
-      || previous.count <= 0
-      || Math.abs(previous.count - nextCount) > Math.max(24, previous.count * 0.45);
+      || previous.count <= 0;
 
     if (hardReset) {
       cameraRef.current = {
@@ -794,10 +879,15 @@ export default function GpuChartV4Surface({
     const nextSpan = Math.max(8, Math.min(nextCount, previousSpan));
     const pinnedRight = currentCamera.to >= previous.count - 2;
     if (pinnedRight) {
-      cameraRef.current = {
-        from: Math.max(0, nextCount - (authoritativeSpanTarget ?? nextSpan)),
-        to: nextCount,
-      };
+      cameraRef.current = preserveVisibleRange
+        ? {
+          from: Math.max(0, nextCount - nextSpan),
+          to: nextCount,
+        }
+        : {
+          from: Math.max(0, nextCount - (authoritativeSpanTarget ?? nextSpan)),
+          to: nextCount,
+        };
       return;
     }
 
@@ -808,7 +898,7 @@ export default function GpuChartV4Surface({
       from: Math.max(0, nextCenter - nextSpan * 0.5),
       to: Math.min(nextCount, nextCenter + nextSpan * 0.5),
     };
-  }, [gpuBars, liveFeedKey, spanAuthorityMode, targetGrid, timeframe]);
+  }, [gpuBars, liveFeedKey, preserveVisibleRange, spanAuthorityMode, targetGrid, timeframe]);
 
   useEffect(() => {
     propCandlesRef.current = candles;
@@ -863,11 +953,12 @@ export default function GpuChartV4Surface({
           visualProfileRef.current,
           microstructureNoiseRatioRef.current,
         );
+        const mergedPrimaryBars = mergeBarsByTimestamp(barsRef.current, nextPrimaryBars);
         continuityRef.current.renderedFrames += 1;
         const jumpPx = measureGpuLastBarJumpPx(
           previousRenderedBarRef.current,
-          nextPrimaryBars[nextPrimaryBars.length - 1] ?? null,
-          nextPrimaryBars,
+          mergedPrimaryBars[mergedPrimaryBars.length - 1] ?? null,
+          mergedPrimaryBars,
           hostRef.current?.clientHeight || canvasRef.current?.clientHeight || 0,
         );
         continuityRef.current.latestJumpPx = jumpPx;
@@ -875,10 +966,10 @@ export default function GpuChartV4Surface({
         if (jumpPx >= 1.5) {
           continuityRef.current.jumpEvents += 1;
         }
-        previousRenderedBarRef.current = nextPrimaryBars[nextPrimaryBars.length - 1] ?? null;
-        barsRef.current = nextPrimaryBars;
+        previousRenderedBarRef.current = mergedPrimaryBars[mergedPrimaryBars.length - 1] ?? null;
+        barsRef.current = mergedPrimaryBars;
         feedBarsRef.current = normalizeViewportFeedsForComparison(
-          nextPrimaryBars,
+          mergedPrimaryBars,
           secondaryBatchedFeedsRef.current.length > 0 ? secondaryBatchedFeedsRef.current : secondarySourceFeedsRef.current,
         );
       });
@@ -1327,6 +1418,9 @@ export default function GpuChartV4Surface({
         host.setAttribute("data-gpu-span-authority-mode", spanAuthorityMode);
         host.setAttribute("data-gpu-span-authority-target-bars", authoritativeTargetBars != null ? String(authoritativeTargetBars) : "");
         host.setAttribute("data-gpu-span-authority-status", authoritativeTargetBars != null && visibleBars >= authoritativeTargetBars ? "PASS" : authoritativeTargetBars != null ? "FAIL" : "OFF");
+        host.setAttribute("data-gpu-preserve-visible-range", preserveVisibleRange ? "true" : "false");
+        host.setAttribute("data-gpu-low-tf-state", lowTimeframeGuard.active ? lowTimeframeGuard.operatorFlag : "stable");
+        host.setAttribute("data-gpu-low-tf-reason", lowTimeframeGuard.reason);
         host.setAttribute("data-gpu-diagnosis-summary", diagnosis.summary);
         host.setAttribute("data-gpu-diagnosis-primary", diagnosis.primary.join(","));
         if (camera) {
@@ -1406,7 +1500,7 @@ export default function GpuChartV4Surface({
       managerRef.current?.dispose();
       managerRef.current = null;
     };
-  }, [effectiveSmoothingMs, gpuDomHistory, gpuHeatmapLevels, gpuPriceSignalBands, gpuRecoveryEpoch, gpuTradeBubbles, heatIntensity, heatmapDiscardThreshold, onPerceptualTelemetry, rest.mode, rest.symbol, timeframe]);
+  }, [effectiveSmoothingMs, gpuDomHistory, gpuHeatmapLevels, gpuPriceSignalBands, gpuRecoveryEpoch, gpuTradeBubbles, heatIntensity, heatmapDiscardThreshold, lowTimeframeGuard.active, lowTimeframeGuard.operatorFlag, lowTimeframeGuard.reason, onPerceptualTelemetry, preserveVisibleRange, rest.mode, rest.symbol, timeframe]);
 
   // ── Input Engine: wheel zoom + left-drag pan + inertia ───────────────────
   useEffect(() => {
@@ -1537,6 +1631,15 @@ export default function GpuChartV4Surface({
   }, []);
 
   const showFallback = engineMode !== "v4" || initPhase === "fallback";
+  const gpuStatusLabel = gpuReady
+    ? `GPU renderer live | ${targetGrid === 16 ? "4x4" : targetGrid === 4 ? "2x2" : "1x1"} | feeds ${Math.max(1, (secondaryBatchedFeedsRef.current.length > 0 ? secondaryBatchedFeedsRef.current.length : fallbackFeedBars.length) + 1)}${liveFrameMeta ? ` | ${liveFrameMeta.syncStatus.toUpperCase()} ${(liveFrameMeta.confidence * 100).toFixed(0)}%` : ""}${lowTimeframeGuard.active ? ` | ${lowTimeframeGuard.operatorFlag}` : ""}`
+    : initPhase === "canvas-init"
+      ? "Initializing GPU..."
+      : `Fallback V3 | ${gpuReason}`;
+  const lowTimeframeGuardLabel = lowTimeframeGuard.active
+    ? `Microstructure incomplete: ${lowTimeframeGuard.recentTrades}/${lowTimeframeGuard.minimumTrades} recent trades on ${timeframe}.`
+    : "";
+  const timezoneLabel = useMemo(() => resolveLocalTimezoneLabel(), []);
 
   return (
     <div ref={hostRef} data-phase={initPhase} className={`gpu-chart-v4-shell ${className || ""}`}>
@@ -1548,15 +1651,7 @@ export default function GpuChartV4Surface({
       {/* Status badge */}
       <div className={`gpu-chart-v4-status ${gpuReady ? "ready" : "fallback"}`}>
         <span className="gpu-chart-v4-kicker">Engine {engineMode.toUpperCase()}</span>
-        <span>
-          {gpuReady
-            ? `GPU renderer live \u2022 ${targetGrid === 16 ? "4x4" : targetGrid === 4 ? "2x2" : "1x1"} \u2022 feeds ${Math.max(1, (secondaryBatchedFeedsRef.current.length > 0 ? secondaryBatchedFeedsRef.current.length : fallbackFeedBars.length) + 1)}${liveFrameMeta ? ` \u2022 ${liveFrameMeta.syncStatus.toUpperCase()} ${(liveFrameMeta.confidence * 100).toFixed(0)}%` : ""}`
-            : initPhase === "canvas-init"
-            ? "Initializing GPU\u2026"
-            : initPhase === "fallback"
-            ? `Fallback V3 \u2022 ${gpuReason}`
-            : `Fallback V3 \u2022 ${gpuReason}`}
-        </span>
+        <span>{gpuStatusLabel}</span>
       </div>
       {/* GPU metrics panel — visible only when WebGL2 is live */}
       {gpuReady && (
@@ -1592,11 +1687,17 @@ export default function GpuChartV4Surface({
           )}
         </div>
       )}
-      <div className="chart-timezone-pill" aria-hidden="true">UTC | drag pan</div>
+      <div className="chart-timezone-pill" aria-hidden="true">{timezoneLabel} | drag pan</div>
       {gpuReady && isPreviewMode ? (
         <div className="gpu-chart-v4-preview-banner" aria-live="polite">
           <strong>Preview candles</strong>
           <span>Feed degraded: display-only candles, perception and execution remain suspended.</span>
+        </div>
+      ) : null}
+      {gpuReady && lowTimeframeGuard.active ? (
+        <div className={`gpu-chart-v4-guard-banner ${isPreviewMode ? "gpu-chart-v4-guard-banner-stacked" : ""}`.trim()} aria-live="polite">
+          <strong>{lowTimeframeGuard.operatorFlag}</strong>
+          <span>{lowTimeframeGuardLabel}</span>
         </div>
       ) : null}
       {showFallback ? (
@@ -1906,14 +2007,19 @@ function buildViewports(input: {
       const x = col * cellWidth;
       const yTop = row * cellHeight;
       const y = Math.max(0, height - yTop - cellHeight);
-      const w = col === cells - 1 ? Math.max(1, width - x) : cellWidth;
-      const h = row === cells - 1 ? Math.max(1, height - yTop) : cellHeight;
+      const rawWidth = col === cells - 1 ? Math.max(1, width - x) : cellWidth;
+      const rawHeight = row === cells - 1 ? Math.max(1, height - yTop) : cellHeight;
+      const reserveRightAxis = grid === 1 && index === 0 ? GPU_HUD_RIGHT_AXIS_WIDTH : 0;
+      const reserveBottomAxis = grid === 1 && index === 0 ? GPU_HUD_BOTTOM_AXIS_HEIGHT : 0;
+      const w = Math.max(1, rawWidth - reserveRightAxis);
+      const h = Math.max(1, rawHeight - reserveBottomAxis);
+      const viewportY = y + reserveBottomAxis;
 
       viewports.push({
         id: index === 0 ? "primary" : (feed?.id || `feed-${index}`),
         symbol: index === 0 ? primarySymbol : (feed?.symbol || `feed-${index}`),
         x,
-        y,
+        y: viewportY,
         width: w,
         height: h,
         candles: bars,

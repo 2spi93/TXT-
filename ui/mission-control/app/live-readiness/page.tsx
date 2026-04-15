@@ -52,6 +52,24 @@ function pillTone(level: "fresh" | "stale" | "degraded" | "hard-fail" | "ok"): s
   return "bad";
 }
 
+function safeRecord(value: unknown): JsonMap {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as JsonMap
+    : {};
+}
+
+function numberOr(value: unknown, fallback = 0): number {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : fallback;
+}
+
+function countDepthLevels(value: unknown): number {
+  const payload = safeRecord(value);
+  const bids = Array.isArray(payload.bids) ? payload.bids.length : 0;
+  const asks = Array.isArray(payload.asks) ? payload.asks.length : 0;
+  return bids + asks;
+}
+
 export default function LiveReadinessPage() {
   const [overview, setOverview] = useState<JsonMap | null>(null);
   const [thresholds, setThresholds] = useState<JsonMap[]>([]);
@@ -161,6 +179,41 @@ export default function LiveReadinessPage() {
   const publicSignalAlignment = (chartOfflineCapture.public_signal_alignment as JsonMap | undefined) || {};
   const advisoryReasons = (chartOfflineCapture.advisory_reasons as string[] | undefined) || [];
   const offlineReasons = (chartOfflineCapture.offline_reasons as string[] | undefined) || [];
+  const routingEnvelope = safeRecord(marketBusSnapshot?.routing_score || marketBusSnapshot?.routingScore);
+  const routingCandidates = Array.isArray(routingEnvelope.candidates) ? routingEnvelope.candidates as JsonMap[] : [];
+  const bestRoute = safeRecord(routingEnvelope.best || routingCandidates[0]);
+  const bestRouteVenue = String(bestRoute.venue || "").trim() || "n/a";
+  const bestRouteScore = Math.max(0, numberOr(bestRoute.score, 0));
+  const routingReason = String(routingEnvelope.reason || (routingCandidates.length > 0 ? "best_route_candidate" : "missing"));
+  const routingSource = String(routingEnvelope.source || "n/a");
+  const snapshotTrades = Array.isArray(marketBusSnapshot?.trades) ? marketBusSnapshot?.trades as JsonMap[] : [];
+  const depthSnapshot = safeRecord(marketBusSnapshot?.depth_snapshot);
+  const depthPayload = safeRecord(depthSnapshot.depth_payload || marketBusSnapshot?.orderbook);
+  const executionDepthLevels = countDepthLevels(depthPayload);
+  const busSeq = Math.max(0, numberOr(marketBusOhlcvSeq.latest_seq, 0));
+  const busConnected = String(marketBusHealth.status || "") === "ok" && busSeq > 0;
+  const executionFlowOk = snapshotTrades.length > 0;
+  const executionDepthOk = executionDepthLevels > 0;
+  const executionRoutingOk = routingCandidates.length > 0 && bestRouteScore > 0;
+  const executionReady = busConnected && executionFlowOk && executionDepthOk && executionRoutingOk;
+  const executionStateLabel = executionReady ? "READY" : "DISABLED";
+  const executionStateTone = executionReady ? "good" : "bad";
+  const executionRejectionReasons = [
+    !busConnected ? (busSeq <= 0 ? "SEQ_ZERO" : "BUS_OFFLINE") : null,
+    !executionFlowOk ? "NO_TRADES" : null,
+    !executionDepthOk ? "NO_DEPTH" : null,
+    !(routingCandidates.length > 0) ? "NO_CANDIDATES" : null,
+    bestRouteScore <= 0 ? "ROUTING_SCORE_ZERO" : null,
+  ].filter((value): value is string => Boolean(value));
+  const executionBlockingReason = !busConnected
+    ? `bus ${String(marketBusHealth.status || "offline").toUpperCase()} seq #${busSeq}`
+    : !executionRoutingOk
+      ? `routing ${routingCandidates.length} candidate(s) score ${bestRouteScore.toFixed(2)}`
+      : !executionFlowOk
+        ? "flow empty"
+        : !executionDepthOk
+          ? "depth empty"
+          : "ready";
 
   return (
     <main className="shell txt-page-shell">
@@ -226,6 +279,32 @@ export default function LiveReadinessPage() {
           <div className="row"><span>Dernier sync</span><span>{String(marketBusSnapshot?.as_of || "-")}</span></div>
           <div className="row"><span>OHLCV latest seq</span><span>{String(marketBusOhlcvSeq.latest_seq || "-")}</span></div>
           <div className="row"><span>OHLCV contiguous</span><span className={Boolean(marketBusOhlcvSeq.contiguous) ? "good" : "warn"}>{String(Boolean(marketBusOhlcvSeq.contiguous))}</span></div>
+        </div>
+      </section>
+
+      <section className="grid" style={{ gridTemplateColumns: "1fr", marginBottom: 16 }}>
+        <div className="panel">
+          <div className="eyebrow">Execution Routing State <HelpHint text="Même verdict opérateur que dans le terminal: si bus, flow, depth ou routing manquent, l'exécution ne doit pas être lue comme disponible." examples={["Si le score de route est à 0, considère l'envoi comme bloqué même si les candles restent visibles.", "Si le bus est ok mais qu'il n'y a ni depth ni trades, le marché n'est pas exécutable proprement."]} /></div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10, marginBottom: 10 }}>
+            <span className={`chart-flow-pill tone-${busConnected ? "good" : "bad"}`}>BUS {busConnected ? "OK" : "OFFLINE"}</span>
+            <span className={`chart-flow-pill tone-${executionFlowOk ? "good" : "bad"}`}>FLOW {executionFlowOk ? "OK" : "EMPTY"}</span>
+            <span className={`chart-flow-pill tone-${executionDepthOk ? "good" : "bad"}`}>DEPTH {executionDepthOk ? "OK" : "EMPTY"}</span>
+            <span className={`chart-flow-pill tone-${executionRoutingOk ? "good" : "bad"}`}>ROUTING {executionRoutingOk ? `${routingCandidates.length} / ${bestRouteScore.toFixed(0)}` : "0 / 0"}</span>
+            <span className={`chart-flow-pill tone-${executionStateTone}`}>EXECUTION {executionStateLabel}</span>
+          </div>
+          {executionReady ? (
+            <div className="good" style={{ marginBottom: 10 }}>Etat d'execution coherent: bus, flow, depth et routing sont alignes.</div>
+          ) : (
+            <div className="warn" style={{ marginBottom: 10 }}>Execution desactivee: {executionBlockingReason}.</div>
+          )}
+          <div className="row"><span>Routing source</span><span>{routingSource}</span></div>
+          <div className="row"><span>Routing reason</span><span>{routingReason.replace(/_/g, " ")}</span></div>
+          <div className="row"><span>Routing candidates</span><span>{String(routingCandidates.length)}</span></div>
+          <div className="row"><span>Best route</span><span>{bestRouteVenue} · score {bestRouteScore.toFixed(2)}</span></div>
+          <div className="row"><span>Trades snapshot</span><span>{String(snapshotTrades.length)}</span></div>
+          <div className="row"><span>Depth levels</span><span>{String(executionDepthLevels)}</span></div>
+          <div className="row"><span>Bus seq</span><span>#{String(busSeq || 0)}</span></div>
+          <div className="row"><span>Reject reasons</span><span>{executionRejectionReasons.length > 0 ? executionRejectionReasons.join(" · ") : "NONE"}</span></div>
         </div>
       </section>
 

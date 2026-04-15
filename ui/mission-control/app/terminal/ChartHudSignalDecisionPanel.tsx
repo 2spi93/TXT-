@@ -1,6 +1,10 @@
 "use client";
 
+import { useEffect, useMemo, useState } from "react";
+
 import type { ChartHudSignalDecisionPanelProps } from "./chartHudTypes";
+
+const ADVANCED_MODULES_STORAGE_KEY = "txt.terminal.signal-panel.advanced";
 
 export default function ChartHudSignalDecisionPanel({
   signalDisplayMode,
@@ -100,9 +104,81 @@ export default function ChartHudSignalDecisionPanel({
   pendingExecutionAdaptation,
   onApplyPendingExecutionAdaptation,
 }: ChartHudSignalDecisionPanelProps) {
+  const [showAdvancedModules, setShowAdvancedModules] = useState(false);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    try {
+      const persisted = window.localStorage.getItem(ADVANCED_MODULES_STORAGE_KEY);
+      if (persisted === "1" || persisted === "0") {
+        setShowAdvancedModules(persisted === "1");
+        return;
+      }
+    } catch {
+      // noop
+    }
+    setShowAdvancedModules(signalDisplayMode === "ai-dominant");
+  }, [signalDisplayMode]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    try {
+      window.localStorage.setItem(ADVANCED_MODULES_STORAGE_KEY, showAdvancedModules ? "1" : "0");
+    } catch {
+      // noop
+    }
+  }, [showAdvancedModules]);
+
   if (signalDisplayMode === "classic") {
     return null;
   }
+
+  const advancedSummaryPills = useMemo(() => [
+    {
+      label: `AUTO ${autoExecutionGate.autoState} · ${autoExecutionGate.riskLabel}`,
+      tone: autoExecutionGate.autoState === "READY" ? "good" : autoExecutionGate.autoState === "KILLED" ? "bad" : "warn",
+    },
+    {
+      label: `INST ${institutionalSnapshot.healthScorePct.toFixed(0)}% · ${institutionalHealing.action}`,
+      tone: institutionalSnapshot.healthState === "strong" ? "good" : institutionalSnapshot.healthState === "guarded" ? "warn" : "bad",
+    },
+    {
+      label: `WAR ${executionWarfare.mode} · ${executionWarfare.guardAction}`,
+      tone: executionWarfare.guardAction === "BLOCK" ? "bad" : executionWarfare.mode === "AGGRESSIVE" ? "good" : "warn",
+    },
+    {
+      label: `LAT ${executionWarfare.latencyEdgeMs >= 0 ? "+" : ""}${executionWarfare.latencyEdgeMs.toFixed(0)}ms · sweep ${executionWarfare.sweepRiskPct.toFixed(0)}%`,
+      tone: Math.abs(executionWarfare.latencyEdgeMs) <= 80 && executionWarfare.sweepRiskPct < 45 ? "good" : Math.abs(executionWarfare.latencyEdgeMs) <= 180 ? "warn" : "bad",
+    },
+    {
+      label: `STAB ${stabilityEngine.monitorScorePct.toFixed(0)}% · ${stabilityEngine.shouldBlockExecution ? "BLOCK" : stabilityEngine.mode.toUpperCase()}`,
+      tone: stabilityEngine.shouldBlockExecution ? "bad" : stabilityEngine.mode === "live" ? "good" : "warn",
+    },
+    {
+      label: `LEARN ${selfLearningV4Active ? "ACTIVE" : "WARMUP"} · ${selfLearningV4DriftLabel}`,
+      tone: selfLearningDriftV4.shouldDemote ? "bad" : selfLearningV4Active ? "good" : "warn",
+    },
+  ], [
+    autoExecutionGate.autoState,
+    autoExecutionGate.riskLabel,
+    executionWarfare.guardAction,
+    executionWarfare.latencyEdgeMs,
+    executionWarfare.mode,
+    executionWarfare.sweepRiskPct,
+    institutionalHealing.action,
+    institutionalSnapshot.healthScorePct,
+    institutionalSnapshot.healthState,
+    selfLearningDriftV4.shouldDemote,
+    selfLearningV4Active,
+    selfLearningV4DriftLabel,
+    stabilityEngine.mode,
+    stabilityEngine.monitorScorePct,
+    stabilityEngine.shouldBlockExecution,
+  ]);
 
   return (
     <div className={`chart-signal-card chart-signal-card-${marketSignal.dominantDirection}`}>
@@ -233,6 +309,32 @@ export default function ChartHudSignalDecisionPanel({
               <span className="chart-action-pill">{trailingV3.detail}</span>
             </div>
           </div>
+          <div className="chart-module-summary">
+            <div className="chart-signal-kicker">Desk Summary</div>
+            <div className="chart-module-summary-grid">
+              {advancedSummaryPills.map((pill) => (
+                <span key={pill.label} className={`chart-action-pill chart-action-pill-status ${pill.tone}`}>
+                  {pill.label}
+                </span>
+              ))}
+            </div>
+            <div className="chart-module-summary-actions">
+              <span className="chart-module-summary-copy">
+                {showAdvancedModules
+                  ? "Les modules experts sont affiches."
+                  : "Les modules experts sont replies pour garder une lecture nette du terminal."}
+              </span>
+              <button
+                type="button"
+                className={`chart-chip ${showAdvancedModules ? "active" : ""}`}
+                onClick={() => setShowAdvancedModules((current) => !current)}
+              >
+                {showAdvancedModules ? "Masquer modules experts" : "Afficher modules experts"}
+              </button>
+            </div>
+          </div>
+          {showAdvancedModules ? (
+            <>
           <div className="chart-execution-brain-v3">
             <div className="chart-signal-kicker">Explainable RL</div>
             <div className="chart-learning-strip">
@@ -488,6 +590,8 @@ export default function ChartHudSignalDecisionPanel({
                 Apply Adaptation
               </button>
             </div>
+          ) : null}
+            </>
           ) : null}
         </div>
         {marketDecision.criticalConfirmed ? <div className="chart-decision-confirmed">Critical confirmation: 2 sources aligned</div> : null}

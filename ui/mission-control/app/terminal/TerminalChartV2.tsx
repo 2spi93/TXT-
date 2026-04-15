@@ -16,6 +16,7 @@ import type { ChartPerceptualTelemetry, GpuPerceptualTelemetry } from "./chartPe
 import type { PerceptualExecutionSignal } from "./chartPerceptualEngine";
 import type { MarketSimulation } from "./marketSimulationEngine";
 import type { PriceSignalBand } from "../../lib/engine/gpu-chart/PriceSignalLayer";
+import type { LiveChartFrameMeta } from "../../lib/chartFrameFeed";
 import { DEFAULT_MIN_RENDERABLE_BARS } from "../../lib/ohlcvIntegrity";
 import { timeframeToMs } from "../../lib/ohlcvDataEngine";
 import { computePredictionV5, type PredictionV5 } from "../../lib/predictionEngineV5";
@@ -181,8 +182,18 @@ type Props = {
   chartEngineMode?: ChartEngineMode;
   gpuViewportGrid?: GpuViewportGrid;
   chartSmoothingMs?: ChartSmoothingMs;
+  chartTruth?: {
+    sourceLabel: string;
+    modeLabel: string;
+    clockLabel: string;
+    lagLabel: string;
+    freshnessLabel: string;
+    routeLabel: string;
+    lagTone: "good" | "warn" | "bad" | "neutral";
+  } | null;
   onChartPerceptualTelemetry?: (payload: ChartPerceptualTelemetry) => void;
   onGpuPerceptualTelemetry?: (payload: GpuPerceptualTelemetry) => void;
+  onGpuViewportFrameMetaChange?: (payload: Record<string, LiveChartFrameMeta>) => void;
   onSmartDecisionHudChange?: (payload: SmartDecisionHudShape) => void;
 };
 
@@ -329,8 +340,10 @@ export default function TerminalChartV2(props: Props) {
     chartEngineMode = "v3",
     gpuViewportGrid = "auto",
     chartSmoothingMs = 140,
+    chartTruth = null,
     onChartPerceptualTelemetry,
     onGpuPerceptualTelemetry,
+    onGpuViewportFrameMetaChange,
     onSmartDecisionHudChange,
   } = props;
 
@@ -870,6 +883,16 @@ export default function TerminalChartV2(props: Props) {
         <span className="terminal-v2-sep" />
         <span className="terminal-v2-intent-label">{lowFlowEdgeBlocked ? `${flowConfidenceLabel} · execution blocked` : intent === "observe" ? "perception layer" : intent === "analyze" ? "structure analysis" : "execution mode"}</span>
       </div>
+      {chartTruth ? (
+        <div className="terminal-v2-truth-strip" aria-live="polite">
+          <span className="terminal-v2-truth-pill terminal-v2-truth-pill-source">{chartTruth.sourceLabel}</span>
+          <span className="terminal-v2-truth-pill">{chartTruth.modeLabel}</span>
+          <span className="terminal-v2-truth-pill">{chartTruth.clockLabel}</span>
+          <span className={`terminal-v2-truth-pill terminal-v2-truth-pill-${chartTruth.lagTone}`}>{chartTruth.lagLabel}</span>
+          <span className="terminal-v2-truth-pill">{chartTruth.freshnessLabel}</span>
+          <span className="terminal-v2-truth-pill">{chartTruth.routeLabel}</span>
+        </div>
+      ) : null}
 
       {/* ─── ROW 2: CHART CORE + AI HUD ─── */}
       <div className={`terminal-v2-core${hasSidecar ? " has-sidecar" : ""}`}>
@@ -905,7 +928,8 @@ export default function TerminalChartV2(props: Props) {
               smoothingMs={effectiveChartSmoothingMs}
               multiSymbolFeeds={gpuViewportFeeds}
               onCrosshairMove={handleCrosshairMove}
-              onPerceptualTelemetry={analyticsReady ? onGpuPerceptualTelemetry : undefined}
+              onPerceptualTelemetry={onGpuPerceptualTelemetry}
+              onViewportFrameMetaChange={onGpuViewportFrameMetaChange}
             />
           ) : (
             <InstitutionalChart

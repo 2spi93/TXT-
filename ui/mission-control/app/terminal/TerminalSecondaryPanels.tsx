@@ -6,6 +6,12 @@ import HelpHint from "../../components/HelpHint";
 import PanelShell from "../../components/ui/PanelShell";
 import type { SmartDecisionHudShape } from "./chartHudTypes";
 import { buildFeedbackSummary } from "./feedbackEngine";
+import {
+  EXECUTION_DECISION_POLICY_VERSION,
+  resolveExecutionDecisionCodeFromJournalAction,
+  validateExecutionDecisionAudit,
+  type ExecutionDecisionAudit,
+} from "../../lib/executionDecisionSchema";
 import SmartDecisionSummary from "./SmartDecisionSummary";
 
 type RiskTimelineFilter = "all" | "compliant" | "miss";
@@ -528,6 +534,19 @@ type DisciplineAnalytics = {
   heatmap: DisciplineHeatRow[];
 };
 
+type ExecutionDecisionJournalAuditSummary = {
+  relevantCount: number;
+  canonicalCount: number;
+  missingCount: number;
+  versionDriftCount: number;
+  mismatchedCodeCount: number;
+  tone: "good" | "subtle" | "warn";
+  summary: string;
+  topCodes: Array<{ label: string; count: number }>;
+  latestIssueEntry: OperatorJournalEntry | null;
+  latestIssueLabel: string;
+};
+
 const OPERATOR_OVERRIDE_STORAGE_KEY = "txt.operator.override.v1";
 
 function isOperatorJournalEntry(value: unknown): value is OperatorJournalEntry {
@@ -541,6 +560,117 @@ function isOperatorJournalEntry(value: unknown): value is OperatorJournalEntry {
     && String(row.action || "").trim()
     && String(row.detail || "").trim(),
   );
+}
+
+function isExecutionDecisionJournalAction(action: string): boolean {
+  const normalized = action.trim().toLowerCase();
+  return normalized === "execution-v7-blocked"
+    || normalized === "execution-disabled-fallback"
+    || normalized === "execution-disabled-policy"
+    || normalized === "execution-disabled-routing"
+    || normalized.startsWith("execution-v7-outcome-");
+}
+
+function getExecutionDecisionAudit(entry: OperatorJournalEntry): ExecutionDecisionAudit | null {
+  const meta = safeRecord(entry.meta);
+  return validateExecutionDecisionAudit(meta.decision_audit);
+}
+
+function resolveExpectedExecutionDecisionCode(entry: OperatorJournalEntry) {
+  const meta = safeRecord(entry.meta);
+  const executionLock = safeRecord(meta.execution_lock);
+  return resolveExecutionDecisionCodeFromJournalAction(entry.action, {
+    executionLockCode: executionLock.code,
+  });
+}
+
+function buildExecutionDecisionJournalAudit(entries: OperatorJournalEntry[]): ExecutionDecisionJournalAuditSummary {
+  const relevantEntries = entries.filter((entry) => isExecutionDecisionJournalAction(entry.action));
+  if (relevantEntries.length === 0) {
+    return {
+      relevantCount: 0,
+      canonicalCount: 0,
+      missingCount: 0,
+      versionDriftCount: 0,
+      mismatchedCodeCount: 0,
+      tone: "subtle",
+      summary: "Aucun evenement d'execution recent dans ce journal. Le schema canonique n'a rien a auditer sur la fenetre chargee.",
+      topCodes: [],
+      latestIssueEntry: null,
+      latestIssueLabel: "",
+    };
+  }
+
+  const codeCounts = new Map<string, number>();
+  let canonicalCount = 0;
+  let missingCount = 0;
+  let versionDriftCount = 0;
+  let mismatchedCodeCount = 0;
+  let latestIssueEntry: OperatorJournalEntry | null = null;
+  let latestIssueLabel = "";
+
+  relevantEntries.forEach((entry) => {
+    const audit = getExecutionDecisionAudit(entry);
+    const expectedCode = resolveExpectedExecutionDecisionCode(entry);
+
+    if (!audit) {
+      missingCount += 1;
+      if (!latestIssueEntry) {
+        latestIssueEntry = entry;
+        latestIssueLabel = "decision_audit absent";
+      }
+      return;
+    }
+
+    codeCounts.set(audit.code, (codeCounts.get(audit.code) || 0) + 1);
+
+    if (audit.policyVersion !== EXECUTION_DECISION_POLICY_VERSION) {
+      versionDriftCount += 1;
+      if (!latestIssueEntry) {
+        latestIssueEntry = entry;
+        latestIssueLabel = `version ${audit.policyVersion}`;
+      }
+      return;
+    }
+
+    if (expectedCode && audit.code !== expectedCode) {
+      mismatchedCodeCount += 1;
+      if (!latestIssueEntry) {
+        latestIssueEntry = entry;
+        latestIssueLabel = `code inattendu ${audit.code}`;
+      }
+      return;
+    }
+
+    canonicalCount += 1;
+  });
+
+  const issueCount = missingCount + versionDriftCount + mismatchedCodeCount;
+  const tone: ExecutionDecisionJournalAuditSummary["tone"] = issueCount === 0
+    ? "good"
+    : missingCount > 0 || mismatchedCodeCount > 0
+      ? "warn"
+      : "subtle";
+  const summary = issueCount === 0
+    ? `Les ${canonicalCount} evenements d'execution recents respectent le schema canonique ${EXECUTION_DECISION_POLICY_VERSION}.`
+    : `${canonicalCount}/${relevantEntries.length} evenements sont canoniques. ${missingCount} sans audit, ${versionDriftCount} en derive de version, ${mismatchedCodeCount} avec code incoherent.`;
+  const topCodes = Array.from(codeCounts.entries())
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, 3)
+    .map(([label, count]) => ({ label, count }));
+
+  return {
+    relevantCount: relevantEntries.length,
+    canonicalCount,
+    missingCount,
+    versionDriftCount,
+    mismatchedCodeCount,
+    tone,
+    summary,
+    topCodes,
+    latestIssueEntry,
+    latestIssueLabel,
+  };
 }
 
 function formatOperatorJournalAction(action: string): string {
@@ -1306,6 +1436,10 @@ export function OperatorActionSummary({
     driftItems,
     journalContext,
   }), [decision, executionPnlPayload, liveOpsPayload, driftItems, journalContext, journalEntries]);
+  const executionDecisionAudit = useMemo(
+    () => buildExecutionDecisionJournalAudit(journalEntries),
+    [journalEntries],
+  );
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -1638,6 +1772,41 @@ export function OperatorActionSummary({
                 </div>
               )}
             </div>
+          </div>
+          <div className="operator-discipline-drift-box" data-testid="execution-decision-schema-audit">
+            <div className="operator-feedback-head">
+              <div className="subtle mini">Execution decision schema</div>
+              <div className={`operator-dominance-chip ${executionDecisionAudit.tone}`}>
+                {executionDecisionAudit.relevantCount > 0
+                  ? `${executionDecisionAudit.canonicalCount}/${executionDecisionAudit.relevantCount} canonical`
+                  : "AUCUN EVENT"}
+              </div>
+            </div>
+            <div className="operator-journal-summary">{executionDecisionAudit.summary}</div>
+            <div className="operator-discipline-list">
+              <div className="operator-discipline-row">
+                <strong>Sans audit</strong>
+                <span>{executionDecisionAudit.missingCount}</span>
+              </div>
+              <div className="operator-discipline-row">
+                <strong>Version drift</strong>
+                <span>{executionDecisionAudit.versionDriftCount}</span>
+              </div>
+              <div className="operator-discipline-row">
+                <strong>Code mismatch</strong>
+                <span>{executionDecisionAudit.mismatchedCodeCount}</span>
+              </div>
+              <div className="operator-discipline-row">
+                <strong>Top codes</strong>
+                <span>{executionDecisionAudit.topCodes.length > 0 ? executionDecisionAudit.topCodes.map((item) => `${item.label} x${item.count}`).join(" · ") : "n/a"}</span>
+              </div>
+            </div>
+            {executionDecisionAudit.latestIssueEntry ? (
+              <div className="operator-discipline-row operator-discipline-blocked-row">
+                <strong>{formatClock(executionDecisionAudit.latestIssueEntry.createdAtIso)} · {executionDecisionAudit.latestIssueLabel}</strong>
+                <span>{formatOperatorJournalAction(executionDecisionAudit.latestIssueEntry.action)} · {executionDecisionAudit.latestIssueEntry.detail}</span>
+              </div>
+            ) : null}
           </div>
           {driftError ? <div className="operator-journal-summary warn">{driftError}</div> : null}
         </div>

@@ -79,6 +79,62 @@ export type MarketDataBusKernelTelemetry = {
   lastDrainAt: string | null;
 };
 
+type FusionQuoteSyncStats = {
+  totalQuotes: number;
+  instrumentMatches: number;
+  activeVenueMatches: number;
+  acceptedQuotes: number;
+  activeVenues: string[];
+  instrumentCandidates: string[];
+  acceptedVenues: string[];
+};
+
+type HydrationSocketTrace = {
+  url: string | null;
+  open_count: number;
+  message_count: number;
+  error_count: number;
+  close_count: number;
+  last_state: "idle" | "connecting" | "open" | "error" | "closed";
+  last_message_type: string | null;
+  last_message_at: string | null;
+  last_error_at: string | null;
+  last_close_at: string | null;
+};
+
+type HydrationTrace = {
+  instance_id: string;
+  connect_calls: number;
+  last_connect_at: string | null;
+  last_config_key: string | null;
+  last_connect_short_circuit: string | null;
+  reset_count: number;
+  last_reset_reason: string | null;
+  last_reset_at: string | null;
+  refresh_count: number;
+  refresh_started_count: number;
+  last_refresh_request_type: string | null;
+  last_refresh_stage: "idle" | "started" | "skipped" | "completed" | "aborted" | "failed";
+  last_refresh_skip_reason: string | null;
+  last_refresh_ok: boolean;
+  last_refresh_status: number;
+  last_refresh_at: string | null;
+  last_quotes_count: number;
+  last_snapshot_trade_count: number;
+  last_snapshot_depth_levels: number;
+  last_snapshot_routing_candidates: number;
+  last_snapshot_seq: number;
+  trade_ws: HydrationSocketTrace;
+  depth_ws: HydrationSocketTrace;
+  listener_count: number;
+  emit_count: number;
+  last_emit_at: string | null;
+  last_dispatch_trade_count: number;
+  last_dispatch_depth_levels: number;
+  last_dispatch_routing_candidates: number;
+  last_dispatch_seq: number;
+};
+
 type MarketDataBusListener = (snapshot: MarketDataBusSnapshot) => void;
 
 const SIDE_REFRESH_MS = 2_500;
@@ -101,6 +157,8 @@ const RENDER_BUFFER_MIN_MS = 20;
 const RENDER_BUFFER_MAX_MS = 80;
 const RENDER_JITTER_SAMPLE_SIZE = 32;
 const RENDER_COALESCE_BACKLOG_THRESHOLD = 500;
+
+let marketDataBusInstanceCounter = 0;
 
 type PendingRenderFrame = {
   feedKey: string;
@@ -383,6 +441,66 @@ function mapToDepthRows(sideMap: Map<string, number>, side: "bid" | "ask"): Arra
     .sort((left, right) => (side === "bid" ? right[0] - left[0] : left[0] - right[0]));
 }
 
+function countDepthLevelsFromPayload(value: unknown): number {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return 0;
+  }
+  const payload = value as JsonMap;
+  const bids = Array.isArray(payload.bids) ? payload.bids.length : 0;
+  const asks = Array.isArray(payload.asks) ? payload.asks.length : 0;
+  return bids + asks;
+}
+
+function createHydrationSocketTrace(): HydrationSocketTrace {
+  return {
+    url: null,
+    open_count: 0,
+    message_count: 0,
+    error_count: 0,
+    close_count: 0,
+    last_state: "idle",
+    last_message_type: null,
+    last_message_at: null,
+    last_error_at: null,
+    last_close_at: null,
+  };
+}
+
+function createHydrationTrace(): HydrationTrace {
+  return {
+    instance_id: "",
+    connect_calls: 0,
+    last_connect_at: null,
+    last_config_key: null,
+    last_connect_short_circuit: null,
+    reset_count: 0,
+    last_reset_reason: null,
+    last_reset_at: null,
+    refresh_count: 0,
+    refresh_started_count: 0,
+    last_refresh_request_type: null,
+    last_refresh_stage: "idle",
+    last_refresh_skip_reason: null,
+    last_refresh_ok: false,
+    last_refresh_status: 0,
+    last_refresh_at: null,
+    last_quotes_count: 0,
+    last_snapshot_trade_count: 0,
+    last_snapshot_depth_levels: 0,
+    last_snapshot_routing_candidates: 0,
+    last_snapshot_seq: 0,
+    trade_ws: createHydrationSocketTrace(),
+    depth_ws: createHydrationSocketTrace(),
+    listener_count: 0,
+    emit_count: 0,
+    last_emit_at: null,
+    last_dispatch_trade_count: 0,
+    last_dispatch_depth_levels: 0,
+    last_dispatch_routing_candidates: 0,
+    last_dispatch_seq: 0,
+  };
+}
+
 function mergeDepthDelta(currentDepth: JsonMap | null, deltaPayload: JsonMap): JsonMap {
   const currentPayload = ((currentDepth?.depth_payload as JsonMap | undefined) || {});
   const bidsMap = new Map<string, number>();
@@ -557,6 +675,7 @@ function hasUsableSnapshotData(payload: JsonMap): boolean {
 }
 
 class MarketDataBus {
+  private readonly instanceId: string;
   private listeners = new Set<MarketDataBusListener>();
   private snapshot: MarketDataBusSnapshot = {
     configKey: "",
@@ -627,8 +746,24 @@ class MarketDataBus {
   private lastTradeArrivalAt = 0;
   private lastDepthArrivalAt = 0;
   private goldenFrameWorker: GoldenFrameWorkerAdapter | null = null;
+  private fusionQuoteSyncStats: FusionQuoteSyncStats = {
+    totalQuotes: 0,
+    instrumentMatches: 0,
+    activeVenueMatches: 0,
+    acceptedQuotes: 0,
+    activeVenues: [],
+    instrumentCandidates: [],
+    acceptedVenues: [],
+  };
+  private hydrationTrace: HydrationTrace = createHydrationTrace();
 
   constructor() {
+    marketDataBusInstanceCounter += 1;
+    this.instanceId = `mdb-${marketDataBusInstanceCounter}`;
+    this.hydrationTrace = {
+      ...this.hydrationTrace,
+      instance_id: this.instanceId,
+    };
     this.goldenFrameWorker = new GoldenFrameWorkerAdapter((event) => {
       this.handleGoldenFrameWorkerEvent(event);
     });
@@ -636,15 +771,43 @@ class MarketDataBus {
 
   subscribe(listener: MarketDataBusListener): () => void {
     this.listeners.add(listener);
+    this.hydrationTrace = {
+      ...this.hydrationTrace,
+      listener_count: this.listeners.size,
+    };
     listener(this.snapshot);
     return () => {
       this.listeners.delete(listener);
+      this.hydrationTrace = {
+        ...this.hydrationTrace,
+        listener_count: this.listeners.size,
+      };
     };
   }
 
   connect(config: MarketDataBusConfig): void {
     const nextKey = `${config.instrument}|${config.venue}|${config.timeframe}`;
+    this.hydrationTrace = {
+      ...createHydrationTrace(),
+      instance_id: this.instanceId,
+      connect_calls: this.hydrationTrace.connect_calls + 1,
+      reset_count: this.hydrationTrace.reset_count,
+      last_reset_reason: this.hydrationTrace.last_reset_reason,
+      last_reset_at: this.hydrationTrace.last_reset_at,
+      last_connect_at: new Date().toISOString(),
+      last_config_key: nextKey,
+      listener_count: this.listeners.size,
+    };
     if (this.snapshot.configKey === nextKey) {
+      this.hydrationTrace = {
+        ...this.hydrationTrace,
+        last_connect_short_circuit: "same-config-key",
+      };
+      this.snapshot = {
+        ...this.snapshot,
+        busMeta: this.buildWorkerBusMeta(this.snapshot.busMeta),
+      };
+      this.emit();
       return;
     }
 
@@ -738,8 +901,9 @@ class MarketDataBus {
     void this.refreshNow("ai");
   }
 
-  disconnect(): void {
+  disconnect(reason = "manual-disconnect"): void {
     const previousKey = this.snapshot.configKey;
+    const previousHydrationTrace = this.hydrationTrace;
     this.disconnectSockets();
     this.config = null;
     this.engine = null;
@@ -783,6 +947,37 @@ class MarketDataBus {
     this.depthArrivalGapSamples = [];
     this.lastTradeArrivalAt = 0;
     this.lastDepthArrivalAt = 0;
+    this.hydrationTrace = {
+      ...createHydrationTrace(),
+      instance_id: this.instanceId,
+      connect_calls: previousHydrationTrace.connect_calls,
+      last_connect_at: previousHydrationTrace.last_connect_at,
+      last_config_key: previousHydrationTrace.last_config_key,
+      last_connect_short_circuit: previousHydrationTrace.last_connect_short_circuit,
+      reset_count: previousHydrationTrace.reset_count + 1,
+      last_reset_reason: reason,
+      last_reset_at: new Date().toISOString(),
+      refresh_count: previousHydrationTrace.refresh_count,
+      refresh_started_count: previousHydrationTrace.refresh_started_count,
+      last_refresh_request_type: previousHydrationTrace.last_refresh_request_type,
+      last_refresh_stage: previousHydrationTrace.last_refresh_stage,
+      last_refresh_skip_reason: previousHydrationTrace.last_refresh_skip_reason,
+      last_refresh_ok: previousHydrationTrace.last_refresh_ok,
+      last_refresh_status: previousHydrationTrace.last_refresh_status,
+      last_refresh_at: previousHydrationTrace.last_refresh_at,
+      last_quotes_count: previousHydrationTrace.last_quotes_count,
+      last_snapshot_trade_count: previousHydrationTrace.last_snapshot_trade_count,
+      last_snapshot_depth_levels: previousHydrationTrace.last_snapshot_depth_levels,
+      last_snapshot_routing_candidates: previousHydrationTrace.last_snapshot_routing_candidates,
+      last_snapshot_seq: previousHydrationTrace.last_snapshot_seq,
+      listener_count: this.listeners.size,
+      emit_count: previousHydrationTrace.emit_count,
+      last_emit_at: previousHydrationTrace.last_emit_at,
+      last_dispatch_trade_count: previousHydrationTrace.last_dispatch_trade_count,
+      last_dispatch_depth_levels: previousHydrationTrace.last_dispatch_depth_levels,
+      last_dispatch_routing_candidates: previousHydrationTrace.last_dispatch_routing_candidates,
+      last_dispatch_seq: previousHydrationTrace.last_dispatch_seq,
+    };
     this.emit();
   }
 
@@ -846,6 +1041,9 @@ class MarketDataBus {
         adaptiveGraceMs: kernelTelemetry.adaptiveGraceMs,
         frameSyncStatus: kernelTelemetry.frameSyncStatus,
         frameSyncConfidence: kernelTelemetry.frameSyncConfidence,
+      },
+      hydration_trace: {
+        ...this.hydrationTrace,
       },
     };
   }
@@ -1199,15 +1397,39 @@ class MarketDataBus {
   async refreshNow(requestType: MarketBusRequestType = "ai"): Promise<void> {
     const config = this.config;
     if (!config) {
+      this.hydrationTrace = {
+        ...this.hydrationTrace,
+        last_refresh_stage: "failed",
+        last_refresh_skip_reason: "missing-config",
+      };
       return;
     }
+    this.hydrationTrace = {
+      ...this.hydrationTrace,
+      refresh_count: this.hydrationTrace.refresh_count + 1,
+      refresh_started_count: this.hydrationTrace.refresh_started_count + 1,
+      last_refresh_request_type: requestType,
+      last_refresh_at: new Date().toISOString(),
+      last_refresh_stage: "started",
+      last_refresh_skip_reason: null,
+    };
 
     const sideFetchConfigKey = `${config.instrument}|${config.venue}|${config.timeframe}`;
     if (this.sideFetchController && this.sideFetchConfigKey === sideFetchConfigKey) {
+      this.hydrationTrace = {
+        ...this.hydrationTrace,
+        last_refresh_stage: "skipped",
+        last_refresh_skip_reason: "side-fetch-already-active",
+      };
       return;
     }
 
     if (Date.now() < this.snapshotFailureCooldownUntil) {
+      this.hydrationTrace = {
+        ...this.hydrationTrace,
+        last_refresh_stage: "skipped",
+        last_refresh_skip_reason: "snapshot-retry-cooldown",
+      };
       this.scheduleSideRefresh(Math.max(5_000, this.snapshotFailureCooldownUntil - Date.now()));
       return;
     }
@@ -1246,6 +1468,11 @@ class MarketDataBus {
     ]);
 
     if (controller.signal.aborted || this.config?.instrument !== instrument || this.config?.timeframe !== config.timeframe || this.config?.venue !== venue) {
+      this.hydrationTrace = {
+        ...this.hydrationTrace,
+        last_refresh_stage: "aborted",
+        last_refresh_skip_reason: "request-aborted-or-config-changed",
+      };
       releaseSideFetch();
       return;
     }
@@ -1311,6 +1538,31 @@ class MarketDataBus {
     }
 
     const busPayload = payload && typeof payload === "object" ? payload as JsonMap : {};
+    const busDepthPayload = busPayload.depth_snapshot && typeof busPayload.depth_snapshot === "object"
+      ? (((busPayload.depth_snapshot as JsonMap).depth_payload as JsonMap | undefined) || (busPayload.depth_snapshot as JsonMap))
+      : busPayload.orderbook && typeof busPayload.orderbook === "object"
+        ? busPayload.orderbook as JsonMap
+        : null;
+    const snapshotRouting = (busPayload.routing_score && typeof busPayload.routing_score === "object")
+      ? busPayload.routing_score as JsonMap
+      : (busPayload.routingScore && typeof busPayload.routingScore === "object")
+        ? busPayload.routingScore as JsonMap
+        : null;
+    const snapshotCandidates = Array.isArray(snapshotRouting?.candidates) ? snapshotRouting?.candidates as JsonMap[] : [];
+    const snapshotSeq = busPayload.meta && typeof busPayload.meta === "object"
+      ? toNumber((((busPayload.meta as JsonMap).sequencing as JsonMap | undefined)?.ohlcv as JsonMap | undefined)?.latest_seq, 0)
+      : 0;
+    this.hydrationTrace = {
+      ...this.hydrationTrace,
+      last_refresh_stage: snapshotResponse.ok ? "completed" : "failed",
+      last_refresh_ok: snapshotResponse.ok,
+      last_refresh_status: snapshotResponse.status,
+      last_quotes_count: Array.isArray(quotesPayload) ? quotesPayload.length : 0,
+      last_snapshot_trade_count: Array.isArray(busPayload.trades) ? busPayload.trades.length : 0,
+      last_snapshot_depth_levels: countDepthLevelsFromPayload(busDepthPayload),
+      last_snapshot_routing_candidates: snapshotCandidates.length,
+      last_snapshot_seq: Math.max(0, Math.round(snapshotSeq)),
+    };
     this.syncFusionQuotes(Array.isArray(quotesPayload) ? quotesPayload as JsonMap[] : []);
     const fallbackBars = normalizeOhlcvRows(Array.isArray(busPayload.ohlcv_rows) ? busPayload.ohlcv_rows : [], { timeframe: config.timeframe });
     const rawTrades = Array.isArray(busPayload.trades) ? busPayload.trades as JsonMap[] : [];
@@ -1376,12 +1628,35 @@ class MarketDataBus {
 
   private emit(): void {
     const nextOrderflowRuntime = this.orderflowRuntimeEngine ? this.orderflowRuntimeEngine.getSnapshot() : null;
+    const depthPayload = this.snapshot.marketDepth && typeof this.snapshot.marketDepth === "object"
+      ? (((this.snapshot.marketDepth as JsonMap).depth_payload as JsonMap | undefined) || (this.snapshot.marketDepth as JsonMap))
+      : this.snapshot.orderbook && typeof this.snapshot.orderbook === "object"
+        ? this.snapshot.orderbook as JsonMap
+        : null;
+    const routingCandidates = Array.isArray(this.snapshot.routingScore?.candidates)
+      ? this.snapshot.routingScore?.candidates as JsonMap[]
+      : [];
+    const latestSeq = toNumber((((this.snapshot.busMeta?.sequencing as JsonMap | undefined)?.ohlcv as JsonMap | undefined)?.latest_seq), 0);
+    this.hydrationTrace = {
+      ...this.hydrationTrace,
+      listener_count: this.listeners.size,
+      emit_count: this.hydrationTrace.emit_count + 1,
+      last_emit_at: new Date().toISOString(),
+      last_dispatch_trade_count: this.snapshot.nativeTrades.length,
+      last_dispatch_depth_levels: countDepthLevelsFromPayload(depthPayload),
+      last_dispatch_routing_candidates: routingCandidates.length,
+      last_dispatch_seq: Math.max(0, Math.round(latestSeq)),
+    };
     if (this.snapshot.orderflowRuntime !== nextOrderflowRuntime) {
       this.snapshot = {
         ...this.snapshot,
         orderflowRuntime: nextOrderflowRuntime,
       };
     }
+    this.snapshot = {
+      ...this.snapshot,
+      busMeta: this.buildWorkerBusMeta(this.snapshot.busMeta),
+    };
     for (const listener of this.listeners) {
       listener(this.snapshot);
     }
@@ -1702,17 +1977,25 @@ class MarketDataBus {
     if (!config || !this.fusionEngine) {
       return;
     }
-    const candidates = new Set(fusionInstrumentCandidates(config.instrument));
+    const instrumentCandidates = fusionInstrumentCandidates(config.instrument);
+    const candidates = new Set(instrumentCandidates);
+    const activeVenues = this.activeFusionVenues();
     const now = Date.now();
+    let instrumentMatches = 0;
+    let activeVenueMatches = 0;
+    let acceptedQuotes = 0;
+    const acceptedVenues = new Set<string>();
     for (const item of quotes) {
       const instrument = String(item.instrument || "").toUpperCase();
       if (!candidates.has(instrument)) {
         continue;
       }
+      instrumentMatches += 1;
       const venue = String(item.venue || "");
-      if (!this.activeFusionVenues().includes(venue)) {
+      if (!activeVenues.includes(venue)) {
         continue;
       }
+      activeVenueMatches += 1;
       const updatedAt = typeof item.updated_at === "string" ? Date.parse(item.updated_at) : NaN;
       this.fusionEngine.updateQuote({
         venue,
@@ -1721,7 +2004,18 @@ class MarketDataBus {
         last: toNumber(item.last, 0),
         tsMs: Number.isFinite(updatedAt) ? updatedAt : now,
       });
+      acceptedQuotes += 1;
+      acceptedVenues.add(venue);
     }
+    this.fusionQuoteSyncStats = {
+      totalQuotes: quotes.length,
+      instrumentMatches,
+      activeVenueMatches,
+      acceptedQuotes,
+      activeVenues,
+      instrumentCandidates,
+      acceptedVenues: [...acceptedVenues],
+    };
   }
 
   // ── V5 Helpers ────────────────────────────────────────────────────────────
@@ -2170,6 +2464,16 @@ class MarketDataBus {
     if (!wsUrl) {
       return;
     }
+    if (!auxiliary) {
+      this.hydrationTrace = {
+        ...this.hydrationTrace,
+        trade_ws: {
+          ...this.hydrationTrace.trade_ws,
+          url: wsUrl,
+          last_state: "connecting",
+        },
+      };
+    }
     const socket = new WebSocket(wsUrl);
     if (auxiliary) {
       this.auxTradeSockets.set(venue, socket);
@@ -2183,6 +2487,16 @@ class MarketDataBus {
 
     socket.onopen = () => {
       opened = true;
+      if (!auxiliary) {
+        this.hydrationTrace = {
+          ...this.hydrationTrace,
+          trade_ws: {
+            ...this.hydrationTrace.trade_ws,
+            open_count: this.hydrationTrace.trade_ws.open_count + 1,
+            last_state: "open",
+          },
+        };
+      }
       if (!auxiliary) {
         this.resetStreamFailures("ohlcv");
         this.snapshot = { ...this.snapshot, ohlcvStreamState: "live" };
@@ -2206,6 +2520,18 @@ class MarketDataBus {
         const payload = JSON.parse(String(event.data || "{}")) as JsonMap;
         if (!payload || typeof payload !== "object") {
           return;
+        }
+        if (!auxiliary) {
+          this.hydrationTrace = {
+            ...this.hydrationTrace,
+            trade_ws: {
+              ...this.hydrationTrace.trade_ws,
+              message_count: this.hydrationTrace.trade_ws.message_count + 1,
+              last_state: "open",
+              last_message_type: String(payload.type || "unknown"),
+              last_message_at: new Date(arrivalAt).toISOString(),
+            },
+          };
         }
         if (payload.type === "snapshot") {
           const items = Array.isArray(payload.items) ? payload.items as JsonMap[] : [];
@@ -2257,6 +2583,17 @@ class MarketDataBus {
     };
 
     socket.onerror = () => {
+      if (!auxiliary) {
+        this.hydrationTrace = {
+          ...this.hydrationTrace,
+          trade_ws: {
+            ...this.hydrationTrace.trade_ws,
+            error_count: this.hydrationTrace.trade_ws.error_count + 1,
+            last_state: "error",
+            last_error_at: new Date().toISOString(),
+          },
+        };
+      }
       if (!auxiliary && !opened) {
         this.registerStreamFailure("ohlcv");
         this.snapshot = { ...this.snapshot, ohlcvStreamState: this.snapshot.ohlcvBars.length > 0 ? "live" : "offline" };
@@ -2290,6 +2627,15 @@ class MarketDataBus {
       if (this.ohlcvSocket !== socket) {
         return;
       }
+      this.hydrationTrace = {
+        ...this.hydrationTrace,
+        trade_ws: {
+          ...this.hydrationTrace.trade_ws,
+          close_count: this.hydrationTrace.trade_ws.close_count + 1,
+          last_state: "closed",
+          last_close_at: new Date().toISOString(),
+        },
+      };
       if (!opened) {
         this.registerStreamFailure("ohlcv");
       }
@@ -2304,16 +2650,30 @@ class MarketDataBus {
   }
 
   private _buildRoutingScore(baseRouting: JsonMap | null): JsonMap | null {
+    const baseCandidates = Array.isArray(baseRouting?.candidates)
+      ? baseRouting.candidates as JsonMap[]
+      : [];
+    const backendSource = String(baseRouting?.source || "").trim() || null;
     const fusion = this.fusionEngine?.getSnapshot() || null;
     if (!fusion) {
-      return baseRouting;
+      return baseRouting
+        ? {
+          ...baseRouting,
+          routing_debug: {
+            mode: baseCandidates.length > 0 ? "backend-only" : "no-routing",
+            backend_source: backendSource,
+            backend_candidate_count: baseCandidates.length,
+            fusion_candidate_count: 0,
+            fusion_venue_count: 0,
+            fusion_filtered_tick_count: 0,
+            quote_sync: this.fusionQuoteSyncStats,
+          },
+        }
+        : null;
     }
     const baseArbitrage = baseRouting?.arbitrage && typeof baseRouting.arbitrage === "object" && !Array.isArray(baseRouting.arbitrage)
       ? baseRouting.arbitrage as JsonMap
       : null;
-    const baseCandidates = Array.isArray(baseRouting?.candidates)
-      ? baseRouting.candidates as JsonMap[]
-      : [];
     const baseCandidateByVenue = new Map(baseCandidates.map((candidate) => [String(candidate.venue || "unknown"), candidate]));
     const candidates = fusion.routeCandidates.map((candidate) => ({
       ...(baseCandidateByVenue.get(candidate.venue) || {}),
@@ -2329,6 +2689,11 @@ class MarketDataBus {
       freshness_ms: candidate.freshnessMs,
       source: "v6-price-fusion",
     }));
+    const mode = candidates.length > 0
+      ? "fusion-active"
+      : baseCandidates.length > 0
+        ? "fusion-empty-overrode-backend"
+        : "fusion-empty-no-backend";
     return {
       ...(baseRouting || {}),
       source: "v6-price-fusion",
@@ -2349,6 +2714,15 @@ class MarketDataBus {
       best: candidates[0] || ((baseRouting?.best as JsonMap | undefined) || null),
       backup: candidates[1] || ((baseRouting?.backup as JsonMap | undefined) || null),
       candidates,
+      routing_debug: {
+        mode,
+        backend_source: backendSource,
+        backend_candidate_count: baseCandidates.length,
+        fusion_candidate_count: candidates.length,
+        fusion_venue_count: fusion.venueCount,
+        fusion_filtered_tick_count: fusion.filteredTicks.length,
+        quote_sync: this.fusionQuoteSyncStats,
+      },
     };
   }
 
@@ -2391,6 +2765,16 @@ class MarketDataBus {
     if (!wsUrl) {
       return;
     }
+    if (!auxiliary) {
+      this.hydrationTrace = {
+        ...this.hydrationTrace,
+        depth_ws: {
+          ...this.hydrationTrace.depth_ws,
+          url: wsUrl,
+          last_state: "connecting",
+        },
+      };
+    }
     const socket = new WebSocket(wsUrl);
     if (auxiliary) {
       this.auxDepthSockets.set(venue, socket);
@@ -2402,6 +2786,16 @@ class MarketDataBus {
 
     socket.onopen = () => {
       opened = true;
+      if (!auxiliary) {
+        this.hydrationTrace = {
+          ...this.hydrationTrace,
+          depth_ws: {
+            ...this.hydrationTrace.depth_ws,
+            open_count: this.hydrationTrace.depth_ws.open_count + 1,
+            last_state: "open",
+          },
+        };
+      }
       if (!auxiliary) {
         this.resetStreamFailures("depth");
         this.snapshot = { ...this.snapshot, depthStreamState: "live" };
@@ -2425,6 +2819,18 @@ class MarketDataBus {
         const payload = JSON.parse(String(event.data || "{}")) as JsonMap;
         if (!payload || typeof payload !== "object") {
           return;
+        }
+        if (!auxiliary) {
+          this.hydrationTrace = {
+            ...this.hydrationTrace,
+            depth_ws: {
+              ...this.hydrationTrace.depth_ws,
+              message_count: this.hydrationTrace.depth_ws.message_count + 1,
+              last_state: "open",
+              last_message_type: String(payload.type || "unknown"),
+              last_message_at: new Date(arrivalAt).toISOString(),
+            },
+          };
         }
         const currentVenueDepth = (this.depthSnapshotsByVenue.get(venue) as JsonMap | undefined) || null;
         if (payload.type === "snapshot") {
@@ -2497,6 +2903,17 @@ class MarketDataBus {
     };
 
     socket.onerror = () => {
+      if (!auxiliary) {
+        this.hydrationTrace = {
+          ...this.hydrationTrace,
+          depth_ws: {
+            ...this.hydrationTrace.depth_ws,
+            error_count: this.hydrationTrace.depth_ws.error_count + 1,
+            last_state: "error",
+            last_error_at: new Date().toISOString(),
+          },
+        };
+      }
       if (!auxiliary && !opened && !failureRecorded) {
         failureRecorded = true;
         this.registerStreamFailure("depth");
@@ -2539,6 +2956,15 @@ class MarketDataBus {
       if (this.depthSocket !== socket) {
         return;
       }
+      this.hydrationTrace = {
+        ...this.hydrationTrace,
+        depth_ws: {
+          ...this.hydrationTrace.depth_ws,
+          close_count: this.hydrationTrace.depth_ws.close_count + 1,
+          last_state: "closed",
+          last_close_at: new Date().toISOString(),
+        },
+      };
       if (!opened && !failureRecorded) {
         failureRecorded = true;
         this.registerStreamFailure("depth");
@@ -2593,27 +3019,41 @@ class MarketDataBus {
     const effectiveAsks = asksRaw ?? MarketDataBus._toDepthRows(depthPayload?.asks);
     return this.engine.getSyncedFrame(effectiveBids, effectiveAsks);
   }
+
+  getHydrationTrace(): HydrationTrace {
+    return {
+      ...this.hydrationTrace,
+      trade_ws: {
+        ...this.hydrationTrace.trade_ws,
+      },
+      depth_ws: {
+        ...this.hydrationTrace.depth_ws,
+      },
+    };
+  }
 }
 
 export function createMarketDataBus(): {
   subscribe: (listener: MarketDataBusListener) => () => void;
   connect: (config: MarketDataBusConfig) => void;
-  disconnect: () => void;
+  disconnect: (reason?: string) => void;
   refreshNow: (requestType?: MarketBusRequestType) => Promise<void>;
   ingestPriceTick: (price: number, tsMs?: number) => void;
   setSchedulerHint: (hint: MarketDataBusSchedulerHint) => void;
   setBenchmarkMode: (enabled: boolean, ticksPerSec?: number) => void;
   getSyncedFrame: (bidsRaw?: DepthRow[], asksRaw?: DepthRow[]) => SyncedMarketFrame | null;
+  getHydrationTrace: () => HydrationTrace;
 } {
   const bus = new MarketDataBus();
   return {
     subscribe: (listener) => bus.subscribe(listener),
     connect: (config) => bus.connect(config),
-    disconnect: () => bus.disconnect(),
+    disconnect: (reason) => bus.disconnect(reason),
     refreshNow: (requestType) => bus.refreshNow(requestType),
     ingestPriceTick: (price, tsMs) => bus.ingestPriceTick(price, tsMs),
     setSchedulerHint: (hint) => bus.setSchedulerHint(hint),
     setBenchmarkMode: (enabled, ticksPerSec) => bus.setBenchmarkMode(enabled, ticksPerSec),
     getSyncedFrame: (bidsRaw, asksRaw) => bus.getSyncedFrame(bidsRaw, asksRaw),
+    getHydrationTrace: () => bus.getHydrationTrace(),
   };
 }

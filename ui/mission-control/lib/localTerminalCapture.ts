@@ -29,6 +29,124 @@ export type LocalTerminalPerceptualRuntime = {
   updatedAt: string;
 };
 
+export type LocalRoutingDiagnostics = {
+  bus_connected: boolean;
+  bus: "OK" | "OFFLINE";
+  bus_status: string;
+  bus_seq: number;
+  bus_lag_ms: number | null;
+  flow: "OK" | "EMPTY";
+  trades_count: number;
+  depth: "OK" | "EMPTY";
+  depth_levels: number;
+  best_bid: number | null;
+  best_ask: number | null;
+  routing_state: "READY" | "BLOCKED";
+  rejection_reasons: string[];
+  routing_candidates: number;
+  routing_debug: {
+    mode: string;
+    backend_source: string | null;
+    backend_candidate_count: number;
+    fusion_candidate_count: number;
+    fusion_venue_count: number;
+    fusion_filtered_tick_count: number;
+    quote_sync_total: number;
+    quote_sync_instrument_matches: number;
+    quote_sync_active_venue_matches: number;
+    quote_sync_accepted: number;
+    quote_sync_active_venues: string[];
+    quote_sync_instrument_candidates: string[];
+    quote_sync_accepted_venues: string[];
+    gate_trace: {
+      evaluations: number;
+      connect_requested_count: number;
+      connect_invoked_count: number;
+      last_bus_ref_ready: boolean;
+      chart_data_mode: string;
+      auth_status: string;
+      auth_session_required: boolean;
+      bus_ready_version: number;
+      instrument: string;
+      venue: string;
+      timeframe: string;
+      should_connect: boolean;
+      block_reason: string;
+      last_evaluated_at: string | null;
+      last_triggered_at: string | null;
+      last_bus_instance_id?: string | null;
+      last_connect_calls_before?: number;
+      last_connect_calls_after?: number;
+      last_connect_error?: string | null;
+    };
+    hydration_trace: {
+      instance_id: string | null;
+      connect_calls: number;
+      last_connect_short_circuit: string | null;
+      reset_count: number;
+      last_reset_reason: string | null;
+      last_reset_at: string | null;
+      refresh_count: number;
+      refresh_started_count: number;
+      refresh_stage: string;
+      refresh_skip_reason: string | null;
+      refresh_status: number;
+      refresh_ok: boolean;
+      snapshot_quotes: number;
+      snapshot_trades: number;
+      snapshot_depth_levels: number;
+      snapshot_routing_candidates: number;
+      snapshot_seq: number;
+      trade_ws_state: string;
+      trade_ws_messages: number;
+      trade_ws_errors: number;
+      trade_ws_last_type: string | null;
+      depth_ws_state: string;
+      depth_ws_messages: number;
+      depth_ws_errors: number;
+      depth_ws_last_type: string | null;
+      listener_count: number;
+      emit_count: number;
+      dispatch_trades: number;
+      dispatch_depth_levels: number;
+      dispatch_routing_candidates: number;
+      dispatch_seq: number;
+    };
+  };
+  routing_score_inputs: {
+    preferred_route_venue: string | null;
+    preferred_route_score: number;
+    spread_bps: number | null;
+    available_depth_usd: number | null;
+    fill_probability: number | null;
+    infra_health: number;
+    network_regime: string;
+    routing_reason: string;
+    source_labels: string[];
+  };
+};
+
+export type LocalDecisionDataset = {
+  action: "NO_TRADE" | "WAIT" | "TRADE_ALLOWED";
+  execution_lock_active: boolean;
+  execution_lock_code: string;
+  summary: string;
+  detail: string;
+};
+
+export type LocalExecutionDataset = {
+  status: string | null;
+  filled: boolean | null;
+  venue: string | null;
+  fill_latency_ms: number | null;
+  slippage_bps: number | null;
+  fill_ratio: number | null;
+  pnl_usd: number | null;
+  max_drawdown_usd: number | null;
+  holding_time_sec: number | null;
+  captured_from: string | null;
+};
+
 export type LocalTerminalRuntimeCapture = {
   version: 1;
   clientId: string;
@@ -104,6 +222,13 @@ export type LocalTerminalRuntimeCapture = {
       syntheticHeartbeatOpens: number;
       lastUpdateAge: string;
     };
+    syncDiagnostics?: {
+      bus_seq: number;
+      last_trade_time: string | null;
+      depth_age_ms: number | null;
+      ohlcv_time: string | null;
+    };
+    routingDiagnostics?: LocalRoutingDiagnostics;
     attention?: {
       state: "stable" | "degraded" | "fragile" | "blocked";
       dominantLayer: string;
@@ -166,6 +291,29 @@ export type LocalTerminalRuntimeCapture = {
     exactStateVector: string[];
     noCandlesExpected: boolean;
     blockedByFiveStateFailure: boolean;
+  };
+  dataset: {
+    market_state: {
+      bus_seq: number;
+      bus_lag_ms: number | null;
+      ohlcv_time: string | null;
+      trades_count: number;
+      depth_levels: number;
+      bbo_spread_bps: number | null;
+    };
+    routing: {
+      state: "READY" | "BLOCKED";
+      reasons: string[];
+      score: number;
+    };
+    context: {
+      volatility: string;
+      regime: string;
+      intent: string;
+      desync: string;
+    };
+    decision: LocalDecisionDataset;
+    execution: LocalExecutionDataset | null;
   };
 };
 
@@ -273,6 +421,27 @@ export type BuildLocalTerminalRuntimeCaptureInput = {
   candleUpdates: number;
   syntheticHeartbeatOpens: number;
   candleLastUpdateAge: string;
+  syncBusSeq: number;
+  syncLastTradeTime: string | null;
+  syncDepthAgeMs: number | null;
+  syncOhlcvTime: string | null;
+  routingDiagnostics: LocalRoutingDiagnostics;
+  volatilityRegime: string;
+  marketRegime: string;
+  executionLockActive: boolean;
+  executionLockCode: string;
+  executionLockSummaryLabel: string;
+  executionLockDetailLabel: string;
+  latestExecutionStatus: string | null;
+  latestExecutionFilled: boolean | null;
+  latestExecutionVenue: string | null;
+  latestExecutionFillLatencyMs: number | null;
+  latestExecutionSlippageBps: number | null;
+  latestExecutionFillRatio: number | null;
+  latestExecutionPnlUsd: number | null;
+  latestExecutionMaxDrawdownUsd: number | null;
+  latestExecutionHoldingTimeSec: number | null;
+  latestExecutionCapturedFrom: string | null;
   chartCompactAlertLabel: string;
   chartFlowAlertText: string;
   perceptual?: LocalTerminalPerceptualRuntime | null;
@@ -322,6 +491,49 @@ export function buildLocalTerminalIncidentSignature(capture: LocalTerminalRuntim
         reason: capture.runtime.smartState.reason,
       }
       : null,
+    routing: capture.runtime.routingDiagnostics
+      ? {
+        bus: capture.runtime.routingDiagnostics.bus,
+        bus_seq: capture.runtime.routingDiagnostics.bus_seq,
+        bus_lag_ms: capture.runtime.routingDiagnostics.bus_lag_ms,
+        flow: capture.runtime.routingDiagnostics.flow,
+        depth: capture.runtime.routingDiagnostics.depth,
+        routing_state: capture.runtime.routingDiagnostics.routing_state,
+        rejection_reasons: capture.runtime.routingDiagnostics.rejection_reasons,
+        routing_candidates: capture.runtime.routingDiagnostics.routing_candidates,
+        routing_mode: capture.runtime.routingDiagnostics.routing_debug.mode,
+        gate_requests: capture.runtime.routingDiagnostics.routing_debug.gate_trace.connect_requested_count,
+        gate_invokes: capture.runtime.routingDiagnostics.routing_debug.gate_trace.connect_invoked_count,
+        gate_ref_ready: capture.runtime.routingDiagnostics.routing_debug.gate_trace.last_bus_ref_ready,
+        gate_should_connect: capture.runtime.routingDiagnostics.routing_debug.gate_trace.should_connect,
+        gate_reason: capture.runtime.routingDiagnostics.routing_debug.gate_trace.block_reason,
+        backend_candidate_count: capture.runtime.routingDiagnostics.routing_debug.backend_candidate_count,
+        fusion_candidate_count: capture.runtime.routingDiagnostics.routing_debug.fusion_candidate_count,
+        quote_sync_accepted: capture.runtime.routingDiagnostics.routing_debug.quote_sync_accepted,
+        quote_sync_total: capture.runtime.routingDiagnostics.routing_debug.quote_sync_total,
+        refresh_status: capture.runtime.routingDiagnostics.routing_debug.hydration_trace.refresh_status,
+        refresh_stage: capture.runtime.routingDiagnostics.routing_debug.hydration_trace.refresh_stage,
+        reset_reason: capture.runtime.routingDiagnostics.routing_debug.hydration_trace.last_reset_reason,
+        reset_count: capture.runtime.routingDiagnostics.routing_debug.hydration_trace.reset_count,
+        instance_id: capture.runtime.routingDiagnostics.routing_debug.hydration_trace.instance_id,
+        snapshot_seq: capture.runtime.routingDiagnostics.routing_debug.hydration_trace.snapshot_seq,
+        trade_ws_messages: capture.runtime.routingDiagnostics.routing_debug.hydration_trace.trade_ws_messages,
+        depth_ws_messages: capture.runtime.routingDiagnostics.routing_debug.hydration_trace.depth_ws_messages,
+        dispatch_seq: capture.runtime.routingDiagnostics.routing_debug.hydration_trace.dispatch_seq,
+      }
+      : null,
+    dataset: {
+      decision: capture.dataset.decision,
+      routing: capture.dataset.routing,
+      execution: capture.dataset.execution
+        ? {
+          status: capture.dataset.execution.status,
+          filled: capture.dataset.execution.filled,
+          venue: capture.dataset.execution.venue,
+          pnl_usd: capture.dataset.execution.pnl_usd,
+        }
+        : null,
+    },
     desync: capture.runtime.desync
       ? {
         type: capture.runtime.desync.type,
@@ -365,6 +577,35 @@ export function buildLocalTerminalRuntimeCapture(input: BuildLocalTerminalRuntim
     && input.depthFreshnessState === "hard-fail"
     && input.tradesFreshnessState === "hard-fail";
   const noCandlesExpected = !input.crossLayerAttentionRenderable && !hasValidBusState;
+  const decisionAction: LocalDecisionDataset["action"] = input.executionLockActive
+    ? "NO_TRADE"
+    : input.smartMarketState === "WAIT"
+      ? "WAIT"
+      : "TRADE_ALLOWED";
+  const bestBid = input.routingDiagnostics.best_bid;
+  const bestAsk = input.routingDiagnostics.best_ask;
+  const spreadMid = bestBid != null && bestAsk != null ? (bestBid + bestAsk) / 2 : Number.NaN;
+  const bboSpreadBps = Number.isFinite(spreadMid) && spreadMid > 0 && bestBid != null && bestAsk != null
+    ? Number((((bestAsk - bestBid) / spreadMid) * 10_000).toFixed(4))
+    : null;
+  const executionDataset: LocalExecutionDataset | null = input.latestExecutionStatus
+    || input.latestExecutionVenue
+    || input.latestExecutionFillLatencyMs != null
+    || input.latestExecutionSlippageBps != null
+    || input.latestExecutionPnlUsd != null
+    ? {
+      status: input.latestExecutionStatus,
+      filled: input.latestExecutionFilled,
+      venue: input.latestExecutionVenue,
+      fill_latency_ms: input.latestExecutionFillLatencyMs,
+      slippage_bps: input.latestExecutionSlippageBps,
+      fill_ratio: input.latestExecutionFillRatio,
+      pnl_usd: input.latestExecutionPnlUsd,
+      max_drawdown_usd: input.latestExecutionMaxDrawdownUsd,
+      holding_time_sec: input.latestExecutionHoldingTimeSec,
+      captured_from: input.latestExecutionCapturedFrom,
+    }
+    : null;
 
   return {
     version: 1,
@@ -441,6 +682,13 @@ export function buildLocalTerminalRuntimeCapture(input: BuildLocalTerminalRuntim
         syntheticHeartbeatOpens: input.syntheticHeartbeatOpens,
         lastUpdateAge: input.candleLastUpdateAge,
       },
+      syncDiagnostics: {
+        bus_seq: input.syncBusSeq,
+        last_trade_time: input.syncLastTradeTime,
+        depth_age_ms: input.syncDepthAgeMs,
+        ohlcv_time: input.syncOhlcvTime,
+      },
+      routingDiagnostics: input.routingDiagnostics,
       attention: {
         state: input.crossLayerAttentionState,
         dominantLayer: input.crossLayerAttentionDominantLayer,
@@ -503,6 +751,35 @@ export function buildLocalTerminalRuntimeCapture(input: BuildLocalTerminalRuntim
       exactStateVector,
       noCandlesExpected,
       blockedByFiveStateFailure,
+    },
+    dataset: {
+      market_state: {
+        bus_seq: input.syncBusSeq,
+        bus_lag_ms: input.routingDiagnostics.bus_lag_ms,
+        ohlcv_time: input.syncOhlcvTime,
+        trades_count: input.routingDiagnostics.trades_count,
+        depth_levels: input.routingDiagnostics.depth_levels,
+        bbo_spread_bps: bboSpreadBps,
+      },
+      routing: {
+        state: input.routingDiagnostics.routing_state,
+        reasons: input.routingDiagnostics.rejection_reasons,
+        score: input.routingDiagnostics.routing_score_inputs.preferred_route_score,
+      },
+      context: {
+        volatility: input.volatilityRegime,
+        regime: input.marketRegime,
+        intent: input.intentType,
+        desync: input.desyncType,
+      },
+      decision: {
+        action: decisionAction,
+        execution_lock_active: input.executionLockActive,
+        execution_lock_code: input.executionLockCode,
+        summary: input.executionLockActive ? input.executionLockSummaryLabel : input.smartMarketSummaryLabel,
+        detail: input.executionLockActive ? input.executionLockDetailLabel : input.smartMarketDetailLabel,
+      },
+      execution: executionDataset,
     },
   };
 }
