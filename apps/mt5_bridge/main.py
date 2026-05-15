@@ -22,6 +22,11 @@ class Mt5AccountCreateRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class Mt5BrokerSessionUpdateRequest(BaseModel):
+    broker_session: dict[str, Any] = Field(default_factory=dict)
+    merge: bool = True
+
+
 class Mt5OrderFilterRequest(BaseModel):
     account_id: str
     symbol: str
@@ -148,6 +153,138 @@ def _normalized_balances_from_account(account: dict[str, Any]) -> list[dict[str,
     ]
 
 
+def _normalized_positions_from_broker_state(account: dict[str, Any]) -> list[dict[str, Any]]:
+    metadata = account.get("metadata") if isinstance(account.get("metadata"), dict) else {}
+    raw_positions = metadata.get("positions") if isinstance(metadata.get("positions"), list) else []
+    if not raw_positions:
+        return []
+    normalized: list[dict[str, Any]] = []
+    as_of_default = _now_iso()
+    for item in raw_positions:
+        if not isinstance(item, dict):
+            continue
+        symbol = str(item.get("symbol") or item.get("instrument") or "").strip().upper()
+        if not symbol:
+            continue
+        side = str(item.get("side") or item.get("position_side") or "").strip().lower()
+        if side in {"buy", "long"}:
+            normalized_side = "long"
+        elif side in {"sell", "short"}:
+            normalized_side = "short"
+        else:
+            normalized_side = "flat"
+        quantity = abs(_to_float(item.get("quantity"), _to_float(item.get("lots"), _to_float(item.get("volume"), 0.0))))
+        mark_price = _to_float(item.get("mark_price"), _to_float(item.get("last_price"), _default_mark_price(symbol, metadata)))
+        avg_entry_price = _to_float(item.get("avg_entry_price"), _to_float(item.get("entry_price"), mark_price))
+        notional_usd = abs(_to_float(item.get("notional_usd"), quantity * (mark_price or avg_entry_price)))
+        if quantity <= 0 and notional_usd <= 0:
+            continue
+        as_of = str(item.get("as_of") or item.get("updated_at") or item.get("timestamp") or as_of_default)
+        normalized.append(
+            {
+                "position_id": str(item.get("position_id") or f"mt5:{account['account_id']}:{symbol}").strip(),
+                "account_id": account["account_id"],
+                "symbol": symbol,
+                "instrument": symbol,
+                "side": normalized_side,
+                "quantity": quantity,
+                "notional_usd": notional_usd,
+                "avg_entry_price": avg_entry_price,
+                "mark_price": mark_price,
+                "pnl_unrealized_usd": _to_float(item.get("pnl_unrealized_usd"), _to_float(item.get("profit"), 0.0)),
+                "pnl_realized_usd": _to_float(item.get("pnl_realized_usd"), 0.0),
+                "entry_notional_usd": abs(_to_float(item.get("entry_notional_usd"), quantity * (avg_entry_price or mark_price))),
+                "as_of": as_of,
+                "source": "mt5-broker-position",
+                "payload": {
+                    **item,
+                    "truth_source": "mt5-broker-state",
+                },
+            }
+        )
+    return normalized
+
+
+def _normalized_protective_orders_from_broker_state(account: dict[str, Any]) -> list[dict[str, Any]]:
+    metadata = account.get("metadata") if isinstance(account.get("metadata"), dict) else {}
+    raw_orders = metadata.get("protective_orders") if isinstance(metadata.get("protective_orders"), list) else []
+    normalized: list[dict[str, Any]] = []
+    as_of_default = _now_iso()
+    for item in raw_orders:
+        if not isinstance(item, dict):
+            continue
+        symbol = str(item.get("symbol") or item.get("instrument") or "").strip().upper()
+        if not symbol:
+            continue
+        order_type = str(item.get("order_type") or item.get("type") or item.get("kind") or "").strip().upper()
+        trigger_price = _to_float(item.get("trigger_price"), _to_float(item.get("price"), _to_float(item.get("stop_price"), 0.0)))
+        if trigger_price <= 0:
+            continue
+        side = str(item.get("position_side") or item.get("side") or "").strip().upper()
+        if side in {"BUY", "LONG"}:
+            position_side = "LONG"
+        elif side in {"SELL", "SHORT"}:
+            position_side = "SHORT"
+        else:
+            position_side = ""
+        normalized.append(
+            {
+                "order_id": str(item.get("order_id") or item.get("ticket") or item.get("id") or "").strip(),
+                "symbol": symbol,
+                "position_side": position_side,
+                "order_type": order_type,
+                "trigger_price": trigger_price,
+                "working_type": str(item.get("working_type") or "MARK_PRICE").strip() or "MARK_PRICE",
+                "status": str(item.get("status") or "OPEN").strip() or "OPEN",
+                "as_of": str(item.get("as_of") or item.get("updated_at") or item.get("timestamp") or as_of_default),
+                "source": "mt5-broker-protective-order",
+                "payload": item,
+            }
+        )
+    return normalized
+
+
+def _sanitize_mt5_broker_state_rows(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]
+
+
+def _merge_mt5_broker_state_metadata(existing_metadata: dict[str, Any] | None, payload: dict[str, Any] | None) -> dict[str, Any]:
+    metadata = dict(existing_metadata) if isinstance(existing_metadata, dict) else {}
+    request_payload = payload if isinstance(payload, dict) else {}
+    broker_state = request_payload.get("broker_state") if isinstance(request_payload.get("broker_state"), dict) else request_payload
+
+    positions = _sanitize_mt5_broker_state_rows(broker_state.get("positions"))
+    if positions:
+        metadata["positions"] = positions
+    protective_orders = _sanitize_mt5_broker_state_rows(broker_state.get("protective_orders"))
+    if protective_orders:
+        metadata["protective_orders"] = protective_orders
+    balances = _sanitize_mt5_broker_state_rows(broker_state.get("balances"))
+    if balances:
+        metadata["balances"] = balances
+
+    broker_session = broker_state.get("session") if isinstance(broker_state.get("session"), dict) else request_payload.get("session") if isinstance(request_payload.get("session"), dict) else None
+    if isinstance(broker_session, dict) and broker_session:
+        metadata["broker_runtime_session"] = broker_session
+
+    truth_source = str(
+        broker_state.get("truth_source")
+        or request_payload.get("truth_source")
+        or metadata.get("truth_source")
+        or "mt5-broker-state"
+    ).strip() or "mt5-broker-state"
+    metadata["truth_source"] = truth_source
+    metadata["broker_state_updated_at"] = str(
+        broker_state.get("as_of")
+        or request_payload.get("as_of")
+        or request_payload.get("updated_at")
+        or _now_iso()
+    )
+    return metadata
+
+
 def _normalized_positions_from_orders(account: dict[str, Any]) -> list[dict[str, Any]]:
     metadata = account.get("metadata") if isinstance(account.get("metadata"), dict) else {}
     rows = fetch_all(
@@ -218,12 +355,26 @@ def _normalized_positions_from_orders(account: dict[str, Any]) -> list[dict[str,
                 "payload": {
                     "contract_size": contract_size,
                     "mode": account.get("mode"),
+                    "truth_source": "mt5-order-events-reconstructed",
                     "events": bucket.get("payload_rows", []),
                 },
             }
         )
     positions.sort(key=lambda item: (str(item["symbol"]), str(item["as_of"])), reverse=False)
     return positions
+
+
+def _merge_mt5_broker_session_metadata(
+    metadata: dict[str, Any] | None,
+    broker_session: dict[str, Any] | None,
+    merge: bool = True,
+) -> dict[str, Any]:
+    current = dict(metadata or {})
+    if not isinstance(broker_session, dict):
+        broker_session = {}
+    existing_session = current.get("broker_session") if isinstance(current.get("broker_session"), dict) else {}
+    current["broker_session"] = {**existing_session, **broker_session} if merge else dict(broker_session)
+    return current
 
 
 def _now_iso() -> str:
@@ -294,13 +445,81 @@ async def account_status(account_id: str) -> dict[str, Any]:
     return {"status": "ok", "account": account}
 
 
+@app.patch("/v1/accounts/{account_id}/broker-session")
+async def update_account_broker_session(account_id: str, request: Mt5BrokerSessionUpdateRequest) -> dict[str, Any]:
+    account = fetch_one("SELECT * FROM mt5_accounts WHERE account_id = %s", (account_id,))
+    if not account:
+        raise HTTPException(status_code=404, detail="MT5 account not found")
+
+    metadata = _merge_mt5_broker_session_metadata(account.get("metadata"), request.broker_session, merge=bool(request.merge))
+    execute(
+        """
+        UPDATE mt5_accounts
+        SET metadata = %s::jsonb,
+            updated_at = NOW()
+        WHERE account_id = %s
+        """,
+        (json_dumps(metadata), account_id),
+    )
+    row = fetch_one("SELECT * FROM mt5_accounts WHERE account_id = %s", (account_id,))
+    return {
+        "status": "updated",
+        "account": row,
+        "broker_session": metadata.get("broker_session") if isinstance(metadata.get("broker_session"), dict) else {},
+    }
+
+
+@app.post("/v1/accounts/{account_id}/broker-state")
+async def upsert_account_broker_state(account_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    account = fetch_one("SELECT * FROM mt5_accounts WHERE account_id = %s", (account_id,))
+    if not account:
+        raise HTTPException(status_code=404, detail="MT5 account not found")
+    request_payload = payload if isinstance(payload, dict) else {}
+    metadata = _merge_mt5_broker_state_metadata(account.get("metadata"), request_payload)
+    connected = request_payload.get("connected")
+    requested_status = str(request_payload.get("status") or account.get("status") or "connected").strip().lower() or "connected"
+    if connected is False:
+        requested_status = "disconnected"
+    elif connected is True and requested_status in {"", "disconnected"}:
+        requested_status = "connected"
+    execute(
+        """
+        UPDATE mt5_accounts
+        SET status = %s,
+            metadata = %s::jsonb,
+            updated_at = NOW()
+        WHERE account_id = %s
+        """,
+        (
+            requested_status,
+            json_dumps(metadata),
+            account_id,
+        ),
+    )
+    row = fetch_one("SELECT * FROM mt5_accounts WHERE account_id = %s", (account_id,))
+    return {
+        "status": "updated",
+        "account": row,
+        "summary": {
+            "positions_count": len(metadata.get("positions") if isinstance(metadata.get("positions"), list) else []),
+            "protective_order_count": len(metadata.get("protective_orders") if isinstance(metadata.get("protective_orders"), list) else []),
+            "balance_count": len(metadata.get("balances") if isinstance(metadata.get("balances"), list) else []),
+            "truth_source": metadata.get("truth_source"),
+            "broker_state_updated_at": metadata.get("broker_state_updated_at"),
+        },
+    }
+
+
 @app.get("/v1/accounts/{account_id}/normalized-state")
 async def account_normalized_state(account_id: str) -> dict[str, Any]:
     account = fetch_one("SELECT * FROM mt5_accounts WHERE account_id = %s", (account_id,))
     if not account:
         raise HTTPException(status_code=404, detail="MT5 account not found")
     balances = _normalized_balances_from_account(account)
-    positions = _normalized_positions_from_orders(account)
+    broker_positions = _normalized_positions_from_broker_state(account)
+    positions = broker_positions if broker_positions else _normalized_positions_from_orders(account)
+    protective_orders = _normalized_protective_orders_from_broker_state(account)
+    truth_source = "mt5-broker-state" if broker_positions else "mt5-order-events-reconstructed"
     equity_usd = sum(_to_float(item.get("equity_usd"), 0.0) for item in balances)
     gross_exposure_usd = sum(abs(_to_float(item.get("notional_usd"), 0.0)) for item in positions)
     net_exposure_usd = sum(
@@ -315,12 +534,16 @@ async def account_normalized_state(account_id: str) -> dict[str, Any]:
         "as_of": max(as_of_candidates) if as_of_candidates else _now_iso(),
         "balances": balances,
         "positions": positions,
+        "protective_orders": protective_orders,
+        "truth_source": truth_source,
+        "positions_source": truth_source,
         "summary": {
             "equity_usd": equity_usd,
             "gross_exposure_usd": gross_exposure_usd,
             "net_exposure_usd": net_exposure_usd,
             "position_count": len(positions),
             "balance_count": len(balances),
+            "protective_order_count": len(protective_orders),
         },
     }
 

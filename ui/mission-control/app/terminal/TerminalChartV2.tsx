@@ -85,6 +85,15 @@ type AutoTraderV5State = {
   lastAction: string | null;
 };
 
+export type TerminalAutoTraderV5Observation = {
+  enabled: boolean;
+  mode: AutoTraderV5Mode;
+  drawdownPaused: boolean;
+  blockedReasons: string[];
+  currentDrawdownPct: number;
+  lastAction: string | null;
+};
+
 const INIT_AUTO_TRADER: AutoTraderV5State = {
   enabled: false,
   mode: "standby",
@@ -111,6 +120,7 @@ type Props = {
   candles: CandlePoint[];
   analyticsCandles?: CandlePoint[];
   isPreviewMode?: boolean;
+  suspendDecisionLayer?: boolean;
   fallbackPrice: number;
   loading: boolean;
   uiMode: UiMode;
@@ -157,7 +167,7 @@ type Props = {
   selectedVenue: string;
   availableVenues: string[];
   onSelectVenue: (venue: string | null) => void;
-  multiChartRows: Array<{ symbol: string; price: number; deltaPct: number; spread: number; venue: string }>;
+  multiChartRows: Array<{ symbol: string; price: number; deltaPct: number; spread: number; venue: string; historyKey?: string }>;
   quoteHistory: QuoteHistoryMap;
   onSelectSymbol: (symbol: string) => void;
   onSelectSymbolVenue: (symbol: string, venue?: string) => void;
@@ -185,7 +195,15 @@ type Props = {
   chartTruth?: {
     sourceLabel: string;
     modeLabel: string;
+    truthStatusLabel?: string;
+    truthStatusTone?: "good" | "warn" | "bad" | "neutral";
+    truthStatusReasonLabel?: string;
     clockLabel: string;
+    feedStatusLabel: string;
+    feedStatusTone: "good" | "warn" | "bad" | "neutral";
+    exchangeStatusLabel: string;
+    exchangeStatusTone: "good" | "warn" | "bad" | "neutral";
+    exchangeStatusEmphasis?: "default" | "secondary";
     lagLabel: string;
     freshnessLabel: string;
     routeLabel: string;
@@ -195,6 +213,7 @@ type Props = {
   onGpuPerceptualTelemetry?: (payload: GpuPerceptualTelemetry) => void;
   onGpuViewportFrameMetaChange?: (payload: Record<string, LiveChartFrameMeta>) => void;
   onSmartDecisionHudChange?: (payload: SmartDecisionHudShape) => void;
+  onAutoTraderV5ObservationChange?: (payload: TerminalAutoTraderV5Observation) => void;
 };
 
 function ensureVisibleCandles(candles: CandlePoint[], _fallbackPrice: number): CandlePoint[] {
@@ -345,10 +364,12 @@ export default function TerminalChartV2(props: Props) {
     onGpuPerceptualTelemetry,
     onGpuViewportFrameMetaChange,
     onSmartDecisionHudChange,
+    onAutoTraderV5ObservationChange,
   } = props;
 
   const analyticsCandlesInput = props.analyticsCandles ?? props.candles;
   const isPreviewMode = Boolean(props.isPreviewMode);
+  const suspendDecisionLayer = Boolean(props.suspendDecisionLayer);
   const effectiveChartSmoothingMs: ChartSmoothingMs = useMemo(
     () => (timeframeToMs(timeframe) <= 5_000 ? 0 : chartSmoothingMs),
     [chartSmoothingMs, timeframe],
@@ -443,11 +464,11 @@ export default function TerminalChartV2(props: Props) {
     }
     return stable;
   }, [analyticsCandlesInput, fallbackPrice, isPreviewMode]);
-  const analyticsEligibleCandles = isPreviewMode ? [] : safeAnalyticsCandles;
+  const analyticsEligibleCandles = suspendDecisionLayer ? [] : safeAnalyticsCandles;
   const analyticsReady = analyticsEligibleCandles.length >= MIN_RENDER_CANDLES;
   const structureSourceCandles = useMemo(
-    () => (analyticsReady ? analyticsEligibleCandles : isPreviewMode ? [] : safeRenderCandles),
-    [analyticsEligibleCandles, analyticsReady, isPreviewMode, safeRenderCandles],
+    () => (analyticsReady ? analyticsEligibleCandles : suspendDecisionLayer ? [] : safeRenderCandles),
+    [analyticsEligibleCandles, analyticsReady, safeRenderCandles, suspendDecisionLayer],
   );
   const structureSnapshot = useMemo(
     () => detectStructure(structureSourceCandles),
@@ -579,7 +600,7 @@ export default function TerminalChartV2(props: Props) {
     return sorted.slice(0, 16).map((row) => ({
       id: `${row.symbol}-${row.venue}`,
       symbol: row.symbol,
-      candles: buildCandlesFromHistory(quoteHistory[row.symbol] || [], row.price),
+      candles: buildCandlesFromHistory(quoteHistory[row.historyKey || row.symbol] || [], row.price),
     }));
   }, [multiChartRows, quoteHistory, timeframe]);
 
@@ -611,15 +632,17 @@ export default function TerminalChartV2(props: Props) {
     routeScorePct: effectiveRouteScore,
     domImbalance: domStats.imbalance,
     decisionLatencyMs,
-    suspended: isPreviewMode || !analyticsReady,
-    suspendedReason: isPreviewMode || !analyticsReady
-      ? "Preview or degraded feed blocks the decision layer"
+    suspended: suspendDecisionLayer || !analyticsReady,
+    suspendedReason: suspendDecisionLayer || !analyticsReady
+      ? suspendDecisionLayer
+        ? "Canonical feed degraded: decision layer suspended until renderable feed recovers"
+        : "Preview mode blocks the decision layer"
       : null,
     externalGate: marketSyncGate ? {
       state: marketSyncGate.state,
       reason: marketSyncGate.detailLabel,
     } : null,
-  }), [analyticsReady, decisionLatencyMs, domStats.imbalance, effectiveRouteScore, isPreviewMode, liquiditySnapshot, lowFlowEdgeBlocked, marketSyncGate, predictionV5.direction, predictionV5.invalidation, predictionV5.probability, predictionV5.trigger, regimeSnapshot, structureSnapshot]);
+  }), [analyticsReady, decisionLatencyMs, domStats.imbalance, effectiveRouteScore, liquiditySnapshot, lowFlowEdgeBlocked, marketSyncGate, predictionV5.direction, predictionV5.invalidation, predictionV5.probability, predictionV5.trigger, regimeSnapshot, structureSnapshot, suspendDecisionLayer]);
   const stableSmartDecision = useMemo(
     () => applyDecisionStability(smartDecision, decisionStabilityEngineRef.current.update(smartDecision.state, decisionClockMs)),
     [decisionClockMs, smartDecision],
@@ -648,6 +671,36 @@ export default function TerminalChartV2(props: Props) {
       return next;
     });
   }, []);
+
+  useEffect(() => {
+    if (!onAutoTraderV5ObservationChange) {
+      return;
+    }
+    const blockedReasons: string[] = [];
+    if (isPreviewMode) {
+      blockedReasons.push("preview_mode");
+    }
+    if (suspendDecisionLayer) {
+      blockedReasons.push("feed_degraded");
+    }
+    if (!analyticsReady) {
+      blockedReasons.push("canonical_feed_required");
+    }
+    if (autoTraderV5.mode === "paused") {
+      blockedReasons.push("drawdown_pause");
+    }
+    if ((autoTraderV5.lastAction || "").toLowerCase().includes("feed degrade")) {
+      blockedReasons.push("feed_degraded");
+    }
+    onAutoTraderV5ObservationChange({
+      enabled: autoTraderV5.enabled,
+      mode: autoTraderV5.mode,
+      drawdownPaused: autoTraderV5.mode === "paused",
+      blockedReasons,
+      currentDrawdownPct: autoTraderV5.currentDrawdownPct,
+      lastAction: autoTraderV5.lastAction,
+    });
+  }, [analyticsReady, autoTraderV5, isPreviewMode, onAutoTraderV5ObservationChange, suspendDecisionLayer]);
 
   // Mémoire de perte : réduit la confiance effective pour les 2 prochains trades
   const lossMemoryRef = useRef(0);
@@ -887,7 +940,17 @@ export default function TerminalChartV2(props: Props) {
         <div className="terminal-v2-truth-strip" aria-live="polite">
           <span className="terminal-v2-truth-pill terminal-v2-truth-pill-source">{chartTruth.sourceLabel}</span>
           <span className="terminal-v2-truth-pill">{chartTruth.modeLabel}</span>
+          {chartTruth.truthStatusLabel ? (
+            <span
+              className={`terminal-v2-truth-pill terminal-v2-truth-pill-${chartTruth.truthStatusTone || "neutral"}`}
+              title={chartTruth.truthStatusReasonLabel || undefined}
+            >
+              {chartTruth.truthStatusLabel}
+            </span>
+          ) : null}
           <span className="terminal-v2-truth-pill">{chartTruth.clockLabel}</span>
+          <span className={`terminal-v2-truth-pill terminal-v2-truth-pill-${chartTruth.feedStatusTone}`}>{chartTruth.feedStatusLabel}</span>
+          <span className={`terminal-v2-truth-pill terminal-v2-truth-pill-${chartTruth.exchangeStatusTone}${chartTruth.exchangeStatusEmphasis === "secondary" ? " terminal-v2-truth-pill-secondary" : ""}`}>{chartTruth.exchangeStatusLabel}</span>
           <span className={`terminal-v2-truth-pill terminal-v2-truth-pill-${chartTruth.lagTone}`}>{chartTruth.lagLabel}</span>
           <span className="terminal-v2-truth-pill">{chartTruth.freshnessLabel}</span>
           <span className="terminal-v2-truth-pill">{chartTruth.routeLabel}</span>
@@ -925,6 +988,7 @@ export default function TerminalChartV2(props: Props) {
               candleTransform="none"
               engineMode="v4"
               viewportGrid={gpuViewportGrid}
+              viewportWindowHint={chartWindow}
               smoothingMs={effectiveChartSmoothingMs}
               multiSymbolFeeds={gpuViewportFeeds}
               onCrosshairMove={handleCrosshairMove}
@@ -977,9 +1041,13 @@ export default function TerminalChartV2(props: Props) {
             predictionV5.probability >= 70 ? " perception-focus" : ""
           }`}>
             <span className="terminal-v2-card-kicker">Perception V5</span>
-            {isPreviewMode || !analyticsReady ? (
+            {isPreviewMode || suspendDecisionLayer || !analyticsReady ? (
               <div className="terminal-v2-meta" style={{ marginBottom: 8 }}>
-                Preview / feed degrade: perception and execution logic suspended.
+                {isPreviewMode
+                  ? "Preview mode: perception and execution logic suspended."
+                  : suspendDecisionLayer
+                    ? "Feed canonique degrade: chart visible, mais perception et execution restent suspendues."
+                    : "Canonical feed required: perception and execution logic suspended."}
               </div>
             ) : null}
 
@@ -1214,7 +1282,7 @@ export default function TerminalChartV2(props: Props) {
         </div>
         <div className={`terminal-v2-multi-grid terminal-v2-multi-grid-${multiSlots}`}>
           {multiRows.map((row) => {
-            const miniCandles = buildCandlesFromHistory(quoteHistory[row.symbol] || [], row.price);
+            const miniCandles = buildCandlesFromHistory(quoteHistory[row.historyKey || row.symbol] || [], row.price);
             const values = miniCandles.slice(-24).map((point) => point.close);
             const path = buildSparklinePath(values, 96, 24);
             return (

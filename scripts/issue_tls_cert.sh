@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Default to the mission-control / txt project domain set. To issue the cert
+# for another project (e.g. mwc.gtixt.com), invoke this script with:
+#   DOMAIN=mwc.gtixt.com CERT_NAME=mwc.gtixt.com scripts/issue_tls_cert.sh
+# Never mix unrelated projects into the same SAN list.
 DOMAINS_RAW="${DOMAINS:-${DOMAIN:-app.txt.gtixt.com,txt.gtixt.com,api.txt.gtixt.com,staging.txt.gtixt.com,api.staging.txt.gtixt.com}}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WEBROOT_DIR="${WEBROOT_DIR:-$ROOT_DIR/data/certbot/www}"
@@ -72,6 +76,6 @@ if [[ ! -s "$CONFIG_DIR/live/$CERT_NAME/fullchain.pem" || ! -s "$CONFIG_DIR/live
   exit 1
 fi
 
-docker compose -f docker-compose.yml up -d mission-control-tls
+docker compose -f docker-compose.yml up -d --force-recreate --no-deps mission-control-tls
 
 echo "[ok] certificate available at $CONFIG_DIR/live/$CERT_NAME for domains: ${DOMAINS[*]}"

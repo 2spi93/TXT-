@@ -30,10 +30,31 @@ PUBLIC_CHART_FAILURE_REASON_FILE="${PUBLIC_CHART_FAILURE_REASON_FILE:-${STATE_FI
 PUBLIC_CHART_FAILURE_DETAILS_FILE="${PUBLIC_CHART_FAILURE_DETAILS_FILE:-${STATE_FILE}.public_chart_failure_details.json}"
 PUBLIC_CHART_DIAGNOSTIC_LAST_RUN_FILE="${PUBLIC_CHART_DIAGNOSTIC_LAST_RUN_FILE:-${STATE_FILE}.public_chart_last_run}"
 PUBLIC_CHART_LATEST_DIAG_JSON="${ROOT_DIR}/logs/healthwatch/public-chart/latest/diagnostic.json"
+LOCAL_TERMINAL_DIAGNOSTIC_ENABLED="${LOCAL_TERMINAL_DIAGNOSTIC_ENABLED:-1}"
+LOCAL_TERMINAL_CAPTURE_FILE="${LOCAL_TERMINAL_CAPTURE_FILE:-${ROOT_DIR}/logs/healthwatch/local-terminal-captures.json}"
+LOCAL_TERMINAL_DIAGNOSTIC_JSON="${LOCAL_TERMINAL_DIAGNOSTIC_JSON:-${ROOT_DIR}/logs/healthwatch/local-terminal-diagnostic.json}"
+LOCAL_TERMINAL_STALE_AFTER_SEC="${LOCAL_TERMINAL_STALE_AFTER_SEC:-120}"
+LOCAL_TERMINAL_ROUTING_BLOCK_CONSECUTIVE_CAPTURES="${LOCAL_TERMINAL_ROUTING_BLOCK_CONSECUTIVE_CAPTURES:-3}"
+LOCAL_TERMINAL_STALE_STATE_FILE="${LOCAL_TERMINAL_STALE_STATE_FILE:-${STATE_FILE}.local_terminal_stale}"
+LOCAL_TERMINAL_ROUTING_BLOCK_STATE_FILE="${LOCAL_TERMINAL_ROUTING_BLOCK_STATE_FILE:-${STATE_FILE}.local_terminal_routing_block}"
 
 # Comma-separated list of URLs to probe.
-URLS_RAW="${HEALTHCHECK_URLS:-http://127.0.0.1:3000/,https://app.txt.gtixt.com/,http://127.0.0.1:8000/health,http://127.0.0.1:8003/health,http://127.0.0.1:8001/health,http://127.0.0.1:8004/health}"
+URLS_RAW="${HEALTHCHECK_URLS:-http://127.0.0.1:3000/,https://app.txt.gtixt.com/,http://127.0.0.1:8000/health}"
 IFS=',' read -r -a URLS <<< "$URLS_RAW"
+
+# Internal services not exposed on host — check via docker exec
+DOCKER_HEALTH_TARGETS="risk-gateway:8001 market-data:8003 broker-adapter:8004"
+check_docker_health() {
+  for entry in $DOCKER_HEALTH_TARGETS; do
+    local container="${entry%%:*}"
+    local port="${entry##*:}"
+    local result
+    result="$(docker exec "$container" python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${port}/health', timeout=5); print('ok')" 2>&1)" || result="FAIL"
+    if [[ "$result" != "ok" ]]; then
+      alert "WARN" "docker health FAIL: $container:$port → $result"
+    fi
+  done
+}
 
 alert() {
   local level="$1"
@@ -185,6 +206,131 @@ print(", ".join(parts))
 PY
 }
 
+read_local_terminal_diag_field() {
+  local field_name="$1"
+  python3 - "$LOCAL_TERMINAL_DIAGNOSTIC_JSON" "$field_name" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+diag_path, field_name = sys.argv[1:3]
+try:
+  payload = json.loads(Path(diag_path).read_text())
+except Exception:
+  payload = {}
+
+value = payload.get(field_name)
+if isinstance(value, list):
+  print(",".join(str(item) for item in value))
+elif value is None:
+  print("")
+else:
+  print(value)
+PY
+}
+
+local_terminal_alert_context() {
+  local alert_kind="$1"
+  python3 - "$LOCAL_TERMINAL_DIAGNOSTIC_JSON" "$alert_kind" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+diag_path, alert_kind = sys.argv[1:3]
+try:
+  payload = json.loads(Path(diag_path).read_text())
+except Exception:
+  payload = {}
+
+latest_capture = payload.get("latest_capture") if isinstance(payload.get("latest_capture"), dict) else {}
+
+print(json.dumps({
+  "alert_kind": alert_kind,
+  "state": payload.get("state"),
+  "capture_freshness_state": payload.get("capture_freshness_state"),
+  "renderable_routing_block_state": payload.get("renderable_routing_block_state"),
+  "latest_client_id": payload.get("latest_client_id"),
+  "latest_capture_at": payload.get("latest_capture_at"),
+  "latest_publish_at": payload.get("latest_publish_at"),
+  "latest_publish_age_sec": payload.get("latest_publish_age_sec"),
+  "stale_after_sec": payload.get("stale_after_sec"),
+  "renderable_routing_block_consecutive_count": payload.get("renderable_routing_block_consecutive_count"),
+  "renderable_routing_block_threshold": payload.get("renderable_routing_block_threshold"),
+  "renderable_routing_block_captured_at": payload.get("renderable_routing_block_captured_at") or [],
+  "latest_capture": {
+    "feed_label": latest_capture.get("feed_label"),
+    "signal": latest_capture.get("signal"),
+    "last_bar_timestamp": latest_capture.get("last_bar_timestamp"),
+    "bus_status": latest_capture.get("bus_status"),
+    "routing_state": latest_capture.get("routing_state"),
+    "rejection_reasons": latest_capture.get("rejection_reasons") or [],
+    "smart_state_summary": latest_capture.get("smart_state_summary"),
+    "truth_exchange_status": latest_capture.get("truth_exchange_status"),
+    "truth_exchange_age_ms": latest_capture.get("truth_exchange_age_ms"),
+    "auto_incident_status": latest_capture.get("auto_incident_status"),
+  },
+}, separators=(",", ":")))
+PY
+}
+
+local_terminal_stale_summary() {
+  python3 - "$LOCAL_TERMINAL_DIAGNOSTIC_JSON" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+  payload = json.loads(Path(sys.argv[1]).read_text())
+except Exception:
+  payload = {}
+
+latest_capture = payload.get("latest_capture") if isinstance(payload.get("latest_capture"), dict) else {}
+parts = [
+  f"freshness={payload.get('capture_freshness_state', 'missing')}",
+  f"publish_age_sec={payload.get('latest_publish_age_sec', 'n/a')}",
+  f"threshold_sec={payload.get('stale_after_sec', 'n/a')}",
+]
+if latest_capture.get("feed_label"):
+  parts.append(f"feed={latest_capture.get('feed_label')}")
+if payload.get("latest_capture_at"):
+  parts.append(f"captured_at={payload.get('latest_capture_at')}")
+if latest_capture.get("signal"):
+  parts.append(f"signal={latest_capture.get('signal')}")
+print(", ".join(parts))
+PY
+}
+
+local_terminal_routing_block_summary() {
+  python3 - "$LOCAL_TERMINAL_DIAGNOSTIC_JSON" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+  payload = json.loads(Path(sys.argv[1]).read_text())
+except Exception:
+  payload = {}
+
+latest_capture = payload.get("latest_capture") if isinstance(payload.get("latest_capture"), dict) else {}
+reasons = latest_capture.get("rejection_reasons") or []
+parts = [
+  f"state={payload.get('renderable_routing_block_state', 'missing')}",
+  f"consecutive={payload.get('renderable_routing_block_consecutive_count', 0)}/{payload.get('renderable_routing_block_threshold', 'n/a')}",
+]
+if latest_capture.get("feed_label"):
+  parts.append(f"feed={latest_capture.get('feed_label')}")
+if latest_capture.get("signal"):
+  parts.append(f"signal={latest_capture.get('signal')}")
+if latest_capture.get("routing_state"):
+  parts.append(f"routing_state={latest_capture.get('routing_state')}")
+if reasons:
+  parts.append(f"reasons={','.join(str(reason) for reason in reasons)}")
+if latest_capture.get("smart_state_summary"):
+  parts.append(f"smart={latest_capture.get('smart_state_summary')}")
+print(", ".join(parts))
+PY
+}
+
 emit_public_chart_transition_alert() {
   local previous_state="$1"
   local alert_context
@@ -278,6 +424,16 @@ if [[ -f "$PUBLIC_CHART_FAILURE_REASON_FILE" ]]; then
   public_chart_failure_reason="$(cat "$PUBLIC_CHART_FAILURE_REASON_FILE" 2>/dev/null || echo none)"
 fi
 
+local_terminal_stale_state="healthy"
+if [[ -f "$LOCAL_TERMINAL_STALE_STATE_FILE" ]]; then
+  local_terminal_stale_state="$(cat "$LOCAL_TERMINAL_STALE_STATE_FILE" 2>/dev/null || echo healthy)"
+fi
+
+local_terminal_routing_block_state="healthy"
+if [[ -f "$LOCAL_TERMINAL_ROUTING_BLOCK_STATE_FILE" ]]; then
+  local_terminal_routing_block_state="$(cat "$LOCAL_TERMINAL_ROUTING_BLOCK_STATE_FILE" 2>/dev/null || echo healthy)"
+fi
+
 if [[ ! -f "$PUBLIC_CHART_FAILURE_DETAILS_FILE" ]]; then
   printf '{"diagnostic_error":null}\n' > "$PUBLIC_CHART_FAILURE_DETAILS_FILE"
 fi
@@ -292,6 +448,9 @@ for u in "${URLS[@]}"; do
     exit 2
   fi
 done
+
+# Check internal services via docker exec
+check_docker_health
 
 if [[ "$UI_ASSET_CHECK_ENABLED" == "1" ]]; then
   if ! asset_result="$("$ROOT_DIR/scripts/check_ui_static_assets.sh" --base-url "$UI_BASE_URL" --host "$HOST_HEADER" 2>&1)"; then
@@ -431,6 +590,47 @@ PY
   fi
 fi
 
+if [[ "$LOCAL_TERMINAL_DIAGNOSTIC_ENABLED" == "1" ]]; then
+  previous_local_terminal_stale_state="$local_terminal_stale_state"
+  previous_local_terminal_routing_block_state="$local_terminal_routing_block_state"
+
+  local_terminal_output="$(LOCAL_TERMINAL_CAPTURE_FILE="$LOCAL_TERMINAL_CAPTURE_FILE" \
+    LOCAL_TERMINAL_DIAGNOSTIC_JSON="$LOCAL_TERMINAL_DIAGNOSTIC_JSON" \
+    LOCAL_TERMINAL_STALE_AFTER_SEC="$LOCAL_TERMINAL_STALE_AFTER_SEC" \
+    LOCAL_TERMINAL_ROUTING_BLOCK_CONSECUTIVE_CAPTURES="$LOCAL_TERMINAL_ROUTING_BLOCK_CONSECUTIVE_CAPTURES" \
+    bash "$ROOT_DIR/scripts/check_local_terminal_health.sh" 2>&1 || true)"
+  printf '%s\n' "$local_terminal_output" >> "$LOG_DIR/healthwatch.log"
+
+  local_terminal_stale_state="$(read_local_terminal_diag_field capture_freshness_state)"
+  local_terminal_routing_block_state="$(read_local_terminal_diag_field renderable_routing_block_state)"
+
+  if [[ -z "$local_terminal_stale_state" ]]; then
+    local_terminal_stale_state="missing"
+  fi
+  if [[ -z "$local_terminal_routing_block_state" ]]; then
+    local_terminal_routing_block_state="missing"
+  fi
+
+  if [[ "$local_terminal_stale_state" == "healthy" ]]; then
+    if [[ "$previous_local_terminal_stale_state" != "healthy" ]]; then
+      alert "recovery" "Local terminal capture publishing recovered. $(local_terminal_stale_summary)" "$(local_terminal_alert_context stale)"
+    fi
+  elif [[ "$previous_local_terminal_stale_state" == "healthy" ]]; then
+    alert "critical" "Local terminal capture publishing stalled. $(local_terminal_stale_summary)" "$(local_terminal_alert_context stale)"
+  fi
+
+  if [[ "$local_terminal_routing_block_state" == "blocked" ]]; then
+    if [[ "$previous_local_terminal_routing_block_state" != "blocked" ]]; then
+      alert "critical" "Local terminal OHLCV stays renderable while routing remains blocked. $(local_terminal_routing_block_summary)" "$(local_terminal_alert_context routing-blocked)"
+    fi
+  elif [[ "$previous_local_terminal_routing_block_state" == "blocked" ]]; then
+    alert "recovery" "Local terminal renderable-but-blocked routing condition cleared. $(local_terminal_routing_block_summary)" "$(local_terminal_alert_context routing-blocked)"
+  fi
+
+  echo "$local_terminal_stale_state" > "$LOCAL_TERMINAL_STALE_STATE_FILE"
+  echo "$local_terminal_routing_block_state" > "$LOCAL_TERMINAL_ROUTING_BLOCK_STATE_FILE"
+fi
+
 if [[ "$current_state" == "failed" ]]; then
   alert "recovery" "Healthwatch recovered: no 5xx on configured endpoints."
 fi
@@ -447,6 +647,9 @@ PUBLIC_CHART_RENDERABILITY_STATE_FILE="$PUBLIC_CHART_RENDERABILITY_STATE_FILE" \
 PUBLIC_CHART_VISUAL_STATE_FILE="$PUBLIC_CHART_VISUAL_STATE_FILE" \
 PUBLIC_CHART_FAILURE_REASON_FILE="$PUBLIC_CHART_FAILURE_REASON_FILE" \
 PUBLIC_CHART_FAILURE_DETAILS_FILE="$PUBLIC_CHART_FAILURE_DETAILS_FILE" \
+LOCAL_TERMINAL_DIAGNOSTIC_JSON="$LOCAL_TERMINAL_DIAGNOSTIC_JSON" \
+LOCAL_TERMINAL_STALE_STATE_FILE="$LOCAL_TERMINAL_STALE_STATE_FILE" \
+LOCAL_TERMINAL_ROUTING_BLOCK_STATE_FILE="$LOCAL_TERMINAL_ROUTING_BLOCK_STATE_FILE" \
 bash "$ROOT_DIR/scripts/write_healthwatch_dashboard.sh" || true
 
 echo "healthy" > "$STATE_FILE"

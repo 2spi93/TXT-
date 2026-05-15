@@ -7,7 +7,9 @@
     "dev": "next dev -H 0.0.0.0 -p 3000",
     "lint": "tsc --noEmit",
     "build": "next build",
-    "start": "next start -p 3000",
+    "start": "./node_modules/.bin/next start -p ${PORT:-3000}",
+    "e2e:web-server:build": "NEXT_DIST_DIR=${NEXT_DIST_DIR:-.next-runtime} ./node_modules/.bin/next build",
+    "e2e:web-server:start": "NEXT_DIST_DIR=${NEXT_DIST_DIR:-.next-runtime} ./node_modules/.bin/next start -p ${PORT:-3000}",
     "analyze:runtime-log": "node scripts/analyze_runtime_log.js",
     "analyze:runtime-log:json": "node scripts/analyze_runtime_log.js --json",
     "analyze:runtime-log:csv": "node scripts/analyze_runtime_log.js --csv artifacts/runtime-log-analysis.csv",
@@ -36,10 +38,13 @@
     "test:xscale-viewport-guard": "node scripts/test-xscale-viewport-guard.js",
     "test:ohlcv-kernel-regression": "sh scripts/test-ohlcv-kernel-regression.sh",
     "test:risk-workspace": "node scripts/risk-workspace.integration.js",
+    "pretest:e2e": "node scripts/playwright-preflight.js",
     "test:e2e": "playwright test",
+    "test:e2e:terminal-reliability": "playwright test --workers=1 --reporter=line tests/e2e/terminal-minimal-mode.spec.ts tests/e2e/terminal-interaction-scan.spec.ts",
     "test:e2e:cancel-replace": "sh scripts/test-terminal-cancel-replace-e2e.sh",
     "test:e2e:cancel-replace-ui": "PLAYWRIGHT_TEST_PATHS='tests/e2e/terminal-cancel-replace-ui.spec.ts' sh scripts/test-terminal-cancel-replace-e2e.sh",
-    "test:e2e:install": "playwright install --with-deps"
+    "test:e2e:install": "playwright install --with-deps",
+    "qa:terminal-reliability": "sh scripts/qa-terminal-reliability.sh"
   },
   "dependencies": {
     "jszip": "^3.10.1",

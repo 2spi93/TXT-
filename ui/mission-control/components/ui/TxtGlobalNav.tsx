@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
@@ -8,7 +9,7 @@ import type { RoleGroup } from "../../lib/roleGroups";
 
 /** Navigation visible to internal TXT staff only (admin · operator · viewer). */
 const INTERNAL_NAV_ITEMS = [
-  { href: "/", label: "Dashboard" },
+  { href: "/dashboard", label: "Dashboard" },
   { href: "/fund-manager", label: "Fund Manager" },
   { href: "/live-capital", label: "Live Capital" },
   { href: "/live-ops", label: "Live Ops" },
@@ -31,6 +32,23 @@ const CLIENT_NAV_ITEMS = [
   { href: "/learn", label: "Learn" },
 ];
 
+const HARD_NAVIGATION_ROUTE_PREFIXES = [
+  "/terminal",
+  "/live-ops",
+  "/live-capital",
+  "/live-readiness",
+  "/connectors",
+  "/connections",
+  "/ai",
+];
+
+function shouldUseHardNavigation(pathname: string | null): boolean {
+  if (!pathname) {
+    return false;
+  }
+  return HARD_NAVIGATION_ROUTE_PREFIXES.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`));
+}
+
 function navTargetIdFromHref(href: string): string {
   if (href === "/") {
     return "txt-global-nav-link-home";
@@ -41,6 +59,12 @@ function navTargetIdFromHref(href: string): string {
 export default function TxtGlobalNav({ roleGroup = "unknown" }: { roleGroup?: RoleGroup }) {
   const pathname = usePathname();
   const [uiMode, setUiMode] = useUiMode();
+  const [hydrated, setHydrated] = useState(false);
+  const useHardNavigation = shouldUseHardNavigation(pathname);
+
+  useEffect(() => {
+    setHydrated(true);
+  }, []);
 
   if (pathname === "/login" || pathname === "/change-password") {
     return null;
@@ -52,7 +76,7 @@ export default function TxtGlobalNav({ roleGroup = "unknown" }: { roleGroup?: Ro
   const navItems = roleGroup === "client" ? CLIENT_NAV_ITEMS : INTERNAL_NAV_ITEMS;
 
   return (
-    <header id="txt-global-nav" className="txt-global-nav" role="banner">
+    <header id="txt-global-nav" className="txt-global-nav" role="banner" data-hydrated={hydrated ? "1" : "0"}>
       <div className="txt-global-brand-wrap">
         <div className="txt-global-brand">TXT</div>
         <div className="txt-global-subbrand">Trader eXelle Terminal</div>
@@ -60,10 +84,18 @@ export default function TxtGlobalNav({ roleGroup = "unknown" }: { roleGroup?: Ro
       <nav className="txt-global-links" aria-label="TXT main navigation">
         {navItems.map((item) => {
           const active = pathname === item.href;
+          const linkId = navTargetIdFromHref(item.href);
+          const className = `txt-global-link${active ? " active" : ""}`;
           return (
-            <Link key={item.href} id={navTargetIdFromHref(item.href)} href={item.href} className={`txt-global-link${active ? " active" : ""}`}>
-              {item.label}
-            </Link>
+            useHardNavigation ? (
+              <a key={item.href} id={linkId} href={item.href} className={className}>
+                {item.label}
+              </a>
+            ) : (
+              <Link key={item.href} id={linkId} href={item.href} className={className}>
+                {item.label}
+              </Link>
+            )
           );
         })}
         <button

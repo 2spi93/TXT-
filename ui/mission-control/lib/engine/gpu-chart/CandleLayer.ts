@@ -157,7 +157,7 @@ export class CandleLayer {
     }
   }
 
-  draw(viewportId: string, bars: OhlcBar[], options?: { allowUpload?: boolean; frameTimeMs?: number; smoothingMs?: number; canvasWidth?: number; canvasHeight?: number }): void {
+  draw(viewportId: string, bars: OhlcBar[], options?: { allowUpload?: boolean; frameTimeMs?: number; smoothingMs?: number; canvasWidth?: number; canvasHeight?: number; slotCount?: number; minPrice?: number; maxPrice?: number; minTime?: number; maxTime?: number }): void {
     if (bars.length === 0) {
       return;
     }
@@ -172,6 +172,7 @@ export class CandleLayer {
       : LAST_BAR_SMOOTH_TIME_MS_DEFAULT;
     const canvasWidth = Number.isFinite(options?.canvasWidth) ? Math.max(1, Number(options?.canvasWidth)) : this.gl.canvas.width;
     const canvasHeight = Number.isFinite(options?.canvasHeight) ? Math.max(1, Number(options?.canvasHeight)) : this.gl.canvas.height;
+    const slotCount = Number.isFinite(options?.slotCount) ? Math.max(count, Math.round(Number(options?.slotCount))) : count;
     const cssCanvasWidth = (this.gl.canvas as HTMLCanvasElement).clientWidth || canvasWidth;
     const devicePixelRatio = canvasWidth / Math.max(1, cssCanvasWidth);
 
@@ -188,7 +189,9 @@ export class CandleLayer {
 
     this.ensureInstanceCapacity(state, count);
 
-    const targetRange = resolvePerceptualRange(bars, count);
+    const targetRange = Number.isFinite(options?.minPrice) && Number.isFinite(options?.maxPrice) && Number(options?.maxPrice) > Number(options?.minPrice)
+      ? { minPrice: Number(options?.minPrice), maxPrice: Number(options?.maxPrice) }
+      : resolvePerceptualRange(bars, count);
     const rangeSig = `${count}|${targetRange.minPrice}|${targetRange.maxPrice}`;
     const lastSig = buildLastBarSignature(lastBar);
     const shouldResetRange = state.previousCount < 0
@@ -198,7 +201,7 @@ export class CandleLayer {
     const displaySpan = Math.max(1e-6, range.maxPrice - range.minPrice);
     const rangeNeedsUpload = Math.abs(state.minPrice - range.minPrice) > 1e-6
       || Math.abs(state.span - displaySpan) > 1e-6;
-    const styleSig = buildBarsStyleSignature(bars, count);
+    const styleSig = `${buildBarsStyleSignature(bars, count)}|slots:${slotCount}`;
     const isFullUpload = state.previousCount !== count
       || state.previousRangeSig !== rangeSig
       || state.previousStyleSig !== styleSig
@@ -208,8 +211,10 @@ export class CandleLayer {
       .slice(0, count)
       .map((bar) => Number(bar.time))
       .filter((time) => Number.isFinite(time));
-    const minTime = visibleTimes.length > 0 ? Math.min(...visibleTimes) : 0;
-    const maxTime = visibleTimes.length > 0 ? Math.max(...visibleTimes) : minTime;
+    const defaultMinTime = visibleTimes.length > 0 ? Math.min(...visibleTimes) : 0;
+    const defaultMaxTime = visibleTimes.length > 0 ? Math.max(...visibleTimes) : defaultMinTime;
+    const minTime = Number.isFinite(options?.minTime) ? Number(options?.minTime) : defaultMinTime;
+    const maxTime = Number.isFinite(options?.maxTime) ? Number(options?.maxTime) : defaultMaxTime;
     let smallestDelta = Number.POSITIVE_INFINITY;
     for (let index = 1; index < visibleTimes.length; index += 1) {
       const delta = visibleTimes[index] - visibleTimes[index - 1];
@@ -224,17 +229,17 @@ export class CandleLayer {
     gl.bindBuffer(gl.ARRAY_BUFFER, state.instanceBuffer);
 
     if (isFullUpload) {
-      const packed = packAllBars(bars, count, range.minPrice, range.maxPrice, state.instanceData, canvasWidth, canvasHeight, devicePixelRatio);
+      const packed = packAllBars(bars, count, slotCount, range.minPrice, range.maxPrice, state.instanceData, canvasWidth, canvasHeight, devicePixelRatio, minTime, maxTime);
       const lastBase = (count - 1) * INSTANCE_STRIDE_FLOATS;
       writePackedBar(
         state.instanceData,
         lastBase,
         count - 1,
-        count,
+        slotCount,
         displayLastBar,
         range.minPrice,
         displaySpan,
-        Math.min(0.028, 0.76 / Math.max(1, count)),
+        Math.min(0.028, 0.76 / Math.max(1, slotCount)),
         canvasWidth,
         canvasHeight,
         averageRange,
@@ -246,7 +251,7 @@ export class CandleLayer {
       gl.bufferSubData(gl.ARRAY_BUFFER, 0, packed.subarray(0, count * INSTANCE_STRIDE_FLOATS));
       state.minPrice = range.minPrice;
       state.span = displaySpan;
-      state.halfWidth = Math.min(0.028, 0.76 / Math.max(1, count));
+      state.halfWidth = Math.min(0.028, 0.76 / Math.max(1, slotCount));
       state.previousCount = count;
       state.previousRangeSig = rangeSig;
       state.previousStyleSig = styleSig;
@@ -262,7 +267,7 @@ export class CandleLayer {
           state.instanceData,
           base,
           index,
-          count,
+          slotCount,
           displayLastBar,
           state.minPrice,
           state.span,
@@ -500,15 +505,18 @@ function sanitizeBar(bar: OhlcBar): OhlcBar {
 function packAllBars(
   bars: OhlcBar[],
   count: number,
+  slotCount: number,
   minPrice: number,
   maxPrice: number,
   target: Float32Array,
   canvasWidth: number,
   canvasHeight: number,
   devicePixelRatio: number,
+  minTimeOverride?: number,
+  maxTimeOverride?: number,
 ): Float32Array {
   const span = Math.max(1e-6, maxPrice - minPrice);
-  const halfWidth = Math.min(0.028, 0.76 / Math.max(1, count));
+  const halfWidth = Math.min(0.028, 0.76 / Math.max(1, slotCount));
   const averageRange = bars.length > 0
     ? bars.reduce((sum, bar) => sum + Math.max(0, bar.high - bar.low), 0) / bars.length
     : 0;
@@ -516,8 +524,8 @@ function packAllBars(
     .slice(0, count)
     .map((bar) => Number(bar.time))
     .filter((time) => Number.isFinite(time));
-  const minTime = visibleTimes.length > 0 ? Math.min(...visibleTimes) : 0;
-  const maxTime = visibleTimes.length > 0 ? Math.max(...visibleTimes) : minTime;
+  const minTime = Number.isFinite(minTimeOverride) ? Number(minTimeOverride) : (visibleTimes.length > 0 ? Math.min(...visibleTimes) : 0);
+  const maxTime = Number.isFinite(maxTimeOverride) ? Number(maxTimeOverride) : (visibleTimes.length > 0 ? Math.max(...visibleTimes) : minTime);
   let smallestDelta = Number.POSITIVE_INFINITY;
   for (let index = 1; index < visibleTimes.length; index += 1) {
     const delta = visibleTimes[index] - visibleTimes[index - 1];
@@ -529,7 +537,7 @@ function packAllBars(
 
   for (let index = 0; index < count; index += 1) {
     const base = index * INSTANCE_STRIDE_FLOATS;
-    writePackedBar(target, base, index, count, bars[index], minPrice, span, halfWidth, canvasWidth, canvasHeight, averageRange, devicePixelRatio, minTime, maxTime, edgePadTime);
+    writePackedBar(target, base, index, slotCount, bars[index], minPrice, span, halfWidth, canvasWidth, canvasHeight, averageRange, devicePixelRatio, minTime, maxTime, edgePadTime);
   }
 
   return target;
@@ -723,7 +731,7 @@ function resolvePackedRenderStyle(bar: OhlcBar, count: number, canvasWidth: numb
     pixelSnapping,
     bodyHalfWidthNdc: pixelWidthToNdcX(bodyWidthPx * 0.5, canvasWidth),
     wickHalfWidthNdc: pixelWidthToNdcX(wickWidthPx * 0.5, canvasWidth),
-    minBodyHeightPx: Math.min(dominance.minBodyHeightPx, Math.max(1.8, canvasHeight * 0.032)),
+    minBodyHeightPx: Math.min(dominance.minBodyHeightPx, Math.max(1.6, canvasHeight * 0.016)),
   };
 }
 

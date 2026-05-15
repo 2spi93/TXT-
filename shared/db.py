@@ -149,6 +149,55 @@ CREATE TABLE IF NOT EXISTS orders (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS live_position_protection_status (
+    position_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    snapshot_source TEXT NOT NULL DEFAULT '',
+    broker_truth_source TEXT NOT NULL DEFAULT '',
+    freshness_status TEXT NOT NULL DEFAULT 'unknown',
+    live_truth BOOLEAN NOT NULL DEFAULT FALSE,
+    snapshot_age_seconds DOUBLE PRECISION,
+    stale_after_seconds INTEGER NOT NULL DEFAULT 900,
+    position_as_of TIMESTAMPTZ,
+    protection_as_of TIMESTAMPTZ,
+    requested_protection JSONB NOT NULL DEFAULT '{}'::jsonb,
+    broker_accepted_protection JSONB NOT NULL DEFAULT '{}'::jsonb,
+    broker_active_protection JSONB NOT NULL DEFAULT '{}'::jsonb,
+    last_amend_request JSONB NOT NULL DEFAULT '{}'::jsonb,
+    governor_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+    protection_status TEXT NOT NULL DEFAULT 'unknown',
+    forced_action TEXT,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS live_position_protection_audit (
+    id BIGSERIAL PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    position_id TEXT,
+    provider TEXT NOT NULL,
+    symbol TEXT,
+    event_type TEXT NOT NULL,
+    event_reason TEXT,
+    event_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_live_position_protection_status_account_provider
+    ON live_position_protection_status (account_id, provider, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_live_position_protection_status_symbol
+    ON live_position_protection_status (provider, symbol, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_live_position_protection_audit_account_provider
+    ON live_position_protection_audit (account_id, provider, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_live_position_protection_audit_position
+    ON live_position_protection_audit (position_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS audit_events (
   id BIGSERIAL PRIMARY KEY,
   category TEXT NOT NULL,
@@ -242,6 +291,25 @@ CREATE TABLE IF NOT EXISTS market_derivatives_metrics (
     payload JSONB NOT NULL DEFAULT '{}'::jsonb,
     captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS market_trade_preprocessor_journal (
+    id BIGSERIAL PRIMARY KEY,
+    sample_bucket TIMESTAMPTZ NOT NULL,
+    venue TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'snapshot',
+    mode TEXT NOT NULL,
+    market_regime TEXT NOT NULL,
+    sample_count INTEGER NOT NULL DEFAULT 1,
+    raw_count_total INTEGER NOT NULL DEFAULT 0,
+    emitted_count_total INTEGER NOT NULL DEFAULT 0,
+    last_compression_ratio DOUBLE PRECISION,
+    last_saved_pct DOUBLE PRECISION,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (venue, instrument, source, mode, market_regime, sample_bucket)
 );
 
 CREATE TABLE IF NOT EXISTS execution_telemetry (
@@ -535,9 +603,16 @@ CREATE TABLE IF NOT EXISTS decision_outcomes (
     fees_usd DOUBLE PRECISION,
     net_result_usd DOUBLE PRECISION,
     status TEXT NOT NULL DEFAULT 'pending',
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    edge_eligibility_state TEXT,
+    edge_eligibility_score_pct DOUBLE PRECISION,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE decision_outcomes ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE decision_outcomes ADD COLUMN IF NOT EXISTS edge_eligibility_state TEXT;
+ALTER TABLE decision_outcomes ADD COLUMN IF NOT EXISTS edge_eligibility_score_pct DOUBLE PRECISION;
 
 CREATE TABLE IF NOT EXISTS strategy_embeddings (
     embedding_id TEXT PRIMARY KEY,
@@ -1095,6 +1170,12 @@ ON market_orderbook_snapshots (venue, instrument, snapshot_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_market_derivatives_metrics_symbol_time
 ON market_derivatives_metrics (venue, instrument, captured_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_market_trade_preprocessor_journal_bucket
+ON market_trade_preprocessor_journal (venue, instrument, sample_bucket DESC);
+
+CREATE INDEX IF NOT EXISTS idx_market_trade_preprocessor_journal_source
+ON market_trade_preprocessor_journal (source, updated_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_execution_telemetry_symbol_time
 ON execution_telemetry (symbol, created_at DESC);

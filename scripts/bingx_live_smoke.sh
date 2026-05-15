@@ -13,7 +13,7 @@ PASSWORD="${PASSWORD:-}"
 ACCOUNT_ID="${ACCOUNT_ID:-}"
 SYMBOL="${SYMBOL:-BTCUSDT}"
 SIDE="${SIDE:-buy}"
-NOTIONAL_USD="${NOTIONAL_USD:-7}"
+NOTIONAL_USD="${NOTIONAL_USD:-7.5}"
 LIMIT_OFFSET_BPS="${LIMIT_OFFSET_BPS:-}"
 CONFIRM_LIVE="${CONFIRM_LIVE:-}"
 PRINT_RAW="${PRINT_RAW:-0}"
@@ -30,7 +30,7 @@ Options:
   --account-id VALUE         Linked BingX account id (required)
   --symbol VALUE             Symbol to use (default: BTCUSDT)
   --side VALUE               buy or sell (default: buy)
-  --notional-usd VALUE       Smoke notional in USD (default: 7)
+  --notional-usd VALUE       Smoke notional in USD (default: 7.5)
   --limit-offset-bps VALUE   Optional far-from-market limit offset in bps
   --confirm-live VALUE       Must equal BINGX_LIVE_SMOKE to execute
   --print-raw                Print raw JSON response

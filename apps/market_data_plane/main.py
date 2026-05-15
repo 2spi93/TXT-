@@ -102,12 +102,23 @@ DERIVATIVES_CACHE: dict[str, dict[str, Any]] = {}
 OHLCV_SUBSCRIBERS: dict[str, set[WebSocket]] = {}
 OHLCV_STREAM_STATE: dict[str, dict[str, Any]] = {}
 TRADE_SUBSCRIBERS: dict[str, set[WebSocket]] = {}
+PREPROCESSED_TRADE_SUBSCRIBERS: dict[str, set[WebSocket]] = {}
+PREPROCESSED_TRADE_BUFFERS: dict[str, list[dict[str, Any]]] = {}
+PREPROCESSED_TRADE_FLUSH_TASKS: dict[str, asyncio.Task[Any]] = {}
 TRADE_RECENT_KEYS: dict[str, list[str]] = {}
 LIVENESS_SERVER_STARTED = False
 GOLDAPI_RESPONSE_CACHE: dict[str, tuple[datetime, dict[str, Any]]] = {}
 TWELVEDATA_RESPONSE_CACHE: dict[str, tuple[datetime, dict[str, Any]]] = {}
 METALSAPI_RESPONSE_CACHE: dict[str, tuple[datetime, dict[str, Any]]] = {}
 VENUE_STREAM_TELEMETRY: dict[str, dict[str, dict[str, Any]]] = {}
+PREPROCESSED_TRADE_FLUSH_MS = max(75, min(1000, int(os.getenv("MARKET_PREPROCESSOR_FLUSH_MS", "250"))))
+PREPROCESSED_TRADE_TARGET_COUNT = max(20, min(400, int(os.getenv("MARKET_PREPROCESSOR_TARGET_COUNT", "80"))))
+PREPROCESSED_TRADE_JOURNAL_BUCKET = os.getenv("MARKET_PREPROCESSOR_JOURNAL_BUCKET", "1m").strip().lower() or "1m"
+if PREPROCESSED_TRADE_JOURNAL_BUCKET not in {"1m", "5m", "15m", "1h"}:
+    PREPROCESSED_TRADE_JOURNAL_BUCKET = "1m"
+PREPROCESSED_TRADE_JOURNAL_RETENTION_DAYS = max(1, int(os.getenv("MARKET_PREPROCESSOR_JOURNAL_RETENTION_DAYS", "14")))
+PREPROCESSED_TRADE_PRICE_DISCOVERY_ALERT_SAVED_PCT = max(5.0, min(95.0, float(os.getenv("MARKET_PREPROCESSOR_PRICE_DISCOVERY_ALERT_SAVED_PCT", "30"))))
+PREPROCESSED_TRADE_PRICE_DISCOVERY_ALERT_RAW_COUNT = max(10, int(os.getenv("MARKET_PREPROCESSOR_PRICE_DISCOVERY_ALERT_RAW_COUNT", "40")))
 
 
 class _LivenessHandler(BaseHTTPRequestHandler):
@@ -1149,6 +1160,571 @@ def _serialize_trade(venue: str, instrument: str, trade: dict[str, Any]) -> dict
     }
 
 
+def _trade_datetime(trade: dict[str, Any]) -> datetime:
+    traded_at = trade.get("traded_at")
+    if isinstance(traded_at, datetime):
+        return traded_at.astimezone(timezone.utc) if traded_at.tzinfo else traded_at.replace(tzinfo=timezone.utc)
+    parsed = _parse_iso_timestamp(traded_at)
+    if parsed is not None:
+        return parsed
+    return _now_utc()
+
+
+def _trade_side(trade: dict[str, Any]) -> str:
+    side = str(trade.get("side") or "").strip().lower()
+    if side in {"buy", "sell"}:
+        return side
+    return side or "unknown"
+
+
+def _price_distance_bps(reference_price: float, candidate_price: float) -> float:
+    base = max(abs(reference_price), abs(candidate_price), 1e-9)
+    return abs(candidate_price - reference_price) / base * 10000.0
+
+
+def _adaptive_trade_preprocessor_window_ms(trades: list[dict[str, Any]], target_count: int) -> int:
+    if len(trades) < 2:
+        return PREPROCESSED_TRADE_FLUSH_MS
+    first_at = _trade_datetime(trades[0])
+    last_at = _trade_datetime(trades[-1])
+    span_ms = max(0, int((last_at - first_at).total_seconds() * 1000))
+    if span_ms <= 0:
+        return PREPROCESSED_TRADE_FLUSH_MS
+    adaptive = int(span_ms / max(1, target_count))
+    return max(80, min(1500, adaptive))
+
+
+def _adaptive_trade_price_band_bps(raw_count: int, target_count: int) -> float:
+    density = raw_count / max(float(target_count), 1.0)
+    if density >= 3.0:
+        return 1.2
+    if density >= 2.0:
+        return 0.8
+    if density >= 1.25:
+        return 0.45
+    return 0.2
+
+
+def _resolve_trade_preprocessor_profile(trade_rows: list[dict[str, Any]], target_count: int) -> dict[str, Any]:
+    raw_count = len(trade_rows)
+    if raw_count == 0:
+        return {
+            "mode": "semantic_window_v1",
+            "market_regime": "empty",
+            "effective_target_count": target_count,
+            "aggregation_window_ms": PREPROCESSED_TRADE_FLUSH_MS,
+            "price_band_bps": 0.0,
+            "features": {},
+        }
+
+    base_window = _adaptive_trade_preprocessor_window_ms([item["trade"] for item in trade_rows], target_count)
+    base_band = _adaptive_trade_price_band_bps(raw_count, target_count)
+    first_at = trade_rows[0]["traded_at"]
+    last_at = trade_rows[-1]["traded_at"]
+    time_span_ms = max(1, int((last_at - first_at).total_seconds() * 1000))
+    time_span_seconds = max(time_span_ms / 1000.0, 1e-9)
+    buy_volume = sum(item["size"] for item in trade_rows if item["side"] == "buy")
+    sell_volume = sum(item["size"] for item in trade_rows if item["side"] == "sell")
+    raw_size = sum(item["size"] for item in trade_rows)
+    raw_notional = sum(item["price"] * item["size"] for item in trade_rows)
+    positive_prices = [item["price"] for item in trade_rows if item["price"] > 0]
+    first_price = positive_prices[0] if positive_prices else 0.0
+    last_price = positive_prices[-1] if positive_prices else 0.0
+    low_price = min(positive_prices) if positive_prices else 0.0
+    high_price = max(positive_prices) if positive_prices else 0.0
+    price_range_bps = _price_distance_bps(low_price, high_price) if low_price > 0 and high_price > 0 else 0.0
+    drift_bps = _price_distance_bps(first_price, last_price) if first_price > 0 and last_price > 0 else 0.0
+    volume_imbalance = (buy_volume - sell_volume) / max(buy_volume + sell_volume, 1e-9)
+    trades_per_second = raw_count / time_span_seconds
+    largest_trade_size = max((item["size"] for item in trade_rows), default=0.0)
+    largest_trade_share = largest_trade_size / max(raw_size, 1e-9)
+    effective_target_count = target_count
+    mode = "semantic_window_v1"
+    market_regime = "transitional"
+    aggregation_window_ms = base_window
+    price_band_bps = base_band
+
+    if raw_count <= max(14, int(target_count * 0.55)) and price_range_bps <= 2.2 and trades_per_second <= 3.5:
+        market_regime = "quiet_absorption"
+        mode = "semantic_quiet_absorption_v1"
+        aggregation_window_ms = max(160, min(2200, int(base_window * 1.75)))
+        price_band_bps = max(0.35, base_band * 1.8)
+        effective_target_count = max(20, min(raw_count, int(target_count * 0.75)))
+    elif price_range_bps >= 16.0 or drift_bps >= 10.0 or largest_trade_share >= 0.33:
+        market_regime = "price_discovery"
+        mode = "semantic_price_discovery_v1"
+        aggregation_window_ms = max(45, min(650, int(base_window * 0.35)))
+        price_band_bps = max(0.08, base_band * 0.35)
+        effective_target_count = max(target_count, min(raw_count, int(raw_count * 0.82)))
+    elif abs(volume_imbalance) >= 0.55 and (drift_bps >= 3.0 or trades_per_second >= 6.0):
+        market_regime = "directional_pressure"
+        mode = "semantic_directional_pressure_v1"
+        aggregation_window_ms = max(70, min(900, int(base_window * 0.6)))
+        price_band_bps = max(0.12, base_band * 0.55)
+        effective_target_count = max(target_count, min(raw_count, int(raw_count * 0.72)))
+    elif raw_count >= max(48, int(target_count * 1.4)) and price_range_bps <= 5.0 and abs(volume_imbalance) <= 0.2:
+        market_regime = "balanced_rotation"
+        mode = "semantic_balanced_rotation_v1"
+        aggregation_window_ms = max(100, min(1600, int(base_window * 1.15)))
+        price_band_bps = max(0.25, base_band * 1.2)
+        effective_target_count = max(20, min(raw_count, int(target_count * 0.9)))
+
+    return {
+        "mode": mode,
+        "market_regime": market_regime,
+        "effective_target_count": max(20, min(max(raw_count, 20), effective_target_count)),
+        "aggregation_window_ms": aggregation_window_ms,
+        "price_band_bps": price_band_bps,
+        "features": {
+            "price_range_bps": round(price_range_bps, 6),
+            "drift_bps": round(drift_bps, 6),
+            "volume_imbalance": round(volume_imbalance, 6),
+            "trades_per_second": round(trades_per_second, 6),
+            "largest_trade_share": round(largest_trade_share, 6),
+            "time_span_ms": time_span_ms,
+            "raw_size": round(raw_size, 10),
+            "raw_notional": round(raw_notional, 10),
+        },
+    }
+
+
+def _record_trade_preprocessor_journal(venue: str, instrument: str, compressed: dict[str, Any], source: str) -> None:
+    preprocessor = compressed.get("preprocessor") if isinstance(compressed.get("preprocessor"), dict) else None
+    if not preprocessor:
+        return
+    mode = str(preprocessor.get("mode") or "semantic_window_v1")
+    market_regime = str(preprocessor.get("market_regime") or "unknown")
+    raw_count = max(0, int(preprocessor.get("raw_count") or 0))
+    emitted_count = max(0, int(preprocessor.get("emitted_count") or 0))
+    sample_bucket = _bucket_floor(_now_utc(), PREPROCESSED_TRADE_JOURNAL_BUCKET)
+    execute(
+        """
+        INSERT INTO market_trade_preprocessor_journal (
+            sample_bucket,
+            venue,
+            instrument,
+            source,
+            mode,
+            market_regime,
+            sample_count,
+            raw_count_total,
+            emitted_count_total,
+            last_compression_ratio,
+            last_saved_pct,
+            payload,
+            updated_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, 1, %s, %s, %s, %s, %s::jsonb, NOW())
+        ON CONFLICT (venue, instrument, source, mode, market_regime, sample_bucket)
+        DO UPDATE SET
+            sample_count = market_trade_preprocessor_journal.sample_count + 1,
+            raw_count_total = market_trade_preprocessor_journal.raw_count_total + EXCLUDED.raw_count_total,
+            emitted_count_total = market_trade_preprocessor_journal.emitted_count_total + EXCLUDED.emitted_count_total,
+            last_compression_ratio = EXCLUDED.last_compression_ratio,
+            last_saved_pct = EXCLUDED.last_saved_pct,
+            payload = EXCLUDED.payload,
+            updated_at = NOW()
+        """,
+        (
+            sample_bucket,
+            venue,
+            _normalize_instrument(instrument),
+            source,
+            mode,
+            market_regime,
+            raw_count,
+            emitted_count,
+            _float(preprocessor.get("compression_ratio"), 0.0),
+            _float(preprocessor.get("compression_saved_pct"), 0.0),
+            json_dumps(preprocessor),
+        ),
+    )
+
+
+def _fetch_trade_preprocessor_analytics_rows(
+    *,
+    hours: int,
+    venue: str | None = None,
+    instrument: str | None = None,
+    limit: int = 24,
+) -> list[dict[str, Any]]:
+    clauses = ["sample_bucket >= NOW() - (%s || ' hours')::interval"]
+    params: list[Any] = [max(1, hours)]
+    if venue:
+        clauses.append("venue = %s")
+        params.append(venue)
+    if instrument:
+        clauses.append("instrument = %s")
+        params.append(_normalize_instrument(instrument))
+    params.extend([PREPROCESSED_TRADE_PRICE_DISCOVERY_ALERT_SAVED_PCT, max(1, min(limit, 100))])
+    where_sql = " AND ".join(clauses)
+    return fetch_all(
+        f"""
+        SELECT
+            venue,
+            market_regime,
+            COUNT(*) AS bucket_count,
+            SUM(sample_count) AS sample_count,
+            SUM(raw_count_total) AS raw_count_total,
+            SUM(emitted_count_total) AS emitted_count_total,
+            CASE
+                WHEN SUM(raw_count_total) > 0 THEN SUM(emitted_count_total)::double precision / SUM(raw_count_total)
+                ELSE 0
+            END AS compression_ratio,
+            CASE
+                WHEN SUM(raw_count_total) > 0 THEN (1 - SUM(emitted_count_total)::double precision / SUM(raw_count_total)) * 100
+                ELSE 0
+            END AS compression_saved_pct,
+            AVG(COALESCE(last_saved_pct, 0)) AS avg_saved_pct,
+            MAX(COALESCE(last_saved_pct, 0)) AS max_saved_pct,
+            SUM(
+                CASE
+                    WHEN market_regime = 'price_discovery' AND COALESCE(last_saved_pct, 0) >= %s THEN 1
+                    ELSE 0
+                END
+            ) AS aggressive_bucket_count,
+            MAX(updated_at) AS updated_at
+        FROM market_trade_preprocessor_journal
+        WHERE {where_sql}
+        GROUP BY venue, market_regime
+        ORDER BY raw_count_total DESC, sample_count DESC, venue ASC, market_regime ASC
+        LIMIT %s
+        """,
+        tuple(params),
+    )
+
+
+def _build_trade_preprocessor_analytics_payload(
+    *,
+    venue: str | None = None,
+    instrument: str | None = None,
+    limit: int = 24,
+) -> dict[str, Any]:
+    window_24h = _fetch_trade_preprocessor_analytics_rows(hours=24, venue=venue, instrument=instrument, limit=limit)
+    window_7d = _fetch_trade_preprocessor_analytics_rows(hours=168, venue=venue, instrument=instrument, limit=limit)
+    return {
+        "filters": {
+            "venue": venue,
+            "instrument": _normalize_instrument(instrument) if instrument else None,
+        },
+        "thresholds": {
+            "price_discovery_saved_pct": PREPROCESSED_TRADE_PRICE_DISCOVERY_ALERT_SAVED_PCT,
+            "price_discovery_min_raw_count": PREPROCESSED_TRADE_PRICE_DISCOVERY_ALERT_RAW_COUNT,
+        },
+        "windows": {
+            "last_24h": window_24h,
+            "last_7d": window_7d,
+        },
+        "as_of": _now_utc().isoformat(),
+    }
+
+
+def _build_trade_preprocessor_alert(preprocessor: dict[str, Any] | None, analytics: dict[str, Any] | None = None) -> dict[str, Any]:
+    threshold_saved_pct = PREPROCESSED_TRADE_PRICE_DISCOVERY_ALERT_SAVED_PCT
+    threshold_raw_count = PREPROCESSED_TRADE_PRICE_DISCOVERY_ALERT_RAW_COUNT
+    if not isinstance(preprocessor, dict):
+        return {
+            "state": "unknown",
+            "triggered": False,
+            "reason_code": "preprocessor-missing",
+            "threshold_saved_pct": threshold_saved_pct,
+            "threshold_raw_count": threshold_raw_count,
+            "summary": "No preprocessor payload available.",
+        }
+    market_regime = str(preprocessor.get("market_regime") or "unknown")
+    saved_pct = _float(preprocessor.get("compression_saved_pct"), 0.0)
+    raw_count = max(0, int(preprocessor.get("raw_count") or 0))
+    current_triggered = market_regime == "price_discovery" and raw_count >= threshold_raw_count and saved_pct >= threshold_saved_pct
+    analytics_rows_24h = []
+    if isinstance(analytics, dict):
+        windows = analytics.get("windows") if isinstance(analytics.get("windows"), dict) else {}
+        analytics_rows_24h = windows.get("last_24h") if isinstance(windows.get("last_24h"), list) else []
+    price_discovery_24h = next(
+        (
+            row for row in analytics_rows_24h
+            if isinstance(row, dict) and str(row.get("market_regime") or "") == "price_discovery"
+        ),
+        None,
+    )
+    aggressive_buckets_24h = max(0, int((price_discovery_24h or {}).get("aggressive_bucket_count") or 0))
+    if current_triggered:
+        return {
+            "state": "warn",
+            "triggered": True,
+            "reason_code": "price-discovery-compression-too-high",
+            "threshold_saved_pct": threshold_saved_pct,
+            "threshold_raw_count": threshold_raw_count,
+            "summary": f"Price discovery compression too aggressive: {saved_pct:.1f}% saved on raw {raw_count}.",
+            "current_saved_pct": round(saved_pct, 4),
+            "current_raw_count": raw_count,
+            "aggressive_buckets_24h": aggressive_buckets_24h,
+        }
+    if aggressive_buckets_24h > 0:
+        max_saved_pct_24h = _float((price_discovery_24h or {}).get("max_saved_pct"), 0.0)
+        return {
+            "state": "watch",
+            "triggered": True,
+            "reason_code": "price-discovery-buckets-over-threshold-24h",
+            "threshold_saved_pct": threshold_saved_pct,
+            "threshold_raw_count": threshold_raw_count,
+            "summary": f"24h price discovery alert buckets: {aggressive_buckets_24h} (max saved {max_saved_pct_24h:.1f}%).",
+            "current_saved_pct": round(saved_pct, 4),
+            "current_raw_count": raw_count,
+            "aggressive_buckets_24h": aggressive_buckets_24h,
+        }
+    return {
+        "state": "ok",
+        "triggered": False,
+        "reason_code": "within-threshold",
+        "threshold_saved_pct": threshold_saved_pct,
+        "threshold_raw_count": threshold_raw_count,
+        "summary": f"Compression within price discovery threshold ({saved_pct:.1f}% / raw {raw_count}).",
+        "current_saved_pct": round(saved_pct, 4),
+        "current_raw_count": raw_count,
+        "aggressive_buckets_24h": aggressive_buckets_24h,
+    }
+
+
+def _build_preprocessed_trade_feed(
+    venue: str,
+    instrument: str,
+    trades: list[dict[str, Any]],
+    *,
+    target_count: int | None = None,
+) -> dict[str, Any]:
+    raw_count = len(trades)
+    safe_target = max(20, min(target_count or PREPROCESSED_TRADE_TARGET_COUNT, max(raw_count, 20)))
+    if raw_count == 0:
+        return {
+            "venue": venue,
+            "instrument": _normalize_instrument(instrument),
+            "items": [],
+            "preprocessor": {
+                "mode": "semantic_window_v1",
+                "market_regime": "empty",
+                "raw_count": 0,
+                "emitted_count": 0,
+                "compression_ratio": 0.0,
+                "compression_saved_pct": 0.0,
+                "target_count": safe_target,
+                "aggregation_window_ms": PREPROCESSED_TRADE_FLUSH_MS,
+                "price_band_bps": 0.0,
+            },
+            "as_of": _now_utc().isoformat(),
+        }
+
+    trade_rows: list[dict[str, Any]] = []
+    for trade in trades:
+        trade_rows.append(
+            {
+                "trade": trade,
+                "traded_at": _trade_datetime(trade),
+                "side": _trade_side(trade),
+                "price": _float(trade.get("price"), 0.0),
+                "size": _float(trade.get("size"), 0.0),
+            }
+        )
+    input_desc = len(trade_rows) > 1 and trade_rows[0]["traded_at"] > trade_rows[-1]["traded_at"]
+    ordered_rows = sorted(trade_rows, key=lambda item: item["traded_at"])
+    profile = _resolve_trade_preprocessor_profile(ordered_rows, safe_target)
+    aggregation_window_ms = int(profile.get("aggregation_window_ms") or PREPROCESSED_TRADE_FLUSH_MS)
+    price_band_bps = _float(profile.get("price_band_bps"), _adaptive_trade_price_band_bps(raw_count, safe_target))
+    effective_target_count = max(20, int(profile.get("effective_target_count") or safe_target))
+    mode = str(profile.get("mode") or "semantic_window_v1")
+    market_regime = str(profile.get("market_regime") or "transitional")
+    profile_features = profile.get("features") if isinstance(profile.get("features"), dict) else {}
+
+    grouped: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for row in ordered_rows:
+        trade = row["trade"]
+        traded_at = row["traded_at"]
+        price = row["price"]
+        size = max(0.0, row["size"])
+        side = row["side"]
+        if current is None:
+            current = {
+                "side": side,
+                "count": 1,
+                "first_at": traded_at,
+                "last_at": traded_at,
+                "price_weighted_sum": price * size,
+                "size": size,
+                "notional": price * size,
+                "min_price": price,
+                "max_price": price,
+                "last_price": price,
+                "trade_id": str(trade.get("trade_id") or trade.get("id") or ""),
+                "payload": trade.get("payload", {}),
+            }
+            continue
+        representative_price = current["price_weighted_sum"] / max(current["size"], 1e-9) if current["size"] > 0 else current["last_price"]
+        within_window = int((traded_at - current["last_at"]).total_seconds() * 1000) <= aggregation_window_ms
+        within_price_band = _price_distance_bps(representative_price, price) <= price_band_bps
+        if side == current["side"] and within_window and within_price_band:
+            current["count"] += 1
+            current["last_at"] = traded_at
+            current["price_weighted_sum"] += price * size
+            current["size"] += size
+            current["notional"] += price * size
+            current["min_price"] = min(current["min_price"], price)
+            current["max_price"] = max(current["max_price"], price)
+            current["last_price"] = price
+        else:
+            grouped.append(current)
+            current = {
+                "side": side,
+                "count": 1,
+                "first_at": traded_at,
+                "last_at": traded_at,
+                "price_weighted_sum": price * size,
+                "size": size,
+                "notional": price * size,
+                "min_price": price,
+                "max_price": price,
+                "last_price": price,
+                "trade_id": str(trade.get("trade_id") or trade.get("id") or ""),
+                "payload": trade.get("payload", {}),
+            }
+    if current is not None:
+        grouped.append(current)
+
+    emitted_items: list[dict[str, Any]] = []
+    buy_volume = 0.0
+    sell_volume = 0.0
+    for index, item in enumerate(grouped):
+        average_price = item["price_weighted_sum"] / max(item["size"], 1e-9) if item["size"] > 0 else item["last_price"]
+        if item["side"] == "buy":
+            buy_volume += item["size"]
+        elif item["side"] == "sell":
+            sell_volume += item["size"]
+        price_span_bps = _price_distance_bps(item["min_price"], item["max_price"]) if item["count"] > 1 else 0.0
+        payload = item["payload"] if isinstance(item["payload"], dict) else {}
+        payload = {
+            **payload,
+            "preprocessor": {
+                "mode": mode,
+                "market_regime": market_regime,
+                "aggregated": item["count"] > 1,
+                "raw_trade_count": item["count"],
+                "first_traded_at": item["first_at"].isoformat(),
+                "last_traded_at": item["last_at"].isoformat(),
+                "window_ms": max(0, int((item["last_at"] - item["first_at"]).total_seconds() * 1000)),
+                "price_span_bps": round(price_span_bps, 6),
+                "representative_price": round(average_price, 10),
+                "total_notional": round(item["notional"], 10),
+            },
+        }
+        emitted_items.append(
+            _serialize_trade(
+                venue,
+                instrument,
+                {
+                    "trade_id": item["trade_id"] or f"pp-{int(item['last_at'].timestamp() * 1000)}-{index + 1}",
+                    "side": item["side"],
+                    "price": average_price,
+                    "size": item["size"],
+                    "traded_at": item["last_at"],
+                    "payload": payload,
+                },
+            )
+        )
+
+    if input_desc:
+        emitted_items.reverse()
+
+    first_emitted = emitted_items[0] if emitted_items else None
+    last_emitted = emitted_items[-1] if emitted_items else None
+    raw_notional = sum(item["price"] * item["size"] for item in ordered_rows)
+    raw_size = sum(item["size"] for item in ordered_rows)
+    time_span_minutes = max((ordered_rows[-1]["traded_at"] - ordered_rows[0]["traded_at"]).total_seconds() / 60.0, 1.0 / 60.0)
+    emitted_count = len(emitted_items)
+    return {
+        "venue": venue,
+        "instrument": _normalize_instrument(instrument),
+        "items": emitted_items,
+        "preprocessor": {
+            "mode": mode,
+            "market_regime": market_regime,
+            "raw_count": raw_count,
+            "emitted_count": emitted_count,
+            "compression_ratio": round(emitted_count / max(raw_count, 1), 6),
+            "compression_saved_pct": round((1.0 - (emitted_count / max(raw_count, 1))) * 100.0, 4),
+            "target_count": effective_target_count,
+            "aggregation_window_ms": aggregation_window_ms,
+            "price_band_bps": price_band_bps,
+            "buy_volume": round(buy_volume, 10),
+            "sell_volume": round(sell_volume, 10),
+            "volume_imbalance": round((buy_volume - sell_volume) / max(buy_volume + sell_volume, 1e-9), 6),
+            "raw_size": round(raw_size, 10),
+            "raw_notional": round(raw_notional, 10),
+            "tape_acceleration": round(raw_size / max(time_span_minutes, 1e-9), 10),
+            "first_emitted_at": first_emitted.get("traded_at") if isinstance(first_emitted, dict) else None,
+            "last_emitted_at": last_emitted.get("traded_at") if isinstance(last_emitted, dict) else None,
+            "profile_features": profile_features,
+        },
+        "as_of": _now_utc().isoformat(),
+    }
+
+
+async def _flush_preprocessed_trade_buffer(venue: str, instrument: str) -> None:
+    key = _trade_stream_key(venue, instrument)
+    PREPROCESSED_TRADE_FLUSH_TASKS.pop(key, None)
+    subscribers = PREPROCESSED_TRADE_SUBSCRIBERS.get(key, set())
+    if not subscribers:
+        PREPROCESSED_TRADE_BUFFERS.pop(key, None)
+        return
+    trades = PREPROCESSED_TRADE_BUFFERS.pop(key, [])
+    if not trades:
+        return
+    compressed = _build_preprocessed_trade_feed(venue, instrument, trades, target_count=min(len(trades), PREPROCESSED_TRADE_TARGET_COUNT))
+    await asyncio.to_thread(_record_trade_preprocessor_journal, venue, instrument, compressed, "stream_flush")
+    items = compressed.get("items") if isinstance(compressed.get("items"), list) else []
+    if not items:
+        return
+    base_payload = {
+        "venue": venue,
+        "instrument": _normalize_instrument(instrument),
+        "preprocessor": compressed.get("preprocessor"),
+        "as_of": _now_utc().isoformat(),
+    }
+    payload = {"type": "trade", "item": items[0], **base_payload} if len(items) == 1 else {"type": "snapshot", "items": items, **base_payload}
+    stale: list[WebSocket] = []
+    for socket in list(subscribers):
+        try:
+            await socket.send_json(payload)
+        except Exception:
+            stale.append(socket)
+    for socket in stale:
+        subscribers.discard(socket)
+
+
+async def _flush_preprocessed_trade_buffer_after_delay(venue: str, instrument: str) -> None:
+    try:
+        await asyncio.sleep(PREPROCESSED_TRADE_FLUSH_MS / 1000)
+        await _flush_preprocessed_trade_buffer(venue, instrument)
+    except asyncio.CancelledError:
+        return
+
+
+def _buffer_preprocessed_trade(venue: str, instrument: str, trade: dict[str, Any]) -> None:
+    key = _trade_stream_key(venue, instrument)
+    subscribers = PREPROCESSED_TRADE_SUBSCRIBERS.get(key, set())
+    if not subscribers:
+        return
+    buffer = PREPROCESSED_TRADE_BUFFERS.setdefault(key, [])
+    buffer.append(trade)
+    task = PREPROCESSED_TRADE_FLUSH_TASKS.get(key)
+    immediate_flush_threshold = max(4, min(32, PREPROCESSED_TRADE_TARGET_COUNT // 6))
+    if len(buffer) >= immediate_flush_threshold:
+        if task and not task.done():
+            task.cancel()
+        PREPROCESSED_TRADE_FLUSH_TASKS[key] = asyncio.create_task(_flush_preprocessed_trade_buffer(venue, instrument))
+        return
+    if task is None or task.done():
+        PREPROCESSED_TRADE_FLUSH_TASKS[key] = asyncio.create_task(_flush_preprocessed_trade_buffer_after_delay(venue, instrument))
+
+
 async def _broadcast_trade(venue: str, instrument: str, trade: dict[str, Any]) -> None:
     key = _trade_stream_key(venue, instrument)
     subscribers = TRADE_SUBSCRIBERS.get(key, set())
@@ -1177,6 +1753,7 @@ async def _broadcast_trades(venue: str, instrument: str, trades: list[dict[str, 
     for trade in trades:
         if not _remember_trade_signature(venue, instrument, trade):
             continue
+        _buffer_preprocessed_trade(venue, instrument, trade)
         await _broadcast_trade(venue, instrument, trade)
 
 
@@ -1992,6 +2569,10 @@ def _cleanup_old_rows() -> None:
         """
     )
     execute("DELETE FROM market_derivatives_metrics WHERE captured_at < NOW() - INTERVAL '14 days'")
+    execute(
+        "DELETE FROM market_trade_preprocessor_journal WHERE sample_bucket < NOW() - (%s || ' days')::interval",
+        (PREPROCESSED_TRADE_JOURNAL_RETENTION_DAYS,),
+    )
 
 
 def _has_recent_trades(venue: str, instrument: str, lookback_seconds: int = 90) -> bool:
@@ -2931,6 +3512,112 @@ async def market_trades(
     )
 
 
+@app.get("/v1/market/trades/preprocessed")
+async def market_trades_preprocessed(
+    instrument: str = Query(...),
+    venue: str = Query(DEFAULT_VENUE),
+    limit: int = Query(200, ge=20, le=500),
+    target_count: int = Query(PREPROCESSED_TRADE_TARGET_COUNT, ge=20, le=400),
+) -> dict:
+    market_symbol = _market_symbol_for_venue(venue, instrument)
+    safe_target = max(20, min(target_count, limit))
+    rows = fetch_all(
+        """
+        SELECT venue, instrument, trade_id, side, price, size, traded_at, payload
+        FROM market_trades
+        WHERE venue = %s AND instrument = %s
+        ORDER BY traded_at DESC
+        LIMIT %s
+        """,
+        (venue, market_symbol, limit),
+    )
+    compressed = _build_preprocessed_trade_feed(venue, market_symbol, rows, target_count=safe_target)
+    await asyncio.to_thread(_record_trade_preprocessor_journal, venue, market_symbol, compressed, "http_snapshot")
+    return compressed
+
+
+@app.get("/v1/market/trades/preprocessor/journal")
+async def market_trades_preprocessor_journal(
+    instrument: str = Query(...),
+    venue: str = Query(DEFAULT_VENUE),
+    hours: int = Query(12, ge=1, le=168),
+    limit: int = Query(48, ge=1, le=240),
+) -> dict:
+    market_symbol = _market_symbol_for_venue(venue, instrument)
+    rows = fetch_all(
+        """
+        SELECT
+            sample_bucket,
+            venue,
+            instrument,
+            source,
+            mode,
+            market_regime,
+            sample_count,
+            raw_count_total,
+            emitted_count_total,
+            CASE
+                WHEN raw_count_total > 0 THEN emitted_count_total::double precision / raw_count_total
+                ELSE 0
+            END AS compression_ratio,
+            CASE
+                WHEN raw_count_total > 0 THEN (1 - emitted_count_total::double precision / raw_count_total) * 100
+                ELSE 0
+            END AS compression_saved_pct,
+            CASE
+                WHEN sample_count > 0 THEN raw_count_total::double precision / sample_count
+                ELSE 0
+            END AS avg_raw_count,
+            CASE
+                WHEN sample_count > 0 THEN emitted_count_total::double precision / sample_count
+                ELSE 0
+            END AS avg_emitted_count,
+            payload,
+            updated_at
+        FROM market_trade_preprocessor_journal
+        WHERE venue = %s
+          AND instrument = %s
+          AND sample_bucket >= NOW() - (%s || ' hours')::interval
+        ORDER BY sample_bucket DESC, updated_at DESC
+        LIMIT %s
+        """,
+        (venue, market_symbol, hours, limit),
+    )
+    total_raw = sum(max(0, int(row.get("raw_count_total") or 0)) for row in rows)
+    total_emitted = sum(max(0, int(row.get("emitted_count_total") or 0)) for row in rows)
+    total_samples = sum(max(0, int(row.get("sample_count") or 0)) for row in rows)
+    return {
+        "venue": venue,
+        "instrument": market_symbol,
+        "bucket": PREPROCESSED_TRADE_JOURNAL_BUCKET,
+        "items": rows,
+        "summary": {
+            "sample_count": total_samples,
+            "raw_count_total": total_raw,
+            "emitted_count_total": total_emitted,
+            "compression_ratio": round(total_emitted / max(total_raw, 1), 6),
+            "compression_saved_pct": round((1.0 - (total_emitted / max(total_raw, 1))) * 100.0, 4),
+        },
+        "as_of": _now_utc().isoformat(),
+    }
+
+
+@app.get("/v1/market/trades/preprocessor/analytics")
+async def market_trades_preprocessor_analytics(
+    venue: str | None = Query(None),
+    instrument: str | None = Query(None),
+    limit: int = Query(24, ge=1, le=100),
+) -> dict:
+    normalized_venue = str(venue).strip() if isinstance(venue, str) and venue.strip() else None
+    normalized_instrument = _normalize_instrument(instrument) if isinstance(instrument, str) and instrument.strip() else None
+    payload = _build_trade_preprocessor_analytics_payload(
+        venue=normalized_venue,
+        instrument=normalized_instrument,
+        limit=limit,
+    )
+    return payload
+
+
 @app.get("/v1/market/orderbook/depth")
 async def market_depth(
     instrument: str = Query(...),
@@ -3083,6 +3770,56 @@ async def ws_market_trades(
             await websocket.receive_text()
     except WebSocketDisconnect:
         TRADE_SUBSCRIBERS.get(stream_key, set()).discard(websocket)
+
+
+@app.websocket("/ws/v1/market/trades/preprocessed/{instrument}")
+async def ws_market_trades_preprocessed(
+    websocket: WebSocket,
+    instrument: str,
+    venue: str = DEFAULT_VENUE,
+    limit: int = 200,
+    target_count: int = PREPROCESSED_TRADE_TARGET_COUNT,
+) -> None:
+    symbol = _market_symbol_for_venue(venue, instrument)
+    safe_limit = max(20, min(limit, 500))
+    safe_target = max(20, min(target_count, safe_limit))
+    stream_key = _trade_stream_key(venue, symbol)
+    await websocket.accept()
+    PREPROCESSED_TRADE_SUBSCRIBERS.setdefault(stream_key, set()).add(websocket)
+
+    rows = fetch_all(
+        """
+        SELECT venue, instrument, trade_id, side, price, size, traded_at, payload
+        FROM market_trades
+        WHERE venue = %s AND instrument = %s
+        ORDER BY traded_at DESC
+        LIMIT %s
+        """,
+        (venue, symbol, safe_limit),
+    )
+    compressed = _build_preprocessed_trade_feed(venue, symbol, list(reversed(rows)), target_count=safe_target)
+    await websocket.send_json(
+        {
+            "type": "snapshot",
+            "venue": venue,
+            "instrument": symbol,
+            "items": compressed.get("items", []),
+            "preprocessor": compressed.get("preprocessor"),
+            "as_of": _now_utc().isoformat(),
+        }
+    )
+
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        subscribers = PREPROCESSED_TRADE_SUBSCRIBERS.get(stream_key, set())
+        subscribers.discard(websocket)
+        if not subscribers:
+            pending = PREPROCESSED_TRADE_FLUSH_TASKS.pop(stream_key, None)
+            if pending and not pending.done():
+                pending.cancel()
+            PREPROCESSED_TRADE_BUFFERS.pop(stream_key, None)
 
 
 @app.get("/v1/market/microstructure")

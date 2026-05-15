@@ -103,12 +103,12 @@ PY
     -X POST "$control_plane_url/v1/auth/login" \
     --data "$request_body")" || return 1
 
-  token="$(printf '%s' "$login_body" | python3 - <<'PY'
+  token="$(LOGIN_BODY="$login_body" python3 - <<'PY'
 import json
-import sys
+import os
 
 try:
-    body = json.load(sys.stdin)
+    body = json.loads(os.environ["LOGIN_BODY"])
 except Exception:
     print("")
     raise SystemExit(0)

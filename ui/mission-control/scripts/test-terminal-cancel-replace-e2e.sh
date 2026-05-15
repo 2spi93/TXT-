@@ -8,8 +8,9 @@ MOCK_CONTROL_PLANE_PORT="${MOCK_CONTROL_PLANE_PORT:-18011}"
 MOCK_CONTROL_PLANE_URL="http://127.0.0.1:${MOCK_CONTROL_PLANE_PORT}"
 MOCK_CONTROL_PLANE_FALLBACK_URL="${MOCK_CONTROL_PLANE_FALLBACK_URL:-https://api.txt.gtixt.com}"
 PLAYWRIGHT_BASE_URL="${PLAYWRIGHT_BASE_URL:-http://127.0.0.1:3310}"
-PLAYWRIGHT_WEB_SERVER_COMMAND="${PLAYWRIGHT_WEB_SERVER_COMMAND:-npm run dev -- --hostname 127.0.0.1 --port 3310}"
+PLAYWRIGHT_WEB_SERVER_COMMAND="${PLAYWRIGHT_WEB_SERVER_COMMAND:-sh scripts/playwright-web-server.sh}"
 PLAYWRIGHT_TEST_PATHS="${PLAYWRIGHT_TEST_PATHS:-tests/e2e/terminal-cancel-replace-flow.spec.ts tests/e2e/terminal-cancel-replace-ui.spec.ts}"
+NEXT_DIST_DIR="${NEXT_DIST_DIR:-.next-runtime}"
 
 node scripts/mock-control-plane-cancel-replace.js > /tmp/mock-control-plane-cancel-replace.log 2>&1 &
 MOCK_PID=$!
@@ -41,5 +42,6 @@ PLAYWRIGHT_CONTROL_PLANE_URL="${MOCK_CONTROL_PLANE_URL}" \
 MOCK_CONTROL_PLANE_FALLBACK_URL="${MOCK_CONTROL_PLANE_FALLBACK_URL}" \
 PLAYWRIGHT_BASE_URL="${PLAYWRIGHT_BASE_URL}" \
 PLAYWRIGHT_WEB_SERVER_COMMAND="${PLAYWRIGHT_WEB_SERVER_COMMAND}" \
+NEXT_DIST_DIR="${NEXT_DIST_DIR}" \
 PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH="${PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH:-$(command -v chromium-browser || command -v chromium || true)}" \
-./node_modules/.bin/playwright test ${PLAYWRIGHT_TEST_PATHS}
+node scripts/playwright-preflight.js && ./node_modules/.bin/playwright test ${PLAYWRIGHT_TEST_PATHS}

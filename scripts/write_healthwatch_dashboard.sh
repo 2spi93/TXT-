@@ -22,8 +22,11 @@ PUBLIC_CHART_RENDERABILITY_STATE_FILE="${PUBLIC_CHART_RENDERABILITY_STATE_FILE:-
 PUBLIC_CHART_VISUAL_STATE_FILE="${PUBLIC_CHART_VISUAL_STATE_FILE:-${STATE_FILE}.public_chart_visual}"
 PUBLIC_CHART_FAILURE_REASON_FILE="${PUBLIC_CHART_FAILURE_REASON_FILE:-${STATE_FILE}.public_chart_failure_reason}"
 PUBLIC_CHART_FAILURE_DETAILS_FILE="${PUBLIC_CHART_FAILURE_DETAILS_FILE:-${STATE_FILE}.public_chart_failure_details.json}"
+LOCAL_TERMINAL_DIAGNOSTIC_JSON="${LOCAL_TERMINAL_DIAGNOSTIC_JSON:-${ROOT_DIR}/logs/healthwatch/local-terminal-diagnostic.json}"
+LOCAL_TERMINAL_STALE_STATE_FILE="${LOCAL_TERMINAL_STALE_STATE_FILE:-${STATE_FILE}.local_terminal_stale}"
+LOCAL_TERMINAL_ROUTING_BLOCK_STATE_FILE="${LOCAL_TERMINAL_ROUTING_BLOCK_STATE_FILE:-${STATE_FILE}.local_terminal_routing_block}"
 
-python3 - "$DASHBOARD_JSON" "$DASHBOARD_MD" "$STATE_FILE" "$CHART_CAPTURE_STATE_FILE" "$CHART_CAPTURE_COUNT_FILE" "$CHART_CAPTURE_THRESHOLD" "$CHART_CAPTURE_REQUIRED_FAILS_FILE" "$CHART_CAPTURE_THRESHOLD_REASON_FILE" "$PUBLIC_CHART_DIAGNOSTIC_STATE_FILE" "$PUBLIC_CHART_FRESHNESS_STATE_FILE" "$PUBLIC_CHART_RENDERABILITY_STATE_FILE" "$PUBLIC_CHART_VISUAL_STATE_FILE" "$PUBLIC_CHART_FAILURE_REASON_FILE" "$PUBLIC_CHART_FAILURE_DETAILS_FILE" "$CHART_PROBE_JSON" "$PUBLIC_DIAG_JSON" <<'PY'
+python3 - "$DASHBOARD_JSON" "$DASHBOARD_MD" "$STATE_FILE" "$CHART_CAPTURE_STATE_FILE" "$CHART_CAPTURE_COUNT_FILE" "$CHART_CAPTURE_THRESHOLD" "$CHART_CAPTURE_REQUIRED_FAILS_FILE" "$CHART_CAPTURE_THRESHOLD_REASON_FILE" "$PUBLIC_CHART_DIAGNOSTIC_STATE_FILE" "$PUBLIC_CHART_FRESHNESS_STATE_FILE" "$PUBLIC_CHART_RENDERABILITY_STATE_FILE" "$PUBLIC_CHART_VISUAL_STATE_FILE" "$PUBLIC_CHART_FAILURE_REASON_FILE" "$PUBLIC_CHART_FAILURE_DETAILS_FILE" "$LOCAL_TERMINAL_DIAGNOSTIC_JSON" "$LOCAL_TERMINAL_STALE_STATE_FILE" "$LOCAL_TERMINAL_ROUTING_BLOCK_STATE_FILE" "$CHART_PROBE_JSON" "$PUBLIC_DIAG_JSON" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
@@ -44,9 +47,12 @@ from pathlib import Path
     public_chart_visual_state_file,
     public_chart_failure_reason_file,
     public_chart_failure_details_file,
+    local_terminal_diag_path,
+    local_terminal_stale_state_file,
+    local_terminal_routing_block_state_file,
     chart_probe_path,
     public_diag_path,
-) = sys.argv[1:17]
+) = sys.argv[1:20]
 
 
 def read_text(path: str, default: str) -> str:
@@ -65,6 +71,7 @@ def read_json(path: str):
 
 chart_probe = read_json(chart_probe_path) or {}
 public_diag = read_json(public_diag_path) or {}
+local_terminal_diag = read_json(local_terminal_diag_path) or {}
 offline_alignment = chart_probe.get("public_signal_alignment") if isinstance(chart_probe, dict) else None
 advisory_reasons = chart_probe.get("advisory_reasons") if isinstance(chart_probe, dict) else []
 offline_reasons = chart_probe.get("offline_reasons") if isinstance(chart_probe, dict) else []
@@ -82,6 +89,12 @@ failure_details = read_json(public_chart_failure_details_file)
 if not isinstance(failure_details, dict):
     fallback_details = public_diag.get("failure_details") if isinstance(public_diag, dict) else None
     failure_details = fallback_details if isinstance(fallback_details, dict) else {}
+
+local_terminal_capture = local_terminal_diag.get("latest_capture") if isinstance(local_terminal_diag, dict) and isinstance(local_terminal_diag.get("latest_capture"), dict) else {}
+local_terminal_state = str(local_terminal_diag.get("state") or "unknown")
+local_terminal_freshness_state = str(local_terminal_diag.get("capture_freshness_state") or "missing")
+local_terminal_routing_state = str(local_terminal_diag.get("renderable_routing_block_state") or "missing")
+local_terminal_reasons = local_terminal_capture.get("rejection_reasons") if isinstance(local_terminal_capture.get("rejection_reasons"), list) else []
 
 data = {
     "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -116,12 +129,39 @@ data = {
         "settled": settled,
         "settled_full": settled_full,
     },
+    "local_terminal_health": {
+        "state": local_terminal_state,
+        "capture_freshness_state": local_terminal_freshness_state,
+        "stale_alert_state": read_text(local_terminal_stale_state_file, local_terminal_freshness_state),
+        "routing_block_alert_state": read_text(local_terminal_routing_block_state_file, local_terminal_routing_state),
+        "latest_client_id": local_terminal_diag.get("latest_client_id"),
+        "latest_capture_at": local_terminal_diag.get("latest_capture_at"),
+        "latest_publish_at": local_terminal_diag.get("latest_publish_at"),
+        "latest_publish_age_sec": local_terminal_diag.get("latest_publish_age_sec"),
+        "stale_after_sec": local_terminal_diag.get("stale_after_sec"),
+        "capture_history_evaluated": local_terminal_diag.get("capture_history_evaluated"),
+        "latest_feed_label": local_terminal_capture.get("feed_label"),
+        "latest_signal": local_terminal_capture.get("signal"),
+        "latest_last_bar_timestamp": local_terminal_capture.get("last_bar_timestamp"),
+        "latest_bus_status": local_terminal_capture.get("bus_status"),
+        "latest_routing_state": local_terminal_capture.get("routing_state"),
+        "latest_rejection_reasons": local_terminal_reasons,
+        "smart_state_summary": local_terminal_capture.get("smart_state_summary"),
+        "truth_exchange_status": local_terminal_capture.get("truth_exchange_status"),
+        "truth_exchange_age_ms": local_terminal_capture.get("truth_exchange_age_ms"),
+        "auto_incident_status": local_terminal_capture.get("auto_incident_status"),
+        "renderable_routing_block_state": local_terminal_routing_state,
+        "renderable_routing_block_consecutive_count": local_terminal_diag.get("renderable_routing_block_consecutive_count"),
+        "renderable_routing_block_threshold": local_terminal_diag.get("renderable_routing_block_threshold"),
+        "renderable_routing_block_captured_at": local_terminal_diag.get("renderable_routing_block_captured_at") or [],
+    },
 }
 
 Path(dashboard_json_path).write_text(json.dumps(data, indent=2) + "\n")
 
 chart_capture = data["chart_offline_capture"]
 public_chart = data["public_chart_visibility"]
+local_terminal = data["local_terminal_health"]
 ohlcv_contract = public_chart.get("ohlcv_contract") or {}
 alignment = chart_capture.get("public_signal_alignment") or {}
 thresholds = public_chart.get("thresholds") or {}
@@ -168,6 +208,25 @@ md_lines = [
     f"- FULL BARS: {((detailed_flow.get('bars') or {}).get('state'))} {((detailed_flow.get('bars') or {}).get('age'))}",
     f"- FULL DEPTH: {((detailed_flow.get('depth') or {}).get('state'))} {((detailed_flow.get('depth') or {}).get('age'))}",
     f"- FULL TRADES: {((detailed_flow.get('trades') or {}).get('state'))} {((detailed_flow.get('trades') or {}).get('age'))}",
+    "",
+    "## Local Terminal Health",
+    f"- State: {local_terminal['state']}",
+    f"- Capture freshness: {local_terminal['capture_freshness_state']} (alert state {local_terminal['stale_alert_state']})",
+    f"- Latest publish age sec: {local_terminal['latest_publish_age_sec']}",
+    f"- Stale threshold sec: {local_terminal['stale_after_sec']}",
+    f"- Latest capture: {local_terminal['latest_capture_at']}",
+    f"- Latest feed: {local_terminal['latest_feed_label']}",
+    f"- Latest signal: {local_terminal['latest_signal']}",
+    f"- Latest bar timestamp: {local_terminal['latest_last_bar_timestamp']}",
+    f"- Latest bus status: {local_terminal['latest_bus_status']}",
+    f"- Latest routing state: {local_terminal['latest_routing_state']}",
+    f"- Routing alert state: {local_terminal['routing_block_alert_state']}",
+    f"- Renderable but blocked: {local_terminal['renderable_routing_block_state']}",
+    f"- Consecutive renderable+blocked captures: {local_terminal['renderable_routing_block_consecutive_count']} / {local_terminal['renderable_routing_block_threshold']}",
+    f"- Routing reasons: {', '.join(local_terminal['latest_rejection_reasons']) if local_terminal['latest_rejection_reasons'] else 'none'}",
+    f"- Smart state summary: {local_terminal['smart_state_summary']}",
+    f"- Truth exchange: {local_terminal['truth_exchange_status']} ({local_terminal['truth_exchange_age_ms']}ms)",
+    f"- Auto incident status: {local_terminal['auto_incident_status']}",
 ]
 
 Path(dashboard_md_path).write_text("\n".join(md_lines) + "\n")

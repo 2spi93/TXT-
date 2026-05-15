@@ -12,7 +12,10 @@ __pycache__/
 *.tsbuildinfo
 .venv/
 .next/
+.next-runtime-e2e/
 .next-runtime/
+.next-runtime-blue/
+.next-runtime-green/
 node_modules/
 logs/
 *.log
@@ -54,3 +57,10 @@ ui/mission-control/sidecar_smoke.js
 # Artifacts
 artifacts/
 ui/mission-control/artifacts/
+ui/mission-control/build_log.txt
+ui/mission-control/wget-log
+
+# Site deployment/runtime artifacts
+sites/*/.autopublish/
+sites/*/backups/
+sites/*/*.snapshot.*.html

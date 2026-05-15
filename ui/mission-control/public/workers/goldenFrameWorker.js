@@ -78,6 +78,103 @@ function resolveFrameCandleTimestampMs(frame) {
   return Number.isFinite(frame && frame.createdAt) ? frame.createdAt : Date.now();
 }
 
+function buildTruthLayer(frame, reconstructionMeta, renderMeta) {
+  const candles = Array.isArray(frame && frame.candles) ? frame.candles : [];
+  const reasons = [];
+  let integrityStatus = "clean";
+  let previousTs = 0;
+  if (candles.length === 0) {
+    integrityStatus = "invalid";
+    reasons.push("no_candles");
+  }
+  for (const candle of candles.slice(-64)) {
+    const open = Number(candle && candle.open);
+    const high = Number(candle && candle.high);
+    const low = Number(candle && candle.low);
+    const close = Number(candle && candle.close);
+    const ts = Date.parse(String((candle && candle.label) || ""));
+    if (!Number.isFinite(ts) || !(open > 0) || !(high > 0) || !(low > 0) || !(close > 0) || high < Math.max(open, close) || low > Math.min(open, close)) {
+      integrityStatus = "invalid";
+      reasons.push("invalid_ohlc");
+      break;
+    }
+    if (previousTs > 0 && ts < previousTs) {
+      integrityStatus = "invalid";
+      reasons.push("non_monotonic_time");
+      break;
+    }
+    previousTs = ts;
+  }
+  if (integrityStatus === "clean" && candles.length < 2) {
+    integrityStatus = "degraded";
+    reasons.push("thin_frame");
+  }
+
+  const sourceAgeMs = Number.isFinite(reconstructionMeta && reconstructionMeta.sourceAgeMs) ? Number(reconstructionMeta.sourceAgeMs) : null;
+  const freshness = sourceAgeMs == null
+    ? "unknown"
+    : reconstructionMeta.sourceFreshness === "fresh"
+      ? "fresh"
+      : sourceAgeMs <= 120000
+        ? "aging"
+        : "stale";
+  if (freshness === "unknown") {
+    reasons.push("source_age_unknown");
+  } else if (freshness !== "fresh") {
+    reasons.push(`source_${freshness}`);
+  }
+
+  const reconstructionReason = String((reconstructionMeta && reconstructionMeta.reconstructionReason) || "").trim();
+  const observationContinuity = (reconstructionMeta && reconstructionMeta.observationContinuity) || "unknown";
+  const reconstructionFlag = observationContinuity === "resumed"
+    ? "observer_resumed"
+    : /gap|stale|missing/i.test(reconstructionReason)
+      ? "source_gap"
+      : reconstructionReason
+        ? "reconstructed"
+        : "none";
+  if (reconstructionFlag !== "none") {
+    reasons.push(reconstructionFlag);
+  }
+
+  const syncStatus = observationContinuity === "resumed"
+    ? "resumed"
+    : freshness === "stale"
+      ? "stale"
+      : renderMeta.partial || renderMeta.syncStatus !== "atomic"
+        ? "delayed"
+        : "live";
+  if (syncStatus !== "live") {
+    reasons.push(`sync_${syncStatus}`);
+  }
+
+  const tradable = integrityStatus === "clean"
+    && syncStatus === "live"
+    && freshness === "fresh"
+    && reconstructionFlag === "none"
+    && !renderMeta.partial
+    && sourceAgeMs != null;
+  if (!tradable && reasons.length === 0) {
+    reasons.push("truth_validation_failed");
+  }
+
+  const penalty = (integrityStatus === "invalid" ? 1 : integrityStatus === "degraded" ? 0.35 : 0)
+    + (freshness === "stale" ? 0.4 : freshness === "aging" ? 0.18 : freshness === "unknown" ? 0.22 : 0)
+    + (syncStatus === "stale" ? 0.38 : syncStatus === "resumed" ? 0.26 : syncStatus === "delayed" ? 0.16 : syncStatus === "unknown" ? 0.2 : 0)
+    + (reconstructionFlag === "source_gap" ? 0.3 : reconstructionFlag === "observer_resumed" ? 0.22 : reconstructionFlag === "reconstructed" ? 0.14 : 0);
+  const confidence = integrityStatus === "invalid" ? 0 : clampNumber(Number(renderMeta.confidence || 0) - penalty, 0, 1);
+  return {
+    integrity_status: integrityStatus,
+    sync_status: syncStatus,
+    freshness,
+    reconstruction_flag: reconstructionFlag,
+    confidence,
+    tradable,
+    decision_allowed: tradable,
+    reasons: Array.from(new Set(reasons)).slice(0, 8),
+  };
+}
+
 function buildPublishedFrame(frame, options) {
   const publishedAt = Number.isFinite(options && options.publishedAt) ? options.publishedAt : Date.now();
   const stallAgeMs = Math.max(0, publishedAt - frame.createdAt);
@@ -93,14 +190,17 @@ function buildPublishedFrame(frame, options) {
   const baseConfidence = computeConfidence(frame, !atomic, stallAgeMs);
   const batchPenalty = Math.min(0.38, batchSkewMs / Math.max(240, batchSkewBudgetMs * 4));
   const confidence = clampNumber(baseConfidence - batchPenalty, 0.05, 1);
+  const reconstructionMeta = frame.reconstructionMeta || {};
   return {
     feedKey: frame.feedKey,
     candles: frame.candles,
     meta: {
+      ...reconstructionMeta,
       syncStatus,
       partial,
       coalesced: Boolean(frame.coalesced),
       confidence,
+      truth: buildTruthLayer(frame, reconstructionMeta, { syncStatus, partial, confidence }),
       dynamicBufferMs: frame.dynamicBufferMs,
       stallAgeMs: partial ? Math.max(stallAgeMs, batchSkewMs) : 0,
       depthSequence: Number.isFinite(frame.depthSequence) ? frame.depthSequence : null,

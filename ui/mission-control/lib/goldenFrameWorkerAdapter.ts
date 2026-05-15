@@ -3,6 +3,7 @@ import type { LiveChartCandle, LiveChartFrameMeta } from "./chartFrameFeed";
 export type GoldenFrameWorkerFrameInput = {
   feedKey: string;
   candles: LiveChartCandle[];
+  reconstructionMeta?: Partial<LiveChartFrameMeta>;
   createdAt: number;
   tradeTsMs: number | null;
   depthTsMs: number | null;

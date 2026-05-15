@@ -1,0 +1,35 @@
+[Unit]
+Description=TXT Mission Control terminal truth observer
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/txt
+Environment=MISSION_CONTROL_UI_SLOT=active
+Environment=TERMINAL_PATH=/terminal?engine=v4&terminal_passive_mode=1&boot=full
+Environment=OUT=/opt/txt/logs/terminal-truth-observer.jsonl
+Environment=STATE_FILE=/opt/txt/logs/terminal-truth-observer.state.json
+Environment=RUN_FOREVER=1
+Environment=CYCLE_INTERVAL_MS=15000
+Environment=TRUTH_TIMEOUT_MS=45000
+Environment=NAVIGATION_TIMEOUT_MS=90000
+Environment=WAIT_READY_ATTEMPTS=90
+Environment=WAIT_READY_INTERVAL_SEC=2
+Environment=ALERT_ON_STATUS=degraded,error
+Environment=ALERT_REPEAT_ERROR_EVERY=3
+Environment=AUTO_RECOVERY_ENABLED=1
+Environment=AUTO_RECOVERY_SCRIPT=/opt/txt/scripts/auto_recover_terminal_truth_incident.sh
+Environment=AUTO_RECOVERY_MIN_REPEAT_COUNT=6
+Environment=AUTO_RECOVERY_ROLLBACK_REPEAT_COUNT=9
+Environment=AUTO_RECOVERY_COOLDOWN_SEC=300
+ExecStart=/opt/txt/scripts/run_terminal_truth_observer.sh
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/txt/logs/terminal-truth-observer.log
+StandardError=append:/opt/txt/logs/terminal-truth-observer.err.log
+
+[Install]
+WantedBy=multi-user.target

@@ -45,10 +45,57 @@
         "managed_live"
       ],
       "max_order_notional_usd": 10.0,
-      "default_order_notional_usd": 7.0,
-      "smoke_test_notional_usd": 7.0,
+      "default_order_notional_usd": 7.5,
+      "smoke_test_notional_usd": 7.5,
       "smoke_limit_offset_bps": 3500,
       "primary_live_instrument": "BTCUSDT",
+      "micro_live": {
+        "enabled": true,
+        "default_stage": "micro",
+        "allowed_symbols": [
+          "BTCUSDT",
+          "ETHUSDT",
+          "SOLUSDT"
+        ],
+        "stages": [
+          {
+            "name": "micro",
+            "max_order_notional_usd": 7.5,
+            "size_multiplier": 1.0,
+            "allowed_system_modes": [
+              "managed_live"
+            ],
+            "allowed_symbols": [
+              "BTCUSDT"
+            ]
+          },
+          {
+            "name": "pilot",
+            "max_order_notional_usd": 5.0,
+            "size_multiplier": 1.0,
+            "allowed_system_modes": [
+              "managed_live"
+            ],
+            "allowed_symbols": [
+              "BTCUSDT",
+              "ETHUSDT"
+            ]
+          },
+          {
+            "name": "scale",
+            "max_order_notional_usd": 10.0,
+            "size_multiplier": 1.0,
+            "allowed_system_modes": [
+              "managed_live"
+            ],
+            "allowed_symbols": [
+              "BTCUSDT",
+              "ETHUSDT",
+              "SOLUSDT"
+            ]
+          }
+        ]
+      },
       "conditional_live_rules": {
         "SOLUSDT": {
           "allowed_regimes": [

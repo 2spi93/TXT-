@@ -142,11 +142,27 @@ preflight_validate() {
 
   python3 -m py_compile "$ROOT_DIR/apps/market_data_plane/main.py" >"$RUN_DIR/preflight-backend.txt" 2>&1
 
-  if docker ps --format '{{.Names}}' | grep -qx 'mission-control-ui'; then
-    docker exec mission-control-ui sh -lc 'cd /workspace/ui/mission-control && npm run lint' \
+  local ui_container=""
+  if [[ -f "$ROOT_DIR/data/mission-control/ui-active-slot.conf" ]] && grep -q 'mission-control-ui-green:3002' "$ROOT_DIR/data/mission-control/ui-active-slot.conf"; then
+    ui_container="mission-control-ui-green"
+  else
+    ui_container="mission-control-ui-blue"
+  fi
+  if ! docker ps --format '{{.Names}}' | grep -qx "$ui_container"; then
+    if docker ps --format '{{.Names}}' | grep -qx 'mission-control-ui-blue'; then
+      ui_container='mission-control-ui-blue'
+    elif docker ps --format '{{.Names}}' | grep -qx 'mission-control-ui-green'; then
+      ui_container='mission-control-ui-green'
+    else
+      ui_container=''
+    fi
+  fi
+
+  if [[ -n "$ui_container" ]]; then
+    docker exec "$ui_container" sh -lc 'cd /workspace/ui/mission-control && npm run lint' \
       >"$RUN_DIR/preflight-ui-lint.txt" 2>&1
   else
-    printf 'mission-control-ui container not running; skipped containerized lint\n' >"$RUN_DIR/preflight-ui-lint.txt"
+    printf 'mission-control-ui-blue/green container not running; skipped containerized lint\n' >"$RUN_DIR/preflight-ui-lint.txt"
   fi
 
   log "Preflight validation passed"

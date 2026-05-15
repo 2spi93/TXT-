@@ -14,6 +14,8 @@ type OrderIntentPayload = {
   source?: string;
   mode?: string;
   preset?: string;
+  final_decision_truth?: JsonMap;
+  edge_eligibility?: JsonMap;
   oco?: {
     enabled?: boolean;
     group_id?: string;
@@ -60,9 +62,23 @@ export async function POST(request: Request): Promise<NextResponse> {
   const networkRegime = classifyControlPlaneNetworkRegime(networkMetrics, infraHealth);
   const side = asString(raw.side, "buy") === "sell" ? "sell" : "buy";
   const orderIntentRaw = asObject(raw.order_intent) as OrderIntentPayload;
+  const rawMetadata = asObject(raw.metadata);
   const bracket = asObject(orderIntentRaw.bracket);
   const oco = asObject(orderIntentRaw.oco);
   const riskPreview = asObject(orderIntentRaw.risk_preview);
+  const explicitFinalDecisionTruth = asObject(orderIntentRaw.final_decision_truth);
+  const metadataFinalDecisionTruth = asObject(rawMetadata.final_decision_truth);
+  const normalizedFinalDecisionTruth = Object.keys(explicitFinalDecisionTruth).length > 0
+    ? explicitFinalDecisionTruth
+    : metadataFinalDecisionTruth;
+  const explicitEdgeEligibility = asObject(orderIntentRaw.edge_eligibility);
+  const derivedEdgeEligibility = asObject(normalizedFinalDecisionTruth.edge_eligibility);
+  const metadataEdgeEligibility = asObject(rawMetadata.edge_eligibility);
+  const normalizedEdgeEligibility = Object.keys(explicitEdgeEligibility).length > 0
+    ? explicitEdgeEligibility
+    : Object.keys(derivedEdgeEligibility).length > 0
+      ? derivedEdgeEligibility
+      : metadataEdgeEligibility;
   const predictorContext = asObject(raw.predictor_context);
 
   const normalizedOrderIntent: OrderIntentPayload | undefined = Object.keys(orderIntentRaw).length > 0
@@ -70,6 +86,8 @@ export async function POST(request: Request): Promise<NextResponse> {
       source: asString(orderIntentRaw.source, "terminal-chart"),
       mode: asString(orderIntentRaw.mode, "bracket"),
       preset: asString(orderIntentRaw.preset, "custom"),
+      final_decision_truth: Object.keys(normalizedFinalDecisionTruth).length > 0 ? normalizedFinalDecisionTruth : undefined,
+      edge_eligibility: Object.keys(normalizedEdgeEligibility).length > 0 ? normalizedEdgeEligibility : undefined,
       oco: {
         enabled: Boolean(oco.enabled),
         group_id: asString(oco.group_id) || (Boolean(oco.enabled) ? `oco-${Date.now()}-${Math.floor(Math.random() * 100000)}` : ""),
@@ -118,7 +136,9 @@ export async function POST(request: Request): Promise<NextResponse> {
     bracket: normalizedOrderIntent?.bracket,
     oco: normalizedOrderIntent?.oco,
     metadata: {
-      ...(asObject(raw.metadata)),
+      ...rawMetadata,
+      ...(Object.keys(normalizedFinalDecisionTruth).length > 0 ? { final_decision_truth: normalizedFinalDecisionTruth } : {}),
+      ...(Object.keys(normalizedEdgeEligibility).length > 0 ? { edge_eligibility: normalizedEdgeEligibility } : {}),
       ui: "mission-control-ui",
       schema_version: "mt5-order-filter-v2",
       submitted_at: new Date().toISOString(),

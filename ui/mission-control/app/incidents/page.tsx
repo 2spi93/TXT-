@@ -145,7 +145,7 @@ export default function IncidentsPage() {
             example="Prends ownership, investigue la cause, puis close avec une note claire et actionnable."
           />
           <p>
-            <Link href="/">Dashboard</Link>
+            <Link href="/dashboard">Dashboard</Link>
             {" | "}
             <Link href="/terminal">Trading Terminal</Link>
             {" | "}

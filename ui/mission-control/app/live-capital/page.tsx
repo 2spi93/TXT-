@@ -381,6 +381,7 @@ type CapitalLedgerSummary = {
   net_external_cashflow_usd: number;
   internal_transfer_usd: number;
   funding_fee_usd: number;
+  trading_fee_usd: number;
   realized_pnl_usd: number;
   reconciliation_usd: number;
   latest_event_at: string | null;
@@ -732,6 +733,7 @@ function normalizeCapitalLedgerSummary(row: JsonMap | null | undefined): Capital
     net_external_cashflow_usd: toNumber(row?.net_external_cashflow_usd, 0),
     internal_transfer_usd: toNumber(row?.internal_transfer_usd, 0),
     funding_fee_usd: toNumber(row?.funding_fee_usd, 0),
+    trading_fee_usd: toNumber(row?.trading_fee_usd, 0),
     realized_pnl_usd: toNumber(row?.realized_pnl_usd, 0),
     reconciliation_usd: toNumber(row?.reconciliation_usd, 0),
     latest_event_at: row?.latest_event_at ? String(row.latest_event_at) : null,
@@ -1054,6 +1056,10 @@ export default function LiveCapitalPage() {
   const verificationCapitalLedgerSummary = useMemo(
     () => normalizeCapitalLedgerSummary(verificationCapitalLedger?.summary as JsonMap | null | undefined),
     [verificationCapitalLedger],
+  );
+  const verificationNetPerformanceUsd = useMemo(
+    () => verificationCapitalLedgerSummary.realized_pnl_usd + verificationCapitalLedgerSummary.funding_fee_usd + verificationCapitalLedgerSummary.trading_fee_usd,
+    [verificationCapitalLedgerSummary],
   );
   const balanceVerificationPocketSummaries = useMemo(() => summarizeVerificationPockets(verificationBalances), [verificationBalances]);
   const verificationPocketSummaries = useMemo(() => {
@@ -2595,7 +2601,9 @@ export default function LiveCapitalPage() {
           <div className="row"><span>Entrées / sorties nettes</span><span>{verificationCapitalLedgerRows.length > 0 ? formatSignedUsd(verificationCapitalLedgerSummary.net_external_cashflow_usd) : netCapitalDeltaUsd != null ? formatSignedUsd(netCapitalDeltaUsd) : "ledger vide"}</span></div>
           <div className="row"><span>Transferts internes</span><span>{verificationCapitalLedgerRows.length > 0 ? formatUsd(verificationCapitalLedgerSummary.internal_transfer_usd) : "aucun transfert historisé"}</span></div>
           <div className="row"><span>Funding fees</span><span>{verificationCapitalLedgerRows.length > 0 ? formatSignedUsd(verificationCapitalLedgerSummary.funding_fee_usd) : fundingFeesAvailable ? formatSignedUsd(fundingFeesUsd) : "non remontées"}</span></div>
+          <div className="row"><span>Frais de trading</span><span>{verificationCapitalLedgerRows.length > 0 ? formatSignedUsd(verificationCapitalLedgerSummary.trading_fee_usd) : "non remontés"}</span></div>
           <div className="row"><span>PnL réalisé</span><span>{verificationCapitalLedgerRows.length > 0 ? formatSignedUsd(verificationCapitalLedgerSummary.realized_pnl_usd) : formatSignedUsd(realizedPnlUsd)}</span></div>
+          <div className="row"><span>Net trading réalisé</span><span>{verificationCapitalLedgerRows.length > 0 ? formatSignedUsd(verificationNetPerformanceUsd) : "en attente de ledger"}</span></div>
           <div className="row"><span>PnL latent</span><span>{formatSignedUsd(unrealizedPnlUsd)}</span></div>
           <div className="row"><span>Delta de réconciliation</span><span>{verificationCapitalLedgerRows.length > 0 ? formatSignedUsd(verificationCapitalLedgerSummary.reconciliation_usd) : "n/a"}</span></div>
           <div className="panel" style={{ marginTop: 12, borderRadius: 12 }}>

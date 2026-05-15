@@ -21,6 +21,8 @@ export type OhlcvRenderabilityAnalysis = {
   renderableRows: number;
   droppedRows: number;
   duplicateTimestamps: number;
+  gapFillRows: number;
+  recentGapFillRows: number;
   minimumRenderableBars: number;
   reasons: string[];
   droppedReasonKinds: string[];
@@ -265,10 +267,28 @@ export function analyzeOhlcvRows(
     reasons.push("duplicate_timestamps_deduped");
   }
 
+  const timeframe = String(options.timeframe || deduped[0]?.tf || "1m");
+  const timeframeMs = timeframeToMs(timeframe);
+  const gapFillRows = deduped.filter((row) => String(row.source || "").toLowerCase().includes("gap-fill")).length;
+  const recentWindow = deduped.slice(-Math.min(48, Math.max(12, deduped.length)));
+  const recentGapFillRows = recentWindow.filter((row) => String(row.source || "").toLowerCase().includes("gap-fill")).length;
+  const recentGapFillRatio = recentWindow.length > 0 ? recentGapFillRows / recentWindow.length : 0;
+  const gapFillAwareTimeframe = Number.isFinite(timeframeMs) && timeframeMs >= 60_000;
+  if (gapFillRows > 0) {
+    reasons.push("gap_fill_rows_present");
+  }
+  if (gapFillAwareTimeframe && recentWindow.length >= 12 && recentGapFillRatio >= 0.34) {
+    reasons.push(recentGapFillRatio >= 0.75 ? "recent_gap_fill_dominant" : "recent_gap_fill_pressure");
+  }
+
   let signal: OhlcvRenderabilityAnalysis["signal"] = "OHLCV_RENDERABLE";
   if (deduped.length === 0) {
     signal = "OHLCV_UNUSABLE";
   } else if (deduped.length < minimumRenderableBars) {
+    signal = "OHLCV_PARTIAL";
+  } else if (gapFillAwareTimeframe && recentWindow.length >= 12 && recentGapFillRatio >= 0.75) {
+    signal = "OHLCV_UNUSABLE";
+  } else if (gapFillAwareTimeframe && recentWindow.length >= 12 && recentGapFillRatio >= 0.34) {
     signal = "OHLCV_PARTIAL";
   }
 
@@ -279,6 +299,8 @@ export function analyzeOhlcvRows(
     renderableRows: deduped.length,
     droppedRows: rows.length - deduped.length,
     duplicateTimestamps,
+    gapFillRows,
+    recentGapFillRows,
     minimumRenderableBars,
     reasons,
     droppedReasonKinds: [...droppedReasonKinds],

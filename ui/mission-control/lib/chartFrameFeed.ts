@@ -7,6 +7,17 @@ export type LiveChartCandle = {
   volume: number;
 };
 
+export type LiveChartFrameTruth = {
+  integrity_status: "clean" | "degraded" | "invalid";
+  sync_status: "live" | "delayed" | "stale" | "resumed" | "unknown";
+  freshness: "fresh" | "aging" | "stale" | "unknown";
+  reconstruction_flag: "none" | "reconstructed" | "observer_resumed" | "source_gap";
+  confidence: number;
+  tradable: boolean;
+  decision_allowed: boolean;
+  reasons: string[];
+};
+
 export type LiveChartFrameMeta = {
   syncStatus: "atomic" | "loose-sync" | "coalesced";
   partial: boolean;
@@ -20,6 +31,19 @@ export type LiveChartFrameMeta = {
   batchSkewMs?: number | null;
   batchPublishedAt?: number | null;
   batchFrameCount?: number | null;
+  viewportUpdatedAt?: number | null;
+  observerSessionId?: string | null;
+  observerStartedAt?: string | null;
+  observerUptimeMs?: number | null;
+  observerResetCount?: number;
+  observerLastResetReason?: string | null;
+  observerLastResetAt?: string | null;
+  observationGapMs?: number | null;
+  observationContinuity?: "continuous" | "resumed" | "unknown";
+  sourceAgeMs?: number | null;
+  sourceFreshness?: "fresh" | "stale" | "unknown";
+  reconstructionReason?: string | null;
+  truth?: LiveChartFrameTruth;
 };
 
 export type LiveChartFrame = {
@@ -44,6 +68,35 @@ const batchListeners = new Set<LiveChartFrameBatchListener>();
 const latestFrames = new Map<string, LiveChartFrame>();
 let latestBatch: LiveChartFrameBatch | null = null;
 
+function normalizeFrameTruth(truth?: Partial<LiveChartFrameTruth>): LiveChartFrameTruth {
+  const integrityStatus = truth?.integrity_status === "clean" || truth?.integrity_status === "degraded" || truth?.integrity_status === "invalid"
+    ? truth.integrity_status
+    : "degraded";
+  const syncStatus = truth?.sync_status === "live" || truth?.sync_status === "delayed" || truth?.sync_status === "stale" || truth?.sync_status === "resumed" || truth?.sync_status === "unknown"
+    ? truth.sync_status
+    : "unknown";
+  const freshness = truth?.freshness === "fresh" || truth?.freshness === "aging" || truth?.freshness === "stale" || truth?.freshness === "unknown"
+    ? truth.freshness
+    : "unknown";
+  const reconstructionFlag = truth?.reconstruction_flag === "none" || truth?.reconstruction_flag === "reconstructed" || truth?.reconstruction_flag === "observer_resumed" || truth?.reconstruction_flag === "source_gap"
+    ? truth.reconstruction_flag
+    : "none";
+  const confidence = Number.isFinite(truth?.confidence) ? Math.max(0, Math.min(1, Number(truth?.confidence))) : 0;
+  const reasons = Array.isArray(truth?.reasons)
+    ? truth.reasons.map((reason) => String(reason || "").trim()).filter(Boolean).slice(0, 12)
+    : [];
+  return {
+    integrity_status: integrityStatus,
+    sync_status: syncStatus,
+    freshness,
+    reconstruction_flag: reconstructionFlag,
+    confidence,
+    tradable: Boolean(truth?.tradable),
+    decision_allowed: Boolean(truth?.decision_allowed),
+    reasons,
+  };
+}
+
 function normalizeFrameMeta(meta?: Partial<LiveChartFrameMeta>): LiveChartFrameMeta {
   return {
     syncStatus: meta?.syncStatus === "loose-sync" || meta?.syncStatus === "coalesced" ? meta.syncStatus : "atomic",
@@ -58,6 +111,19 @@ function normalizeFrameMeta(meta?: Partial<LiveChartFrameMeta>): LiveChartFrameM
     batchSkewMs: Number.isFinite(meta?.batchSkewMs) ? Math.max(0, Math.round(Number(meta?.batchSkewMs))) : null,
     batchPublishedAt: Number.isFinite(meta?.batchPublishedAt) ? Number(meta?.batchPublishedAt) : null,
     batchFrameCount: Number.isFinite(meta?.batchFrameCount) ? Math.max(1, Math.round(Number(meta?.batchFrameCount))) : null,
+    viewportUpdatedAt: Number.isFinite(meta?.viewportUpdatedAt) ? Number(meta?.viewportUpdatedAt) : null,
+    observerSessionId: typeof meta?.observerSessionId === "string" && meta.observerSessionId.trim() ? meta.observerSessionId.trim() : null,
+    observerStartedAt: typeof meta?.observerStartedAt === "string" && meta.observerStartedAt.trim() ? meta.observerStartedAt.trim() : null,
+    observerUptimeMs: Number.isFinite(meta?.observerUptimeMs) ? Math.max(0, Math.round(Number(meta?.observerUptimeMs))) : null,
+    observerResetCount: Number.isFinite(meta?.observerResetCount) ? Math.max(0, Math.round(Number(meta?.observerResetCount))) : 0,
+    observerLastResetReason: typeof meta?.observerLastResetReason === "string" && meta.observerLastResetReason.trim() ? meta.observerLastResetReason.trim() : null,
+    observerLastResetAt: typeof meta?.observerLastResetAt === "string" && meta.observerLastResetAt.trim() ? meta.observerLastResetAt.trim() : null,
+    observationGapMs: Number.isFinite(meta?.observationGapMs) ? Math.max(0, Math.round(Number(meta?.observationGapMs))) : null,
+    observationContinuity: meta?.observationContinuity === "continuous" || meta?.observationContinuity === "resumed" ? meta.observationContinuity : "unknown",
+    sourceAgeMs: Number.isFinite(meta?.sourceAgeMs) ? Math.max(0, Math.round(Number(meta?.sourceAgeMs))) : null,
+    sourceFreshness: meta?.sourceFreshness === "fresh" || meta?.sourceFreshness === "stale" ? meta.sourceFreshness : "unknown",
+    reconstructionReason: typeof meta?.reconstructionReason === "string" && meta.reconstructionReason.trim() ? meta.reconstructionReason.trim() : null,
+    truth: normalizeFrameTruth(meta?.truth),
   };
 }
 
@@ -128,6 +194,16 @@ function frameSignature(candles: LiveChartCandle[], meta: LiveChartFrameMeta): s
     meta.depthSequence ?? "-",
     meta.batchSkewMs ?? "-",
     meta.batchFrameCount ?? "-",
+    meta.observerResetCount ?? 0,
+    meta.observationContinuity ?? "unknown",
+    meta.sourceFreshness ?? "unknown",
+    meta.truth?.integrity_status ?? "degraded",
+    meta.truth?.sync_status ?? "unknown",
+    meta.truth?.freshness ?? "unknown",
+    meta.truth?.reconstruction_flag ?? "none",
+    meta.truth?.tradable ? "t1" : "t0",
+    meta.truth?.decision_allowed ? "d1" : "d0",
+    meta.truth?.confidence.toFixed(3) ?? "0.000",
   ].join("|");
 }
 

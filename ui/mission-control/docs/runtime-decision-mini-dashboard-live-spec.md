@@ -35,7 +35,7 @@ Baseline taken from the current runtime journal analysis:
 
 ## Placement
 
-Phase 1 should land in the canonical dashboard surface at `/`, because `/dashboard` is now only an alias redirect.
+Phase 1 should land in the canonical dashboard surface at `/dashboard`, while `/` remains a compatibility redirect.
 Phase 1.5 can mirror a compact version inside the terminal secondary panels for operators already working in `/terminal`.
 
 ## Primary cards

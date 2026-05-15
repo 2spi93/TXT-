@@ -56,7 +56,7 @@ current_build_id="$(cat "$build_id_file" 2>/dev/null || true)"
 app_pid=""
 
 start_server() {
-  npm run start &
+  ./node_modules/.bin/next start -p "${PORT:-3000}" &
   app_pid=$!
 }
 

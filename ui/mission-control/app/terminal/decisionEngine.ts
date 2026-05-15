@@ -133,7 +133,7 @@ export function resolveSmartDecision(input: ResolveDecisionInput): SmartDecision
       state: "NO_TRADE",
       stateLabel: resolveStateLabel("NO_TRADE"),
       confidence: clamp(confidence * 0.2, 0, 0.25),
-      headline: "Market sync invalidated",
+      headline: "Execution gate locked",
       reason: input.externalGate.reason,
       triggerSide,
       trigger: input.predictionTrigger,

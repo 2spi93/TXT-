@@ -3,15 +3,12 @@ import { expect, test } from "@playwright/test";
 import { loginIfRequired } from "./helpers/terminal";
 
 const REQUIRED_BLOCKS = [
-  "Routing Governance",
-  "Infrastructure Posture",
-  "Execution Studio",
-  "Latest Decision",
-  "Local Inference Desk",
-  "Regime Lab",
-  "Scenario Lab",
-  "Memory & Calibration",
-  "Execution Journal",
+  "Desk Header",
+  "Routes IA disponibles",
+  "Capacite machine",
+  "Lancer une tache IA",
+  "Modeles locaux",
+  "Journal des taches IA",
 ] as const;
 
 test("ai desk renders the institutional blocks for an authenticated operator", async ({ page }) => {
@@ -19,7 +16,8 @@ test("ai desk renders the institutional blocks for an authenticated operator", a
 
   await loginIfRequired(page, "/ai", "ai desk validation");
 
-  await expect(page.getByRole("heading", { name: "Institutional AI Desk" })).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText("AI Desk Institutionnelle").first()).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByRole("heading", { name: "Desk IA operationnel" })).toBeVisible({ timeout: 30_000 });
   for (const block of REQUIRED_BLOCKS) {
     await expect(page.getByText(block).first()).toBeVisible({ timeout: 30_000 });
   }

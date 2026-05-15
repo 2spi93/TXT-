@@ -31,6 +31,7 @@ export type ExecutionDecisionAudit = {
   priority: number;
   policyVersion: typeof EXECUTION_DECISION_POLICY_VERSION;
   summary: string;
+  oracleFingerprint?: string;
 };
 
 const EXECUTION_DECISION_DEFINITIONS: Record<ExecutionDecisionCode, Omit<ExecutionDecisionAudit, "code" | "policyVersion" | "summary">> = {
@@ -118,8 +119,10 @@ export function resolveExecutionDecisionCodeFromJournalAction(
 export function buildExecutionDecisionAudit(input: {
   code: ExecutionDecisionCode;
   summary?: string;
+  oracleFingerprint?: string;
 }): ExecutionDecisionAudit {
   const definition = EXECUTION_DECISION_DEFINITIONS[input.code];
+  const oracleFingerprint = String(input.oracleFingerprint || "").trim();
   return {
     code: input.code,
     severity: definition.severity,
@@ -127,6 +130,7 @@ export function buildExecutionDecisionAudit(input: {
     priority: definition.priority,
     policyVersion: EXECUTION_DECISION_POLICY_VERSION,
     summary: String(input.summary || "").trim(),
+    ...(oracleFingerprint ? { oracleFingerprint } : {}),
   };
 }
 
@@ -134,6 +138,7 @@ export function buildExecutionDecisionAuditFromLockState(lockState: {
   active?: unknown;
   code?: unknown;
   summaryLabel?: unknown;
+  oracleFingerprint?: unknown;
 } | null | undefined): ExecutionDecisionAudit | null {
   if (!lockState || !lockState.active) {
     return null;
@@ -145,6 +150,7 @@ export function buildExecutionDecisionAuditFromLockState(lockState: {
   return buildExecutionDecisionAudit({
     code,
     summary: String(lockState.summaryLabel || "").trim(),
+    oracleFingerprint: String(lockState.oracleFingerprint || "").trim() || undefined,
   });
 }
 
@@ -161,7 +167,11 @@ export function validateExecutionDecisionAudit(value: unknown): ExecutionDecisio
   const policyVersion = String(value.policyVersion || "").trim();
   const severity = String(value.severity || "").trim() as ExecutionDecisionSeverity;
   const source = String(value.source || "").trim() as ExecutionDecisionSource;
+  const oracleFingerprint = value.oracleFingerprint === undefined ? undefined : String(value.oracleFingerprint || "").trim();
   if (!summary || !Number.isFinite(priority) || !policyVersion || !severity || !source) {
+    return null;
+  }
+  if (value.oracleFingerprint !== undefined && !oracleFingerprint) {
     return null;
   }
   const definition = EXECUTION_DECISION_DEFINITIONS[code];
@@ -175,5 +185,6 @@ export function validateExecutionDecisionAudit(value: unknown): ExecutionDecisio
     priority,
     policyVersion: policyVersion as typeof EXECUTION_DECISION_POLICY_VERSION,
     summary,
+    ...(oracleFingerprint ? { oracleFingerprint } : {}),
   };
 }

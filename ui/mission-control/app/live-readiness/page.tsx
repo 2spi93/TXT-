@@ -5,6 +5,11 @@ import { useEffect, useState } from "react";
 
 import HelpHint from "../../components/HelpHint";
 import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
+import RuntimeOperatorMonitoringCard from "../../components/ui/RuntimeOperatorMonitoringCard";
+import TradabilityScienceCard from "../../components/ui/TradabilityScienceCard";
+import type { MarketStateMapSnapshot } from "../../lib/marketStateMap";
+import type { RuntimeDecisionAnalyticsSummary } from "../../lib/runtimeDecisionAnalytics";
+import type { TradabilityAnalyticsSummary } from "../../lib/tradabilityAnalytics";
 
 type JsonMap = Record<string, unknown>;
 
@@ -63,6 +68,27 @@ function numberOr(value: unknown, fallback = 0): number {
   return Number.isFinite(numeric) ? numeric : fallback;
 }
 
+function formatPercent(value: unknown, digits = 1): string {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return "n/a";
+  }
+  return `${numeric.toFixed(digits)}%`;
+}
+
+function formatFixed(value: unknown, digits = 2): string {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return "n/a";
+  }
+  return numeric.toFixed(digits);
+}
+
+function formatLabel(value: unknown): string {
+  const label = String(value || "").trim();
+  return label ? label.replace(/_/g, " ") : "n/a";
+}
+
 function countDepthLevels(value: unknown): number {
   const payload = safeRecord(value);
   const bids = Array.isArray(payload.bids) ? payload.bids.length : 0;
@@ -75,6 +101,10 @@ export default function LiveReadinessPage() {
   const [thresholds, setThresholds] = useState<JsonMap[]>([]);
   const [marketBusSnapshot, setMarketBusSnapshot] = useState<JsonMap | null>(null);
   const [healthwatchDashboard, setHealthwatchDashboard] = useState<JsonMap | null>(null);
+  const [controlledCollection, setControlledCollection] = useState<JsonMap | null>(null);
+  const [runtimeDecisionSummary, setRuntimeDecisionSummary] = useState<RuntimeDecisionAnalyticsSummary | null>(null);
+  const [tradabilityAnalytics, setTradabilityAnalytics] = useState<TradabilityAnalyticsSummary | null>(null);
+  const [marketStateMap, setMarketStateMap] = useState<MarketStateMapSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -85,11 +115,15 @@ export default function LiveReadinessPage() {
   const [maxAvgLoss, setMaxAvgLoss] = useState(140);
 
   async function loadData(): Promise<void> {
-    const [readinessRes, thresholdRes, marketBusRes, healthwatchRes] = await Promise.all([
+    const [readinessRes, thresholdRes, marketBusRes, healthwatchRes, runtimeDecisionRes, controlledCollectionRes, tradabilityAnalyticsRes, marketStateMapRes] = await Promise.all([
       fetch("/api/live-readiness/overview", { cache: "no-store" }),
       fetch("/api/strategies/drift-thresholds", { cache: "no-store" }),
       fetch("/api/market/bus/snapshot?instrument=BTCUSDT&venue=binance-public&timeframe=1m&lookback_minutes=60&trade_limit=200", { cache: "no-store" }),
       fetch("/api/system/healthwatch/dashboard", { cache: "no-store" }),
+      fetch("/api/system/runtime-decision?sinceDays=7&limit=1200", { cache: "no-store" }),
+      fetch("/api/system/observation/controlled-collection", { cache: "no-store" }),
+      fetch("/api/terminal/tradability/analytics?sinceDays=14&limit=1200", { cache: "no-store" }),
+      fetch("/api/market-state-map?symbol=DESK&timeframe=live&strategy=live-ops&sinceDays=14&limit=1200&windowHours=24", { cache: "no-store" }),
     ]);
     if (!readinessRes.ok || !thresholdRes.ok) {
       throw new Error("Impossible de charger la vue Live Readiness");
@@ -99,6 +133,10 @@ export default function LiveReadinessPage() {
     setThresholds((thresholdsPayload.items as JsonMap[] | undefined) || []);
     setMarketBusSnapshot(marketBusRes.ok ? await marketBusRes.json() : null);
     setHealthwatchDashboard(healthwatchRes.ok ? await healthwatchRes.json() : null);
+    setRuntimeDecisionSummary(runtimeDecisionRes.ok ? await runtimeDecisionRes.json() as RuntimeDecisionAnalyticsSummary : null);
+    setControlledCollection(controlledCollectionRes.ok ? await controlledCollectionRes.json() : null);
+    setTradabilityAnalytics(tradabilityAnalyticsRes.ok ? await tradabilityAnalyticsRes.json() as TradabilityAnalyticsSummary : null);
+    setMarketStateMap(marketStateMapRes.ok ? await marketStateMapRes.json() as MarketStateMapSnapshot : null);
     setError(null);
   }
 
@@ -163,6 +201,17 @@ export default function LiveReadinessPage() {
   const marketBusTrades = (marketBusComponents.trades as JsonMap | undefined) || {};
   const marketBusSequencing = (marketBusMeta.sequencing as JsonMap | undefined) || {};
   const marketBusOhlcvSeq = (marketBusSequencing.ohlcv as JsonMap | undefined) || {};
+  const marketBusPreprocessor = (marketBusMeta.preprocessor as JsonMap | undefined) || {};
+  const marketBusTradePreprocessor = (marketBusPreprocessor.trades as JsonMap | undefined) || {};
+  const tradePreprocessorJournal = Array.isArray(marketBusTradePreprocessor.journal) ? marketBusTradePreprocessor.journal as JsonMap[] : [];
+  const tradePreprocessorJournalSummary = safeRecord(marketBusTradePreprocessor.journal_summary);
+  const tradePreprocessorAnalytics = safeRecord(marketBusTradePreprocessor.analytics);
+  const tradePreprocessorAlert = safeRecord(marketBusTradePreprocessor.alert);
+  const tradePreprocessorWindows = safeRecord(tradePreprocessorAnalytics.windows);
+  const tradePreprocessorAnalytics24h = Array.isArray(tradePreprocessorWindows.last_24h) ? tradePreprocessorWindows.last_24h as JsonMap[] : [];
+  const tradePreprocessorAnalytics7d = Array.isArray(tradePreprocessorWindows.last_7d) ? tradePreprocessorWindows.last_7d as JsonMap[] : [];
+  const tradePreprocessorPriceDiscovery24h = safeRecord(tradePreprocessorAnalytics24h.find((row) => String((row as JsonMap).market_regime || "") === "price_discovery"));
+  const tradePreprocessorPriceDiscovery7d = safeRecord(tradePreprocessorAnalytics7d.find((row) => String((row as JsonMap).market_regime || "") === "price_discovery"));
   const ohlcvState = classifyFreshness(marketBusOhlcv.freshness_ms);
   const depthState = classifyFreshness(marketBusDepth.freshness_ms);
   const tradesState = classifyFreshness(marketBusTrades.freshness_ms);
@@ -180,6 +229,18 @@ export default function LiveReadinessPage() {
   const advisoryReasons = (chartOfflineCapture.advisory_reasons as string[] | undefined) || [];
   const offlineReasons = (chartOfflineCapture.offline_reasons as string[] | undefined) || [];
   const routingEnvelope = safeRecord(marketBusSnapshot?.routing_score || marketBusSnapshot?.routingScore);
+  const controlledCollectionState = safeRecord(controlledCollection);
+  const controlledCollectionAvailable = Boolean(controlledCollectionState.available);
+  const controlledCollectionActive = Boolean(controlledCollectionState.active);
+  const controlledCollectionPhase = String(controlledCollectionState.phase || "NO_SESSION");
+  const controlledCollectionGateStatus = String(controlledCollectionState.gateStatus || "-");
+  const controlledCollectionGateHealth = numberOr(controlledCollectionState.gateHealthScore, 0);
+  const controlledCollectionFills = numberOr(controlledCollectionState.fillsSeen, 0);
+  const controlledCollectionLabels = numberOr(controlledCollectionState.labelsSeen, 0);
+  const controlledCollectionDurationMinutes = numberOr(controlledCollectionState.durationMinutes, 0);
+  const controlledCollectionKillRearmed = Boolean(controlledCollectionState.killSwitchRearmed);
+  const controlledCollectionKillActive = Boolean(controlledCollectionState.killSwitchActive);
+  const controlledCollectionKillReason = String(controlledCollectionState.killSwitchReason || "-");
   const routingCandidates = Array.isArray(routingEnvelope.candidates) ? routingEnvelope.candidates as JsonMap[] : [];
   const bestRoute = safeRecord(routingEnvelope.best || routingCandidates[0]);
   const bestRouteVenue = String(bestRoute.venue || "").trim() || "n/a";
@@ -189,6 +250,25 @@ export default function LiveReadinessPage() {
   const snapshotTrades = Array.isArray(marketBusSnapshot?.trades) ? marketBusSnapshot?.trades as JsonMap[] : [];
   const depthSnapshot = safeRecord(marketBusSnapshot?.depth_snapshot);
   const depthPayload = safeRecord(depthSnapshot.depth_payload || marketBusSnapshot?.orderbook);
+  const tradePreprocessorMode = String(marketBusTradePreprocessor.mode || "n/a");
+  const tradePreprocessorRegime = String(marketBusTradePreprocessor.market_regime || "n/a");
+  const tradePreprocessorRawCount = Math.max(0, numberOr(marketBusTradePreprocessor.raw_count, 0));
+  const tradePreprocessorEmittedCount = Math.max(0, numberOr(marketBusTradePreprocessor.emitted_count, 0));
+  const tradePreprocessorCompressionRatio = numberOr(marketBusTradePreprocessor.compression_ratio, NaN);
+  const tradePreprocessorSavedPct = numberOr(marketBusTradePreprocessor.compression_saved_pct, NaN);
+  const tradePreprocessorWindowMs = Math.max(0, numberOr(marketBusTradePreprocessor.aggregation_window_ms, 0));
+  const tradePreprocessorPriceBandBps = numberOr(marketBusTradePreprocessor.price_band_bps, NaN);
+  const tradePreprocessorJournalSamples = Math.max(0, numberOr(tradePreprocessorJournalSummary.sample_count, 0));
+  const tradePreprocessorJournalRaw = Math.max(0, numberOr(tradePreprocessorJournalSummary.raw_count_total, 0));
+  const tradePreprocessorJournalEmitted = Math.max(0, numberOr(tradePreprocessorJournalSummary.emitted_count_total, 0));
+  const tradePreprocessorJournalSavedPct = numberOr(tradePreprocessorJournalSummary.compression_saved_pct, NaN);
+  const tradePreprocessorAlertState = String(tradePreprocessorAlert.state || "unknown");
+  const tradePreprocessorAlertTriggered = Boolean(tradePreprocessorAlert.triggered);
+  const tradePreprocessorAlertSummary = String(tradePreprocessorAlert.summary || "No alert state.");
+  const tradePreprocessorAnalytics24hSavedPct = numberOr(tradePreprocessorPriceDiscovery24h.compression_saved_pct, NaN);
+  const tradePreprocessorAnalytics24hAggressiveBuckets = Math.max(0, numberOr(tradePreprocessorPriceDiscovery24h.aggressive_bucket_count, 0));
+  const tradePreprocessorAnalytics7dSavedPct = numberOr(tradePreprocessorPriceDiscovery7d.compression_saved_pct, NaN);
+  const tradePreprocessorAnalytics7dAggressiveBuckets = Math.max(0, numberOr(tradePreprocessorPriceDiscovery7d.aggressive_bucket_count, 0));
   const executionDepthLevels = countDepthLevels(depthPayload);
   const busSeq = Math.max(0, numberOr(marketBusOhlcvSeq.latest_seq, 0));
   const busConnected = String(marketBusHealth.status || "") === "ok" && busSeq > 0;
@@ -198,6 +278,10 @@ export default function LiveReadinessPage() {
   const executionReady = busConnected && executionFlowOk && executionDepthOk && executionRoutingOk;
   const executionStateLabel = executionReady ? "READY" : "DISABLED";
   const executionStateTone = executionReady ? "good" : "bad";
+  const marketStateMapCells = marketStateMap?.cells.slice(0, 4) || [];
+  const marketStateMapTransitions = marketStateMap?.transitions.slice(0, 4) || [];
+  const marketStateMapZones = marketStateMap?.inadmissibleZones.slice(0, 4) || [];
+  const marketStateMapSummary = marketStateMap?.summary || null;
   const executionRejectionReasons = [
     !busConnected ? (busSeq <= 0 ? "SEQ_ZERO" : "BUS_OFFLINE") : null,
     !executionFlowOk ? "NO_TRADES" : null,
@@ -214,7 +298,6 @@ export default function LiveReadinessPage() {
         : !executionDepthOk
           ? "depth empty"
           : "ready";
-
   return (
     <main className="shell txt-page-shell">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.4fr 1fr" }}>
@@ -233,7 +316,15 @@ export default function LiveReadinessPage() {
             Si plusieurs blocs passent au warn en meme temps, ne cherche pas a optimiser. Coupe le rythme, garde le risque bas et traite d'abord la cause de derive.
           </div>
           <p>
-            <Link href="/">Dashboard</Link>
+            <Link href="/dashboard">Dashboard</Link>
+            {" | "}
+            <Link href="/live-readiness/drift-alert-log">Drift Alert Log</Link>
+            {" | "}
+            <Link href="/live-readiness/edge-map">Edge Map</Link>
+            {" | "}
+            <Link href="/live-readiness/market-state-map">Market State Map</Link>
+            {" | "}
+            <Link href="/live-readiness/ui-blue-green">UI Blue/Green</Link>
             {" | "}
             <Link href="/terminal">Trading Terminal</Link>
             {" | "}
@@ -257,6 +348,38 @@ export default function LiveReadinessPage() {
       </section>
 
       <section className="grid" style={{ gridTemplateColumns: "1fr", marginBottom: 16 }}>
+        <div className="panel runtime-decision-dashboard-panel" data-testid="live-readiness-runtime-monitor-panel">
+          <RuntimeOperatorMonitoringCard summary={runtimeDecisionSummary} title="Runtime Operator Monitor" />
+        </div>
+      </section>
+
+      <section className="grid" style={{ gridTemplateColumns: "1fr", marginBottom: 16 }}>
+        <div className="panel" data-testid="live-readiness-controlled-collection-panel">
+          <div className="eyebrow">Controlled Collection Session</div>
+          {controlledCollectionAvailable ? (
+            <>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10, marginBottom: 10 }}>
+                <span className={`chart-flow-pill tone-${controlledCollectionActive ? "good" : "warn"}`}>SESSION {controlledCollectionActive ? "OPEN" : "CLOSED"}</span>
+                <span className={`chart-flow-pill tone-${controlledCollectionGateStatus.toLowerCase() === "go" ? "good" : "warn"}`}>GATE {controlledCollectionGateStatus.toUpperCase()}</span>
+                <span className={`chart-flow-pill tone-${controlledCollectionKillActive ? "bad" : "good"}`}>KILL {controlledCollectionKillActive ? "ACTIVE" : "CLEAR"}</span>
+                <span className={`chart-flow-pill tone-${controlledCollectionKillRearmed ? "bad" : "neutral"}`}>REARM {controlledCollectionKillRearmed ? "YES" : "NO"}</span>
+              </div>
+              <div className="row"><span>Phase</span><span>{controlledCollectionPhase}</span></div>
+              <div className="row"><span>Baseline</span><span>{String(controlledCollectionState.baselineSince || "-")}</span></div>
+              <div className="row"><span>Duration</span><span>{controlledCollectionDurationMinutes.toFixed(2)}m</span></div>
+              <div className="row"><span>Fills seen</span><span>{String(controlledCollectionFills)}</span></div>
+              <div className="row"><span>Labels seen</span><span>{String(controlledCollectionLabels)}</span></div>
+              <div className="row"><span>Gate health</span><span>{controlledCollectionGateHealth > 0 ? controlledCollectionGateHealth.toFixed(2) : "-"}</span></div>
+              <div className="row"><span>Kill reason</span><span>{controlledCollectionKillReason}</span></div>
+              <div className="row"><span>Last snapshot</span><span>{String(controlledCollectionState.lastSnapshotAt || "-")}</span></div>
+            </>
+          ) : (
+            <p className="subtle">Aucune session de collecte contrôlée observée pour l’instant.</p>
+          )}
+        </div>
+      </section>
+
+      <section className="grid" style={{ gridTemplateColumns: "1.15fr 0.85fr", marginBottom: 16 }}>
         <div className="panel">
           <div className="eyebrow">Market Data Bus <HelpHint text="Ce bloc dit si le flux marché reste propre pour les graphiques, l'IA et l'exécution." examples={["Si les bougies ou la profondeur ne tiennent plus, considère l'écran comme dégradé.", "Un trou dans la suite des données mérite une vérification même si le flux n'est pas totalement coupé."]} /></div>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10, marginBottom: 10 }}>
@@ -279,6 +402,105 @@ export default function LiveReadinessPage() {
           <div className="row"><span>Dernier sync</span><span>{String(marketBusSnapshot?.as_of || "-")}</span></div>
           <div className="row"><span>OHLCV latest seq</span><span>{String(marketBusOhlcvSeq.latest_seq || "-")}</span></div>
           <div className="row"><span>OHLCV contiguous</span><span className={Boolean(marketBusOhlcvSeq.contiguous) ? "good" : "warn"}>{String(Boolean(marketBusOhlcvSeq.contiguous))}</span></div>
+        </div>
+
+        <div className="panel">
+          <div className="eyebrow">Trades Preprocessor <HelpHint text="Montre explicitement combien de trades bruts sont reduits avant consommation, avec le mode adaptatif retenu et un petit historique compare raw vs emitted." examples={["Si le regime passe en price discovery, attends-toi a moins de compression pour garder plus de verite microstructure.", "Si raw reste eleve mais emitted chute tres fort, verifie que le gain de masse ne masque pas un changement de regime."]} /></div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10, marginBottom: 10 }}>
+            <span className="chart-flow-pill tone-neutral">MODE {tradePreprocessorMode.replace(/_/g, " ").toUpperCase()}</span>
+            <span className="chart-flow-pill tone-neutral">REGIME {tradePreprocessorRegime.replace(/_/g, " ").toUpperCase()}</span>
+            <span className={`chart-flow-pill tone-${Number.isFinite(tradePreprocessorSavedPct) && tradePreprocessorSavedPct >= 35 ? "good" : Number.isFinite(tradePreprocessorSavedPct) && tradePreprocessorSavedPct >= 15 ? "warn" : "neutral"}`}>SAVE {formatPercent(tradePreprocessorSavedPct)}</span>
+            <span className={`chart-flow-pill tone-${tradePreprocessorAlertState === "warn" ? "bad" : tradePreprocessorAlertState === "watch" ? "warn" : "good"}`}>ALERT {tradePreprocessorAlertState.toUpperCase()}</span>
+          </div>
+          {tradePreprocessorAlertTriggered ? (
+            <div className={tradePreprocessorAlertState === "warn" ? "warn" : "subtle"} style={{ marginBottom: 10 }}>
+              {tradePreprocessorAlertSummary}
+            </div>
+          ) : null}
+          {tradePreprocessorRawCount > 0 ? (
+            <div className="good" style={{ marginBottom: 10 }}>
+              Snapshot courant: raw {tradePreprocessorRawCount}{" -> "}emitted {tradePreprocessorEmittedCount} ({formatPercent(tradePreprocessorSavedPct)} sauvegarde, ratio {formatFixed(tradePreprocessorCompressionRatio, 3)}).
+            </div>
+          ) : (
+            <div className="warn" style={{ marginBottom: 10 }}>Aucune metrique de compression disponible sur le snapshot courant.</div>
+          )}
+          <div className="row"><span>Window / band</span><span>{tradePreprocessorWindowMs}ms / {formatFixed(tradePreprocessorPriceBandBps, 3)}bps</span></div>
+          <div className="row"><span>Snapshot raw vs emitted</span><span>{tradePreprocessorRawCount} / {tradePreprocessorEmittedCount}</span></div>
+          <div className="row"><span>Price discovery 24h</span><span>{formatPercent(tradePreprocessorAnalytics24hSavedPct)} · buckets {tradePreprocessorAnalytics24hAggressiveBuckets}</span></div>
+          <div className="row"><span>Price discovery 7d</span><span>{formatPercent(tradePreprocessorAnalytics7dSavedPct)} · buckets {tradePreprocessorAnalytics7dAggressiveBuckets}</span></div>
+          <div className="row"><span>Journal samples</span><span>{tradePreprocessorJournalSamples}</span></div>
+          <div className="row"><span>Journal raw vs emitted</span><span>{tradePreprocessorJournalRaw} / {tradePreprocessorJournalEmitted}</span></div>
+          <div className="row"><span>Journal saved</span><span>{formatPercent(tradePreprocessorJournalSavedPct)}</span></div>
+          <div className="txt-scroll-shell compact" style={{ marginTop: 10 }}>
+            {tradePreprocessorJournal.length === 0 ? <p className="subtle">Pas encore de buckets persistes.</p> : tradePreprocessorJournal.slice(0, 8).map((row, index) => {
+              const item = safeRecord(row);
+              const bucket = String(item.sample_bucket || "-");
+              const source = String(item.source || "snapshot");
+              const regimeLabel = String(item.market_regime || "n/a").replace(/_/g, " ");
+              const avgRaw = formatFixed(item.avg_raw_count, 1);
+              const avgEmitted = formatFixed(item.avg_emitted_count, 1);
+              const saved = formatPercent(item.compression_saved_pct);
+              return (
+                <div className="row" key={`${bucket}-${source}-${index}`}>
+                  <span>{bucket} · {source} · {regimeLabel}</span>
+                  <span>{avgRaw}{" -> "}{avgEmitted} ({saved})</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </section>
+
+      <section className="grid" style={{ gridTemplateColumns: "1fr", marginBottom: 16 }}>
+        <TradabilityScienceCard summary={tradabilityAnalytics} testId="live-readiness-tradability-science-panel" />
+      </section>
+
+      <section className="grid" style={{ gridTemplateColumns: "1fr", marginBottom: 16 }}>
+        <div className="panel" data-testid="live-readiness-market-state-map-panel">
+          <div className="eyebrow">Market State Map <HelpHint text="Carte opérateur des contextes admissibles, fragiles ou interdits, calculée à partir de l'oracle, de la mémoire marché et de l'observation edge." examples={["Si une zone devient inadmissible avec plusieurs transitions, traite-la comme faux contexte exploitable.", "Si les cellules admissibles baissent alors que les anomalies montent, le marché reste visible mais pas forcément exploitable."]} /></div>
+          {marketStateMap ? (
+            <>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10, marginBottom: 10 }}>
+                <span className="chart-flow-pill tone-good">ADMISSIBLE {marketStateMapSummary?.admissibleCells || 0}</span>
+                <span className="chart-flow-pill tone-warn">WATCH {marketStateMapSummary?.watchCells || 0}</span>
+                <span className="chart-flow-pill tone-warn">DEGRADED {marketStateMapSummary?.degradedCells || 0}</span>
+                <span className="chart-flow-pill tone-bad">INADMISSIBLE {marketStateMapSummary?.inadmissibleCells || 0}</span>
+              </div>
+              <div className={(marketStateMapZones.length > 0 || (marketStateMapSummary?.inadmissibleCells || 0) > 0) ? "warn" : "good"} style={{ marginBottom: 10 }}>
+                {(marketStateMapSummary?.inadmissibleCells || 0) > 0
+                  ? `${marketStateMapSummary?.inadmissibleCells || 0} zone(s) actuellement hors admissibilité. Surveiller les régimes les plus instables avant toute hausse d'agressivité.`
+                  : "Aucune zone inadmissible active sur la fenêtre courante."}
+              </div>
+              <div className="row"><span>Scope</span><span>{marketStateMap.scope.symbol} · {marketStateMap.scope.timeframe} · {marketStateMap.scope.venue} · {marketStateMap.scope.windowHours}h</span></div>
+              <div className="row"><span>Failure modes</span><span>{(marketStateMapSummary?.dominantFailureModes || []).length > 0 ? marketStateMapSummary?.dominantFailureModes.map((reason) => formatLabel(reason)).join(" · ") : "none"}</span></div>
+              <div className="txt-scroll-shell compact" style={{ marginTop: 10 }}>
+                {marketStateMapCells.length === 0 ? <p className="subtle">Aucune cellule state map disponible.</p> : marketStateMapCells.map((cell) => (
+                  <div className="row" key={`${cell.key.venue}-${cell.key.timeframe}-${cell.key.regime}`}>
+                    <span>{cell.key.regime} · {cell.state} · truth {cell.truthQualityPct}%</span>
+                    <span>{formatLabel(cell.reasons[0] || "")}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="txt-scroll-shell compact" style={{ marginTop: 10 }}>
+                {marketStateMapTransitions.length === 0 ? <p className="subtle">Pas de transition récente.</p> : marketStateMapTransitions.map((transition, index) => (
+                  <div className="row" key={`${transition.regime}-${transition.detectedAtIso}-${index}`}>
+                    <span>{transition.regime} · {formatLabel(transition.transitionType)}</span>
+                    <span>{transition.truthQualityDeltaPct}% · {transition.detectedAtIso}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="txt-scroll-shell compact" style={{ marginTop: 10 }}>
+                {marketStateMapZones.length === 0 ? <p className="subtle">Aucune zone dégradée listée.</p> : marketStateMapZones.map((zone) => (
+                  <div className="row" key={zone.zoneKey}>
+                    <span>{zone.regime} · {zone.severity.toUpperCase()}</span>
+                    <span>{formatLabel(zone.reason)}</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : (
+            <p className="subtle">State map indisponible pour l'instant.</p>
+          )}
         </div>
       </section>
 

@@ -14,6 +14,7 @@ import httpx
 from fastapi import FastAPI, HTTPException
 
 from shared.db import ensure_schema, fetch_all
+from shared.models import TradeProtectionRequest
 
 app = FastAPI(title="Broker Adapter", version="0.1.0")
 
@@ -73,6 +74,161 @@ def _default_bingx_position_side(side: str, reduce_only: bool) -> str:
     return "LONG" if side == "buy" else "SHORT"
 
 
+def _normalize_bingx_working_type(value: object) -> str:
+    raw = str(value or "MARK_PRICE").strip().upper()
+    return raw if raw in {"MARK_PRICE", "CONTRACT_PRICE"} else "MARK_PRICE"
+
+
+def _normalize_trade_protection_request(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict) or not payload:
+        return {}
+    try:
+        normalized = TradeProtectionRequest.model_validate(payload).model_dump(mode="json", exclude_none=True)
+    except Exception as exc:
+        raise ValueError(f"invalid protection request: {exc}") from exc
+    if not isinstance(normalized.get("take_profit"), dict) and not isinstance(normalized.get("stop_loss"), dict):
+        raise ValueError("protection requires take_profit or stop_loss")
+    return normalized
+
+
+def _requested_protection_leg_count(protection: dict[str, object] | None) -> int:
+    if not isinstance(protection, dict):
+        return 0
+    return sum(1 for key in ("take_profit", "stop_loss") if isinstance(protection.get(key), dict))
+
+
+def _build_bingx_attached_protection_params(
+    protection: dict[str, object],
+    *,
+    side: str,
+    reference_price: float,
+) -> dict[str, str]:
+    if not isinstance(protection, dict) or not protection:
+        return {}
+
+    def _validate_leg(name: str, trigger_price: float) -> None:
+        if trigger_price <= 0:
+            raise ValueError(f"{name} trigger_price must be > 0")
+        if reference_price <= 0:
+            return
+        if side == "buy":
+            if name == "take_profit" and trigger_price <= reference_price:
+                raise ValueError("take_profit trigger_price must be above the live reference price for buy orders")
+            if name == "stop_loss" and trigger_price >= reference_price:
+                raise ValueError("stop_loss trigger_price must be below the live reference price for buy orders")
+        else:
+            if name == "take_profit" and trigger_price >= reference_price:
+                raise ValueError("take_profit trigger_price must be below the live reference price for sell orders")
+            if name == "stop_loss" and trigger_price <= reference_price:
+                raise ValueError("stop_loss trigger_price must be above the live reference price for sell orders")
+
+    payloads: dict[str, str] = {}
+    mapping = {
+        "take_profit": ("takeProfit", "TAKE_PROFIT_MARKET", "TAKE_PROFIT"),
+        "stop_loss": ("stopLoss", "STOP_MARKET", "STOP"),
+    }
+    for request_key, (param_key, market_type, limit_type) in mapping.items():
+        leg = protection.get(request_key)
+        if not isinstance(leg, dict):
+            continue
+        trigger_price = _to_float(leg.get("trigger_price"), 0.0)
+        _validate_leg(request_key, trigger_price)
+        order_type = str(leg.get("order_type") or "market").strip().lower()
+        payload: dict[str, str] = {
+            "type": market_type if order_type != "limit" else limit_type,
+            "stopPrice": _format_decimal(trigger_price),
+            "workingType": _normalize_bingx_working_type(leg.get("working_type")),
+        }
+        if order_type == "limit":
+            limit_price = _to_float(leg.get("limit_price"), 0.0)
+            if limit_price <= 0:
+                raise ValueError(f"{request_key} limit order requires limit_price")
+            payload["price"] = _format_decimal(limit_price)
+        payloads[param_key] = json.dumps(payload, separators=(",", ":"))
+    return payloads
+
+
+def _extract_bingx_returned_protection_leg(raw_leg: object, *, entrust_price: object = None) -> dict[str, object] | None:
+    if not isinstance(raw_leg, dict):
+        return None
+    venue_order_type = str(raw_leg.get("type") or "").strip().upper()
+    trigger_price = _to_float(raw_leg.get("stopPrice"), 0.0)
+    limit_price = _to_float(raw_leg.get("price"), _to_float(entrust_price, 0.0))
+    if trigger_price <= 0 and limit_price <= 0 and not venue_order_type:
+        return None
+    normalized: dict[str, object] = {
+        "order_type": "limit" if venue_order_type in {"TAKE_PROFIT", "STOP"} or limit_price > 0 else "market",
+        "working_type": _normalize_bingx_working_type(raw_leg.get("workingType")),
+        "venue_order_type": venue_order_type,
+    }
+    if trigger_price > 0:
+        normalized["trigger_price"] = _json_number(trigger_price)
+    if limit_price > 0:
+        normalized["limit_price"] = _json_number(limit_price)
+    return normalized
+
+
+def _resolve_protection_state(requested: dict[str, object] | None, accepted: dict[str, object] | None) -> tuple[str, dict[str, object]]:
+    requested_payload = requested if isinstance(requested, dict) else {}
+    requested_count = _requested_protection_leg_count(requested_payload)
+    if requested_count <= 0:
+        return "not_requested", {}
+
+    accepted_payload = accepted if isinstance(accepted, dict) else {}
+    accepted_count = _requested_protection_leg_count(accepted_payload)
+    missing: list[str] = []
+    for key in ("take_profit", "stop_loss"):
+        if isinstance(requested_payload.get(key), dict) and not isinstance(accepted_payload.get(key), dict):
+            missing.append(key)
+    status = "armed" if accepted_count >= requested_count else "protection_partial" if accepted_count > 0 else "protection_rejected"
+    protection_state: dict[str, object] = {
+        "mode": "native_attached",
+        "status": status,
+        "require_full_acceptance": bool(requested_payload.get("require_full_acceptance", True)),
+        "requested": requested_payload,
+        "accepted": accepted_payload,
+        "reasons": [f"{name} was not acknowledged by BingX" for name in missing],
+    }
+    return status, protection_state
+
+
+def _normalize_dry_run_accepted_legs(raw_value: object, requested: dict[str, object]) -> list[str]:
+    requested_names = [name for name in ("take_profit", "stop_loss") if isinstance(requested.get(name), dict)]
+    if not requested_names:
+        return []
+    if raw_value is None:
+        return list(requested_names)
+    if isinstance(raw_value, str):
+        value = raw_value.strip().lower()
+        if value in {"", "auto", "all"}:
+            return list(requested_names)
+        if value == "none":
+            return []
+        tokens = [part.strip().lower() for part in value.split(",") if part.strip()]
+    elif isinstance(raw_value, (list, tuple, set)):
+        tokens = [str(part or "").strip().lower() for part in raw_value]
+    else:
+        tokens = []
+    normalized: list[str] = []
+    for token in tokens:
+        if token in {"tp", "take-profit", "take_profit"}:
+            token = "take_profit"
+        elif token in {"sl", "stop-loss", "stop_loss"}:
+            token = "stop_loss"
+        if token in requested_names and token not in normalized:
+            normalized.append(token)
+    return normalized
+
+
+def _build_dry_run_accepted_protection(requested: dict[str, object], accepted_legs: list[str]) -> dict[str, object]:
+    accepted: dict[str, object] = {}
+    for leg_name in accepted_legs:
+        leg = requested.get(leg_name)
+        if isinstance(leg, dict):
+            accepted[leg_name] = dict(leg)
+    return accepted
+
+
 def _normalize_bingx_symbol(symbol: str) -> str:
     raw = str(symbol or "").strip().upper().replace("/", "-").replace("_", "-")
     if not raw:
@@ -94,6 +250,14 @@ def _normalize_bingx_symbol(symbol: str) -> str:
 
 def _canonical_instrument(symbol: str) -> str:
     return str(symbol or "").replace("/", "").replace("-", "").upper()
+
+
+def _symbol_assets(symbol: str) -> tuple[str, str]:
+    normalized = _normalize_bingx_symbol(symbol)
+    if "-" in normalized:
+        base_asset, quote_asset = normalized.split("-", 1)
+        return base_asset, quote_asset
+    return normalized, ""
 
 
 def _normalize_bybit_symbol(symbol: str) -> str:
@@ -813,6 +977,36 @@ def _bingx_minimum_quantity(contract_spec: dict[str, float | int | str], referen
     return _round_to_precision(minimum_quantity, quantity_precision)
 
 
+def _bingx_minimum_executable_notional_usd(contract_spec: dict[str, float | int | str], reference_price: float) -> float:
+    minimum_quantity = _bingx_minimum_quantity(contract_spec, reference_price)
+    if minimum_quantity <= 0 or reference_price <= 0:
+        return 0.0
+    return minimum_quantity * reference_price
+
+
+def _resolve_notional_adjustment(
+    requested_notional_usd: float,
+    min_notional_usd: float,
+    *,
+    auto_adjust_enabled: bool,
+) -> dict[str, object]:
+    requested = max(0.0, requested_notional_usd)
+    minimum = max(0.0, min_notional_usd)
+    supports_requested = requested <= 0 or minimum <= requested + 1e-9
+    applied = bool(auto_adjust_enabled and requested > 0 and minimum > requested + 1e-9)
+    effective = minimum if applied else requested
+    return {
+        "enabled": bool(auto_adjust_enabled),
+        "applied": applied,
+        "requested_notional_usd": _json_number(requested),
+        "adjusted_notional_usd": _json_number(effective),
+        "min_notional_usd": _json_number(minimum),
+        "supports_requested_notional": supports_requested,
+        "supports_auto_adjusted_notional": requested <= 0 or supports_requested or applied,
+        "reason": "venue_min_notional" if applied else "none",
+    }
+
+
 async def _bingx_submit_order(
     *,
     secret_payload: dict,
@@ -879,7 +1073,14 @@ def _bingx_status(raw_status: object) -> str:
     return "unknown"
 
 
-def _bingx_order_snapshot(payload: dict, *, symbol: str, side: str, requested_notional_usd: float) -> dict:
+def _bingx_order_snapshot(
+    payload: dict,
+    *,
+    symbol: str,
+    side: str,
+    requested_notional_usd: float,
+    requested_protection: dict[str, object] | None = None,
+) -> dict:
     order_payload = payload.get("order") if isinstance(payload.get("order"), dict) else payload
     if not isinstance(order_payload, dict):
         order_payload = {}
@@ -907,6 +1108,20 @@ def _bingx_order_snapshot(payload: dict, *, symbol: str, side: str, requested_no
                 "filled_at": _now_iso(),
             }
         )
+    accepted_protection: dict[str, object] = {}
+    take_profit = _extract_bingx_returned_protection_leg(
+        order_payload.get("takeProfit"),
+        entrust_price=order_payload.get("takeProfitEntrustPrice"),
+    )
+    stop_loss = _extract_bingx_returned_protection_leg(
+        order_payload.get("stopLoss"),
+        entrust_price=order_payload.get("stopLossEntrustPrice"),
+    )
+    if take_profit is not None:
+        accepted_protection["take_profit"] = take_profit
+    if stop_loss is not None:
+        accepted_protection["stop_loss"] = stop_loss
+    protection_status, protection_state = _resolve_protection_state(requested_protection, accepted_protection)
     return {
         "provider": "bingx",
         "venue": "bingx",
@@ -919,12 +1134,22 @@ def _bingx_order_snapshot(payload: dict, *, symbol: str, side: str, requested_no
         "requested_notional_usd": requested_notional_usd,
         "filled_notional_usd": filled_notional_usd,
         "avg_fill_price": avg_fill_price,
+        "protection_status": protection_status,
+        "protection": protection_state,
         "fills": fills,
         "raw_order": payload,
     }
 
 
-async def _bingx_query_order(secret_payload: dict, symbol: str, order_id: str | None, client_order_id: str | None, requested_notional_usd: float, side: str) -> dict | None:
+async def _bingx_query_order(
+    secret_payload: dict,
+    symbol: str,
+    order_id: str | None,
+    client_order_id: str | None,
+    requested_notional_usd: float,
+    side: str,
+    requested_protection: dict[str, object] | None = None,
+) -> dict | None:
     params: dict[str, str] = {"symbol": _normalize_bingx_symbol(symbol)}
     if order_id:
         params["orderId"] = order_id
@@ -938,12 +1163,20 @@ async def _bingx_query_order(secret_payload: dict, symbol: str, order_id: str | 
         return None
     if not isinstance(order, dict):
         return None
-    return _bingx_order_snapshot(order, symbol=symbol, side=side, requested_notional_usd=requested_notional_usd)
+    return _bingx_order_snapshot(
+        order,
+        symbol=symbol,
+        side=side,
+        requested_notional_usd=requested_notional_usd,
+        requested_protection=requested_protection,
+    )
 
 
 async def _bingx_place_live_order(payload: dict) -> dict:
+    dry_run = bool(payload.get("dry_run"))
+    auto_adjust_notional = bool(payload.get("auto_adjust_notional"))
     secret_payload = payload.get("secret_payload") if isinstance(payload.get("secret_payload"), dict) else None
-    if not isinstance(secret_payload, dict):
+    if not dry_run and not isinstance(secret_payload, dict):
         raise ValueError("secret_payload is required for BingX live orders")
     side = str(payload.get("side") or "buy").strip().lower()
     if side not in {"buy", "sell"}:
@@ -954,6 +1187,8 @@ async def _bingx_place_live_order(payload: dict) -> dict:
 
     order_type = str(payload.get("order_type") or "MARKET").strip().upper()
     requested_notional_usd = _to_float(payload.get("notional_usd"), 0.0)
+    requested_protection = _normalize_trade_protection_request(payload.get("protection")) if isinstance(payload.get("protection"), dict) and payload.get("protection") else {}
+    dry_run_accepted_legs = _normalize_dry_run_accepted_legs(payload.get("dry_run_accepted_legs"), requested_protection)
     contract_spec = await _bingx_contract_spec(symbol)
     params: dict[str, str] = {
         "symbol": symbol,
@@ -980,6 +1215,7 @@ async def _bingx_place_live_order(payload: dict) -> dict:
     auto_sized_quantity = False
     reference_price = 0.0
     requested_quote_notional = quote_order_qty if quote_order_qty > 0 else requested_notional_usd
+    effective_requested_notional_usd = requested_quote_notional
     sizing_telemetry: dict[str, object] = {
         "symbol": symbol,
         "side": side,
@@ -987,6 +1223,7 @@ async def _bingx_place_live_order(payload: dict) -> dict:
         "position_side": position_side,
         "requested_notional_usd": _json_number(requested_notional_usd),
         "requested_quote_notional_usd": _json_number(requested_quote_notional),
+        "effective_requested_notional_usd": _json_number(requested_quote_notional),
         "requested_quantity": _json_number(quantity),
         "auto_sized_quantity": False,
         "reference_price": 0.0,
@@ -1001,15 +1238,39 @@ async def _bingx_place_live_order(payload: dict) -> dict:
         "attempts": [],
         "fallbacks": [],
     }
+
+    def _resolve_effective_notional(minimum_reference_price: float) -> float:
+        nonlocal effective_requested_notional_usd, requested_quote_notional
+        if requested_quote_notional <= 0 or minimum_reference_price <= 0:
+            return requested_quote_notional
+        minimum_notional_usd = _bingx_minimum_executable_notional_usd(contract_spec, minimum_reference_price)
+        sizing_telemetry["minimum_executable_notional_usd"] = _json_number(minimum_notional_usd)
+        adjustment = _resolve_notional_adjustment(
+            requested_quote_notional,
+            minimum_notional_usd,
+            auto_adjust_enabled=auto_adjust_notional,
+        )
+        sizing_telemetry["auto_adjustment"] = adjustment
+        if not bool(adjustment.get("supports_auto_adjusted_notional")):
+            raise ValueError(
+                "requested notional is below BingX minimum executable size "
+                f"({minimum_notional_usd:.6f} USD required, {requested_quote_notional:.6f} USD requested)"
+            )
+        effective_requested_notional_usd = _to_float(adjustment.get("adjusted_notional_usd"), requested_quote_notional)
+        requested_quote_notional = effective_requested_notional_usd
+        sizing_telemetry["effective_requested_notional_usd"] = _json_number(effective_requested_notional_usd)
+        return effective_requested_notional_usd
+
     if order_type == "MARKET":
         reference_price = await _reference_price_for_market_order(symbol, side)
         sizing_telemetry["reference_price"] = _json_number(reference_price)
+        _resolve_effective_notional(reference_price)
         if quantity > 0:
             quantity = _bingx_normalize_quantity(
                 quantity,
                 contract_spec=contract_spec,
                 reference_price=reference_price,
-                requested_notional_usd=requested_notional_usd,
+                requested_notional_usd=effective_requested_notional_usd,
             )
             sizing_telemetry["normalized_quantity"] = _json_number(quantity)
             params["quantity"] = _format_decimal(quantity)
@@ -1037,8 +1298,9 @@ async def _bingx_place_live_order(payload: dict) -> dict:
         reference_price = price
         sizing_telemetry["reference_price"] = _json_number(reference_price)
         sizing_telemetry["limit_price"] = _json_number(price)
+        _resolve_effective_notional(price)
         if quantity <= 0 and requested_notional_usd > 0:
-            quantity = requested_notional_usd / max(price, 1e-9)
+            quantity = effective_requested_notional_usd / max(price, 1e-9)
             auto_sized_quantity = True
             sizing_telemetry["auto_sized_quantity"] = True
             sizing_telemetry["raw_auto_quantity"] = _json_number(quantity)
@@ -1046,7 +1308,7 @@ async def _bingx_place_live_order(payload: dict) -> dict:
             quantity,
             contract_spec=contract_spec,
             reference_price=price,
-            requested_notional_usd=requested_notional_usd,
+            requested_notional_usd=effective_requested_notional_usd,
         )
         sizing_telemetry["normalized_quantity"] = _json_number(quantity)
         if quantity <= 0:
@@ -1054,6 +1316,50 @@ async def _bingx_place_live_order(payload: dict) -> dict:
         params["price"] = _format_decimal(price)
         params["quantity"] = _format_decimal(quantity)
         params["timeInForce"] = str(payload.get("time_in_force") or "GTC").strip().upper()
+
+    if requested_protection:
+        params.update(
+            _build_bingx_attached_protection_params(
+                requested_protection,
+                side=side,
+                reference_price=reference_price,
+            )
+        )
+
+    if dry_run:
+        accepted_protection = _build_dry_run_accepted_protection(requested_protection, dry_run_accepted_legs)
+        protection_status, protection_state = _resolve_protection_state(requested_protection, accepted_protection)
+        return {
+            "provider": "bingx",
+            "venue": "bingx",
+            "order_id": f"dry-run-{client_order_id or int(time.time() * 1000)}",
+            "client_order_id": client_order_id,
+            "status": "dry_run",
+            "raw_status": "DRY_RUN",
+            "instrument": _canonical_instrument(symbol),
+            "side": side,
+            "requested_notional_usd": effective_requested_notional_usd,
+            "filled_notional_usd": 0.0,
+            "avg_fill_price": 0.0,
+            "protection_status": protection_status,
+            "protection": protection_state,
+            "fills": [],
+            "sizing": sizing_telemetry,
+            "dry_run": {
+                "request": {
+                    "symbol": symbol,
+                    "side": side,
+                    "order_type": order_type,
+                    "position_side": position_side,
+                    "time_in_force": params.get("timeInForce"),
+                    "price": _json_number(price) if price > 0 else None,
+                    "quantity": _json_number(quantity) if quantity > 0 else None,
+                    "notional_usd": _json_number(effective_requested_notional_usd),
+                },
+                "accepted_legs": dry_run_accepted_legs,
+                "request_params": {key: value for key, value in params.items() if key not in {"apiKey", "timestamp", "signature"}},
+            },
+        }
 
     try:
         order = await _bingx_submit_order(
@@ -1087,14 +1393,21 @@ async def _bingx_place_live_order(payload: dict) -> dict:
             raise
     if not isinstance(order, dict):
         raise RuntimeError("BingX order placement returned an invalid payload")
-    snapshot = _bingx_order_snapshot(order, symbol=symbol, side=side, requested_notional_usd=requested_notional_usd)
+    snapshot = _bingx_order_snapshot(
+        order,
+        symbol=symbol,
+        side=side,
+        requested_notional_usd=effective_requested_notional_usd,
+        requested_protection=requested_protection,
+    )
     queried = await _bingx_query_order(
         secret_payload,
         symbol,
         snapshot.get("order_id"),
         snapshot.get("client_order_id"),
-        requested_notional_usd,
+        effective_requested_notional_usd,
         side,
+        requested_protection,
     )
     result = queried or snapshot
     result["sizing"] = sizing_telemetry
@@ -1166,8 +1479,287 @@ async def _bingx_live_order_status(payload: dict) -> dict:
     return result
 
 
+def _bingx_close_side_for_position(position_side: str) -> str:
+    normalized = str(position_side or "").strip().upper()
+    if normalized == "LONG":
+        return "sell"
+    if normalized == "SHORT":
+        return "buy"
+    raise ValueError("position_side must be LONG or SHORT for BingX protection amendments")
+
+
+def _bingx_protection_order_leg_snapshot(
+    leg_name: str,
+    requested_leg: dict[str, object],
+    order_result: dict[str, object] | None,
+) -> dict[str, object]:
+    snapshot: dict[str, object] = {
+        "trigger_price": _json_number(_to_float(requested_leg.get("trigger_price"), 0.0)),
+        "order_type": str(requested_leg.get("order_type") or "market").strip().lower() or "market",
+        "working_type": _normalize_bingx_working_type(requested_leg.get("working_type")),
+        "leg": leg_name,
+    }
+    limit_price = _to_float(requested_leg.get("limit_price"), 0.0)
+    if limit_price > 0:
+        snapshot["limit_price"] = _json_number(limit_price)
+    if isinstance(order_result, dict):
+        order_id = str(order_result.get("order_id") or "").strip()
+        client_order_id = str(order_result.get("client_order_id") or "").strip()
+        status = str(order_result.get("status") or "").strip().lower()
+        if order_id:
+            snapshot["order_id"] = order_id
+        if client_order_id:
+            snapshot["client_order_id"] = client_order_id
+        if status:
+            snapshot["status"] = status
+        raw_order = order_result.get("raw_order") if isinstance(order_result.get("raw_order"), dict) else {}
+        created_at = str(raw_order.get("createTime") or raw_order.get("time") or raw_order.get("updateTime") or "").strip()
+        if created_at:
+            snapshot["as_of"] = created_at
+    return snapshot
+
+
+def _build_bingx_standalone_protection_order_params(
+    *,
+    symbol: str,
+    leg_name: str,
+    leg: dict[str, object],
+    quantity: float,
+    position_side: str,
+    close_side: str,
+    client_order_id: str,
+    contract_spec: dict[str, float | int | str],
+) -> dict[str, str]:
+    trigger_price = _to_float(leg.get("trigger_price"), 0.0)
+    if trigger_price <= 0:
+        raise ValueError(f"{leg_name} trigger_price must be > 0")
+    normalized_quantity = _bingx_normalize_quantity(
+        quantity,
+        contract_spec=contract_spec,
+        reference_price=trigger_price,
+        requested_notional_usd=quantity * trigger_price,
+    )
+    if normalized_quantity <= 0:
+        raise ValueError("normalized BingX protection quantity is zero")
+    order_type = str(leg.get("order_type") or "market").strip().lower() or "market"
+    params: dict[str, str] = {
+        "symbol": _normalize_bingx_symbol(symbol),
+        "side": "BUY" if close_side == "buy" else "SELL",
+        "positionSide": str(position_side).strip().upper(),
+        "quantity": _format_decimal(normalized_quantity),
+        "clientOrderId": client_order_id[:40],
+        "reduceOnly": "true",
+        "stopPrice": _format_decimal(trigger_price),
+        "workingType": _normalize_bingx_working_type(leg.get("working_type")),
+    }
+    if leg_name == "take_profit":
+        params["type"] = "TAKE_PROFIT" if order_type == "limit" else "TAKE_PROFIT_MARKET"
+    else:
+        params["type"] = "STOP" if order_type == "limit" else "STOP_MARKET"
+    if order_type == "limit":
+        limit_price = _to_float(leg.get("limit_price"), 0.0)
+        if limit_price <= 0:
+            raise ValueError(f"{leg_name} limit order requires limit_price")
+        params["price"] = _format_decimal(_bingx_normalize_price(limit_price, contract_spec))
+    return params
+
+
+def _bingx_leg_request_from_active_protection(leg_name: str, leg: dict[str, object]) -> dict[str, object]:
+    trigger_price = _to_float(leg.get("trigger_price"), 0.0)
+    if trigger_price <= 0:
+        raise ValueError(f"{leg_name} trigger_price must be > 0 for rollback")
+    payload: dict[str, object] = {
+        "trigger_price": trigger_price,
+        "order_type": str(leg.get("order_type") or "market").strip().lower() or "market",
+        "working_type": str(leg.get("working_type") or "MARK_PRICE").strip().upper() or "MARK_PRICE",
+    }
+    limit_price = _to_float(leg.get("limit_price"), 0.0)
+    if limit_price > 0:
+        payload["limit_price"] = limit_price
+    return payload
+
+
 async def _bingx_amend_live_order(payload: dict) -> dict:
-    raise ValueError("native amend is not enabled for BingX in this stack")
+    secret_payload = payload.get("secret_payload") if isinstance(payload.get("secret_payload"), dict) else None
+    if not isinstance(secret_payload, dict):
+        raise ValueError("secret_payload is required for BingX amendments")
+    symbol = _normalize_bingx_symbol(str(payload.get("symbol") or ""))
+    if not symbol:
+        raise ValueError("symbol is required")
+    position_side = str(payload.get("position_side") or "").strip().upper()
+    close_side = str(payload.get("side") or "").strip().lower() or _bingx_close_side_for_position(position_side)
+    if close_side not in {"buy", "sell"}:
+        raise ValueError("side must be buy or sell")
+    if position_side not in {"LONG", "SHORT"}:
+        if close_side == "sell":
+            position_side = "LONG"
+        elif close_side == "buy":
+            position_side = "SHORT"
+    quantity = _to_float(payload.get("quantity"), 0.0)
+    if quantity <= 0:
+        raise ValueError("quantity is required for BingX protection amendments")
+    requested_notional_usd = _to_float(payload.get("notional_usd"), 0.0)
+    replacement_protection = _normalize_trade_protection_request(payload.get("protection") or payload.get("replacement_protection"))
+    active_protection = payload.get("active_protection") if isinstance(payload.get("active_protection"), dict) else {}
+
+    cancelled_orders: list[dict[str, object]] = []
+    cancelled_legs: list[tuple[str, dict[str, object]]] = []
+    created_orders: list[dict[str, object]] = []
+    accepted_protection: dict[str, object] = {}
+    contract_spec = await _bingx_contract_spec(symbol)
+
+    try:
+        for leg_name in ("stop_loss", "take_profit"):
+            active_leg = active_protection.get(leg_name) if isinstance(active_protection.get(leg_name), dict) else None
+            if not isinstance(active_leg, dict):
+                continue
+            order_id = str(active_leg.get("order_id") or "").strip()
+            client_order_id = str(active_leg.get("client_order_id") or "").strip()
+            if not order_id and not client_order_id:
+                continue
+            cancelled_orders.append(
+                await _bingx_cancel_live_order(
+                    {
+                        "secret_payload": secret_payload,
+                        "symbol": symbol,
+                        "side": close_side,
+                        "order_id": order_id,
+                        "client_order_id": client_order_id,
+                        "notional_usd": requested_notional_usd,
+                    }
+                )
+            )
+            cancelled_legs.append((leg_name, active_leg))
+
+        for leg_name in ("stop_loss", "take_profit"):
+            requested_leg = replacement_protection.get(leg_name)
+            if not isinstance(requested_leg, dict):
+                continue
+            client_order_id = f"txt-{leg_name[:2]}-{int(time.time() * 1000)}"
+            params = _build_bingx_standalone_protection_order_params(
+                symbol=symbol,
+                leg_name=leg_name,
+                leg=requested_leg,
+                quantity=quantity,
+                position_side=position_side,
+                close_side=close_side,
+                client_order_id=client_order_id,
+                contract_spec=contract_spec,
+            )
+            created = await _bingx_signed_request(secret_payload, "POST", "/openApi/swap/v2/trade/order", params)
+            snapshot = _bingx_order_snapshot(
+                created if isinstance(created, dict) else {},
+                symbol=symbol,
+                side=close_side,
+                requested_notional_usd=requested_notional_usd or quantity * _to_float(requested_leg.get("trigger_price"), 0.0),
+            )
+            queried = await _bingx_query_order(
+                secret_payload,
+                symbol,
+                snapshot.get("order_id"),
+                snapshot.get("client_order_id") or client_order_id,
+                requested_notional_usd or quantity * _to_float(requested_leg.get("trigger_price"), 0.0),
+                close_side,
+            )
+            result = queried or snapshot
+            result["requested_leg"] = leg_name
+            created_orders.append(result)
+            accepted_protection[leg_name] = _bingx_protection_order_leg_snapshot(leg_name, requested_leg, result)
+    except Exception as exc:
+        rollback_cancelled_replacements: list[dict[str, object]] = []
+        rollback_recreated_orders: list[dict[str, object]] = []
+        rollback_errors: list[str] = []
+
+        for created_order in created_orders:
+            try:
+                rollback_cancelled_replacements.append(
+                    await _bingx_cancel_live_order(
+                        {
+                            "secret_payload": secret_payload,
+                            "symbol": symbol,
+                            "side": close_side,
+                            "order_id": str(created_order.get("order_id") or "").strip(),
+                            "client_order_id": str(created_order.get("client_order_id") or "").strip(),
+                            "notional_usd": requested_notional_usd,
+                        }
+                    )
+                )
+            except Exception as rollback_exc:
+                rollback_errors.append(f"cancel_replacement:{rollback_exc}")
+
+        for leg_name, previous_leg in cancelled_legs:
+            try:
+                previous_request = _bingx_leg_request_from_active_protection(leg_name, previous_leg)
+                rollback_client_order_id = f"txt-rb-{leg_name[:2]}-{int(time.time() * 1000)}"
+                params = _build_bingx_standalone_protection_order_params(
+                    symbol=symbol,
+                    leg_name=leg_name,
+                    leg=previous_request,
+                    quantity=quantity,
+                    position_side=position_side,
+                    close_side=close_side,
+                    client_order_id=rollback_client_order_id,
+                    contract_spec=contract_spec,
+                )
+                recreated = await _bingx_signed_request(secret_payload, "POST", "/openApi/swap/v2/trade/order", params)
+                snapshot = _bingx_order_snapshot(
+                    recreated if isinstance(recreated, dict) else {},
+                    symbol=symbol,
+                    side=close_side,
+                    requested_notional_usd=requested_notional_usd or quantity * _to_float(previous_request.get("trigger_price"), 0.0),
+                )
+                queried = await _bingx_query_order(
+                    secret_payload,
+                    symbol,
+                    snapshot.get("order_id"),
+                    snapshot.get("client_order_id") or rollback_client_order_id,
+                    requested_notional_usd or quantity * _to_float(previous_request.get("trigger_price"), 0.0),
+                    close_side,
+                )
+                rollback_recreated_orders.append((queried or snapshot) if isinstance(queried or snapshot, dict) else snapshot)
+            except Exception as rollback_exc:
+                rollback_errors.append(f"recreate_original_{leg_name}:{rollback_exc}")
+
+        rollback_state = {
+            "status": "rollback_attempted",
+            "provider": "bingx",
+            "symbol": symbol,
+            "position_side": position_side,
+            "recommended_action": "cancel_replace_rollback",
+            "error": str(exc),
+            "cancelled_orders": cancelled_orders,
+            "created_orders": created_orders,
+            "rollback": {
+                "cancelled_replacements": rollback_cancelled_replacements,
+                "recreated_original_orders": rollback_recreated_orders,
+                "errors": rollback_errors,
+                "restored": not rollback_errors,
+            },
+        }
+        error = RuntimeError(
+            "BingX protection amend failed after cancellation; rollback attempted"
+        )
+        setattr(error, "rollback_state", rollback_state)
+        raise error from exc
+
+    protection_status, protection_state = _resolve_protection_state(replacement_protection, accepted_protection)
+    protection_state["mode"] = "cancel_replace"
+    return {
+        "provider": "bingx",
+        "venue": "bingx",
+        "instrument": _canonical_instrument(symbol),
+        "symbol": symbol,
+        "side": close_side,
+        "position_side": position_side,
+        "quantity": quantity,
+        "requested_notional_usd": requested_notional_usd,
+        "status": "replaced" if created_orders else "cancelled",
+        "modify_supported": True,
+        "protection_status": protection_status,
+        "protection": protection_state,
+        "cancelled_orders": cancelled_orders,
+        "created_orders": created_orders,
+    }
 
 
 def _binance_sign(params: dict[str, str]) -> str:
@@ -1355,6 +1947,109 @@ async def orderbook(venue: str, instrument: str) -> dict:
     return {"venue": venue, "instrument": instrument, "status": "unknown", "source": "none"}
 
 
+@app.post("/v1/live/execution-constraints")
+async def live_execution_constraints(payload: dict) -> dict:
+    provider = str(payload.get("provider") or "").strip().lower()
+    if provider != "bingx":
+        raise HTTPException(status_code=400, detail="unsupported live provider")
+
+    side = str(payload.get("side") or "buy").strip().lower()
+    if side not in {"buy", "sell"}:
+        raise HTTPException(status_code=400, detail="side must be buy or sell")
+
+    symbol = _normalize_bingx_symbol(str(payload.get("symbol") or ""))
+    if not symbol:
+        raise HTTPException(status_code=400, detail="symbol is required")
+
+    contract_spec = await _bingx_contract_spec(symbol)
+    if not contract_spec:
+        raise HTTPException(status_code=404, detail="instrument contract spec unavailable")
+
+    ticker = await _bingx_public_get("/openApi/swap/v2/quote/ticker", {"symbol": symbol})
+    ticker_payload = ticker if isinstance(ticker, dict) else {}
+    bid = _to_float(ticker_payload.get("bidPrice"), 0.0)
+    ask = _to_float(ticker_payload.get("askPrice"), 0.0)
+    last = _to_float(ticker_payload.get("lastPrice"), (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0)
+    reference_price = ask if side == "buy" else bid
+    if reference_price <= 0:
+        reference_price = last
+    if reference_price <= 0:
+        raise HTTPException(status_code=502, detail="reference price unavailable")
+
+    min_quantity = _bingx_minimum_quantity(contract_spec, reference_price)
+    min_notional_usd = _bingx_minimum_executable_notional_usd(contract_spec, reference_price)
+    requested_notional_usd = _to_float(payload.get("requested_notional_usd") or payload.get("notional_usd"), 0.0)
+    notional_adjustment = _resolve_notional_adjustment(
+        requested_notional_usd,
+        min_notional_usd,
+        auto_adjust_enabled=bool(payload.get("auto_adjust_notional")),
+    )
+    effective_notional_usd = _to_float(notional_adjustment.get("adjusted_notional_usd"), requested_notional_usd if requested_notional_usd > 0 else 0.0)
+    supports_requested_notional = bool(notional_adjustment.get("supports_requested_notional"))
+    supports_auto_adjusted_notional = bool(notional_adjustment.get("supports_auto_adjusted_notional"))
+    requested_protection: dict[str, object] = {}
+    protection_state: dict[str, object]
+    if isinstance(payload.get("protection"), dict) and payload.get("protection"):
+        try:
+            requested_protection = _normalize_trade_protection_request(payload.get("protection"))
+            _build_bingx_attached_protection_params(requested_protection, side=side, reference_price=reference_price)
+            protection_state = {
+                "mode": "native_attached",
+                "status": "ready_preflight",
+                "require_full_acceptance": bool(requested_protection.get("require_full_acceptance", True)),
+                "requested": requested_protection,
+                "accepted": {},
+                "reasons": [],
+            }
+        except ValueError as exc:
+            protection_state = {
+                "mode": "native_attached",
+                "status": "rejected_preflight",
+                "require_full_acceptance": bool(requested_protection.get("require_full_acceptance", True)) if requested_protection else True,
+                "requested": requested_protection or payload.get("protection"),
+                "accepted": {},
+                "reasons": [str(exc)],
+            }
+    else:
+        protection_state = {
+            "mode": "native_attached",
+            "status": "not_requested",
+            "require_full_acceptance": True,
+            "requested": {},
+            "accepted": {},
+            "reasons": [],
+        }
+    base_asset, quote_asset = _symbol_assets(symbol)
+    response = {
+        "provider": provider,
+        "instrument": _canonical_instrument(symbol),
+        "symbol": symbol,
+        "side": side,
+        "base_asset": base_asset,
+        "quote_asset": quote_asset,
+        "status": "rejected_preflight" if requested_notional_usd > 0 and not supports_auto_adjusted_notional else "ready_preflight",
+        "reference_price": _json_number(reference_price),
+        "requested_notional_usd": _json_number(requested_notional_usd),
+        "effective_notional_usd": _json_number(effective_notional_usd),
+        "min_notional_usd": _json_number(min_notional_usd),
+        "min_amount_base": _json_number(min_quantity),
+        "size_step": _json_number(_to_float(contract_spec.get("size_step"), 0.0)),
+        "trade_min_quantity": _json_number(_to_float(contract_spec.get("trade_min_quantity"), 0.0)),
+        "trade_min_usdt": _json_number(_to_float(contract_spec.get("trade_min_usdt"), 0.0)),
+        "quantity_precision": int(contract_spec.get("quantity_precision") or 0),
+        "price_precision": int(contract_spec.get("price_precision") or 0),
+        "supports_requested_notional": supports_requested_notional,
+        "supports_auto_adjusted_notional": supports_auto_adjusted_notional,
+        "auto_adjustment": notional_adjustment,
+        "protection": protection_state,
+    }
+    if str(protection_state.get("status") or "").strip().lower() == "rejected_preflight" and bool(protection_state.get("require_full_acceptance", True)):
+        response["status"] = "rejected_preflight"
+    if base_asset:
+        response[f"min_amount_{base_asset.lower()}"] = _json_number(min_quantity)
+    return response
+
+
 @app.post("/v1/live/orders")
 async def place_live_order(payload: dict) -> dict:
     provider = str(payload.get("provider") or "").strip().lower()
@@ -1421,4 +2116,5 @@ async def amend_live_order(payload: dict) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        rollback_state = getattr(exc, "rollback_state", None)
+        raise HTTPException(status_code=502, detail=rollback_state if isinstance(rollback_state, dict) else str(exc)) from exc

@@ -14,9 +14,15 @@ if ! docker compose version >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "[qa:wrapper] 1/2 Smoke QA in mission-control-ui container"
+ACTIVE_SLOT_FILE="$ROOT_DIR/data/mission-control/ui-active-slot.conf"
+MC_UI_SERVICE="mission-control-ui-blue"
+if [ -f "$ACTIVE_SLOT_FILE" ] && grep -q 'mission-control-ui-green:3002' "$ACTIVE_SLOT_FILE"; then
+  MC_UI_SERVICE="mission-control-ui-green"
+fi
+
+echo "[qa:wrapper] 1/2 Smoke QA in $MC_UI_SERVICE container"
 cd "$ROOT_DIR"
-docker compose run --rm mission-control-ui sh -lc "npm ci --no-audit --no-fund && npm run qa:smoke"
+docker compose run --rm "$MC_UI_SERVICE" sh -lc "npm ci --no-audit --no-fund && npm run qa:smoke"
 
 echo "[qa:wrapper] 2/2 UI regression in pinned Playwright image"
 cd "$MC_UI_DIR"

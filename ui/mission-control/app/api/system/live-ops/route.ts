@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 
 import { requireControlPlaneSession } from "../../../../lib/apiAuth";
 import { cpFetchJsonSafe, getControlPlaneNetworkMetricsSnapshot } from "../../../../lib/controlPlane";
+import { getEdgeObservationSummary } from "../../../../lib/edgeObservation";
 import { computeExecutionDomination } from "../../../../lib/liveOps/executionDominationEngine";
 import { classifyMarketState } from "../../../../lib/liveOps/marketStateEngine";
 import { detectSmartMoney } from "../../../../lib/liveOps/smartMoneyDetector";
@@ -37,6 +38,38 @@ function average(values: number[], fallback = 0): number {
 
 function sum(values: number[]): number {
   return values.reduce((total, value) => total + value, 0);
+}
+
+const WATCHDOG_FRESHNESS_WINDOW_MS = 30 * 60 * 1000;
+
+function parseTimestampMs(value: unknown): number | null {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return null;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function hasSyntheticHarnessMarker(row: JsonMap): boolean {
+  const decisionId = String(row.decision_id || "").trim().toLowerCase();
+  if (decisionId.startsWith("kairos-harness-seed")) {
+    return true;
+  }
+  return asArray<string>(row.failure_reasons).some((reason) => String(reason).trim().toLowerCase() === "synthetic_harness_seed");
+}
+
+function isFreshOperationalRow(row: JsonMap, nowMs: number): boolean {
+  const timestampMs = parseTimestampMs(row.created_at ?? row.timestamp ?? row.updated_at);
+  return timestampMs !== null && timestampMs <= nowMs && (nowMs - timestampMs) <= WATCHDOG_FRESHNESS_WINDOW_MS;
+}
+
+function computeAdverseExecutionDriftScore(row: JsonMap): number {
+  const gapSlippageBps = toNumber(row.gap_slippage_bps, 0);
+  const gapFillProbability = toNumber(row.gap_fill_probability, 0);
+  const gapLatencyMs = toNumber(row.gap_latency_ms, 0);
+  return (Math.max(0, gapSlippageBps) * 0.04)
+    + (Math.max(0, gapFillProbability) * 1.6)
+    + (Math.max(0, gapLatencyMs) / 400);
 }
 
 function mapSystemMode(mode: string, killSwitchActive: boolean): "SAFE" | "LIVE" | "LOCKED" {
@@ -139,18 +172,23 @@ export async function GET(): Promise<NextResponse> {
   }
   const shadowSnapshot = getMetricsSnapshot();
   const networkSnapshot = getControlPlaneNetworkMetricsSnapshot();
-  const [killSwitchResult, systemConfigResult, telemetryResult, realityGapResult, auditResult, outcomesResult, dashboardResult] = await Promise.all([
+  const [killSwitchResult, systemConfigResult, gateResult, telemetryResult, realityGapResult, auditResult, outcomesResult, dashboardResult, edgeObservationSummary] = await Promise.all([
     cpFetchJsonSafe("/v1/system/kill-switch"),
     cpFetchJsonSafe("/v1/system/config"),
+    cpFetchJsonSafe("/v1/system/opportunity-gate"),
     cpFetchJsonSafe("/v1/execution/telemetry/recent?limit=40"),
     cpFetchJsonSafe("/v1/execution/reality-gap/recent?limit=40"),
     cpFetchJsonSafe("/v1/audit?limit=120"),
     cpFetchJsonSafe("/v1/outcomes/recent?limit=40"),
     cpFetchJsonSafe("/v1/dashboard/overview"),
+    getEdgeObservationSummary(),
   ]);
 
   const killSwitchPayload = asRecord(killSwitchResult.payload);
   const killSwitchState = asRecord(killSwitchPayload.state);
+  const gatePayload = asRecord(gateResult.payload);
+  const gateState = asRecord(gatePayload.gate);
+  const gateReasons = asArray<string>(gateState.reasons);
   const hardening = asRecord(killSwitchPayload.go_live_hardening);
   const watchdogPolicy = asRecord(hardening.watchdog);
   const telemetryRows = asArray<JsonMap>(telemetryResult.payload);
@@ -160,22 +198,24 @@ export async function GET(): Promise<NextResponse> {
   const systemConfig = asRecord(systemConfigResult.payload);
   const dashboard = asRecord(dashboardResult.payload);
 
-  const avgLatencyMs = average(telemetryRows.map((row) => toNumber(row.latency_e2e_ms, 0)), 0);
-  const avgSlippageBps = average(telemetryRows.map((row) => toNumber(row.realized_slippage_bps, 0)), 0);
+  const nowMs = Date.now();
+  const operationalTelemetryRows = telemetryRows.filter((row) => isFreshOperationalRow(row, nowMs) && !hasSyntheticHarnessMarker(row));
+  const operationalRealityGapRows = realityGapRows.filter((row) => isFreshOperationalRow(row, nowMs) && !hasSyntheticHarnessMarker(row));
+
+  const avgLatencyMs = average(operationalTelemetryRows.map((row) => toNumber(row.latency_e2e_ms, 0)), 0);
+  const avgSlippageBps = average(operationalTelemetryRows.map((row) => toNumber(row.realized_slippage_bps, 0)), 0);
   const avgDriftScore = average(
-    realityGapRows.map((row) => (
-      Math.abs(toNumber(row.gap_slippage_bps, 0)) * 0.04
-      + Math.abs(toNumber(row.gap_fill_probability, 0)) * 1.6
-      + Math.abs(toNumber(row.gap_latency_ms, 0)) / 400
-    )),
+    operationalRealityGapRows.map((row) => computeAdverseExecutionDriftScore(row)),
     0,
   );
   const maxRealizedSlippageBps = Math.max(1, toNumber(watchdogPolicy.max_realized_slippage_bps, 15));
-  const blockRate = telemetryRows.length > 0
-    ? telemetryRows.filter((row) => toNumber(row.realized_slippage_bps, 0) > maxRealizedSlippageBps).length / telemetryRows.length
+  const blockRate = operationalTelemetryRows.length > 0
+    ? operationalTelemetryRows.filter((row) => toNumber(row.realized_slippage_bps, 0) > maxRealizedSlippageBps).length / operationalTelemetryRows.length
     : 0;
   const errorRate = clamp(Math.max(networkSnapshot.degraded_usage_ratio, networkSnapshot.timeout_rate, blockRate), 0, 1);
   const killSwitchActive = Boolean(killSwitchState.active);
+  const gateEnabled = Boolean(gateState.opportunity_enabled);
+  const gateHealthScore = toNumber(gateState.health_score, 0);
   const anomalyScore = clamp(
     (avgLatencyMs / Math.max(1, toNumber(watchdogPolicy.max_latency_e2e_ms, 1500))) * 0.28
       + avgDriftScore * 0.32
@@ -184,16 +224,17 @@ export async function GET(): Promise<NextResponse> {
     0,
     1,
   );
-  const watchdogStatus = killSwitchActive || anomalyScore >= 0.8 ? "HALT" : anomalyScore >= 0.4 ? "WARNING" : "OK";
-  const healthScore = clamp((1 - anomalyScore) * 100, 0, 100);
+  const derivedHealthScore = clamp((1 - anomalyScore) * 100, 0, 100);
+  const healthScore = gateHealthScore > 0 ? Math.min(derivedHealthScore, gateHealthScore) : derivedHealthScore;
+  const watchdogStatus = killSwitchActive || !gateEnabled || anomalyScore >= 0.8 ? "HALT" : anomalyScore >= 0.4 ? "WARNING" : "OK";
 
-  const exposures = deriveExposureBySymbol(telemetryRows);
+  const exposures = deriveExposureBySymbol(operationalTelemetryRows);
   const dailyUsedUsd = toNumber(dashboard.net_exposure_usd, 0);
   const drawdownUsd = computeDrawdownUsd(outcomesRows);
   const dominantExposure = exposures[0]?.notionalUsd || 0;
   const drawdownPct = dominantExposure > 0 ? (drawdownUsd / dominantExposure) * 100 : 0;
-  const latestGap = realityGapRows[0] || {};
-  const lastTelemetry = telemetryRows[0] || {};
+  const latestGap = operationalRealityGapRows[0] || {};
+  const lastTelemetry = operationalTelemetryRows[0] || {};
   const preTradeMemoryGate = asRecord(asRecord(lastTelemetry).pre_trade_memory_gate);
   const memoryDecision = preTradeMemoryGate.block_execution
     ? "BLOCKED"
@@ -202,7 +243,7 @@ export async function GET(): Promise<NextResponse> {
       : "OK";
   const dominantCause = String(asRecord(latestGap).failure_source || (asArray<string>(asRecord(latestGap).failure_reasons)[0] || "none")).trim() || "none";
 
-  const quotes: VenueQuoteSnapshot[] = telemetryRows.slice(0, 4).map((row, index) => ({
+  const quotes: VenueQuoteSnapshot[] = operationalTelemetryRows.slice(0, 4).map((row, index) => ({
     venue: String(row.route_chosen || row.route_backup || `venue-${index + 1}`).trim().toLowerCase() || `venue-${index + 1}`,
     bid: 100 + index * 0.15 + Math.max(0, 0.1 - toNumber(row.realized_slippage_bps, 0) * 0.001),
     ask: 100 + index * 0.15 + 0.2 + Math.max(0, toNumber(row.realized_slippage_bps, 0) * 0.001),
@@ -246,9 +287,25 @@ export async function GET(): Promise<NextResponse> {
   const alerts = [
     avgDriftScore > 0.2 ? { severity: "warn", code: "execution_drift", message: "Execution drift detected", detail: `drift=${avgDriftScore.toFixed(3)}` } : null,
     avgSlippageBps > 10 ? { severity: "warn", code: "slippage_spike", message: "Slippage spike", detail: `${avgSlippageBps.toFixed(2)} bps` } : null,
+    !gateEnabled ? { severity: "critical", code: "opportunity_gate_blocked", message: "Opportunity gate blocked", detail: String(gateReasons.join(", ") || "gate blocked") } : null,
     killSwitchActive ? { severity: "critical", code: "kill_switch_active", message: "System critical", detail: String(killSwitchState.reason || "kill switch active") } : null,
     anomalyScore > 0.8 ? { severity: "critical", code: "preemptive_shutdown", message: "Preemptive shutdown ready", detail: `anomaly_score=${anomalyScore.toFixed(3)}` } : null,
   ].filter(Boolean);
+
+  const controlledCollectionStatus = killSwitchActive
+    ? "LOCKED"
+    : !gateEnabled
+      ? "BLOCKED"
+      : Boolean(dashboard.paper_only)
+        ? "PAPER_ONLY"
+        : "READY";
+  const controlledCollectionNextAction = controlledCollectionStatus === "LOCKED"
+    ? "Manual kill switch reset required before any controlled collection session."
+    : controlledCollectionStatus === "BLOCKED"
+      ? "Wait for opportunity gate GO before opening a controlled collection session."
+      : controlledCollectionStatus === "PAPER_ONLY"
+        ? "Paper-only remains active: keep observing until live permissions are restored."
+        : "Run controlled collection only: BingX, BTCUSDT, micro-size 7-7.5 USD, no strategy tweak.";
 
   return NextResponse.json({
     status: "ok",
@@ -261,6 +318,7 @@ export async function GET(): Promise<NextResponse> {
       status: watchdogStatus,
       triggers: alerts.map((item) => asRecord(item).code),
       health_score: Number(healthScore.toFixed(2)),
+      opportunity_gate_status: String(gateState.status || "unknown"),
     },
     risk_snapshot: {
       dd_pct: Number(drawdownPct.toFixed(4)),
@@ -285,12 +343,43 @@ export async function GET(): Promise<NextResponse> {
       operator_override: !killSwitchActive,
       high_risk_trades_blocked: killSwitchActive || mapSystemMode(String(systemConfig.system_mode || dashboard.system_mode || "guarded_auto"), killSwitchActive) !== "LIVE",
       paper_only: Boolean(dashboard.paper_only),
+      opportunity_gate: gateState,
     },
     recovery: {
       active: killSwitchActive || watchdogStatus === "HALT",
       mode: killSwitchActive ? "RECOVERY_LOCKDOWN" : watchdogStatus === "WARNING" ? "SAFE_RECOVERY" : "NOMINAL",
       reduced_risk: killSwitchActive || avgDriftScore > 0.2,
       blocked_trades: killSwitchActive || blockRate > 0.35,
+    },
+    controlled_collection: {
+      status: controlledCollectionStatus,
+      thesis: "Collect labels, not profit. Each micro-trade is a data point for reaction x regime x outcome.",
+      next_action: controlledCollectionNextAction,
+      manual_reset_required: killSwitchActive,
+      constraints: [
+        "Venue locked: BingX only",
+        "Instrument locked: BTCUSDT only",
+        "Micro-size only: 7.0-7.5 USD notional",
+        "No strategy change during the collection window",
+        "No threshold tweak, no scalping chase, no venue rotation",
+      ],
+      forbidden: [
+        "Do not optimize for profit during collection",
+        "Do not change strategy or execution model mid-session",
+        "Do not widen size after a clean fill",
+        "Do not override no-trade dominance just to force a label",
+      ],
+      stop_conditions: [
+        "Kill switch re-triggered",
+        "Opportunity gate no longer GO",
+        "Execution anomaly or suspicious routing behavior",
+        `Realized slippage above ${maxRealizedSlippageBps.toFixed(2)} bps`,
+        `Latency above ${Math.max(1, toNumber(watchdogPolicy.max_latency_e2e_ms, 1500)).toFixed(0)} ms ceiling`,
+      ],
+      label_progress: edgeObservationSummary.labelProgress,
+      edge_confidence: edgeObservationSummary.liveConfidence,
+      staleness: edgeObservationSummary.staleness,
+      latest_classified_intent_at: edgeObservationSummary.latestClassifiedIntentAt,
     },
     alerts,
     warfare_core: {
@@ -302,6 +391,7 @@ export async function GET(): Promise<NextResponse> {
     },
     raw: {
       kill_switch: killSwitchPayload,
+      opportunity_gate: gatePayload,
       network: networkSnapshot,
       shadow: {
         fallback_rate: shadowSnapshot.fallback_rate,

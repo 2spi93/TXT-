@@ -5,7 +5,7 @@ import { loginIfRequired } from "./helpers/terminal";
 test("@chart terminal chart keeps visible candles after auth refresh cycles", async ({ page }, testInfo) => {
   test.setTimeout(120_000);
 
-  await loginIfRequired(page, "/terminal", "chart visibility test");
+  await loginIfRequired(page, "/terminal?engine=v3", "chart visibility test");
 
   const chart = page.locator(".chart-canvas-host").first();
   await chart.waitFor({ state: "visible", timeout: 45_000 });

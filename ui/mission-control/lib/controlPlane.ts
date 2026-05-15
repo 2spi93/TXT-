@@ -1,3 +1,5 @@
+import { lookup } from "node:dns/promises";
+import { hostname as resolveRuntimeHostname } from "node:os";
 import { cookies } from "next/headers";
 
 function resolveFirstControlPlaneUrl(names: string[], fallback: string): string {
@@ -13,7 +15,6 @@ function resolveFirstControlPlaneUrl(names: string[], fallback: string): string 
 const defaultControlPlaneUrl = "http://control-plane:8000";
 const baseUrl = resolveFirstControlPlaneUrl(["CONTROL_PLANE_URL", "CONTROL_PLANE_FALLBACK_URL", "KAIROS_CONTROL_PLANE_URL"], defaultControlPlaneUrl);
 const fallbackBaseUrl = resolveFirstControlPlaneUrl(["CONTROL_PLANE_FALLBACK_URL", "CONTROL_PLANE_URL", "KAIROS_CONTROL_PLANE_URL"], defaultControlPlaneUrl);
-const fallbackToken = process.env.CONTROL_PLANE_TOKEN || "";
 const retryAttemptsRaw = Number.parseInt(process.env.MC_CONTROL_PLANE_RETRY_ATTEMPTS || "2", 10);
 const retryBaseDelayMsRaw = Number.parseInt(process.env.MC_CONTROL_PLANE_RETRY_BASE_DELAY_MS || "150", 10);
 const controlPlaneRetryAttempts = Number.isFinite(retryAttemptsRaw) ? Math.min(Math.max(retryAttemptsRaw, 1), 4) : 2;
@@ -21,10 +22,15 @@ const controlPlaneRetryBaseDelayMs = Number.isFinite(retryBaseDelayMsRaw) ? Math
 const controlPlaneGlobal = globalThis as typeof globalThis & {
   __mcE2eDegradedWarnedKeys?: Set<string>;
   __mcControlPlaneNetworkMetrics?: ControlPlaneNetworkMetricsStore;
+  __mcResolvedControlPlaneCandidates?: Map<string, { urls: string[]; expiresAt: number }>;
 };
 const degradedWarnedKeys = controlPlaneGlobal.__mcE2eDegradedWarnedKeys || new Set<string>();
 if (!controlPlaneGlobal.__mcE2eDegradedWarnedKeys) {
   controlPlaneGlobal.__mcE2eDegradedWarnedKeys = degradedWarnedKeys;
+}
+const resolvedControlPlaneCandidates = controlPlaneGlobal.__mcResolvedControlPlaneCandidates || new Map<string, { urls: string[]; expiresAt: number }>();
+if (!controlPlaneGlobal.__mcResolvedControlPlaneCandidates) {
+  controlPlaneGlobal.__mcResolvedControlPlaneCandidates = resolvedControlPlaneCandidates;
 }
 
 function isE2eDevDegradedModeEnabled(): boolean {
@@ -35,6 +41,10 @@ function isE2eDevDegradedModeEnabled(): boolean {
 function isTruthyEnvFlag(name: string): boolean {
   const raw = String(process.env[name] || "").toLowerCase();
   return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
+function getFallbackControlPlaneToken(): string {
+  return process.env.CONTROL_PLANE_TOKEN || "";
 }
 
 function isControlPlaneDevNoiseSuppressed(): boolean {
@@ -130,6 +140,27 @@ type ControlPlaneRequestPolicy = {
   retryJitterMs: number;
   infraHealth: number;
   networkRegime: ControlPlaneNetworkRegime;
+};
+
+type ControlPlaneCandidateResolution = {
+  input_url: string;
+  normalized_origin: string;
+  hostname: string;
+  source: "base" | "fallback" | "derived";
+  passthrough_reason: string;
+  cache_hit: boolean;
+  resolved_urls: string[];
+  lookup_error: string;
+};
+
+type ControlPlaneResolutionDebug = {
+  runtime_hostname: string;
+  runtime_pid: number;
+  configured_base_url: string;
+  configured_fallback_url: string;
+  effective_candidate_count: number;
+  effective_candidates: string[];
+  candidates: ControlPlaneCandidateResolution[];
 };
 
 function createControlPlaneRouteMetrics(): ControlPlaneRouteMetrics {
@@ -466,7 +497,7 @@ export async function getControlPlaneToken(): Promise<string> {
     cookieToken = "";
     compatCookieToken = "";
   }
-  return cookieToken || compatCookieToken || fallbackToken;
+  return cookieToken || compatCookieToken || getFallbackControlPlaneToken();
 }
 
 export function getControlPlaneUrl(): string {
@@ -476,12 +507,142 @@ export function getControlPlaneUrl(): string {
 function getControlPlaneUrlCandidates(): string[] {
   const candidates = [baseUrl.trim(), fallbackBaseUrl.trim()].filter(Boolean);
   const deduped: string[] = [];
-  for (const candidate of candidates) {
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
     if (!deduped.includes(candidate)) {
       deduped.push(candidate);
     }
   }
   return deduped;
+}
+
+function isNumericHost(hostname: string): boolean {
+  return /^[\d.:]+$/.test(hostname);
+}
+
+async function resolveControlPlaneUrlCandidates(candidates: string[]): Promise<{
+  urls: string[];
+  debug: ControlPlaneResolutionDebug;
+}> {
+  const deduped: string[] = [];
+  const debugEntries: ControlPlaneCandidateResolution[] = [];
+  const now = Date.now();
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
+    const source: "base" | "fallback" | "derived" = index === 0 ? "base" : index === 1 ? "fallback" : "derived";
+    if (!deduped.includes(candidate)) {
+      deduped.push(candidate);
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(candidate);
+    } catch {
+      debugEntries.push({
+        input_url: candidate,
+        normalized_origin: candidate,
+        hostname: "",
+        source,
+        passthrough_reason: "invalid-url",
+        cache_hit: false,
+        resolved_urls: [],
+        lookup_error: "invalid_url",
+      });
+      continue;
+    }
+    const hostname = parsed.hostname.trim();
+    if (!hostname || hostname === "localhost" || isNumericHost(hostname)) {
+      debugEntries.push({
+        input_url: candidate,
+        normalized_origin: parsed.origin,
+        hostname,
+        source,
+        passthrough_reason: !hostname ? "empty-host" : hostname === "localhost" ? "localhost" : "numeric-host",
+        cache_hit: false,
+        resolved_urls: [],
+        lookup_error: "",
+      });
+      continue;
+    }
+    const cacheKey = parsed.origin;
+    const cached = resolvedControlPlaneCandidates.get(cacheKey);
+    if (cached && cached.expiresAt > now) {
+      for (const resolved of cached.urls) {
+        if (!deduped.includes(resolved)) {
+          deduped.push(resolved);
+        }
+      }
+      debugEntries.push({
+        input_url: candidate,
+        normalized_origin: parsed.origin,
+        hostname,
+        source,
+        passthrough_reason: "resolved-cache",
+        cache_hit: true,
+        resolved_urls: [...cached.urls],
+        lookup_error: "",
+      });
+      continue;
+    }
+    try {
+      const addresses = await lookup(hostname, { all: true });
+      const resolvedUrls: string[] = [];
+      for (const entry of addresses) {
+        const address = String(entry.address || "").trim();
+        if (!address) {
+          continue;
+        }
+        const resolved = new URL(candidate);
+        resolved.hostname = address;
+        const resolvedUrl = resolved.origin;
+        resolvedUrls.push(resolvedUrl);
+        if (!deduped.includes(resolvedUrl)) {
+          deduped.push(resolvedUrl);
+        }
+      }
+      resolvedControlPlaneCandidates.set(cacheKey, {
+        urls: resolvedUrls,
+        expiresAt: now + 60_000,
+      });
+      debugEntries.push({
+        input_url: candidate,
+        normalized_origin: parsed.origin,
+        hostname,
+        source,
+        passthrough_reason: "resolved-lookup",
+        cache_hit: false,
+        resolved_urls: resolvedUrls,
+        lookup_error: "",
+      });
+    } catch (error) {
+      const lookupError = summarizeFetchError(error);
+      resolvedControlPlaneCandidates.set(cacheKey, {
+        urls: [],
+        expiresAt: now + 10_000,
+      });
+      debugEntries.push({
+        input_url: candidate,
+        normalized_origin: parsed.origin,
+        hostname,
+        source,
+        passthrough_reason: "lookup-failed",
+        cache_hit: false,
+        resolved_urls: [],
+        lookup_error: lookupError,
+      });
+    }
+  }
+  return {
+    urls: deduped,
+    debug: {
+      runtime_hostname: resolveRuntimeHostname(),
+      runtime_pid: process.pid,
+      configured_base_url: baseUrl,
+      configured_fallback_url: fallbackBaseUrl,
+      effective_candidate_count: deduped.length,
+      effective_candidates: deduped,
+      candidates: debugEntries,
+    },
+  };
 }
 
 export function extractMcContextHeaders(request: Request): Headers {
@@ -515,8 +676,11 @@ export async function cpFetch(path: string, init: RequestInit = {}): Promise<Res
   let lastFailure: ControlPlaneFailureDetails | null = null;
   let attemptedBaseUrls: string[] = [];
   const attemptedTargets: string[] = [];
+  let resolutionDebug: ControlPlaneResolutionDebug | null = null;
   try {
-    const candidates = getControlPlaneUrlCandidates();
+    const resolved = await resolveControlPlaneUrlCandidates(getControlPlaneUrlCandidates());
+    const candidates = resolved.urls;
+    resolutionDebug = resolved.debug;
     attemptedBaseUrls = candidates;
     if (requestPolicy.preflightDelayMs > 0 && isRetryableMethod(method)) {
       await sleep(requestPolicy.preflightDelayMs + Math.floor(Math.random() * (requestPolicy.retryJitterMs + 1)));
@@ -552,6 +716,7 @@ export async function cpFetch(path: string, init: RequestInit = {}): Promise<Res
           responseHeaders.set("x-mc-control-plane-failure-class", networkMeta.failure_classification);
           responseHeaders.set("x-mc-control-plane-failure-detail", networkMeta.failure_detail);
           responseHeaders.set("x-mc-control-plane-network-state", networkState);
+          responseHeaders.set("x-mc-control-plane-effective-candidate-count", String(resolutionDebug?.effective_candidate_count || candidates.length));
           responseHeaders.set(
             "x-mc-control-plane-retry-policy",
             `${requestPolicy.networkRegime}:${requestPolicy.attempts}:${requestPolicy.baseDelayMs}:${requestPolicy.preflightDelayMs}`,
@@ -609,6 +774,7 @@ export async function cpFetch(path: string, init: RequestInit = {}): Promise<Res
         method,
         path,
         baseUrl,
+        resolution_debug: resolutionDebug,
         attempted_base_urls: attemptedBaseUrls,
         attempted_targets: attemptedTargets,
         retry_count: degradedNetworkMeta.retry_count,
@@ -628,6 +794,7 @@ export async function cpFetch(path: string, init: RequestInit = {}): Promise<Res
           "x-mc-control-plane-failure-class": degradedNetworkMeta.failure_classification,
           "x-mc-control-plane-failure-detail": degradedNetworkMeta.failure_detail,
           "x-mc-control-plane-network-state": degradedNetworkMeta.network_state,
+          "x-mc-control-plane-effective-candidate-count": String(resolutionDebug?.effective_candidate_count || attemptedBaseUrls.length),
           "x-mc-control-plane-retry-policy": `${requestPolicy.networkRegime}:${requestPolicy.attempts}:${requestPolicy.baseDelayMs}:${requestPolicy.preflightDelayMs}`,
         },
       },

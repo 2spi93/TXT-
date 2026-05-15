@@ -61,11 +61,39 @@ function walletStatusLabel(item: JsonMap): string {
   return authMethod === "wallet_public_key" ? "watch-only" : (Boolean(item.has_credentials) ? "credential linked" : "watch-only");
 }
 
+function isWalletAccount(item: JsonMap): boolean {
+  return String(item.provider_type || "") === "wallet";
+}
+
+function routeAccountLabel(item: JsonMap): string {
+  const provider = String(item.provider || "").trim();
+  const accountId = String(item.account_id || "").trim();
+  const mode = String(item.mode || "-").trim();
+  const label = String(item.label || item.display_name || "").trim();
+  return [provider, accountId, label || mode].filter(Boolean).join(" | ");
+}
+
+function routeSuggestedVenue(item: JsonMap, liveEnabled: boolean, exchangeCapabilities: Record<string, ExchangeCapability>): string {
+  const provider = String(item.provider || "").trim().toLowerCase();
+  const fallbackVenue = String(asMap(item.broker_capabilities).preferred_venue || provider || "AUTO");
+  if (provider === "mt5" || provider === "ftmo") {
+    return fallbackVenue || "mt5";
+  }
+  return suggestedExchangeVenue(getExchangeCapability(exchangeCapabilities, provider), liveEnabled, fallbackVenue);
+}
+
 export default function ConnectionsPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<JsonMap | null>(null);
   const [mt5Accounts, setMt5Accounts] = useState<JsonMap[]>([]);
+  const [mt5BrokerSessionAccountId, setMt5BrokerSessionAccountId] = useState("");
+  const [mt5SnapshotUrl, setMt5SnapshotUrl] = useState("");
+  const [mt5PayloadPath, setMt5PayloadPath] = useState("payload");
+  const [mt5TruthSource, setMt5TruthSource] = useState("mt5-external-broker-session");
+  const [mt5MinPollIntervalSeconds, setMt5MinPollIntervalSeconds] = useState("20");
+  const [mt5BrokerSessionRefresh, setMt5BrokerSessionRefresh] = useState(true);
+  const [mt5BrokerSessionBusy, setMt5BrokerSessionBusy] = useState(false);
   const [linkedAccounts, setLinkedAccounts] = useState<JsonMap[]>([]);
   const [accountId, setAccountId] = useState("");
   const [broker, setBroker] = useState("metaquotes");
@@ -107,9 +135,14 @@ export default function ConnectionsPage() {
   const exchangePassphraseRequired = selectedExchangeCapability.api_key_requires_passphrase || ["okx", "bitget"].includes(exchangeProviderId);
   const selectedWalletProvider = WALLET_CONNECTION_CATALOG.find((item) => item.providerId === walletProviderId) || WALLET_CONNECTION_CATALOG[0];
 
-  const linkedExchangeAccounts = linkedAccounts.filter((item) => String(item.provider || "") !== "mt5" && String(item.provider_type || "") !== "wallet");
-  const selectedIntegrationAccount = linkedExchangeAccounts.find((item) => String(item.account_id || "") === integrationAccountId) || null;
+  const linkedExecutionAccounts = linkedAccounts.filter((item) => !isWalletAccount(item));
+  const linkedExchangeAccounts = linkedExecutionAccounts.filter((item) => String(item.provider || "") !== "mt5");
+  const selectedIntegrationAccount = linkedExecutionAccounts.find((item) => String(item.account_id || "") === integrationAccountId) || null;
   const selectedIntegrationCapability = getExchangeCapability(exchangeCapabilities, String(selectedIntegrationAccount?.provider || ""));
+  const selectedMt5BrokerSessionAccount = mt5Accounts.find((item) => String(item.account_id || "") === mt5BrokerSessionAccountId) || null;
+  const selectedMt5BrokerSessionMetadata = asMap(selectedMt5BrokerSessionAccount?.metadata);
+  const selectedMt5BrokerSessionConfig = asMap(selectedMt5BrokerSessionMetadata.broker_session);
+  const selectedMt5BrokerRuntimeSession = asMap(selectedMt5BrokerSessionMetadata.broker_runtime_session);
 
   async function loadConnectionsState(): Promise<void> {
     const [mt5Response, connectorsResponse, routesResponse, capabilitiesResponse] = await Promise.all([
@@ -122,15 +155,19 @@ export default function ConnectionsPage() {
     const connectorsPayload = connectorsResponse.ok ? await connectorsResponse.json().catch(() => ({})) : {};
     const routesPayload = routesResponse.ok ? await routesResponse.json().catch(() => ({}) ) : {};
     const capabilitiesPayload = capabilitiesResponse.ok ? await capabilitiesResponse.json().catch(() => ({})) : {};
+    const nextMt5Accounts = Array.isArray(mt5Payload) ? mt5Payload : [];
     const nextLinkedAccounts = Array.isArray(connectorsPayload?.accounts) ? (connectorsPayload.accounts as JsonMap[]) : [];
     const nextRoutes = asList(asMap(routesPayload).routes);
-    setMt5Accounts(Array.isArray(mt5Payload) ? mt5Payload : []);
+    setMt5Accounts(nextMt5Accounts);
+    if (!mt5BrokerSessionAccountId || !nextMt5Accounts.some((item) => String(asMap(item).account_id || "") === mt5BrokerSessionAccountId)) {
+      setMt5BrokerSessionAccountId(String(asMap(nextMt5Accounts[0]).account_id || ""));
+    }
     setLinkedAccounts(nextLinkedAccounts);
     setExchangeCapabilities(normalizeExchangeCapabilityMap(capabilitiesPayload));
     setIntegrationRoutes(nextRoutes);
-    const exchangeAccounts = nextLinkedAccounts.filter((item) => String(item.provider || "") !== "mt5" && String(item.provider_type || "") !== "wallet");
-    if (!integrationAccountId || !exchangeAccounts.some((item) => String(item.account_id || "") === integrationAccountId)) {
-      setIntegrationAccountId(String(exchangeAccounts[0]?.account_id || ""));
+    const executionAccounts = nextLinkedAccounts.filter((item) => !isWalletAccount(item));
+    if (!integrationAccountId || !executionAccounts.some((item) => String(item.account_id || "") === integrationAccountId)) {
+      setIntegrationAccountId(String(executionAccounts[0]?.account_id || ""));
     }
   }
 
@@ -140,6 +177,19 @@ export default function ConnectionsPage() {
       setLinkedAccounts([]);
     });
   }, []);
+
+  useEffect(() => {
+    if (!selectedMt5BrokerSessionAccount) {
+      return;
+    }
+    const brokerSession = asMap(selectedMt5BrokerSessionAccount.metadata).broker_session;
+    const brokerSessionConfig = asMap(brokerSession);
+    setMt5SnapshotUrl(String(brokerSessionConfig.snapshot_url || brokerSessionConfig.state_url || brokerSessionConfig.url || ""));
+    setMt5PayloadPath(String(brokerSessionConfig.payload_path || "payload"));
+    setMt5TruthSource(String(brokerSessionConfig.truth_source || "mt5-external-broker-session"));
+    setMt5MinPollIntervalSeconds(String(brokerSessionConfig.min_poll_interval_seconds || "20"));
+    setMt5BrokerSessionRefresh(true);
+  }, [selectedMt5BrokerSessionAccount]);
 
   async function connectMt5(): Promise<void> {
     setBusy(true);
@@ -170,6 +220,49 @@ export default function ConnectionsPage() {
       setError(err instanceof Error ? err.message : "Connexion MT5 echouee");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function persistMt5BrokerSession(clearSession = false): Promise<void> {
+    if (!mt5BrokerSessionAccountId.trim()) {
+      setError("Selectionne d'abord un compte MT5 visible.");
+      return;
+    }
+    setMt5BrokerSessionBusy(true);
+    setError(null);
+    setResult(null);
+    try {
+      const brokerSession = clearSession ? {} : {
+        snapshot_url: mt5SnapshotUrl.trim(),
+        payload_path: mt5PayloadPath.trim() || "payload",
+        truth_source: mt5TruthSource.trim() || "mt5-external-broker-session",
+        min_poll_interval_seconds: Number.parseInt(mt5MinPollIntervalSeconds, 10) || 20,
+      };
+      const response = await fetch(`/api/mt5/accounts/${encodeURIComponent(mt5BrokerSessionAccountId)}/broker-session`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          broker_session: brokerSession,
+          merge: false,
+          refresh: clearSession ? false : mt5BrokerSessionRefresh,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(String(payload?.detail || "Mise a jour broker_session impossible"));
+      }
+      setResult((payload || null) as JsonMap | null);
+      if (clearSession) {
+        setMt5SnapshotUrl("");
+        setMt5PayloadPath("payload");
+        setMt5TruthSource("mt5-external-broker-session");
+        setMt5MinPollIntervalSeconds("20");
+      }
+      await loadConnectionsState();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Mise a jour broker_session impossible");
+    } finally {
+      setMt5BrokerSessionBusy(false);
     }
   }
 
@@ -295,7 +388,7 @@ export default function ConnectionsPage() {
 
   async function upsertIntegrationRoute(): Promise<void> {
     if (!selectedIntegrationAccount) {
-      setError("Selectionne d'abord un compte exchange lie.");
+      setError("Selectionne d'abord un compte lie pour l'execution live.");
       return;
     }
     setBusy(true);
@@ -311,11 +404,7 @@ export default function ConnectionsPage() {
           provider: String(selectedIntegrationAccount.provider || "").trim().toLowerCase(),
           account_id: String(selectedIntegrationAccount.account_id || "").trim(),
           live_enabled: integrationLiveEnabled,
-          preferred_venue: integrationPreferredVenue || suggestedExchangeVenue(
-            selectedIntegrationCapability,
-            integrationLiveEnabled,
-            String(asMap(selectedIntegrationAccount.broker_capabilities).preferred_venue || selectedIntegrationAccount.provider || "AUTO"),
-          ),
+          preferred_venue: integrationPreferredVenue || routeSuggestedVenue(selectedIntegrationAccount, integrationLiveEnabled, exchangeCapabilities),
           notional_usd: integrationNotionalUsd,
         }),
       });
@@ -336,12 +425,8 @@ export default function ConnectionsPage() {
     if (!selectedIntegrationAccount) {
       return;
     }
-    const provider = String(selectedIntegrationAccount.provider || "").trim().toLowerCase();
-    const fallbackVenue = String(asMap(selectedIntegrationAccount.broker_capabilities).preferred_venue || provider || "AUTO");
-    const liveVenue = suggestedExchangeVenue(selectedIntegrationCapability, true, fallbackVenue);
-    const paperVenue = suggestedExchangeVenue(selectedIntegrationCapability, false, fallbackVenue);
-    setIntegrationPreferredVenue(integrationLiveEnabled ? liveVenue : paperVenue);
-  }, [integrationAccountId, integrationLiveEnabled, selectedIntegrationAccount, selectedIntegrationCapability]);
+    setIntegrationPreferredVenue(routeSuggestedVenue(selectedIntegrationAccount, integrationLiveEnabled, exchangeCapabilities));
+  }, [exchangeCapabilities, integrationAccountId, integrationLiveEnabled, selectedIntegrationAccount]);
 
   return (
     <main className="shell txt-page-shell" data-testid="mission-control-connections-page">
@@ -385,7 +470,7 @@ export default function ConnectionsPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Connexion MT5 directe <HelpHint text="Point d'entree client pour rattacher un compte MetaTrader 5 paper ou live a TXT." examples={["Commencez par paper pour tester le pipeline complet sans risque reel.", "Si vous etes sur une prop firm sans MT5, utilisez plutot la demande d'onboarding a droite."]} /></div>
+          <div className="eyebrow">Connexion MT5 directe <HelpHint text="Point d'entree client pour rattacher un compte MetaTrader 5 paper ou live a TXT, y compris FTMO via MT5." examples={["Pour FTMO, branche le compte en mode live, puis utilise ensuite la route live plus bas pour l'activer cote agent.", "Commencez par paper pour tester le pipeline complet sans risque reel."]} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <input value={accountId} onChange={(e) => setAccountId(e.target.value)} placeholder="account_id" />
             <input value={broker} onChange={(e) => setBroker(e.target.value)} placeholder="broker" />
@@ -398,6 +483,9 @@ export default function ConnectionsPage() {
             </select>
             <button type="button" onClick={() => connectMt5()} disabled={busy}>{busy ? "Connexion…" : "Connecter le compte"}</button>
           </div>
+          <p className="subtle" style={{ marginTop: 10 }}>
+            Pour un compte FTMO, garde le provider `mt5`, renseigne le vrai serveur FTMO, le login MT5 et le mot de passe investisseur ou principal selon le niveau d'acces voulu. Une fois le compte visible ici, il devient selectionnable dans la route live plus bas.
+          </p>
           {mt5Accounts.length > 0 ? (
             <div className="panel" style={{ marginTop: 12, borderRadius: 12 }}>
               <div className="eyebrow">Comptes MT5 visibles</div>
@@ -408,6 +496,36 @@ export default function ConnectionsPage() {
                     <span>{String(item.mode || "-")} / {String(item.status || "-")} / {item.has_credentials ? "secret ok" : "secret missing"}</span>
                   </div>
                 ))}
+              </div>
+            </div>
+          ) : null}
+          {mt5Accounts.length > 0 ? (
+            <div className="panel" style={{ marginTop: 12, borderRadius: 12 }}>
+              <div className="eyebrow">Source broker_session MT5 <HelpHint text="Persiste ici la source externe du broker_state MT5 pour que le control-plane tire automatiquement l'etat broker sans push manuel." examples={["Snapshot URL + payload_path = TXT lit le JSON externe, puis l'injecte dans le bridge MT5 canonique.", "Effacer la source remet broker_session a vide pour couper l'ingestion automatique."]} /></div>
+              <div className="form-grid" style={{ marginTop: 12 }}>
+                <select value={mt5BrokerSessionAccountId} onChange={(e) => setMt5BrokerSessionAccountId(e.target.value)}>
+                  {mt5Accounts.map((item) => (
+                    <option key={String(item.account_id)} value={String(item.account_id)}>{String(item.account_id)} | {String(item.server || "-")}</option>
+                  ))}
+                </select>
+                <input value={mt5SnapshotUrl} onChange={(e) => setMt5SnapshotUrl(e.target.value)} placeholder="snapshot_url http://mt5-bridge:18086/state.json" />
+                <input value={mt5PayloadPath} onChange={(e) => setMt5PayloadPath(e.target.value)} placeholder="payload_path (ex: payload)" />
+                <input value={mt5TruthSource} onChange={(e) => setMt5TruthSource(e.target.value)} placeholder="truth_source" />
+                <input value={mt5MinPollIntervalSeconds} onChange={(e) => setMt5MinPollIntervalSeconds(e.target.value)} placeholder="min_poll_interval_seconds" />
+                <label className="subtle" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <input type="checkbox" checked={mt5BrokerSessionRefresh} onChange={(e) => setMt5BrokerSessionRefresh(e.target.checked)} />
+                  refresh immediat apres sauvegarde
+                </label>
+                <button type="button" onClick={() => persistMt5BrokerSession(false)} disabled={mt5BrokerSessionBusy}>{mt5BrokerSessionBusy ? "Sauvegarde…" : "Sauvegarder la source broker"}</button>
+                <button type="button" onClick={() => persistMt5BrokerSession(true)} disabled={mt5BrokerSessionBusy}>Effacer la source</button>
+              </div>
+              <div className="row" style={{ marginTop: 10 }}>
+                <span>Source persistée</span>
+                <span>{JSON.stringify(selectedMt5BrokerSessionConfig)}</span>
+              </div>
+              <div className="row" style={{ marginTop: 10 }}>
+                <span>Etat live broker</span>
+                <span>{JSON.stringify(selectedMt5BrokerRuntimeSession)}</span>
               </div>
             </div>
           ) : null}
@@ -453,15 +571,15 @@ export default function ConnectionsPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Route d'integration live <HelpHint text="Expose la creation de route pour un signal autonome vers un compte exchange lie, y compris BingX live." examples={["Source kairos + route default + live enabled = le moteur peut demander du vrai live gouverne.", "Si tu veux rester sans risque, desactive live_enabled ou garde un venue paper."]} /></div>
+          <div className="eyebrow">Route d'integration live <HelpHint text="Expose la creation de route pour un signal autonome vers un compte lie, exchange ou broker MT5/FTMO." examples={["Source kairos + route default + live enabled = le moteur peut demander du vrai live gouverne vers BingX ou un compte MT5 FTMO.", "Si tu veux rester sans risque, desactive live_enabled ou garde un venue paper."]} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <input value={integrationSource} onChange={(e) => setIntegrationSource(e.target.value)} placeholder="source (ex: kairos)" />
             <input value={integrationRouteKey} onChange={(e) => setIntegrationRouteKey(e.target.value)} placeholder="route_key" />
             <select value={integrationAccountId} onChange={(e) => setIntegrationAccountId(e.target.value)}>
-              <option value="">compte exchange lie</option>
-              {linkedExchangeAccounts.map((item) => (
+              <option value="">compte lie pour execution</option>
+              {linkedExecutionAccounts.map((item) => (
                 <option value={String(item.account_id)} key={`${String(item.provider)}-${String(item.account_id)}`}>
-                  {String(item.provider)} | {String(item.account_id)} | {String(item.mode || "-")}
+                  {routeAccountLabel(item)}
                 </option>
               ))}
             </select>
@@ -476,7 +594,7 @@ export default function ConnectionsPage() {
             </button>
           </div>
           <div className="panel" style={{ marginTop: 12, borderRadius: 12 }}>
-            <div className="row"><span>Compte choisi</span><span>{selectedIntegrationAccount ? `${String(selectedIntegrationAccount.provider)} | ${String(selectedIntegrationAccount.account_id)} | ${String(selectedIntegrationAccount.mode || "-")}` : "Aucun"}</span></div>
+            <div className="row"><span>Compte choisi</span><span>{selectedIntegrationAccount ? routeAccountLabel(selectedIntegrationAccount) : "Aucun"}</span></div>
             <div className="row"><span>Permission trade</span><span>{selectedIntegrationAccount ? String(asMap(asMap(selectedIntegrationAccount.permissions_view).permissions).trade || false) : "false"}</span></div>
             <div className="row"><span>Venue suggere</span><span>{selectedIntegrationAccount ? String(asMap(selectedIntegrationAccount.broker_capabilities).preferred_venue || "-") : "-"}</span></div>
           </div>

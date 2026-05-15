@@ -49,20 +49,23 @@ export function shouldPausePublicOpsRefresh(): boolean {
   return document.visibilityState !== "visible" || !document.hasFocus();
 }
 
-export async function fetchTerminalAuthStatus(wasAuthenticated: boolean): Promise<{ authenticated: boolean; definitive: boolean }> {
+export async function fetchTerminalAuthStatus(wasAuthenticated: boolean): Promise<{ authenticated: boolean; definitive: boolean; username: string; role: string }> {
   return fetch("/api/auth/status", { cache: "no-store" })
     .then(async (response) => {
       if (response.status === 401 || response.status === 403) {
-        return { authenticated: false, definitive: true };
+        return { authenticated: false, definitive: true, username: "", role: "" };
       }
       if (!response.ok) {
-        return { authenticated: wasAuthenticated, definitive: false };
+        return { authenticated: wasAuthenticated, definitive: false, username: "", role: "" };
       }
       const payload = await response.json().catch(() => null);
+      const authPayload = payload && typeof payload === "object" ? payload as Record<string, unknown> : null;
       return {
-        authenticated: Boolean(payload && typeof payload === "object" && (payload as Record<string, unknown>).authenticated),
+        authenticated: Boolean(authPayload?.authenticated),
         definitive: true,
+        username: String(authPayload?.username || "").trim(),
+        role: String(authPayload?.role || "").trim(),
       };
     })
-    .catch(() => ({ authenticated: wasAuthenticated, definitive: false }));
+    .catch(() => ({ authenticated: wasAuthenticated, definitive: false, username: "", role: "" }));
 }

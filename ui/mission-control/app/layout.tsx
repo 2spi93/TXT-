@@ -1,5 +1,6 @@
 import "./globals.css";
 import type { ReactNode } from "react";
+import type { Metadata } from "next";
 import Script from "next/script";
 
 import OpsChatbot from "../components/OpsChatbot";
@@ -203,9 +204,9 @@ const PERFORMANCE_COMPAT_BOOTSTRAP = `(function(){
   globalObject.__txtPerformanceCompat = compat;
 })();`;
 
-export const metadata = {
+export const metadata: Metadata = {
   title: "TXT - Trader eXelle Terminal",
-  description: "Human-first trading platform"
+  description: "Human-first trading platform",
 };
 
 export default async function RootLayout({ children }: { children: ReactNode }) {

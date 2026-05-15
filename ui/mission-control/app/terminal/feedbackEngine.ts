@@ -1,3 +1,5 @@
+import { findFinalDecisionTruth } from "./finalDecisionTruth";
+
 export type TradeQuality =
   | "GOOD_EXECUTION"
   | "BAD_EXECUTION"
@@ -76,6 +78,14 @@ export type FeedbackSummary = {
   forceNoTrade: boolean;
   learningDisabled: boolean;
   maxAdjustmentPerDayPct: number;
+  canonicalDecision: {
+    action: string;
+    executionAllowed: boolean;
+    edgeEligibilityState: string;
+    edgeEligibilityScorePct: number;
+    blockingLayer: string | null;
+    summaryLabel: string;
+  } | null;
 };
 
 type JournalEntry = Record<string, unknown>;
@@ -110,9 +120,7 @@ function safeRecord(value: unknown): JsonRow {
 }
 
 function safeRows(value: unknown): JsonRow[] {
-  return Array.isArray(value)
-    ? value.filter((item): item is JsonRow => Boolean(item) && typeof item === "object" && !Array.isArray(item))
-    : [];
+  return Array.isArray(value) ? value.map(safeRecord) : [];
 }
 
 function safeTextArray(value: unknown): string[] {
@@ -496,6 +504,7 @@ export function buildFeedbackSummary(input: {
   executionAiV6Payload?: Record<string, unknown> | null;
   journalEntries?: Array<Record<string, unknown>>;
   nowMs?: number;
+  finalDecisionTruth?: Record<string, unknown> | null;
 }): FeedbackSummary {
   const envelope = safeRecord(input.executionPnlPayload);
   const summary = safeRecord(envelope.summary);
@@ -504,6 +513,11 @@ export function buildFeedbackSummary(input: {
   const liveOps = safeRecord(input.liveOpsPayload);
   const executionAiV6 = safeRecord(input.executionAiV6Payload);
   const journalEntries = Array.isArray(input.journalEntries) ? input.journalEntries.map(safeRecord) : [];
+  const canonicalDecision = findFinalDecisionTruth(
+    input.finalDecisionTruth,
+    ...journalEntries,
+    ...trades,
+  );
   const nowMs = input.nowMs ?? Date.now();
   const tradeCount = safeNumber(summary.trade_count, trades.length);
   const badModelFlags = new Set(
@@ -652,16 +666,23 @@ export function buildFeedbackSummary(input: {
     modelHealth,
   });
   const windows = buildWindows({ trades, reward, shield, modelHealth });
-  const reduceSize = modelHealth === "DEGRADING" || modelHealth === "BROKEN";
-  const forceNoTrade = modelHealth === "BROKEN" || driftState === "LOCK";
-  const learningDisabled = shield.freezeLearning || driftState === "LOCK";
+  const canonicalBlocksExecution = canonicalDecision?.execution_allowed === false;
+  const canonicalRequestsReduce = canonicalDecision?.action === "REDUCE";
+  const canonicalEligibilityBlocked = canonicalDecision?.edge_eligibility.state === "BLOCKED";
+  const reduceSize = modelHealth === "DEGRADING" || modelHealth === "BROKEN" || canonicalRequestsReduce;
+  const forceNoTrade = modelHealth === "BROKEN" || driftState === "LOCK" || canonicalBlocksExecution;
+  const learningDisabled = shield.freezeLearning || driftState === "LOCK" || canonicalEligibilityBlocked;
   const protections = [
     reduceSize ? "reduce_size" : null,
     forceNoTrade ? "force_no_trade" : null,
     learningDisabled ? "disable_learning" : null,
     shield.contextCompression === "compressed" ? "compress_context" : null,
+    canonicalBlocksExecution ? "canonical_block" : null,
   ].filter((value): value is string => Boolean(value));
   const recommendations = [
+    canonicalDecision
+      ? `final decision contract ${canonicalDecision.action.toLowerCase()} · ${canonicalDecision.edge_eligibility.state.toLowerCase()} ${canonicalDecision.edge_eligibility.score_pct}%`
+      : null,
     calibrationActions.length > 0
       ? `apply calibration with a daily cap of ${MAX_ADJUSTMENT_PER_DAY_PCT.toFixed(0)}%`
       : "keep calibration unchanged until a stronger pattern appears",
@@ -679,7 +700,7 @@ export function buildFeedbackSummary(input: {
     behaviorError > 0.25
       ? "operator overrides are contaminating feedback: keep overrides visible and rare"
       : "operator discipline remains compatible with self-rewarding updates",
-  ];
+  ].filter((value): value is string => Boolean(value));
 
   return {
     tradeCount,
@@ -698,5 +719,13 @@ export function buildFeedbackSummary(input: {
     forceNoTrade,
     learningDisabled,
     maxAdjustmentPerDayPct: MAX_ADJUSTMENT_PER_DAY_PCT,
+    canonicalDecision: canonicalDecision ? {
+      action: canonicalDecision.action,
+      executionAllowed: canonicalDecision.execution_allowed,
+      edgeEligibilityState: canonicalDecision.edge_eligibility.state,
+      edgeEligibilityScorePct: canonicalDecision.edge_eligibility.score_pct,
+      blockingLayer: canonicalDecision.blocking_layer,
+      summaryLabel: canonicalDecision.summary_label,
+    } : null,
   };
 }

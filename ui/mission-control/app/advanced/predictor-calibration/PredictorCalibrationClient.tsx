@@ -62,6 +62,38 @@ type JournalCalibrationPayload = {
   entries: CalibrationJournalEntry[];
 };
 
+type OutcomeCalibrationBucket = {
+  score_bucket: number;
+  sample_count: number;
+  avg_net_result_usd: number;
+  win_rate: number;
+};
+
+type EdgeEligibilityStateBucket = {
+  state: string;
+  sample_count: number;
+  avg_net_result_usd: number;
+  win_rate: number;
+  avg_edge_score_pct: number;
+  avg_score_pre_trade_pct: number;
+};
+
+type EdgeEligibilityScoreBucket = {
+  state: string;
+  score_bucket_pct: number;
+  sample_count: number;
+  avg_net_result_usd: number;
+  win_rate: number;
+  avg_score_pre_trade_pct: number;
+};
+
+type OutcomesCalibrationPayload = {
+  status?: string;
+  buckets: OutcomeCalibrationBucket[];
+  edge_state_buckets: EdgeEligibilityStateBucket[];
+  edge_score_buckets: EdgeEligibilityScoreBucket[];
+};
+
 const WINDOW_LABELS: Record<string, string> = {
   "24h": "24h",
   "7d": "7 jours",
@@ -93,6 +125,25 @@ function formatSourceLabel(value: string): string {
 
 function formatWindowLabel(value: string): string {
   return WINDOW_LABELS[value] || value;
+}
+
+function formatEdgeStateLabel(value: string): string {
+  switch (value.trim().toUpperCase()) {
+    case "ELIGIBLE":
+      return "Eligible";
+    case "OBSERVE":
+      return "Observe";
+    case "BLOCKED":
+      return "Blocked";
+    default:
+      return value || "Unknown";
+  }
+}
+
+function formatScoreBucketRange(scoreBucketPct: number): string {
+  const lower = Math.max(0, Math.round(scoreBucketPct));
+  const upper = Math.min(100, lower + 9);
+  return `${lower}-${upper}%`;
 }
 
 function formatSigned(value: number, digits = 2, suffix = ""): string {
@@ -191,15 +242,60 @@ function normalizePayload(raw: unknown): CalibrationPayload {
   };
 }
 
+function normalizeOutcomesCalibrationPayload(raw: unknown): OutcomesCalibrationPayload {
+  const payload = raw && typeof raw === "object" ? raw as JsonMap : {};
+  const toOutcomeBucket = (candidate: unknown): OutcomeCalibrationBucket => {
+    const row = candidate && typeof candidate === "object" ? candidate as JsonMap : {};
+    return {
+      score_bucket: toNumber(row.score_bucket, 0),
+      sample_count: Math.max(0, Math.round(toNumber(row.sample_count, 0))),
+      avg_net_result_usd: toNumber(row.avg_net_result_usd, 0),
+      win_rate: toNumber(row.win_rate, 0),
+    };
+  };
+  const toEdgeStateBucket = (candidate: unknown): EdgeEligibilityStateBucket => {
+    const row = candidate && typeof candidate === "object" ? candidate as JsonMap : {};
+    return {
+      state: String(row.state || "UNKNOWN").trim().toUpperCase() || "UNKNOWN",
+      sample_count: Math.max(0, Math.round(toNumber(row.sample_count, 0))),
+      avg_net_result_usd: toNumber(row.avg_net_result_usd, 0),
+      win_rate: toNumber(row.win_rate, 0),
+      avg_edge_score_pct: toNumber(row.avg_edge_score_pct, 0),
+      avg_score_pre_trade_pct: toNumber(row.avg_score_pre_trade_pct, 0),
+    };
+  };
+  const toEdgeScoreBucket = (candidate: unknown): EdgeEligibilityScoreBucket => {
+    const row = candidate && typeof candidate === "object" ? candidate as JsonMap : {};
+    return {
+      state: String(row.state || "UNKNOWN").trim().toUpperCase() || "UNKNOWN",
+      score_bucket_pct: toNumber(row.score_bucket_pct, 0),
+      sample_count: Math.max(0, Math.round(toNumber(row.sample_count, 0))),
+      avg_net_result_usd: toNumber(row.avg_net_result_usd, 0),
+      win_rate: toNumber(row.win_rate, 0),
+      avg_score_pre_trade_pct: toNumber(row.avg_score_pre_trade_pct, 0),
+    };
+  };
+  return {
+    status: typeof payload.status === "string" ? payload.status : undefined,
+    buckets: Array.isArray(payload.buckets) ? payload.buckets.map(toOutcomeBucket) : [],
+    edge_state_buckets: Array.isArray(payload.edge_state_buckets) ? payload.edge_state_buckets.map(toEdgeStateBucket) : [],
+    edge_score_buckets: Array.isArray(payload.edge_score_buckets) ? payload.edge_score_buckets.map(toEdgeScoreBucket) : [],
+  };
+}
+
 export default function PredictorCalibrationClient() {
   const [payload, setPayload] = useState<CalibrationPayload | null>(null);
+  const [outcomesCalibration, setOutcomesCalibration] = useState<OutcomesCalibrationPayload | null>(null);
   const [journalEntries, setJournalEntries] = useState<CalibrationJournalEntry[]>([]);
   const [selectedSource, setSelectedSource] = useState("infra");
   const [error, setError] = useState<string | null>(null);
+  const [outcomesError, setOutcomesError] = useState<string | null>(null);
   const [journalError, setJournalError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [outcomesLoading, setOutcomesLoading] = useState(true);
   const [journalLoading, setJournalLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [outcomesRefreshing, setOutcomesRefreshing] = useState(false);
   const [journalRefreshing, setJournalRefreshing] = useState(false);
 
   async function loadPayload(refresh = false): Promise<void> {
@@ -249,9 +345,32 @@ export default function PredictorCalibrationClient() {
     }
   }
 
+  async function loadOutcomesCalibration(refresh = false): Promise<void> {
+    try {
+      if (refresh) {
+        setOutcomesRefreshing(true);
+      } else {
+        setOutcomesLoading(true);
+      }
+      setOutcomesError(null);
+      const response = await fetch("/api/outcomes/calibration", { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error(`Impossible de charger la calibration edge (${response.status})`);
+      }
+      const body = normalizeOutcomesCalibrationPayload(await response.json());
+      setOutcomesCalibration(body);
+    } catch (fetchError) {
+      setOutcomesError(fetchError instanceof Error ? fetchError.message : "Impossible de charger la calibration edge");
+    } finally {
+      setOutcomesLoading(false);
+      setOutcomesRefreshing(false);
+    }
+  }
+
   useEffect(() => {
     void loadPayload();
     void loadJournal();
+    void loadOutcomesCalibration();
   }, []);
 
   const selectedSourceHistory = useMemo(() => {
@@ -300,6 +419,18 @@ export default function PredictorCalibrationClient() {
     .filter((window): window is IntentCalibrationWindowSummary => Boolean(window))), [journalCalibration.windows]);
   const journalTopIntentRows = useMemo(() => journalWindows.flatMap((window) =>
     window.intents.map((intent) => ({ windowLabel: window.label, intent }))), [journalWindows]);
+  const edgeBucketsByState = useMemo(() => {
+    const grouped = new Map<string, EdgeEligibilityScoreBucket[]>();
+    for (const bucket of outcomesCalibration?.edge_score_buckets || []) {
+      const existing = grouped.get(bucket.state) || [];
+      existing.push(bucket);
+      grouped.set(bucket.state, existing);
+    }
+    return [...grouped.entries()].map(([state, buckets]) => ({
+      state,
+      buckets: [...buckets].sort((left, right) => right.score_bucket_pct - left.score_bucket_pct),
+    }));
+  }, [outcomesCalibration]);
 
   return (
     <main className="shell txt-page-shell">
@@ -446,6 +577,62 @@ export default function PredictorCalibrationClient() {
                       </div>
                     );
                   })}
+                </div>
+              </div>
+            ))}
+          </div>
+        </article>
+      </section>
+
+      <section className="grid" style={{ gridTemplateColumns: "1fr 1fr", gap: 16, marginTop: 16, alignItems: "start" }}>
+        <article className="panel">
+          <div className="eyebrow">Edge Eligibility</div>
+          <h2 style={{ margin: "4px 0 10px", fontSize: 22 }}>State Calibration</h2>
+          <p className="subtle" style={{ marginBottom: 10 }}>Buckets persistés depuis decision_outcomes, groupés par edge_eligibility_state et score_pct.</p>
+          {outcomesLoading ? <p className="subtle">Chargement de la calibration edge...</p> : null}
+          {outcomesError ? <p className="warn">{outcomesError}</p> : null}
+          {!outcomesLoading ? (
+            <div style={{ display: "grid", gap: 12 }}>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button type="button" onClick={() => void loadOutcomesCalibration(true)} disabled={outcomesRefreshing}>
+                  {outcomesRefreshing ? "Refreshing..." : "Refresh edge buckets"}
+                </button>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 12 }}>
+                {(outcomesCalibration?.edge_state_buckets || []).map((bucket) => (
+                  <div key={bucket.state} style={{ border: "1px solid rgba(148,163,184,0.18)", borderRadius: 12, padding: 12, background: "rgba(15,23,42,0.22)", display: "grid", gap: 8 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                      <strong>{formatEdgeStateLabel(bucket.state)}</strong>
+                      <span style={{ color: bucket.state === "ELIGIBLE" ? "#cfe9b9" : bucket.state === "BLOCKED" ? "#fca5a5" : "#efc28f" }}>
+                        {(bucket.avg_edge_score_pct).toFixed(0)}% edge
+                      </span>
+                    </div>
+                    <div className="row"><span>Samples</span><span>{bucket.sample_count}</span></div>
+                    <div className="row"><span>Win rate</span><span>{(bucket.win_rate * 100).toFixed(0)}%</span></div>
+                    <div className="row"><span>Avg pnl</span><span>{formatSigned(bucket.avg_net_result_usd, 2, " USD")}</span></div>
+                    <div className="row"><span>Avg pre-trade</span><span>{bucket.avg_score_pre_trade_pct.toFixed(0)}%</span></div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </article>
+
+        <article className="panel">
+          <div className="eyebrow">Score Buckets</div>
+          <div className="subtle" style={{ marginBottom: 10 }}>Lecture explicite des buckets edge par état, avec win rate et pnl moyen par tranche de score.</div>
+          {edgeBucketsByState.length === 0 && !outcomesLoading ? <p className="subtle">Aucun bucket edge persistant disponible.</p> : null}
+          <div style={{ display: "grid", gap: 10 }}>
+            {edgeBucketsByState.map(({ state, buckets }) => (
+              <div key={state} style={{ borderTop: "1px solid rgba(255,255,255,0.05)", paddingTop: 8, display: "grid", gap: 6 }}>
+                <div className="row"><strong>{formatEdgeStateLabel(state)}</strong><span>{buckets.reduce((sum, bucket) => sum + bucket.sample_count, 0)} samples</span></div>
+                <div style={{ display: "grid", gap: 6 }}>
+                  {buckets.map((bucket) => (
+                    <div key={`${state}-${bucket.score_bucket_pct}`} style={{ borderRadius: 10, padding: "8px 10px", background: "rgba(15,23,42,0.18)" }}>
+                      <div className="row"><span>{formatScoreBucketRange(bucket.score_bucket_pct)}</span><span>n {bucket.sample_count}</span></div>
+                      <div className="subtle mini">win {(bucket.win_rate * 100).toFixed(0)}% · pnl {formatSigned(bucket.avg_net_result_usd, 2, " USD")} · pre-trade {bucket.avg_score_pre_trade_pct.toFixed(0)}%</div>
+                    </div>
+                  ))}
                 </div>
               </div>
             ))}

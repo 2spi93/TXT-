@@ -13,8 +13,65 @@ function isTruthy(value: string | undefined): boolean {
   return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
 }
 
+function isFalsey(value: string | undefined): boolean {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized === "0" || normalized === "false" || normalized === "no" || normalized === "off";
+}
+
+function isLoopbackPlaywrightBaseUrl(): boolean {
+  const raw = String(process.env.PLAYWRIGHT_BASE_URL || "http://127.0.0.1:3328").trim();
+  if (!raw) {
+    return false;
+  }
+  try {
+    return ["localhost", "127.0.0.1"].includes(new URL(raw).hostname);
+  } catch {
+    return false;
+  }
+}
+
 function isE2eDevDegradedModeEnabled(): boolean {
-  return isTruthy(process.env.MC_E2E_DEV_DEGRADED);
+  if (isTruthy(process.env.MC_E2E_DEV_DEGRADED)) {
+    return true;
+  }
+  if (isFalsey(process.env.MC_E2E_DEV_DEGRADED)) {
+    return false;
+  }
+  return isLoopbackPlaywrightBaseUrl();
+}
+
+function buildLoopbackOrigins(baseUrl: URL): string[] {
+  const origin = baseUrl.origin;
+  if (!["127.0.0.1", "localhost"].includes(baseUrl.hostname)) {
+    return [origin];
+  }
+
+  const alternateHost = baseUrl.hostname === "127.0.0.1" ? "localhost" : "127.0.0.1";
+  const alternateUrl = new URL(origin);
+  alternateUrl.hostname = alternateHost;
+  return Array.from(new Set([origin, alternateUrl.origin]));
+}
+
+async function addOperatorCookies(page: Page, baseUrl: URL, token: string): Promise<void> {
+  const origins = buildLoopbackOrigins(baseUrl);
+  await page.context().addCookies(origins.flatMap((origin) => ([
+    {
+      name: "mc_token",
+      value: token,
+      url: origin,
+      httpOnly: true,
+      sameSite: "Lax" as const,
+      secure: baseUrl.protocol === "https:",
+    },
+    {
+      name: "mc_token_compat",
+      value: token,
+      url: origin,
+      httpOnly: true,
+      sameSite: "Lax" as const,
+      secure: baseUrl.protocol === "https:",
+    },
+  ])));
 }
 
 function resolveControlPlaneFallback(): string {
@@ -66,28 +123,31 @@ function resolveOperatorPassword(): string {
 async function injectLocalOperatorSession(page: Page): Promise<void> {
   await page.goto("/login", { waitUntil: "domcontentloaded" });
   const baseUrl = new URL(page.url());
-  const origin = baseUrl.origin;
   const payload = Buffer.from(JSON.stringify({ role: "operator", exp: Math.floor(Date.now() / 1000) + 3600 }), "utf8").toString("base64url");
   const token = `${payload}.signature`;
 
-  await page.context().addCookies([
-    {
-      name: "mc_token",
-      value: token,
-      url: origin,
-      httpOnly: true,
-      sameSite: "Lax",
-      secure: baseUrl.protocol === "https:",
-    },
-    {
-      name: "mc_token_compat",
-      value: token,
-      url: origin,
-      httpOnly: true,
-      sameSite: "Lax",
-      secure: baseUrl.protocol === "https:",
-    },
-  ]);
+  await addOperatorCookies(page, baseUrl, token);
+}
+
+async function primeWalkthroughState(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    try {
+      window.localStorage.setItem("txt.global.walkthrough.version", "3");
+      window.localStorage.setItem("txt.global.walkthrough.done", "1");
+      window.localStorage.setItem("txt.global.walkthrough.visible", "0");
+      window.localStorage.setItem("txt.global.walkthrough.index", "0");
+      window.localStorage.setItem("txt.global.walkthrough.state.v1", JSON.stringify({
+        version: "3",
+        roleGroup: "unknown",
+        done: true,
+        visible: false,
+        stepIndex: 0,
+        validatedKeys: [],
+      }));
+    } catch {
+      // noop
+    }
+  });
 }
 
 async function tryUiOperatorLogin(page: Page, password: string, terminalPath: string): Promise<boolean> {
@@ -150,28 +210,12 @@ export async function seedOperatorSession(page: Page): Promise<void> {
     return;
   }
 
-  await page.context().addCookies([
-    {
-      name: "mc_token",
-      value: payload.access_token,
-      url: baseUrl.toString(),
-      httpOnly: true,
-      sameSite: "Lax",
-      secure: baseUrl.protocol === "https:",
-    },
-    {
-      name: "mc_token_compat",
-      value: payload.access_token,
-      url: baseUrl.toString(),
-      httpOnly: true,
-      sameSite: "Lax",
-      secure: baseUrl.protocol === "https:",
-    },
-  ]);
+  await addOperatorCookies(page, baseUrl, payload.access_token);
 }
 
 export async function loginIfRequired(page: Page, terminalPath = "/terminal", failureContext = "terminal test"): Promise<void> {
   const password = resolveOperatorPassword();
+  await primeWalkthroughState(page);
   await seedOperatorSession(page);
   await page.goto(terminalPath, { waitUntil: "domcontentloaded" });
 

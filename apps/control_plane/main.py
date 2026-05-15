@@ -9,10 +9,12 @@ import io
 import json
 import math
 import os
+from enum import Enum
 from pathlib import Path
 import random
 import secrets
 import time
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlencode
@@ -22,6 +24,12 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+from apps.control_plane.protection_runtime import (
+    build_live_freshness_summary,
+    build_live_position_protection_status,
+    build_position_protection_governor,
+    detect_protection_status_events,
+)
 from shared.auth import AuthContext, auth_context_from_token, hash_password, issue_access_token, sign_approval_payload, verify_approval_signature, verify_password
 from shared.db import ensure_schema, execute, execute_rowcount, fetch_all, fetch_one, json_dumps
 from shared.models import (
@@ -46,6 +54,8 @@ from shared.models import (
     StrategyPromotionRequest,
     SystemMode,
     SystemModeChangeRequest,
+    TradeIntent,
+    TradeProtectionRequest,
     UserClientMembershipCreateRequest,
 )
 
@@ -60,22 +70,382 @@ MT5_BRIDGE_URL = os.getenv("MT5_BRIDGE_URL", "http://127.0.0.1:8006")
 BINANCE_API_BASE_URL = os.getenv("BINANCE_API_BASE_URL", "https://api.binance.com").rstrip("/")
 BINANCE_FUTURES_API_BASE_URL = os.getenv("BINANCE_FUTURES_API_BASE_URL", "https://fapi.binance.com").rstrip("/")
 BINANCE_COINM_API_BASE_URL = os.getenv("BINANCE_COINM_API_BASE_URL", "https://dapi.binance.com").rstrip("/")
+BINANCE_INCOME_HISTORY_SOURCE = "binance-income-history"
+BINANCE_INCOME_HISTORY_BACKFILL_DAYS = max(7, int(os.getenv("BINANCE_INCOME_HISTORY_BACKFILL_DAYS", "90")))
 BINGX_API_BASE_URL = os.getenv("BINGX_API_BASE_URL", "https://open-api.bingx.com").rstrip("/")
+BINGX_INCOME_HISTORY_SOURCE = "bingx-income-history"
+BINGX_INCOME_HISTORY_BACKFILL_DAYS = max(7, int(os.getenv("BINGX_INCOME_HISTORY_BACKFILL_DAYS", "365")))
 BITGET_API_BASE_URL = os.getenv("BITGET_API_BASE_URL", "https://api.bitget.com").rstrip("/")
 OKX_API_BASE_URL = os.getenv("OKX_API_BASE_URL", "https://www.okx.com").rstrip("/")
+OKX_BILL_HISTORY_SOURCE = "okx-bill-history"
+OKX_BILL_HISTORY_BACKFILL_DAYS = max(7, int(os.getenv("OKX_BILL_HISTORY_BACKFILL_DAYS", "90")))
 EMBEDDINGS_SERVICE_URL = os.getenv("EMBEDDINGS_SERVICE_URL", "http://127.0.0.1:8007")
 RUST_EXECUTION_ENGINE_URL = os.getenv("RUST_EXECUTION_ENGINE_URL", "http://127.0.0.1:8011")
 PREDICTOR_V8_URL = os.getenv("PREDICTOR_V8_URL", "http://127.0.0.1:8008")
 PREDICTOR_V8_TIMEOUT_SECONDS = max(1.0, float(os.getenv("PREDICTOR_V8_TIMEOUT_SECONDS", "3.0")))
 PREDICTOR_V8_EXPERIENCES_LOG_PATH = Path(os.getenv("PREDICTOR_V8_EXPERIENCES_LOG_PATH", "/workspace/data/predictor_v8/experiences.jsonl"))
+RUNTIME_DECISION_KPI_PATH = Path(os.getenv("RUNTIME_DECISION_KPI_DIR", "/workspace/logs")) / os.getenv("RUNTIME_DECISION_KPI_FILE", "mission-control-runtime-decision-kpi.jsonl")
 LIVE_EXECUTION_POLICY_PATH = Path(os.getenv("LIVE_EXECUTION_POLICY_PATH", "/workspace/config/live_execution_policy.json"))
 RUST_EXECUTION_ENGINE_ENABLED = os.getenv("RUST_EXECUTION_ENGINE_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
 CURRENT_SYSTEM_MODE = SystemMode(os.getenv("SYSTEM_MODE", SystemMode.SUGGEST.value))
 
 RAW_CASH_ASSETS = {"USD", "USDT", "USDC", "BUSD", "DAI", "FDUSD", "TUSD", "USDE", "PYUSD"}
+VENUE_NATIVE_HISTORY_SOURCES = {
+    "bingx": BINGX_INCOME_HISTORY_SOURCE,
+    "binance": BINANCE_INCOME_HISTORY_SOURCE,
+    "okx": OKX_BILL_HISTORY_SOURCE,
+}
+VENUE_NATIVE_HISTORY_EVENT_TYPES = {"funding_fee", "realized_pnl", "trading_fee"}
 
 AUDIT_LOG: list[AuditEvent] = []
 PENDING_INTENTS: dict[str, dict] = {}
+OPPORTUNITY_GATE_TASK: asyncio.Task | None = None
+LIVE_POSITION_PROTECTION_TASK: asyncio.Task | None = None
+OPPORTUNITY_GATE_STATE_CACHE: dict[str, Any] | None = None
+MT5_EXTERNAL_BROKER_STATE_LAST_PULL: dict[str, datetime] = {}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _opportunity_gate_loop_interval_sec() -> float:
+    return max(1.0, min(30.0, _env_float("OPPORTUNITY_GATE_LOOP_INTERVAL_SEC", 5.0)))
+
+
+def _live_position_protection_loop_interval_sec() -> float:
+    return max(15.0, min(300.0, _env_float("LIVE_POSITION_PROTECTION_RECONCILE_INTERVAL_SEC", 45.0)))
+
+
+def _live_snapshot_stale_after_seconds(provider: str) -> int:
+    normalized = str(provider or "").strip().lower()
+    defaults = {
+        "bingx": 300,
+        "mt5": 180,
+    }
+    provider_key = normalized.upper().replace("-", "_")
+    global_default = os.getenv("LIVE_SNAPSHOT_STALE_AFTER_SECONDS", "900").strip() or "900"
+    raw = os.getenv(f"{provider_key}_LIVE_SNAPSHOT_STALE_AFTER_SECONDS", global_default).strip() if provider_key else global_default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = defaults.get(normalized, 900)
+    return max(30, value if value > 0 else defaults.get(normalized, 900))
+
+
+def _opportunity_gate_thresholds() -> dict[str, float]:
+    return {
+        "min_consistency_pct": max(0.0, min(100.0, _env_float("OPPORTUNITY_GATE_MIN_CONSISTENCY_PCT", 70.0))),
+        "min_candidates": max(1.0, min(20.0, _env_float("OPPORTUNITY_GATE_MIN_CANDIDATES", 3.0))),
+        "max_deviation_bps": max(0.1, min(500.0, _env_float("OPPORTUNITY_GATE_MAX_DEVIATION_BPS", 20.0))),
+        "max_freshness_ms": max(50.0, min(60000.0, _env_float("OPPORTUNITY_GATE_MAX_FRESHNESS_MS", 500.0))),
+        "kill_consistency_pct": max(0.0, min(100.0, _env_float("OPPORTUNITY_GATE_KILL_CONSISTENCY_PCT", 65.0))),
+        "kill_deviation_bps": max(0.1, min(500.0, _env_float("OPPORTUNITY_GATE_KILL_DEVIATION_BPS", 25.0))),
+    }
+
+
+def _default_opportunity_gate_state() -> dict[str, Any]:
+    return {
+        "status": "warming_up",
+        "opportunity_enabled": False,
+        "health_score": 0.0,
+        "reasons": ["observation_unavailable"],
+        "kill_switch_recommended": False,
+        "kill_switch_reason": None,
+        "metrics": {
+            "consistency": None,
+            "flags": ["OBSERVATION_WARMING_UP"],
+            "candidates": 0,
+            "deviation_bps": None,
+            "freshness_ms": None,
+            "bus_seq": 0,
+            "failure_blocking": False,
+        },
+        "thresholds": _opportunity_gate_thresholds(),
+        "recommended_mode": SystemMode.OBSERVE.value,
+        "source": "execution-router/health",
+        "updated_at": None,
+        "evaluated_at": None,
+        "last_error": None,
+    }
+
+
+def _latest_runtime_decision_kpi_snapshot() -> dict[str, Any] | None:
+    try:
+        lines = RUNTIME_DECISION_KPI_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for raw_line in reversed(lines):
+        line = raw_line.strip()
+        if not line:
+            continue
+        with suppress(json.JSONDecodeError):
+            payload = json.loads(line)
+            if isinstance(payload, dict):
+                return payload
+    return None
+
+
+def _runtime_calibration_guard_snapshot() -> dict[str, Any]:
+    snapshot = _latest_runtime_decision_kpi_snapshot()
+    if not isinstance(snapshot, dict):
+        return {
+            "status": "locked",
+            "lock_active": True,
+            "reason": "runtime_observation_snapshot_unavailable",
+            "message": "Runtime observation snapshot unavailable; keep calibration disabled until Mission Control observation recovers.",
+            "observation_status": "INSUFFICIENT",
+            "observation_integrity_status": "UNKNOWN",
+            "manual_calibration_eligible": False,
+            "auto_calibration_allowed": False,
+            "covered_hours": 0,
+            "expected_hours": 0,
+            "missing_hours": 0,
+            "snapshot_timestamp": None,
+        }
+
+    observation_status = str(snapshot.get("observationStatus") or "INSUFFICIENT").strip().upper() or "INSUFFICIENT"
+    integrity_status = str(snapshot.get("observationIntegrityStatus") or "UNKNOWN").strip().upper() or "UNKNOWN"
+    manual_calibration_eligible = bool(snapshot.get("manualCalibrationEligible"))
+    auto_calibration_allowed = bool(snapshot.get("autoCalibrationAllowed"))
+    expected_hours = max(0, int(_to_float(snapshot.get("observationExpectedHours"), 0.0)))
+    missing_hours = max(0, int(_to_float(snapshot.get("observationMissingHours"), 0.0)))
+    covered_hours = max(0, expected_hours - missing_hours)
+
+    lock_active = False
+    reason = "manual_review_ready"
+    message = "Observation gate ready for bounded manual review; automatic calibration remains disabled."
+    if observation_status == "INSUFFICIENT":
+        lock_active = True
+        reason = "observation_insufficient"
+        message = "Observation remains insufficient; keep calibration disabled until the runtime gate reaches review-ready."
+    elif observation_status == "OBSERVE":
+        lock_active = True
+        reason = "observation_window_still_active"
+        message = "Observation window is still active; keep calibration disabled until the runtime gate is fully review-ready."
+    elif integrity_status != "OK":
+        lock_active = True
+        reason = "observation_integrity_not_ok"
+        message = "Observation integrity is not clean enough for calibration; keep the system in observation mode."
+    elif not manual_calibration_eligible:
+        lock_active = True
+        reason = "manual_review_gate_closed"
+        message = "Manual calibration gate remains closed; continue observation and runtime hygiene before any bounded review."
+
+    return {
+        "status": "locked" if lock_active else "manual_review_ready",
+        "lock_active": lock_active,
+        "reason": reason,
+        "message": message,
+        "observation_status": observation_status,
+        "observation_integrity_status": integrity_status,
+        "manual_calibration_eligible": manual_calibration_eligible,
+        "auto_calibration_allowed": auto_calibration_allowed,
+        "covered_hours": covered_hours,
+        "expected_hours": expected_hours,
+        "missing_hours": missing_hours,
+        "snapshot_timestamp": str(snapshot.get("timestamp") or "").strip() or None,
+    }
+
+
+def _apply_runtime_calibration_guard(apply_calibration: bool) -> tuple[bool, dict[str, Any]]:
+    guard = _runtime_calibration_guard_snapshot()
+    effective_apply_calibration = bool(apply_calibration) and not bool(guard.get("lock_active"))
+    return effective_apply_calibration, {
+        **guard,
+        "requested_apply_calibration": bool(apply_calibration),
+        "effective_apply_calibration": effective_apply_calibration,
+        "request_blocked": bool(apply_calibration) and not effective_apply_calibration,
+    }
+
+
+def _opportunity_gate_state() -> dict[str, Any]:
+    global OPPORTUNITY_GATE_STATE_CACHE
+    if isinstance(OPPORTUNITY_GATE_STATE_CACHE, dict):
+        return OPPORTUNITY_GATE_STATE_CACHE
+    stored = fetch_one("SELECT config_value FROM system_config WHERE config_key = 'opportunity_gate_state'")
+    if stored and isinstance(stored.get("config_value"), dict):
+        OPPORTUNITY_GATE_STATE_CACHE = stored["config_value"]
+    else:
+        OPPORTUNITY_GATE_STATE_CACHE = _default_opportunity_gate_state()
+    return OPPORTUNITY_GATE_STATE_CACHE
+
+
+def _save_opportunity_gate_state(state: dict[str, Any]) -> None:
+    global OPPORTUNITY_GATE_STATE_CACHE
+    OPPORTUNITY_GATE_STATE_CACHE = state
+    execute(
+        """
+        INSERT INTO system_config (config_key, config_value)
+        VALUES ('opportunity_gate_state', %s::jsonb)
+        ON CONFLICT (config_key) DO UPDATE SET config_value = EXCLUDED.config_value, updated_at = NOW()
+        """,
+        (json_dumps(state),),
+    )
+
+
+async def _fetch_execution_router_observation() -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.get(f"{EXECUTION_ROUTER_URL}/health")
+    if response.status_code >= 400:
+        raise RuntimeError(f"execution_router_health_{response.status_code}")
+    payload = response.json()
+    observation = payload.get("observation") if isinstance(payload, dict) else {}
+    return observation if isinstance(observation, dict) else {}
+
+
+def _compute_opportunity_health_score(
+    *,
+    consistency: float,
+    candidate_count: int,
+    deviation_bps: float,
+    freshness_ms: float,
+    flags: list[str],
+    failure_blocking: bool,
+    thresholds: dict[str, float],
+) -> float:
+    consistency_score = _clamp(consistency / 100.0, 0.0, 1.0)
+    candidate_score = _clamp(candidate_count / max(thresholds["min_candidates"] * 2.0, 6.0), 0.0, 1.0)
+    deviation_score = _clamp(1.0 - (deviation_bps / max(thresholds["max_deviation_bps"] * 2.0, 1.0)), 0.0, 1.0)
+    freshness_score = _clamp(1.0 - (freshness_ms / max(thresholds["max_freshness_ms"] * 2.0, 1.0)), 0.0, 1.0)
+    base_score = (
+        consistency_score * 0.45
+        + freshness_score * 0.2
+        + deviation_score * 0.2
+        + candidate_score * 0.15
+    ) * 100.0
+    penalties = 0.0
+    if failure_blocking:
+        penalties += 20.0
+    penalties += min(40.0, len(flags) * 12.0)
+    return round(_clamp(base_score - penalties, 0.0, 100.0), 2)
+
+
+def _evaluate_opportunity_gate(observation: dict[str, Any], *, last_error: str | None = None) -> dict[str, Any]:
+    thresholds = _opportunity_gate_thresholds()
+    consistency = _clamp(_to_float(observation.get("consistency"), 0.0), 0.0, 100.0)
+    candidate_count = max(0, int(_to_float(observation.get("candidate_count"), 0.0)))
+    deviation_bps = max(0.0, _to_float(observation.get("deviation_bps"), 9999.0))
+    freshness_ms = max(0.0, _to_float(observation.get("freshness_ms"), 999999.0))
+    flags = sorted({str(item).strip().upper() for item in (observation.get("flags") or []) if str(item).strip()})
+    bus_seq = max(0, int(_to_float(observation.get("bus_seq"), 0.0)))
+    failure_blocking = bool(observation.get("failure_blocking"))
+    observation_updated_at = observation.get("updated_at")
+    valid_observation = bool(observation_updated_at) and bus_seq > 0 and last_error is None and "OBSERVATION_WARMING_UP" not in flags and "OBSERVATION_ERROR" not in flags
+
+    reasons: list[str] = []
+    if consistency < thresholds["min_consistency_pct"]:
+        reasons.append("consistency_below_threshold")
+    if candidate_count < int(thresholds["min_candidates"]):
+        reasons.append("candidates_below_threshold")
+    if deviation_bps > thresholds["max_deviation_bps"]:
+        reasons.append("deviation_above_threshold")
+    if freshness_ms > thresholds["max_freshness_ms"]:
+        reasons.append("freshness_above_threshold")
+    if failure_blocking:
+        reasons.append("routing_failure_blocking")
+    if flags:
+        reasons.extend([f"flag_{flag.lower()}" for flag in flags])
+    if last_error:
+        reasons.append("gate_refresh_failed")
+
+    severe_flags = {"BUS_OFFLINE", "NO_TRADES"}
+    kill_reasons: list[str] = []
+    if valid_observation and severe_flags.intersection(flags):
+        kill_reasons.extend(sorted(severe_flags.intersection(flags)))
+    if valid_observation and consistency < thresholds["kill_consistency_pct"]:
+        kill_reasons.append("consistency_kill_threshold")
+    if valid_observation and deviation_bps > thresholds["kill_deviation_bps"]:
+        kill_reasons.append("deviation_kill_threshold")
+
+    status = "go" if not reasons else "no-go"
+    health_score = _compute_opportunity_health_score(
+        consistency=consistency,
+        candidate_count=candidate_count,
+        deviation_bps=deviation_bps,
+        freshness_ms=freshness_ms,
+        flags=flags,
+        failure_blocking=failure_blocking,
+        thresholds=thresholds,
+    )
+    recommended_mode = SystemMode.GUARDED_AUTO.value if status == "go" else SystemMode.OBSERVE.value
+    return {
+        "status": status,
+        "opportunity_enabled": status == "go",
+        "health_score": health_score,
+        "reasons": reasons,
+        "kill_switch_recommended": len(kill_reasons) > 0,
+        "kill_switch_reason": ",".join(kill_reasons) if kill_reasons else None,
+        "metrics": {
+            "consistency": round(consistency, 2),
+            "flags": flags,
+            "candidates": candidate_count,
+            "deviation_bps": round(deviation_bps, 6),
+            "freshness_ms": round(freshness_ms, 3),
+            "bus_seq": bus_seq,
+            "failure_blocking": failure_blocking,
+        },
+        "thresholds": thresholds,
+        "recommended_mode": recommended_mode,
+        "source": "execution-router/health",
+        "updated_at": observation_updated_at,
+        "evaluated_at": _now_utc().isoformat(),
+        "last_error": last_error,
+        "valid_observation": valid_observation,
+    }
+
+
+async def _refresh_opportunity_gate_state() -> dict[str, Any]:
+    try:
+        observation = await _fetch_execution_router_observation()
+        state = _evaluate_opportunity_gate(observation)
+    except Exception as exc:
+        fallback_observation = _default_opportunity_gate_state()["metrics"]
+        state = _evaluate_opportunity_gate(
+            {
+                "consistency": fallback_observation.get("consistency"),
+                "candidate_count": fallback_observation.get("candidates"),
+                "deviation_bps": fallback_observation.get("deviation_bps"),
+                "freshness_ms": fallback_observation.get("freshness_ms"),
+                "bus_seq": fallback_observation.get("bus_seq"),
+                "failure_blocking": fallback_observation.get("failure_blocking"),
+                "flags": ["BUS_OFFLINE", "OBSERVATION_ERROR"],
+                "updated_at": None,
+            },
+            last_error=str(exc),
+        )
+
+    if state.get("kill_switch_recommended") and CURRENT_SYSTEM_MODE in {SystemMode.GUARDED_AUTO, SystemMode.MANAGED_LIVE}:
+        kill_state = _kill_switch_state()
+        if not kill_state.get("active"):
+            _activate_kill_switch(
+                "opportunity_gate",
+                str(state.get("kill_switch_reason") or "opportunity_gate_triggered"),
+                {
+                    "gate": state,
+                    "system_mode": CURRENT_SYSTEM_MODE.value,
+                },
+            )
+    _save_opportunity_gate_state(state)
+    return state
+
+
+async def _opportunity_gate_loop() -> None:
+    while True:
+        try:
+            await _refresh_opportunity_gate_state()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            state = _default_opportunity_gate_state()
+            state["last_error"] = str(exc)
+            state["evaluated_at"] = _now_utc().isoformat()
+            _save_opportunity_gate_state(state)
+        await asyncio.sleep(_opportunity_gate_loop_interval_sec())
 
 
 def _normalize_account_id(value: Any) -> str:
@@ -162,7 +532,7 @@ OAUTH_PROVIDER_CONFIG: dict[str, dict[str, str]] = {
 
 CONNECTOR_MARKET_OBSERVABILITY_VENUES: dict[str, str] = {
     "binance": "binance-public",
-    "bingx": "paper-bingx",
+    "bingx": "bingx-public",
     "bitget": "paper-bitget",
     "bybit": "bybit-public",
     "coinbase": "coinbase-public",
@@ -233,6 +603,14 @@ EXCHANGE_CAPABILITIES: dict[str, dict[str, Any]] = {
         "l3": False,
         "execution_venue": "paper-bitget",
         "api_key_requires_passphrase": True,
+    },
+    "mt5": {
+        "data": False,
+        "execution": True,
+        "l2": False,
+        "l3": False,
+        "execution_venue": "mt5",
+        "api_key_requires_passphrase": False,
     },
 }
 
@@ -387,6 +765,16 @@ def _apply_reality_gap_profile_to_candidate(candidate: dict[str, Any], profile_r
     }
     adjusted["reality_gap_profile_key"] = summary["profile_key"]
     return adjusted, summary
+
+
+def _normalize_trade_side(value: Any, default: str = "buy") -> str:
+    candidate = value.value if isinstance(value, Enum) else value
+    normalized = str(candidate or "").strip().lower()
+    if "." in normalized:
+        normalized = normalized.rsplit(".", 1)[-1]
+    if normalized in {"buy", "sell"}:
+        return normalized
+    return default
 
 
 def _apply_reality_gap_profiles_to_execution(payload: dict[str, Any], routing: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
@@ -1417,7 +1805,7 @@ def _derive_memory_v2_liquidity_state(depth_imbalance: float, spread_bps: float,
 async def _build_intent_memory_v2_query_payload(intent_payload: dict, risk_decision: RiskDecision, live_hint: dict[str, Any] | None = None) -> dict[str, Any]:
     explainability = intent_payload.get("explainability") if isinstance(intent_payload.get("explainability"), dict) else {}
     risk_snapshot = risk_decision.risk_snapshot if isinstance(getattr(risk_decision, "risk_snapshot", None), dict) else {}
-    side = str(intent_payload.get("side") or "buy").strip().lower()
+    side = _normalize_trade_side(intent_payload.get("side"))
     symbol = str(intent_payload.get("instrument") or "").strip().upper()
     requested_notional_usd = _to_float(intent_payload.get("target_notional_usd"), 0.0)
     provider = str((live_hint or {}).get("provider") or intent_payload.get("venue") or "").strip().lower()
@@ -1943,6 +2331,49 @@ def _extract_pre_trade_memory_gate(value: Any) -> dict[str, Any] | None:
         if isinstance(candidate, dict):
             return {key: _json_safe_value(item) for key, item in candidate.items()}
     return None
+
+
+def _extract_execution_context_snapshot(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+
+    payload = value.get("payload") if isinstance(value.get("payload"), dict) else {}
+    metadata = value.get("metadata") if isinstance(value.get("metadata"), dict) else {}
+    raw_payload = value.get("raw_payload") if isinstance(value.get("raw_payload"), dict) else {}
+    raw_metadata = raw_payload.get("metadata") if isinstance(raw_payload.get("metadata"), dict) else {}
+    router_execution = value.get("router_execution") if isinstance(value.get("router_execution"), dict) else {}
+    router_route = router_execution.get("route") if isinstance(router_execution.get("route"), dict) else {}
+
+    candidates: list[Any] = [
+        value.get("execution_context"),
+        metadata.get("execution_context"),
+        raw_metadata.get("execution_context"),
+        payload.get("execution_context"),
+        (payload.get("metadata") or {}).get("execution_context") if isinstance(payload.get("metadata"), dict) else None,
+        router_route.get("execution_context"),
+        router_execution.get("execution_context"),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            return {key: _json_safe_value(item) for key, item in candidate.items()}
+    return None
+
+
+def _extract_no_trade_guard(value: Any) -> dict[str, Any] | None:
+    execution_context = _extract_execution_context_snapshot(value)
+    if not isinstance(execution_context, dict):
+        return None
+    policy = execution_context.get("policy") if isinstance(execution_context.get("policy"), dict) else {}
+    raw_no_trade_reasons = execution_context.get("no_trade_reasons") if isinstance(execution_context.get("no_trade_reasons"), list) else []
+    raw_dominant_reasons = execution_context.get("dominant_reasons") if isinstance(execution_context.get("dominant_reasons"), list) else []
+    return {
+        "no_trade": _bool_from_any(execution_context.get("no_trade"), False),
+        "no_trade_dominance": _bool_from_any(execution_context.get("no_trade_dominance"), _bool_from_any(policy.get("no_trade_dominance"), False)),
+        "no_trade_state": str(execution_context.get("no_trade_state") or policy.get("no_trade_state") or "eligible").strip().lower() or "eligible",
+        "no_trade_reasons": [str(reason) for reason in raw_no_trade_reasons if str(reason)],
+        "dominant_reasons": [str(reason) for reason in raw_dominant_reasons if str(reason)],
+        "confidence": _to_float(execution_context.get("confidence"), 0.0),
+    }
 
 
 def _extract_kairos_harness(value: Any) -> dict[str, Any] | None:
@@ -2677,6 +3108,7 @@ def _normalize_connector_provider(value: Any) -> str:
     raw = str(value or "").strip().lower()
     aliases = {
         "binance-public": "binance",
+        "bingx-public": "bingx",
         "coinbase-public": "coinbase",
         "okx-public": "okx",
         "paper-bingx": "bingx",
@@ -2967,7 +3399,7 @@ def _build_connector_incident_summary(rows: list[dict]) -> dict[str, dict[str, A
     return grouped
 
 
-def _connector_market_observability(provider: str) -> dict[str, Any]:
+def _connector_market_observability(provider: str, instrument: str = "") -> dict[str, Any]:
     provider_norm = _normalize_connector_provider(provider)
     venue_candidates = [
         CONNECTOR_MARKET_OBSERVABILITY_VENUES.get(provider_norm) or "",
@@ -2983,6 +3415,13 @@ def _connector_market_observability(provider: str) -> dict[str, Any]:
             continue
         seen_venues.add(venue_norm)
         normalized_venues.append(venue_norm)
+
+    instrument_norm = _normalize_live_symbol(instrument)
+
+    telemetry_market = _connector_market_observability_from_telemetry(normalized_venues, instrument_norm)
+    if telemetry_market:
+        return telemetry_market
+
     if not normalized_venues:
         return {
             "venue": None,
@@ -3210,6 +3649,109 @@ def _connector_market_observability(provider: str) -> dict[str, Any]:
     }
 
 
+def _connector_market_observability_from_telemetry(venue_candidates: list[str], instrument: str = "") -> dict[str, Any] | None:
+    normalized_venues = [str(item or "").strip().lower() for item in venue_candidates if str(item or "").strip()]
+    if not normalized_venues:
+        return None
+
+    try:
+        with httpx.Client(timeout=3.0) as client:
+            response = client.get(f"{MARKET_DATA_URL}/v1/market/venues/telemetry")
+            if response.status_code >= 400:
+                return None
+            payload = response.json()
+    except Exception:
+        return None
+
+    venues = payload.get("venues") if isinstance(payload, dict) else None
+    if not isinstance(venues, list):
+        return None
+
+    venue_row = next(
+        (
+            item
+            for candidate in normalized_venues
+            for item in venues
+            if isinstance(item, dict) and str(item.get("venue") or "").strip().lower() == candidate
+        ),
+        None,
+    )
+    if not isinstance(venue_row, dict):
+        return None
+
+    instruments = [item for item in (venue_row.get("instruments") if isinstance(venue_row.get("instruments"), list) else []) if isinstance(item, dict)]
+    selected_instrument = None
+    if instrument:
+        selected_instrument = next(
+            (
+                item
+                for item in instruments
+                if _normalize_live_symbol(item.get("instrument")) == instrument
+            ),
+            None,
+        )
+    if selected_instrument is None and instruments:
+        selected_instrument = min(
+            instruments,
+            key=lambda item: (
+                item.get("depth_freshness_ms") is None,
+                _to_float(item.get("depth_freshness_ms"), 10**12),
+                -_to_float(item.get("depth_levels"), 0.0),
+                -_to_float(item.get("depth_updates"), 0.0),
+            ),
+        )
+    if not isinstance(selected_instrument, dict):
+        return None
+
+    depth_freshness_ms = _to_float(selected_instrument.get("depth_freshness_ms"), None)
+    quote_freshness_ms = _to_float(selected_instrument.get("quote_freshness_ms"), None)
+    trade_freshness_ms = _to_float(selected_instrument.get("trade_freshness_ms"), None)
+    depth_levels = int(_to_float(selected_instrument.get("depth_levels"), 0.0) or 0)
+    depth_updates = int(_to_float(selected_instrument.get("depth_updates"), 0.0) or 0)
+    quote_updates = int(_to_float(selected_instrument.get("quote_updates"), 0.0) or 0)
+    trade_updates = int(_to_float(selected_instrument.get("trade_updates"), 0.0) or 0)
+
+    stream_freshness = [value for value in [depth_freshness_ms, quote_freshness_ms, trade_freshness_ms] if value is not None]
+    ws_latency_ms = int(min(stream_freshness)) if stream_freshness else None
+    penalty = 0.0
+    if depth_freshness_ms is not None:
+        penalty += min(45.0, depth_freshness_ms / 2500.0)
+    else:
+        penalty += 30.0
+    if quote_updates > 0 and quote_freshness_ms is not None and quote_freshness_ms > 120_000:
+        penalty += min(10.0, ((quote_freshness_ms - 120_000) / 60_000.0) * 2.0)
+    if trade_updates > 0 and trade_freshness_ms is not None and trade_freshness_ms > 300_000:
+        penalty += min(8.0, ((trade_freshness_ms - 300_000) / 60_000.0) * 1.5)
+    if depth_updates <= 0:
+        penalty += 18.0
+    if depth_levels <= 0:
+        penalty += 10.0
+
+    feed_quality_score = round(max(0.0, 100.0 - penalty), 2)
+    if feed_quality_score >= 92:
+        feed_quality_status = "clean"
+    elif feed_quality_score >= 75:
+        feed_quality_status = "watch"
+    elif feed_quality_score >= 55:
+        feed_quality_status = "degraded"
+    else:
+        feed_quality_status = "critical"
+
+    messages_per_sec = round((depth_updates + trade_updates) / 3600.0, 3) if depth_updates or trade_updates else 0.0
+    return {
+        "venue": str(venue_row.get("venue") or normalized_venues[0]).strip().lower(),
+        "instrument": str(selected_instrument.get("instrument") or "").strip() or None,
+        "ws_latency_ms": ws_latency_ms,
+        "depth_levels": depth_levels,
+        "messages_per_sec": messages_per_sec,
+        "gap_count": None,
+        "desync_ms": None,
+        "feed_quality_score": feed_quality_score,
+        "feed_quality_status": feed_quality_status,
+        "spread_bps": _to_float(selected_instrument.get("spread_bps"), None),
+    }
+
+
 def _connector_market_quote_fallback(venue_candidates: list[str]) -> dict[str, Any] | None:
     if not venue_candidates:
         return None
@@ -3317,12 +3859,14 @@ def _connector_capital_rollup(provider: str, visible_client_ids: list[str] | Non
             "gross_exposure_usd": 0.0,
             "net_exposure_usd": 0.0,
             "margin_available_usd": 0.0,
+            "exploitable_capital_usd": 0.0,
             "solvency_ratio_pct": 100.0,
             "concentration_pct": 0.0,
             "target_cap_usd": 0.0,
             "drift_vs_fund_manager_usd": 0.0,
             "net_external_cashflow_usd": 0.0,
             "funding_fee_usd": 0.0,
+            "net_after_costs_usd": 0.0,
             "internal_transfer_usd": 0.0,
             "pockets": [],
             "accounts": [],
@@ -3336,9 +3880,11 @@ def _connector_capital_rollup(provider: str, visible_client_ids: list[str] | Non
     total_gross_exposure_usd = 0.0
     total_net_exposure_usd = 0.0
     total_margin_available_usd = 0.0
+    total_exploitable_capital_usd = 0.0
     total_target_cap_usd = 0.0
     total_net_external_cashflow_usd = 0.0
     total_funding_fee_usd = 0.0
+    total_net_after_costs_usd = 0.0
     total_internal_transfer_usd = 0.0
     account_rows: list[dict[str, Any]] = []
 
@@ -3346,9 +3892,13 @@ def _connector_capital_rollup(provider: str, visible_client_ids: list[str] | Non
         account_id = str(account.get("account_id") or "").strip()
         balances = _latest_account_balances(account_id)
         positions = _latest_account_positions(account_id)
-        summary = _cash_vs_equivalent_summary(balances)
-        pockets = _build_pocket_capital_views(balances)
-        ledger_summary = (_account_capital_ledger(account_id, limit=60).get("summary") if account_id else {}) or {}
+        capital_snapshot = _account_exploitable_capital_snapshot(account_id)
+        summary = {
+            "total_equivalent_usd": _to_float(capital_snapshot.get("actual_equivalent_usd"), 0.0),
+            "total_raw_cash_usd": _to_float(capital_snapshot.get("actual_raw_cash_usd"), 0.0),
+        }
+        pockets = capital_snapshot.get("pockets") if isinstance(capital_snapshot.get("pockets"), list) else _build_pocket_capital_views(balances)
+        ledger_summary = capital_snapshot.get("ledger_summary") if isinstance(capital_snapshot.get("ledger_summary"), dict) else {}
         gross_exposure = 0.0
         net_exposure = 0.0
         account_symbol_exposure: dict[str, float] = {}
@@ -3364,13 +3914,8 @@ def _connector_capital_rollup(provider: str, visible_client_ids: list[str] | Non
             account_symbol_exposure[symbol] = _to_float(account_symbol_exposure.get(symbol), 0.0) + notional
             symbol_exposure[symbol] = _to_float(symbol_exposure.get(symbol), 0.0) + notional
 
-        margin_available_usd = sum(
-            _to_float(pocket.get("raw_cash_usd"), 0.0)
-            for pocket in pockets
-            if str(pocket.get("pocket") or "").strip().lower() in {"futures", "fund"}
-        )
-        if margin_available_usd <= 0:
-            margin_available_usd = _to_float(summary.get("total_raw_cash_usd"), 0.0)
+        margin_available_usd = _to_float(capital_snapshot.get("margin_available_usd"), 0.0)
+        exploitable_capital_usd = _to_float(capital_snapshot.get("exploitable_capital_usd"), 0.0)
 
         target_cap_row = fetch_one(
             "SELECT COALESCE(SUM(allocation_cap_usd), 0) AS target_cap_usd FROM portfolio_accounts WHERE account_id = %s AND status = 'active'",
@@ -3395,9 +3940,11 @@ def _connector_capital_rollup(provider: str, visible_client_ids: list[str] | Non
         total_gross_exposure_usd += gross_exposure
         total_net_exposure_usd += net_exposure
         total_margin_available_usd += margin_available_usd
+        total_exploitable_capital_usd += exploitable_capital_usd
         total_target_cap_usd += target_cap_usd
         total_net_external_cashflow_usd += _to_float(ledger_summary.get("net_external_cashflow_usd"), 0.0)
         total_funding_fee_usd += _to_float(ledger_summary.get("funding_fee_usd"), 0.0)
+        total_net_after_costs_usd += _to_float(capital_snapshot.get("net_after_costs_usd"), 0.0)
         total_internal_transfer_usd += _to_float(ledger_summary.get("internal_transfer_usd"), 0.0)
 
         account_rows.append(
@@ -3409,6 +3956,8 @@ def _connector_capital_rollup(provider: str, visible_client_ids: list[str] | Non
                 "raw_cash_usd": round(_to_float(summary.get("total_raw_cash_usd"), 0.0), 8),
                 "gross_exposure_usd": round(gross_exposure, 8),
                 "margin_available_usd": round(margin_available_usd, 8),
+                "exploitable_capital_usd": round(exploitable_capital_usd, 8),
+                "capital_basis": str(capital_snapshot.get("capital_basis") or "raw_cash_fallback"),
                 "target_cap_usd": round(target_cap_usd, 8),
                 "largest_symbol": max(account_symbol_exposure, key=account_symbol_exposure.get) if account_symbol_exposure else None,
             }
@@ -3429,12 +3978,14 @@ def _connector_capital_rollup(provider: str, visible_client_ids: list[str] | Non
         "gross_exposure_usd": round(total_gross_exposure_usd, 8),
         "net_exposure_usd": round(total_net_exposure_usd, 8),
         "margin_available_usd": round(total_margin_available_usd, 8),
+        "exploitable_capital_usd": round(total_exploitable_capital_usd, 8),
         "solvency_ratio_pct": round(solvency_ratio_pct, 4),
         "concentration_pct": round(concentration_pct, 4),
         "target_cap_usd": round(total_target_cap_usd, 8),
         "drift_vs_fund_manager_usd": round(total_equivalent_usd - total_target_cap_usd, 8),
         "net_external_cashflow_usd": round(total_net_external_cashflow_usd, 8),
         "funding_fee_usd": round(total_funding_fee_usd, 8),
+        "net_after_costs_usd": round(total_net_after_costs_usd, 8),
         "internal_transfer_usd": round(total_internal_transfer_usd, 8),
         "pockets": sorted(pocket_breakdown.values(), key=lambda item: _to_float(item.get("equivalent_usd"), 0.0), reverse=True),
         "accounts": account_rows,
@@ -3733,7 +4284,7 @@ def _connector_latency_by_group() -> dict[str, float | None]:
     return latency_by_group
 
 
-def _connector_live_degradation_snapshot(provider: str, visible_client_ids: list[str] | None = None) -> dict[str, Any]:
+def _connector_live_degradation_snapshot(provider: str, visible_client_ids: list[str] | None = None, instrument: str = "") -> dict[str, Any]:
     provider_norm = _normalize_connector_provider(provider)
     if not provider_norm:
         return {}
@@ -3755,7 +4306,7 @@ def _connector_live_degradation_snapshot(provider: str, visible_client_ids: list
         )
     ).get(provider_norm, {})
     outcomes = _connector_outcome_analytics().get(provider_norm, {})
-    market = _connector_market_observability(provider_norm)
+    market = _connector_market_observability(provider_norm, instrument=instrument)
     capital = _connector_capital_rollup(provider_norm, visible_client_ids)
     health_group = str(connector.get("health_group") or "market")
     healthy = bool(_connector_health_by_group().get(health_group, False))
@@ -4140,6 +4691,57 @@ def _cash_vs_equivalent_summary(balances: list[dict]) -> dict[str, Any]:
     }
 
 
+def _account_exploitable_capital_snapshot(account_id: str) -> dict[str, Any]:
+    account_key = _normalize_account_id(account_id)
+    if not account_key:
+        return {
+            "account_id": "",
+            "actual_equivalent_usd": 0.0,
+            "actual_raw_cash_usd": 0.0,
+            "inventory_usd": 0.0,
+            "margin_available_usd": 0.0,
+            "exploitable_capital_usd": 0.0,
+            "capital_basis": "raw_cash_fallback",
+            "net_after_costs_usd": 0.0,
+            "pockets": [],
+            "ledger_summary": {},
+        }
+
+    balances = _latest_account_balances(account_key)
+    cash_vs_equivalent = _cash_vs_equivalent_summary(balances)
+    pockets = cash_vs_equivalent.get("pockets") if isinstance(cash_vs_equivalent.get("pockets"), list) else []
+    total_equivalent_usd = _to_float(cash_vs_equivalent.get("total_equivalent_usd"), 0.0)
+    total_raw_cash_usd = _to_float(cash_vs_equivalent.get("total_raw_cash_usd"), 0.0)
+    margin_available_usd = sum(
+        _to_float(pocket.get("raw_cash_usd"), 0.0)
+        for pocket in pockets
+        if isinstance(pocket, dict) and str(pocket.get("pocket") or "").strip().lower() in {"futures", "fund"}
+    )
+    capital_basis = "margin_available"
+    if margin_available_usd <= 0:
+        margin_available_usd = total_raw_cash_usd
+        capital_basis = "raw_cash_fallback"
+    exploitable_capital_usd = max(0.0, min(total_equivalent_usd, margin_available_usd if margin_available_usd > 0 else total_raw_cash_usd))
+    ledger_summary = (_account_capital_ledger(account_key, limit=60).get("summary") if account_key else {}) or {}
+    net_after_costs_usd = (
+        _to_float(ledger_summary.get("realized_pnl_usd"), 0.0)
+        + _to_float(ledger_summary.get("funding_fee_usd"), 0.0)
+        + _to_float(ledger_summary.get("trading_fee_usd"), 0.0)
+    )
+    return {
+        "account_id": account_key,
+        "actual_equivalent_usd": round(total_equivalent_usd, 8),
+        "actual_raw_cash_usd": round(total_raw_cash_usd, 8),
+        "inventory_usd": round(_to_float(cash_vs_equivalent.get("inventory_usd"), 0.0), 8),
+        "margin_available_usd": round(margin_available_usd, 8),
+        "exploitable_capital_usd": round(exploitable_capital_usd, 8),
+        "capital_basis": capital_basis,
+        "net_after_costs_usd": round(net_after_costs_usd, 8),
+        "pockets": pockets,
+        "ledger_summary": ledger_summary,
+    }
+
+
 def _position_metric_value(position: dict | None, *keys: str) -> float:
     if not isinstance(position, dict):
         return 0.0
@@ -4441,17 +5043,47 @@ def _account_capital_ledger(account_id: str, limit: int = 40) -> dict[str, Any]:
             FROM capital_flow_events
             WHERE account_id = %s
             ORDER BY occurred_at DESC, created_at DESC
-            LIMIT %s
             """,
-            (account_id, max(1, min(limit, 250))),
+            (account_id,),
         )
     )
+
+    rows = _filter_capital_ledger_rows(rows)
+    summary = _summarize_capital_ledger_rows(rows)
+    return {
+        "rows": rows[: max(1, min(limit, 250))],
+        "summary": {key: round(value, 8) if isinstance(value, float) else value for key, value in summary.items()},
+    }
+
+
+def _filter_capital_ledger_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    providers_with_native_history = {
+        provider
+        for provider, source in VENUE_NATIVE_HISTORY_SOURCES.items()
+        if any(str(row.get("source") or "") == source for row in rows if isinstance(row, dict))
+    }
+    if not providers_with_native_history:
+        return rows
+    filtered: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        source = str(row.get("source") or "")
+        event_type = str(row.get("event_type") or "")
+        if any(source == f"{provider}-sync-ledger" and event_type in VENUE_NATIVE_HISTORY_EVENT_TYPES for provider in providers_with_native_history):
+            continue
+        filtered.append(row)
+    return filtered
+
+
+def _summarize_capital_ledger_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     summary = {
         "event_count": len(rows),
         "net_external_cashflow_usd": 0.0,
         "internal_transfer_usd": 0.0,
         "funding_fee_usd": 0.0,
         "realized_pnl_usd": 0.0,
+        "trading_fee_usd": 0.0,
         "reconciliation_usd": 0.0,
         "latest_event_at": rows[0].get("occurred_at") if rows else None,
     }
@@ -4466,12 +5098,11 @@ def _account_capital_ledger(account_id: str, limit: int = 40) -> dict[str, Any]:
             summary["funding_fee_usd"] += amount_usd
         elif event_type == "realized_pnl":
             summary["realized_pnl_usd"] += amount_usd
+        elif event_type == "trading_fee":
+            summary["trading_fee_usd"] += amount_usd
         elif event_type == "reconciliation_delta":
             summary["reconciliation_usd"] += amount_usd
-    return {
-        "rows": rows,
-        "summary": {key: round(value, 8) if isinstance(value, float) else value for key, value in summary.items()},
-    }
+    return summary
 
 
 def _postprocess_connector_sync(
@@ -5037,6 +5668,513 @@ def _normalize_bingx_positions(raw_items: list[dict], account_id: str, as_of: st
     return positions
 
 
+def _bingx_income_event_transfer_pockets(info: str) -> tuple[str | None, str | None]:
+    text = str(info or "").strip().lower()
+    if not text or " to " not in text:
+        return None, None
+
+    def resolve(fragment: str) -> str | None:
+        if "fund" in fragment:
+            return "fund"
+        if "perpetual" in fragment or "futures" in fragment or "usdt-m" in fragment:
+            return "futures"
+        if "spot" in fragment:
+            return "spot"
+        return None
+
+    left, right = text.split(" to ", 1)
+    return resolve(left), resolve(right)
+
+
+def _canonical_venue_history_event(
+    *,
+    source: str,
+    external_event_id: str,
+    occurred_at: str,
+    event_type: str,
+    amount_native: float,
+    amount_usd: float,
+    asset_symbol: str | None = None,
+    pocket: str | None = None,
+    counterparty: str | None = None,
+    description: str | None = None,
+    flow_direction: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized_direction = flow_direction
+    if normalized_direction is None:
+        normalized_direction = "neutral" if event_type == "internal_transfer" else ("credit" if amount_usd >= 0 else "debit")
+    return {
+        "source": source,
+        "external_event_id": external_event_id,
+        "occurred_at": occurred_at,
+        "event_type": event_type,
+        "flow_direction": normalized_direction,
+        "asset_symbol": str(asset_symbol or "").strip().upper() or None,
+        "amount_native": amount_native,
+        "amount_usd": amount_usd,
+        "raw_cash_usd": amount_usd,
+        "equivalent_usd": amount_usd,
+        "pocket": pocket,
+        "counterparty": counterparty,
+        "description": description,
+        "payload": payload or {},
+    }
+
+
+def _history_amount_usd(amount_native: float, settlement_asset: str | None, asset_prices: dict[str, float] | None = None) -> float:
+    asset = str(settlement_asset or "").strip().upper()
+    if not asset or _is_raw_cash_asset(asset):
+        return amount_native
+    price = _to_float((asset_prices or {}).get(asset), 0.0)
+    return amount_native * price if price > 0 else 0.0
+
+
+def _history_backfill_start(
+    account_id: str,
+    source: str,
+    as_of_dt: datetime,
+    default_days: int,
+    incremental_days: int,
+) -> datetime:
+    _, last_import_at = _capital_flow_source_bounds(account_id, source)
+    if last_import_at is not None:
+        return max(last_import_at - timedelta(days=1), as_of_dt - timedelta(days=incremental_days))
+    return as_of_dt - timedelta(days=default_days)
+
+
+def _binance_income_event_transfer_pockets(info: str) -> tuple[str | None, str | None]:
+    text = str(info or "").strip().lower()
+    if not text:
+        return None, None
+    if "spot" in text and "futures" in text:
+        if text.index("spot") < text.index("futures"):
+            return "spot", "futures"
+        return "futures", "spot"
+    if "spot" in text:
+        return "spot", None
+    if "futures" in text or "umfutures" in text or "coinm" in text:
+        return "futures", None
+    return None, None
+
+
+def _bingx_normalize_income_history_events(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        income_type = str(item.get("incomeType") or "").strip().upper()
+        amount_usd = _to_float(item.get("income"), 0.0)
+        event_time_ms = int(_to_float(item.get("time"), 0.0))
+        if event_time_ms <= 0:
+            continue
+        occurred_at = datetime.fromtimestamp(event_time_ms / 1000.0, tz=timezone.utc).isoformat()
+        symbol = str(item.get("symbol") or item.get("asset") or "").strip().upper() or None
+        info = str(item.get("info") or "").strip()
+        external_event_id = str(item.get("tranId") or item.get("tradeId") or f"{income_type}:{event_time_ms}:{amount_usd:.8f}")
+        if income_type == "FUNDING_FEE":
+            events.append(
+                _canonical_venue_history_event(
+                    source=BINGX_INCOME_HISTORY_SOURCE,
+                    external_event_id=external_event_id,
+                    occurred_at=occurred_at,
+                    event_type="funding_fee",
+                    amount_native=amount_usd,
+                    amount_usd=amount_usd,
+                    asset_symbol=symbol,
+                    pocket="futures",
+                    description=info or "BingX funding fee",
+                    payload=item,
+                )
+            )
+        elif income_type == "REALIZED_PNL":
+            events.append(
+                _canonical_venue_history_event(
+                    source=BINGX_INCOME_HISTORY_SOURCE,
+                    external_event_id=external_event_id,
+                    occurred_at=occurred_at,
+                    event_type="realized_pnl",
+                    amount_native=amount_usd,
+                    amount_usd=amount_usd,
+                    asset_symbol=symbol,
+                    pocket="futures",
+                    description=info or "BingX realized PnL",
+                    payload=item,
+                )
+            )
+        elif income_type == "TRADING_FEE":
+            events.append(
+                _canonical_venue_history_event(
+                    source=BINGX_INCOME_HISTORY_SOURCE,
+                    external_event_id=external_event_id,
+                    occurred_at=occurred_at,
+                    event_type="trading_fee",
+                    amount_native=amount_usd,
+                    amount_usd=amount_usd,
+                    asset_symbol=symbol,
+                    pocket="futures",
+                    description=info or "BingX trading fee",
+                    payload=item,
+                )
+            )
+        elif income_type == "TRANSFER":
+            from_pocket, to_pocket = _bingx_income_event_transfer_pockets(info)
+            events.append(
+                _canonical_venue_history_event(
+                    source=BINGX_INCOME_HISTORY_SOURCE,
+                    external_event_id=external_event_id,
+                    occurred_at=occurred_at,
+                    event_type="internal_transfer",
+                    amount_native=abs(amount_usd),
+                    amount_usd=abs(amount_usd),
+                    asset_symbol=symbol,
+                    pocket=from_pocket,
+                    counterparty=to_pocket,
+                    description=info or "BingX internal transfer",
+                    flow_direction="neutral",
+                    payload=item,
+                )
+            )
+    return events
+
+
+def _normalize_binance_income_history_events(
+    items: list[dict[str, Any]],
+    *,
+    market_type: str,
+    asset_prices: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        income_type = str(item.get("incomeType") or "").strip().upper()
+        amount_native = _to_float(item.get("income"), 0.0)
+        event_time_ms = int(_to_float(item.get("time"), 0.0))
+        if event_time_ms <= 0:
+            continue
+        occurred_at = datetime.fromtimestamp(event_time_ms / 1000.0, tz=timezone.utc).isoformat()
+        symbol = str(item.get("symbol") or item.get("asset") or "").strip().upper() or None
+        settlement_asset = str(item.get("asset") or "").strip().upper() or None
+        info = str(item.get("info") or "").strip()
+        trade_id = str(item.get("tradeId") or "").strip()
+        tran_id = str(item.get("tranId") or "").strip()
+        external_event_id = f"{market_type}:{income_type}:{tran_id or trade_id or event_time_ms}"
+        amount_usd = _history_amount_usd(amount_native, settlement_asset, asset_prices)
+        payload = {
+            **item,
+            "market_type": market_type,
+            "settlement_asset": settlement_asset,
+        }
+        if income_type == "FUNDING_FEE":
+            events.append(
+                _canonical_venue_history_event(
+                    source=BINANCE_INCOME_HISTORY_SOURCE,
+                    external_event_id=external_event_id,
+                    occurred_at=occurred_at,
+                    event_type="funding_fee",
+                    amount_native=amount_native,
+                    amount_usd=amount_usd,
+                    asset_symbol=symbol,
+                    pocket="futures",
+                    description=info or "Binance funding fee",
+                    payload=payload,
+                )
+            )
+        elif income_type == "REALIZED_PNL":
+            events.append(
+                _canonical_venue_history_event(
+                    source=BINANCE_INCOME_HISTORY_SOURCE,
+                    external_event_id=external_event_id,
+                    occurred_at=occurred_at,
+                    event_type="realized_pnl",
+                    amount_native=amount_native,
+                    amount_usd=amount_usd,
+                    asset_symbol=symbol,
+                    pocket="futures",
+                    description=info or "Binance realized PnL",
+                    payload=payload,
+                )
+            )
+        elif income_type == "COMMISSION":
+            events.append(
+                _canonical_venue_history_event(
+                    source=BINANCE_INCOME_HISTORY_SOURCE,
+                    external_event_id=external_event_id,
+                    occurred_at=occurred_at,
+                    event_type="trading_fee",
+                    amount_native=amount_native,
+                    amount_usd=amount_usd,
+                    asset_symbol=symbol,
+                    pocket="futures",
+                    description=info or "Binance trading fee",
+                    payload=payload,
+                )
+            )
+        elif income_type in {"TRANSFER", "INTERNAL_TRANSFER", "CROSS_COLLATERAL_TRANSFER", "STRATEGY_UMFUTURES_TRANSFER"}:
+            from_pocket, to_pocket = _binance_income_event_transfer_pockets(info)
+            events.append(
+                _canonical_venue_history_event(
+                    source=BINANCE_INCOME_HISTORY_SOURCE,
+                    external_event_id=external_event_id,
+                    occurred_at=occurred_at,
+                    event_type="internal_transfer",
+                    amount_native=abs(amount_native),
+                    amount_usd=abs(amount_usd),
+                    asset_symbol=symbol or settlement_asset,
+                    pocket=from_pocket,
+                    counterparty=to_pocket,
+                    description=info or "Binance internal transfer",
+                    flow_direction="neutral",
+                    payload=payload,
+                )
+            )
+        elif income_type in {"WELCOME_BONUS", "COMMISSION_REBATE", "API_REBATE", "REFERRAL_KICKBACK", "CONTEST_REWARD", "BFUSD_REWARD", "FEE_RETURN"}:
+            events.append(
+                _canonical_venue_history_event(
+                    source=BINANCE_INCOME_HISTORY_SOURCE,
+                    external_event_id=external_event_id,
+                    occurred_at=occurred_at,
+                    event_type="external_cash_in",
+                    amount_native=amount_native,
+                    amount_usd=amount_usd,
+                    asset_symbol=symbol or settlement_asset,
+                    description=info or "Binance reward or rebate",
+                    payload=payload,
+                )
+            )
+    return events
+
+
+def _okx_bill_transfer_pockets(entry: dict[str, Any]) -> tuple[str | None, str | None]:
+    text = " ".join(
+        str(entry.get(key) or "").strip().lower()
+        for key in ("type", "subType", "typeName", "subTypeName")
+        if str(entry.get(key) or "").strip()
+    )
+    if "trade" in text or "futures" in text or "swap" in text:
+        return None, "futures"
+    if "spot" in text or "funding" in text:
+        return None, "spot"
+    return None, None
+
+
+def _normalize_okx_bill_history_events(
+    items: list[dict[str, Any]],
+    *,
+    asset_prices: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        event_time_ms = int(_to_float(item.get("ts"), 0.0))
+        if event_time_ms <= 0:
+            continue
+        occurred_at = datetime.fromtimestamp(event_time_ms / 1000.0, tz=timezone.utc).isoformat()
+        bill_id = str(item.get("billId") or "").strip() or str(event_time_ms)
+        inst_id = str(item.get("instId") or item.get("instFamily") or item.get("ccy") or "").strip().upper() or None
+        settlement_asset = str(item.get("ccy") or "").strip().upper() or None
+        fee_native = _to_float(item.get("fee"), 0.0)
+        pnl_native = _to_float(item.get("pnl"), 0.0)
+        balance_change_native = _to_float(item.get("balChg"), 0.0)
+        type_code = str(item.get("type") or "").strip()
+        subtype_code = str(item.get("subType") or "").strip()
+        payload = {
+            **item,
+            "settlement_asset": settlement_asset,
+        }
+        if abs(fee_native) > 0:
+            events.append(
+                _canonical_venue_history_event(
+                    source=OKX_BILL_HISTORY_SOURCE,
+                    external_event_id=f"fee:{bill_id}",
+                    occurred_at=occurred_at,
+                    event_type="trading_fee",
+                    amount_native=fee_native,
+                    amount_usd=_history_amount_usd(fee_native, settlement_asset, asset_prices),
+                    asset_symbol=inst_id,
+                    pocket="futures",
+                    description="OKX trading fee",
+                    payload=payload,
+                )
+            )
+        if abs(pnl_native) > 0:
+            event_type = "funding_fee" if type_code == "8" or subtype_code == "173" else "realized_pnl"
+            description = "OKX funding fee" if event_type == "funding_fee" else "OKX realized PnL"
+            events.append(
+                _canonical_venue_history_event(
+                    source=OKX_BILL_HISTORY_SOURCE,
+                    external_event_id=f"{event_type}:{bill_id}",
+                    occurred_at=occurred_at,
+                    event_type=event_type,
+                    amount_native=pnl_native,
+                    amount_usd=_history_amount_usd(pnl_native, settlement_asset, asset_prices),
+                    asset_symbol=inst_id,
+                    pocket="futures",
+                    description=description,
+                    payload=payload,
+                )
+            )
+        if abs(fee_native) <= 0 and abs(pnl_native) <= 0 and type_code == "1" and abs(balance_change_native) > 0:
+            from_pocket, to_pocket = _okx_bill_transfer_pockets(item)
+            events.append(
+                _canonical_venue_history_event(
+                    source=OKX_BILL_HISTORY_SOURCE,
+                    external_event_id=f"transfer:{bill_id}",
+                    occurred_at=occurred_at,
+                    event_type="internal_transfer",
+                    amount_native=abs(balance_change_native),
+                    amount_usd=abs(_history_amount_usd(balance_change_native, settlement_asset, asset_prices)),
+                    asset_symbol=inst_id or settlement_asset,
+                    pocket=from_pocket,
+                    counterparty=to_pocket,
+                    description="OKX internal transfer",
+                    flow_direction="neutral",
+                    payload=payload,
+                )
+            )
+    return events
+
+
+def _capital_flow_source_bounds(account_id: str, source: str) -> tuple[datetime | None, datetime | None]:
+    row = fetch_one(
+        "SELECT MIN(occurred_at) AS first_at, MAX(occurred_at) AS last_at FROM capital_flow_events WHERE account_id = %s AND source = %s",
+        (account_id, source),
+    ) or {}
+
+    def coerce(value: object) -> datetime | None:
+        if isinstance(value, datetime):
+            return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        return _parse_iso_utc(str(value or ""))
+
+    return coerce(row.get("first_at")), coerce(row.get("last_at"))
+
+
+async def _bingx_fetch_income_history_events(account_id: str, secret_payload: dict, as_of: str) -> list[dict[str, Any]]:
+    as_of_dt = _parse_iso_utc(as_of) or _now_utc()
+    start_at = _history_backfill_start(
+        account_id,
+        BINGX_INCOME_HISTORY_SOURCE,
+        as_of_dt,
+        BINGX_INCOME_HISTORY_BACKFILL_DAYS,
+        incremental_days=7,
+    )
+
+    window_start = start_at
+    collected: list[dict[str, Any]] = []
+    while window_start < as_of_dt:
+        window_end = min(window_start + timedelta(days=7), as_of_dt)
+        payload = await _bingx_signed_get(
+            secret_payload,
+            "/openApi/swap/v2/user/income",
+            {
+                "recvWindow": 60000,
+                "limit": 100,
+                "startTime": int(window_start.timestamp() * 1000),
+                "endTime": int(window_end.timestamp() * 1000),
+            },
+        )
+        if isinstance(payload, list):
+            collected.extend(item for item in payload if isinstance(item, dict))
+        window_start = window_end
+    return _bingx_normalize_income_history_events(collected)
+
+
+async def _binance_fetch_income_history_events(account_id: str, secret_payload: dict, as_of: str) -> list[dict[str, Any]]:
+    as_of_dt = _parse_iso_utc(as_of) or _now_utc()
+    start_at = _history_backfill_start(
+        account_id,
+        BINANCE_INCOME_HISTORY_SOURCE,
+        as_of_dt,
+        BINANCE_INCOME_HISTORY_BACKFILL_DAYS,
+        incremental_days=30,
+    )
+    collected: list[dict[str, Any]] = []
+    market_specs = [
+        ("usdm", "/fapi/v1/income", BINANCE_FUTURES_API_BASE_URL, "Binance Futures"),
+        ("coinm", "/dapi/v1/income", BINANCE_COINM_API_BASE_URL, "Binance COIN-M Futures"),
+    ]
+    for market_type, path, base_url, venue_label in market_specs:
+        window_start = start_at
+        while window_start < as_of_dt:
+            window_end = min(window_start + timedelta(days=7), as_of_dt)
+            page = 1
+            while True:
+                payload = await _binance_signed_get(
+                    secret_payload,
+                    path,
+                    {
+                        "startTime": int(window_start.timestamp() * 1000),
+                        "endTime": int(window_end.timestamp() * 1000),
+                        "limit": 1000,
+                        "page": page,
+                    },
+                    base_url=base_url,
+                    venue_label=venue_label,
+                )
+                batch = payload if isinstance(payload, list) else []
+                if not batch:
+                    break
+                collected.extend({**item, "_market_type": market_type} for item in batch if isinstance(item, dict))
+                if len(batch) < 1000:
+                    break
+                page += 1
+            window_start = window_end
+    settlement_assets = sorted(
+        {
+            str(item.get("asset") or "").strip().upper()
+            for item in collected
+            if isinstance(item, dict) and str(item.get("asset") or "").strip()
+        }
+    )
+    asset_prices, _ = await _binance_fetch_spot_market_stats(settlement_assets)
+    events: list[dict[str, Any]] = []
+    for market_type in ("usdm", "coinm"):
+        market_rows = [item for item in collected if str(item.get("_market_type") or "") == market_type]
+        events.extend(_normalize_binance_income_history_events(market_rows, market_type=market_type, asset_prices=asset_prices))
+    return events
+
+
+async def _okx_fetch_bill_history_events(account_id: str, secret_payload: dict, as_of: str) -> list[dict[str, Any]]:
+    as_of_dt = _parse_iso_utc(as_of) or _now_utc()
+    start_at = _history_backfill_start(
+        account_id,
+        OKX_BILL_HISTORY_SOURCE,
+        as_of_dt,
+        OKX_BILL_HISTORY_BACKFILL_DAYS,
+        incremental_days=30,
+    )
+    recent_payload = await _okx_signed_get(secret_payload, "/api/v5/account/bills", {"limit": 100})
+    archive_payload = await _okx_signed_get(secret_payload, "/api/v5/account/bills-archive", {"limit": 100})
+    rows = [item for item in (recent_payload if isinstance(recent_payload, list) else []) if isinstance(item, dict)]
+    rows.extend(item for item in (archive_payload if isinstance(archive_payload, list) else []) if isinstance(item, dict))
+    filtered_rows: list[dict[str, Any]] = []
+    seen_bill_ids: set[str] = set()
+    for item in rows:
+        bill_id = str(item.get("billId") or "").strip()
+        if bill_id and bill_id in seen_bill_ids:
+            continue
+        if bill_id:
+            seen_bill_ids.add(bill_id)
+        event_time_ms = _to_float(item.get("ts"), 0.0)
+        if event_time_ms <= 0:
+            continue
+        event_time = datetime.fromtimestamp(event_time_ms / 1000.0, tz=timezone.utc)
+        if event_time < start_at or event_time > as_of_dt:
+            continue
+        filtered_rows.append(item)
+    settlement_assets = sorted(
+        {
+            str(item.get("ccy") or "").strip().upper()
+            for item in filtered_rows
+            if str(item.get("ccy") or "").strip()
+        }
+    )
+    asset_prices, _ = await _okx_fetch_spot_market_stats(settlement_assets)
+    return _normalize_okx_bill_history_events(filtered_rows, asset_prices=asset_prices)
+
+
 def _unwrap_bingx_response(path: str, body: object) -> object:
     if not isinstance(body, (dict, list)):
         raise RuntimeError(f"BingX {path} returned an invalid payload")
@@ -5197,6 +6335,10 @@ def _format_decimal(value: float, digits: int = 8) -> str:
     return rendered or "0"
 
 
+def _json_number(value: float, digits: int = 8) -> float:
+    return float(_format_decimal(value, digits))
+
+
 def _http_error_detail(response: httpx.Response) -> object:
     content_type = str(response.headers.get("content-type") or "").lower()
     if "application/json" in content_type:
@@ -5229,6 +6371,279 @@ def _flatten_downstream_error(status: str, detail: object) -> dict[str, Any]:
         return payload
     payload["error"] = str(resolved)
     return payload
+
+
+def _attach_live_execution_constraints(detail: object, constraints: dict[str, Any]) -> object:
+    if not constraints:
+        return detail
+    if isinstance(detail, dict):
+        enriched = dict(detail)
+        nested = enriched.get("detail")
+        if isinstance(nested, dict):
+            nested_enriched = dict(nested)
+            nested_enriched.setdefault("live_execution_constraints", constraints)
+            enriched["detail"] = nested_enriched
+            return enriched
+        enriched.setdefault("live_execution_constraints", constraints)
+        return enriched
+    return {
+        "detail": detail,
+        "live_execution_constraints": constraints,
+    }
+
+
+def _normalize_live_execution_constraints(constraints: dict[str, Any], intent_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not constraints:
+        return {}
+    normalized = dict(constraints)
+    intent = intent_payload if isinstance(intent_payload, dict) else {}
+    explainability = intent.get("explainability") if isinstance(intent.get("explainability"), dict) else {}
+    live_execution = explainability.get("live_execution") if isinstance(explainability.get("live_execution"), dict) else {}
+    requested_notional_usd = _to_float(
+        live_execution.get("effective_notional_usd"),
+        _to_float(normalized.get("effective_notional_usd"), _to_float(intent.get("target_notional_usd"), _to_float(normalized.get("requested_notional_usd"), 0.0))),
+    )
+    requested_notional_usd = max(
+        requested_notional_usd,
+        _to_float(normalized.get("requested_notional_usd"), _to_float(intent.get("target_notional_usd"), 0.0)),
+    )
+    min_notional_usd = _to_float(normalized.get("min_notional_usd"), 0.0)
+    supports_requested_notional = normalized.get("supports_requested_notional")
+    if not isinstance(supports_requested_notional, bool):
+        supports_requested_notional = requested_notional_usd <= 0 or min_notional_usd <= requested_notional_usd + 1e-9
+    auto_adjustment = normalized.get("auto_adjustment") if isinstance(normalized.get("auto_adjustment"), dict) else {}
+    effective_notional_usd = _to_float(normalized.get("effective_notional_usd"), requested_notional_usd)
+    effective_notional_usd = max(effective_notional_usd, requested_notional_usd)
+    supports_auto_adjusted_notional = normalized.get("supports_auto_adjusted_notional")
+    if not isinstance(supports_auto_adjusted_notional, bool):
+        supports_auto_adjusted_notional = supports_requested_notional or effective_notional_usd <= 0 or min_notional_usd <= effective_notional_usd + 1e-9
+    normalized["requested_notional_usd"] = _json_number(_to_float(normalized.get("requested_notional_usd"), requested_notional_usd))
+    normalized["effective_notional_usd"] = _json_number(effective_notional_usd)
+    normalized["supports_requested_notional"] = supports_requested_notional
+    normalized["supports_auto_adjusted_notional"] = supports_auto_adjusted_notional
+    normalized.setdefault(
+        "status",
+        "rejected_preflight" if requested_notional_usd > 0 and not supports_auto_adjusted_notional else "ready_preflight",
+    )
+    protection = normalized.get("protection") if isinstance(normalized.get("protection"), dict) else {}
+    if protection:
+        protection_status = str(protection.get("status") or "").strip().lower()
+        if protection_status:
+            normalized["protection_status"] = protection_status
+        if protection_status == "rejected_preflight" and bool(protection.get("require_full_acceptance", True)):
+            normalized["status"] = "rejected_preflight"
+    if auto_adjustment:
+        normalized["auto_adjustment"] = dict(auto_adjustment)
+    return normalized
+
+
+def _apply_live_execution_auto_sizing(intent_payload: dict[str, Any], constraints: dict[str, Any]) -> dict[str, Any]:
+    if not constraints:
+        return intent_payload
+    live_hint = _intent_live_execution_context(intent_payload)
+    if not bool(live_hint.get("requested")):
+        return intent_payload
+    requested_notional_usd = _to_float(intent_payload.get("target_notional_usd"), 0.0)
+    effective_notional_usd = _to_float(constraints.get("effective_notional_usd"), requested_notional_usd)
+    supports_auto_adjusted_notional = bool(constraints.get("supports_auto_adjusted_notional", False))
+    if requested_notional_usd <= 0 or effective_notional_usd <= requested_notional_usd + 1e-9 or not supports_auto_adjusted_notional:
+        return intent_payload
+    effective_intent_payload = dict(intent_payload)
+    effective_intent_payload["target_notional_usd"] = round(effective_notional_usd, 8)
+    explainability = effective_intent_payload.get("explainability") if isinstance(effective_intent_payload.get("explainability"), dict) else {}
+    explainability = dict(explainability)
+    live_execution = explainability.get("live_execution") if isinstance(explainability.get("live_execution"), dict) else {}
+    live_execution = dict(live_execution)
+    live_execution["auto_size"] = bool(live_hint.get("auto_size", True))
+    live_execution["requested_notional_usd"] = round(requested_notional_usd, 8)
+    live_execution["effective_notional_usd"] = round(effective_notional_usd, 8)
+    if isinstance(constraints.get("auto_adjustment"), dict):
+        live_execution["auto_adjustment"] = dict(constraints.get("auto_adjustment"))
+    explainability["live_execution"] = live_execution
+    effective_intent_payload["explainability"] = explainability
+    return effective_intent_payload
+
+
+def _apply_live_execution_dynamic_protection(intent_payload: dict[str, Any], constraints: dict[str, Any]) -> dict[str, Any]:
+    if not constraints:
+        return intent_payload
+    live_hint = _intent_live_execution_context(intent_payload)
+    if not bool(live_hint.get("requested")):
+        return intent_payload
+    if isinstance(live_hint.get("protection"), dict) and live_hint.get("protection"):
+        return intent_payload
+
+    explainability = intent_payload.get("explainability") if isinstance(intent_payload.get("explainability"), dict) else {}
+    explainability = dict(explainability)
+    live_execution = explainability.get("live_execution") if isinstance(explainability.get("live_execution"), dict) else {}
+    live_execution = dict(live_execution)
+    dynamic_protection = live_execution.get("dynamic_protection") if isinstance(live_execution.get("dynamic_protection"), dict) else {}
+    auto_protection = _bool_from_any(dynamic_protection.get("enabled"), _bool_from_any(live_execution.get("auto_protection"), True))
+    if not auto_protection:
+        return intent_payload
+
+    reference_price = _to_float(constraints.get("reference_price"), 0.0)
+    effective_notional_usd = _to_float(constraints.get("effective_notional_usd"), _to_float(intent_payload.get("target_notional_usd"), 0.0))
+    if reference_price <= 0 or effective_notional_usd <= 0:
+        return intent_payload
+
+    side = _normalize_trade_side(intent_payload.get("side"))
+    confidence = _clamp(_to_float(intent_payload.get("confidence"), 0.0), 0.0, 1.0)
+    regime_text = " ".join(
+        str(value or "")
+        for value in (
+            intent_payload.get("regime"),
+            explainability.get("regime"),
+            explainability.get("market_regime"),
+            live_execution.get("market_regime"),
+        )
+    ).strip().lower()
+    volatility_text = " ".join(
+        str(value or "")
+        for value in (
+            live_execution.get("volatility_regime"),
+            explainability.get("volatility_regime"),
+            explainability.get("volatility"),
+        )
+    ).strip().lower()
+    price_precision = int(_to_float(constraints.get("price_precision"), 2.0))
+    rounding_precision = price_precision if price_precision > 0 else 0
+    price_tick = 1.0 if price_precision <= 0 else 10.0 ** (-price_precision)
+
+    stop_loss_bps = _to_float(dynamic_protection.get("stop_loss_bps"), 0.0)
+    reward_risk_ratio = _to_float(dynamic_protection.get("reward_risk_ratio"), 0.0)
+    take_profit_bps = _to_float(dynamic_protection.get("take_profit_bps"), 0.0)
+
+    if stop_loss_bps <= 0:
+        stop_loss_bps = 60.0
+        reward_risk_ratio = 1.8 if reward_risk_ratio <= 0 else reward_risk_ratio
+        if "trend" in regime_text or "breakout" in regime_text:
+            stop_loss_bps = 55.0
+            reward_risk_ratio = max(reward_risk_ratio, 2.2)
+        elif "mean" in regime_text or "reversion" in regime_text:
+            stop_loss_bps = 48.0
+            reward_risk_ratio = max(reward_risk_ratio, 1.55)
+        elif "range" in regime_text:
+            stop_loss_bps = 52.0
+            reward_risk_ratio = max(reward_risk_ratio, 1.65)
+
+        if "high" in volatility_text or "volatile" in volatility_text:
+            stop_loss_bps *= 1.35
+            reward_risk_ratio *= 1.12
+        elif "low" in volatility_text or "calm" in volatility_text:
+            stop_loss_bps *= 0.85
+            reward_risk_ratio *= 0.95
+
+        if confidence >= 0.8:
+            stop_loss_bps *= 0.92
+            reward_risk_ratio += 0.15
+        elif confidence <= 0.55:
+            stop_loss_bps *= 1.08
+            reward_risk_ratio = max(1.25, reward_risk_ratio - 0.12)
+
+        if effective_notional_usd <= 10.0:
+            stop_loss_bps *= 1.15
+            reward_risk_ratio = max(reward_risk_ratio, 2.0)
+        elif effective_notional_usd >= 1000.0:
+            stop_loss_bps *= 0.95
+
+    stop_loss_bps = _clamp(stop_loss_bps, 20.0, 250.0)
+    reward_risk_ratio = _clamp(reward_risk_ratio if reward_risk_ratio > 0 else 1.8, 1.25, 3.5)
+    if take_profit_bps <= 0:
+        take_profit_bps = stop_loss_bps * reward_risk_ratio
+    take_profit_bps = max(stop_loss_bps * 1.1, _clamp(take_profit_bps, 25.0, 900.0))
+
+    stop_loss_distance = max(price_tick, reference_price * stop_loss_bps / 10000.0)
+    take_profit_distance = max(price_tick, reference_price * take_profit_bps / 10000.0)
+
+    if side == "sell":
+        raw_take_profit = reference_price - take_profit_distance
+        raw_stop_loss = reference_price + stop_loss_distance
+    else:
+        raw_take_profit = reference_price + take_profit_distance
+        raw_stop_loss = reference_price - stop_loss_distance
+
+    take_profit_price = round(raw_take_profit, rounding_precision)
+    stop_loss_price = round(raw_stop_loss, rounding_precision)
+    if side == "sell":
+        if take_profit_price >= reference_price:
+            take_profit_price = round(max(price_tick, reference_price - price_tick), rounding_precision)
+        if stop_loss_price <= reference_price:
+            stop_loss_price = round(reference_price + price_tick, rounding_precision)
+    else:
+        if take_profit_price <= reference_price:
+            take_profit_price = round(reference_price + price_tick, rounding_precision)
+        if stop_loss_price >= reference_price:
+            stop_loss_price = round(max(price_tick, reference_price - price_tick), rounding_precision)
+
+    protection_payload = {
+        "take_profit": {
+            "trigger_price": take_profit_price,
+            "order_type": str(dynamic_protection.get("order_type") or "market").strip().lower() or "market",
+            "working_type": str(dynamic_protection.get("working_type") or "MARK_PRICE").strip().upper() or "MARK_PRICE",
+        },
+        "stop_loss": {
+            "trigger_price": stop_loss_price,
+            "order_type": str(dynamic_protection.get("order_type") or "market").strip().lower() or "market",
+            "working_type": str(dynamic_protection.get("working_type") or "MARK_PRICE").strip().upper() or "MARK_PRICE",
+        },
+        "require_full_acceptance": _bool_from_any(dynamic_protection.get("require_full_acceptance"), True),
+    }
+
+    effective_intent_payload = dict(intent_payload)
+    effective_intent_payload["protection"] = protection_payload
+    live_execution["auto_protection"] = auto_protection
+    live_execution["dynamic_protection"] = {
+        "enabled": True,
+        "applied": True,
+        "source": "control_plane_dynamic_live_protection",
+        "reference_price": round(reference_price, max(rounding_precision, 2)),
+        "effective_notional_usd": round(effective_notional_usd, 8),
+        "price_precision": price_precision,
+        "stop_loss_bps": round(stop_loss_bps, 6),
+        "take_profit_bps": round(take_profit_bps, 6),
+        "reward_risk_ratio": round(take_profit_bps / max(stop_loss_bps, 1e-9), 6),
+        "regime": regime_text or "unknown",
+        "confidence": round(confidence, 6),
+    }
+    explainability["live_execution"] = live_execution
+    effective_intent_payload["explainability"] = explainability
+    return effective_intent_payload
+
+
+async def _prepare_live_execution_intent(intent_payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    live_execution_constraints = await _fetch_live_execution_constraints(intent_payload)
+    effective_intent_payload = _apply_live_execution_auto_sizing(intent_payload, live_execution_constraints)
+    protected_intent_payload = _apply_live_execution_dynamic_protection(effective_intent_payload, live_execution_constraints)
+    if protected_intent_payload != effective_intent_payload:
+        refreshed_constraints = await _fetch_live_execution_constraints(protected_intent_payload)
+        if refreshed_constraints:
+            live_execution_constraints = refreshed_constraints
+        effective_intent_payload = _apply_live_execution_auto_sizing(protected_intent_payload, live_execution_constraints)
+    else:
+        effective_intent_payload = protected_intent_payload
+    return effective_intent_payload, live_execution_constraints
+
+
+def _live_execution_preflight_rejected(constraints: dict[str, Any]) -> bool:
+    if not constraints:
+        return False
+    status = str(constraints.get("status") or "").strip().lower()
+    if status == "rejected_preflight":
+        return True
+    protection = constraints.get("protection") if isinstance(constraints.get("protection"), dict) else {}
+    protection_status = str(protection.get("status") or constraints.get("protection_status") or "").strip().lower()
+    if protection_status == "rejected_preflight" and bool(protection.get("require_full_acceptance", True)):
+        return True
+    supports_auto_adjusted_notional = constraints.get("supports_auto_adjusted_notional")
+    if isinstance(supports_auto_adjusted_notional, bool):
+        return not supports_auto_adjusted_notional
+    supports_requested_notional = constraints.get("supports_requested_notional")
+    if isinstance(supports_requested_notional, bool):
+        return not supports_requested_notional
+    effective_notional_usd = _to_float(constraints.get("effective_notional_usd"), _to_float(constraints.get("requested_notional_usd"), 0.0))
+    min_notional_usd = _to_float(constraints.get("min_notional_usd"), 0.0)
+    return effective_notional_usd > 0 and min_notional_usd > effective_notional_usd + 1e-9
 
 
 def _bingx_secret_payload_for_account(account_id: str, *, require_trade: bool = True) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -5553,10 +6968,19 @@ async def _sync_binance_account_state(account_id: str, account: dict | None = No
         position_source_prefixes=["binance-futures-position"],
     )
     persisted = _postprocess_connector_sync(account_row, "binance", as_of, balances, positions, previous_balances, previous_positions, persisted)
+    income_history_warning: str | None = None
+    try:
+        income_history_events = await _binance_fetch_income_history_events(account_id, secret_payload, as_of)
+        persisted["binance_income_history_events_persisted"] = _persist_capital_flow_events(account_row, income_history_events)
+        persisted["capital_ledger"] = _account_capital_ledger(account_id)
+    except Exception as exc:
+        income_history_warning = f"binance_income_history: {str(exc)}"
     persisted["status"] = "partial" if errors else "ok"
     persisted["connector_account"] = _connector_account_public_view(connector_account)
     if errors:
         persisted["warnings"] = errors
+    if income_history_warning:
+        persisted["warnings"] = [*(persisted.get("warnings") or []), income_history_warning]
     persisted["risk_snapshots"] = _refresh_portfolio_risk_snapshots_for_account(account_id)
     append_audit(
         "binance_account_state_synced",
@@ -5674,9 +7098,18 @@ async def _sync_bingx_account_state(account_id: str, account: dict | None = None
         position_source_prefixes=["bingx-futures-position"],
     )
     persisted = _postprocess_connector_sync(account_row, "bingx", as_of, balances, positions, previous_balances, previous_positions, persisted)
+    income_history_warning: str | None = None
+    try:
+        income_history_events = await _bingx_fetch_income_history_events(account_id, secret_payload, as_of)
+        persisted["bingx_income_history_events_persisted"] = _persist_capital_flow_events(account_row, income_history_events)
+        persisted["capital_ledger"] = _account_capital_ledger(account_id)
+    except Exception as exc:
+        income_history_warning = f"bingx_income_history: {str(exc)}"
     persisted["status"] = "partial" if errors else "ok"
     persisted["connector_account"] = _connector_account_public_view(connector_account)
     persisted["account_overview"] = account_overview_items
+    persisted["positions"] = positions
+    persisted["balances"] = balances
     persisted["open_orders"] = open_orders
     if diagnostic_notes:
         persisted["notes"] = diagnostic_notes
@@ -5684,7 +7117,17 @@ async def _sync_bingx_account_state(account_id: str, account: dict | None = None
         persisted["warnings"] = [*errors, *diagnostic_notes]
     elif diagnostic_notes:
         persisted["warnings"] = diagnostic_notes
+    if income_history_warning:
+        persisted["warnings"] = [*(persisted.get("warnings") or []), income_history_warning]
     persisted["risk_snapshots"] = _refresh_portfolio_risk_snapshots_for_account(account_id)
+    persisted["live_position_protection"] = await _reconcile_live_position_protection(
+        account_id,
+        account_row,
+        provider_override="bingx",
+        positions=positions,
+        open_orders=open_orders,
+        broker_truth_source="bingx-open-orders+positions",
+    )
     append_audit(
         "bingx_account_state_synced",
         {
@@ -5742,11 +7185,242 @@ def _okx_error_detail(body: object, fallback: str = "unknown error") -> str:
     return detail or fallback
 
 
+def _okx_auth_troubleshooting_hint(path: str, code: str | None, http_status: int | None = None) -> str | None:
+    normalized_code = str(code or "").strip()
+    if normalized_code == "50119":
+        return (
+            "Likely causes: missing or wrong production API key, production/demo environment mismatch, "
+            "rotated or deleted key, malformed pasted api_key value, or OKX V5 authentication mismatch. "
+            "TXT signs V5 requests as 'timestamp + method + requestPath + body' with Base64(HMAC_SHA256) "
+            "and sends OK-ACCESS-PASSPHRASE."
+        )
+    if normalized_code in {"50113", "50114"}:
+        return (
+            "OKX rejected the authentication signature. Verify the API secret, passphrase, system clock, and the exact "
+            "V5 pre-hash string 'timestamp + method + requestPath + body'."
+        )
+    if http_status in {401, 403} and path.startswith("/api/v5/"):
+        return (
+            "OKX rejected authenticated access. Verify production-vs-demo environment, API key scope, passphrase, and "
+            "V5 signature inputs."
+        )
+    return None
+
+
+def _okx_target_environment(base_url: str | None = None) -> str:
+    normalized = str(base_url or OKX_API_BASE_URL).strip().lower()
+    if normalized.startswith("https://www.okx.com") or normalized.startswith("http://www.okx.com"):
+        return "production"
+    return "custom"
+
+
+def _okx_auth_debug_report(row: dict | None) -> dict[str, Any]:
+    target_base_url = OKX_API_BASE_URL
+    target_environment = _okx_target_environment(target_base_url)
+    if not isinstance(row, dict):
+        return {
+            "provider": "okx",
+            "status": "no_recent_auth_failure",
+            "target_base_url": target_base_url,
+            "target_environment": target_environment,
+            "message": "No recent OKX authentication failure audit found.",
+            "latest_failure": None,
+            "diagnosis": {
+                "classification": "no_data",
+                "summary": "No recent OKX authentication failure audit is available yet.",
+                "next_checks": [
+                    "Retry the OKX credential validation once to generate a fresh auth audit.",
+                    "Then read this endpoint again to inspect the latest OKX auth context without querying audit tables directly.",
+                ],
+            },
+        }
+
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    latest_failure = {
+        "timestamp": row.get("timestamp"),
+        "category": str(row.get("category") or "okx_auth_request_failed"),
+        "path": str(payload.get("path") or ""),
+        "request_path": str(payload.get("request_path") or ""),
+        "http_status": int(payload.get("http_status") or 0) or None,
+        "code": str(payload.get("code") or "").strip() or None,
+        "detail": str(payload.get("detail") or "").strip(),
+        "hint": str(payload.get("hint") or "").strip(),
+        "base_url": str(payload.get("base_url") or target_base_url).strip() or target_base_url,
+        "target_environment": _okx_target_environment(str(payload.get("base_url") or target_base_url)),
+        "has_passphrase": bool(payload.get("has_passphrase")),
+        "api_key_length": int(payload.get("api_key_length") or 0),
+        "api_secret_length": int(payload.get("api_secret_length") or 0),
+        "timestamp_format": str(payload.get("timestamp_format") or ""),
+        "prehash_shape": str(payload.get("prehash_shape") or ""),
+        "method": str(payload.get("method") or "GET"),
+    }
+
+    code = latest_failure["code"]
+    classification = "generic_auth_rejection"
+    summary = "OKX rejected authenticated access. Inspect the latest failure details and verify key scope, passphrase, environment, and V5 signature inputs."
+    next_checks = [
+        "Verify the API key, secret, and passphrase were pasted exactly as created on OKX.",
+        "Confirm TXT is targeting the intended OKX environment and account.",
+    ]
+
+    if code == "50119":
+        classification = "key_not_recognized_or_environment_mismatch"
+        summary = (
+            "OKX production did not recognize the supplied API key. TXT already attempted a V5-style authenticated request "
+            "with passphrase, so the most likely causes are a malformed api_key value, a deleted or rotated production key, "
+            "or a production/demo environment mismatch. A signature mismatch is still possible, but is less likely unless OKX "
+            "masks it behind 50119."
+        )
+        next_checks = [
+            "Confirm the pasted api_key is the actual production API key value, not the key label, secret, passphrase, or account id.",
+            "Confirm the key still exists on OKX production and was not regenerated after creation.",
+            "If repeated with brand new production keys, compare the captured prehash shape and timestamp format against OKX V5 docs.",
+        ]
+    elif code in {"50113", "50114"}:
+        classification = "signature_or_timestamp_mismatch"
+        summary = (
+            "OKX rejected the authentication signature itself. This points more directly to API secret, passphrase, clock drift, "
+            "or a request canonicalization mismatch."
+        )
+        next_checks = [
+            "Verify the API secret and passphrase are correct for the same key.",
+            "Verify the server clock is accurate and the timestamp is fresh.",
+            "Compare the exact V5 prehash string 'timestamp + method + requestPath + body' with the OKX docs.",
+        ]
+
+    return {
+        "provider": "okx",
+        "status": "ok",
+        "target_base_url": target_base_url,
+        "target_environment": target_environment,
+        "latest_failure": latest_failure,
+        "diagnosis": {
+            "classification": classification,
+            "summary": summary,
+            "next_checks": next_checks,
+        },
+    }
+
+
+def _latest_okx_auth_debug_report() -> dict[str, Any]:
+    row = _normalize_db_row(
+        fetch_one(
+            """
+            SELECT category, payload, created_at AS timestamp
+            FROM audit_events
+            WHERE category = 'okx_auth_request_failed'
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        )
+    )
+    return _okx_auth_debug_report(row)
+
+
+def _recent_okx_auth_debug_report(limit: int = 5) -> dict[str, Any]:
+    safe_limit = max(1, min(limit, 20))
+    rows = _normalize_db_rows(
+        fetch_all(
+            """
+            SELECT category, payload, created_at AS timestamp
+            FROM audit_events
+            WHERE category = 'okx_auth_request_failed'
+            ORDER BY id DESC
+            LIMIT %s
+            """,
+            (safe_limit,),
+        )
+    )
+    target_base_url = OKX_API_BASE_URL
+    target_environment = _okx_target_environment(target_base_url)
+    if not rows:
+        return {
+            "provider": "okx",
+            "status": "no_recent_auth_failure",
+            "target_base_url": target_base_url,
+            "target_environment": target_environment,
+            "requested_limit": safe_limit,
+            "recent_failures": [],
+            "frequency": {"by_code": [], "by_classification": []},
+            "pattern": {
+                "is_stable": False,
+                "summary": "No recent OKX authentication failure audit is available yet.",
+            },
+        }
+
+    reports = [_okx_auth_debug_report(row) for row in rows]
+    recent_failures: list[dict[str, Any]] = []
+    code_counts: dict[str, int] = {}
+    classification_counts: dict[str, int] = {}
+    for report in reports:
+        latest_failure = report.get("latest_failure") if isinstance(report.get("latest_failure"), dict) else {}
+        diagnosis = report.get("diagnosis") if isinstance(report.get("diagnosis"), dict) else {}
+        code = str(latest_failure.get("code") or "unknown")
+        classification = str(diagnosis.get("classification") or "unknown")
+        code_counts[code] = code_counts.get(code, 0) + 1
+        classification_counts[classification] = classification_counts.get(classification, 0) + 1
+        recent_failures.append(
+            {
+                "timestamp": latest_failure.get("timestamp"),
+                "code": latest_failure.get("code"),
+                "http_status": latest_failure.get("http_status"),
+                "detail": latest_failure.get("detail"),
+                "hint": latest_failure.get("hint"),
+                "classification": classification,
+                "path": latest_failure.get("path"),
+                "request_path": latest_failure.get("request_path"),
+                "api_key_length": latest_failure.get("api_key_length"),
+                "api_secret_length": latest_failure.get("api_secret_length"),
+                "has_passphrase": latest_failure.get("has_passphrase"),
+                "target_environment": latest_failure.get("target_environment"),
+            }
+        )
+
+    stable_code = len(code_counts) == 1
+    stable_classification = len(classification_counts) == 1
+    is_stable = stable_code and stable_classification and len(recent_failures) > 1
+    top_code = max(code_counts.items(), key=lambda item: item[1])[0]
+    top_classification = max(classification_counts.items(), key=lambda item: item[1])[0]
+    summary = (
+        f"Recent OKX auth failures are stable: same code {top_code} and classification {top_classification} across {len(recent_failures)} attempt(s)."
+        if is_stable
+        else f"Recent OKX auth failures vary across {len(recent_failures)} attempt(s); inspect grouped frequencies below."
+    )
+
+    return {
+        "provider": "okx",
+        "status": "ok",
+        "target_base_url": target_base_url,
+        "target_environment": target_environment,
+        "requested_limit": safe_limit,
+        "recent_failures": recent_failures,
+        "frequency": {
+            "by_code": [
+                {"code": code if code != "unknown" else None, "count": count}
+                for code, count in sorted(code_counts.items(), key=lambda item: (-item[1], item[0]))
+            ],
+            "by_classification": [
+                {"classification": classification, "count": count}
+                for classification, count in sorted(classification_counts.items(), key=lambda item: (-item[1], item[0]))
+            ],
+        },
+        "pattern": {
+            "is_stable": is_stable,
+            "summary": summary,
+        },
+    }
+
+
 def _okx_response_error(path: str, body: object, *, http_status: int | None = None, fallback: str = "unknown error") -> OKXAPIError:
+    code = _okx_error_code(body)
+    detail = _okx_error_detail(body, fallback=fallback)
+    hint = _okx_auth_troubleshooting_hint(path, code, http_status=http_status)
+    if hint:
+        detail = f"{detail} Hint: {hint}"
     return OKXAPIError(
         path,
-        _okx_error_detail(body, fallback=fallback),
-        code=_okx_error_code(body),
+        detail,
+        code=code,
         http_status=http_status,
     )
 
@@ -5812,6 +7486,27 @@ async def _okx_signed_get(secret_payload: dict, path: str, params: dict | None =
             body = response.json()
         except ValueError:
             raise RuntimeError(f"OKX {path} failed with status {response.status_code}: {response.text[:300]}")
+        code = _okx_error_code(body)
+        hint = _okx_auth_troubleshooting_hint(path, code, http_status=response.status_code)
+        if hint:
+            append_audit(
+                "okx_auth_request_failed",
+                {
+                    "path": path,
+                    "request_path": request_path,
+                    "http_status": response.status_code,
+                    "code": code,
+                    "detail": _okx_error_detail(body, fallback=response.text[:300]),
+                    "hint": hint,
+                    "method": "GET",
+                    "base_url": OKX_API_BASE_URL,
+                    "timestamp_format": "iso8601-utc-millis-z",
+                    "prehash_shape": "timestamp + method + requestPath + body",
+                    "has_passphrase": bool(passphrase),
+                    "api_key_length": len(api_key),
+                    "api_secret_length": len(api_secret),
+                },
+            )
         raise _okx_response_error(path, body, http_status=response.status_code, fallback=response.text[:300])
     try:
         body = response.json()
@@ -6020,10 +7715,19 @@ async def _sync_okx_account_state(account_id: str, account: dict | None = None) 
         position_source_prefixes=["okx-position"],
     )
     persisted = _postprocess_connector_sync(account_row, "okx", as_of, balances, positions, previous_balances, previous_positions, persisted)
+    bill_history_warning: str | None = None
+    try:
+        bill_history_events = await _okx_fetch_bill_history_events(account_id, secret_payload, as_of)
+        persisted["okx_bill_history_events_persisted"] = _persist_capital_flow_events(account_row, bill_history_events)
+        persisted["capital_ledger"] = _account_capital_ledger(account_id)
+    except Exception as exc:
+        bill_history_warning = f"okx_bill_history: {str(exc)}"
     persisted["status"] = "partial" if errors else "ok"
     persisted["connector_account"] = _connector_account_public_view(connector_account)
     if errors:
         persisted["warnings"] = errors
+    if bill_history_warning:
+        persisted["warnings"] = [*(persisted.get("warnings") or []), bill_history_warning]
     persisted["risk_snapshots"] = _refresh_portfolio_risk_snapshots_for_account(account_id)
     append_audit(
         "okx_account_state_synced",
@@ -6447,9 +8151,15 @@ def _provider_to_preferred_venue(provider: str) -> str:
         "okx": "paper-okx",
         "bitget": "paper-bitget",
         "bingx": "paper-bingx",
+        "mt5": "mt5",
+        "ftmo": "mt5",
         "ig": "paper-ig",
     }
     return mapping.get(provider, "binance-public")
+
+
+def _normalize_live_symbol(value: Any) -> str:
+    return str(value or "").strip().upper().replace("/", "").replace("-", "")
 
 
 def _default_live_execution_policy() -> dict[str, Any]:
@@ -6496,6 +8206,27 @@ def _default_live_execution_policy() -> dict[str, Any]:
                 "max_partial_fill_ratio": 0.55,
                 "kill_on_consecutive_failures": 4,
             },
+            "no_trade_policy": {
+                "block_on_no_trade": True,
+                "block_on_dominance": True,
+                "blocked_states": ["dominant_block", "blocked", "no_trade"],
+            },
+            "drawdown_velocity": {
+                "enabled": False,
+                "lookback_minutes": 90,
+                "warn_loss_usd": 0.0,
+                "block_loss_usd": 0.0,
+                "warn_loss_pct_of_equity": 0.0,
+                "block_loss_pct_of_equity": 0.0,
+                "require_human_on_warning": True,
+            },
+            "oracle_stability": {
+                "enabled": False,
+                "lookback_minutes": 120,
+                "warn_below_score": 0.72,
+                "block_below_score": 0.55,
+                "require_human_on_warning": True,
+            },
         },
         "providers": {
             "bingx": {
@@ -6504,16 +8235,216 @@ def _default_live_execution_policy() -> dict[str, Any]:
                 "allowed_system_modes": [SystemMode.MANAGED_LIVE.value],
                 "allow_smoke_test_in_modes": [SystemMode.GUARDED_AUTO.value, SystemMode.MANAGED_LIVE.value],
                 "max_order_notional_usd": 10.0,
-                "default_order_notional_usd": 7.0,
-                "smoke_test_notional_usd": 7.0,
+                "max_notional_pct_of_exploitable_capital": 1.0,
+                "default_order_notional_usd": 7.5,
+                "smoke_test_notional_usd": 7.5,
                 "smoke_limit_offset_bps": 3500,
                 "primary_live_instrument": "BTCUSDT",
+                "micro_live": {
+                    "enabled": True,
+                    "default_stage": "micro",
+                    "allowed_symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+                    "stages": [
+                        {
+                            "name": "micro",
+                            "max_order_notional_usd": 7.5,
+                            "size_multiplier": 1.0,
+                            "allowed_system_modes": [SystemMode.MANAGED_LIVE.value],
+                            "allowed_symbols": ["BTCUSDT"],
+                        },
+                        {
+                            "name": "pilot",
+                            "max_order_notional_usd": 5.0,
+                            "size_multiplier": 1.0,
+                            "allowed_system_modes": [SystemMode.MANAGED_LIVE.value],
+                            "allowed_symbols": ["BTCUSDT", "ETHUSDT"],
+                        },
+                        {
+                            "name": "scale",
+                            "max_order_notional_usd": 10.0,
+                            "size_multiplier": 1.0,
+                            "allowed_system_modes": [SystemMode.MANAGED_LIVE.value],
+                            "allowed_symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+                        },
+                    ],
+                },
                 "conditional_live_rules": {
                     "SOLUSDT": {
                         "allowed_regimes": ["TREND"],
                         "min_confidence": 0.78,
                         "reason": "sol_only_in_momentum",
                     }
+                },
+            },
+            "mt5": {
+                "enabled": False,
+                "require_route_flag": True,
+                "allowed_system_modes": [SystemMode.MANAGED_LIVE.value],
+                "allow_smoke_test_in_modes": [SystemMode.GUARDED_AUTO.value, SystemMode.MANAGED_LIVE.value],
+                "max_order_notional_usd": 35.0,
+                "max_notional_pct_of_exploitable_capital": 0.0035,
+                "default_order_notional_usd": 10.0,
+                "smoke_test_notional_usd": 5.0,
+                "smoke_limit_offset_bps": 0.0,
+                "primary_live_instrument": "EURUSD",
+                "ftmo_challenge": {
+                    "profile": "ftmo_10k_challenge",
+                    "nominal_balance_usd": 10000.0,
+                    "profit_target_usd": 1000.0,
+                    "max_daily_loss_limit_usd": 500.0,
+                    "max_total_loss_limit_usd": 1000.0,
+                    "internal_guardrails": {
+                        "daily_loss_warning_usd": 75.0,
+                        "daily_loss_stop_usd": 100.0,
+                        "total_drawdown_stop_usd": 400.0,
+                        "challenge_week_loss_stop_usd": 200.0,
+                    },
+                },
+                "go_live_hardening_overrides": {
+                    "approval_exposure_threshold_pct": 10.0,
+                    "max_total_exposure_pct": 15.0,
+                    "max_symbol_exposure_pct": 10.0,
+                    "max_pending_live_approvals": 4,
+                    "drawdown_warning_ratio": 0.05,
+                    "no_trade_policy": {
+                        "block_on_no_trade": True,
+                        "block_on_dominance": True,
+                        "blocked_states": ["dominant_block", "blocked", "no_trade"],
+                    },
+                    "drawdown_velocity": {
+                        "enabled": True,
+                        "lookback_minutes": 90,
+                        "warn_loss_usd": 75.0,
+                        "block_loss_usd": 100.0,
+                        "warn_loss_pct_of_equity": 0.5,
+                        "block_loss_pct_of_equity": 0.75,
+                        "require_human_on_warning": True,
+                    },
+                    "oracle_stability": {
+                        "enabled": True,
+                        "lookback_minutes": 120,
+                        "warn_below_score": 0.74,
+                        "block_below_score": 0.58,
+                        "require_human_on_warning": True,
+                    },
+                },
+                "micro_live": {
+                    "enabled": True,
+                    "default_stage": "micro_risk",
+                    "allowed_symbols": [],
+                    "stages": [
+                        {
+                            "name": "micro_risk",
+                            "max_order_notional_usd": 15.0,
+                            "max_notional_pct_of_exploitable_capital": 0.0015,
+                            "size_multiplier": 1.0,
+                            "allowed_system_modes": [SystemMode.MANAGED_LIVE.value],
+                            "allowed_symbols": [],
+                            "auto_sizing": {
+                                "enabled": True,
+                                "basis": "exploitable_capital",
+                                "regime_confidence_decay": {
+                                    "enabled": True,
+                                    "floor": 0.72,
+                                    "stale_after_hours": 12,
+                                    "stale_decay_per_hour": 0.015,
+                                    "drift_penalty": 0.18,
+                                    "negative_avg_penalty": 0.08,
+                                    "min_sample_count": 5,
+                                    "low_sample_penalty": 0.05,
+                                },
+                                "buckets": [
+                                    {"name": "standard", "min_confidence": 0.0, "notional_pct_of_exploitable_capital": 0.001},
+                                    {"name": "premium", "min_confidence": 0.88, "notional_pct_of_exploitable_capital": 0.0015},
+                                ],
+                            },
+                            "hardening_overrides": {
+                                "drawdown_velocity": {
+                                    "enabled": True,
+                                    "lookback_minutes": 90,
+                                    "warn_loss_usd": 30.0,
+                                    "block_loss_usd": 50.0,
+                                    "warn_loss_pct_of_equity": 0.2,
+                                    "block_loss_pct_of_equity": 0.3,
+                                    "require_human_on_warning": True,
+                                },
+                            },
+                        },
+                        {
+                            "name": "graduated",
+                            "max_order_notional_usd": 25.0,
+                            "max_notional_pct_of_exploitable_capital": 0.0025,
+                            "size_multiplier": 1.0,
+                            "allowed_system_modes": [SystemMode.MANAGED_LIVE.value],
+                            "allowed_symbols": [],
+                            "auto_sizing": {
+                                "enabled": True,
+                                "basis": "exploitable_capital",
+                                "regime_confidence_decay": {
+                                    "enabled": True,
+                                    "floor": 0.74,
+                                    "stale_after_hours": 12,
+                                    "stale_decay_per_hour": 0.012,
+                                    "drift_penalty": 0.16,
+                                    "negative_avg_penalty": 0.07,
+                                    "min_sample_count": 8,
+                                    "low_sample_penalty": 0.04,
+                                },
+                                "buckets": [
+                                    {"name": "standard", "min_confidence": 0.0, "notional_pct_of_exploitable_capital": 0.002},
+                                    {"name": "premium", "min_confidence": 0.9, "notional_pct_of_exploitable_capital": 0.0025},
+                                ],
+                            },
+                            "hardening_overrides": {
+                                "drawdown_velocity": {
+                                    "enabled": True,
+                                    "lookback_minutes": 90,
+                                    "warn_loss_usd": 50.0,
+                                    "block_loss_usd": 75.0,
+                                    "warn_loss_pct_of_equity": 0.35,
+                                    "block_loss_pct_of_equity": 0.5,
+                                    "require_human_on_warning": True,
+                                },
+                            },
+                        },
+                        {
+                            "name": "challenge",
+                            "max_order_notional_usd": 35.0,
+                            "max_notional_pct_of_exploitable_capital": 0.0035,
+                            "size_multiplier": 1.0,
+                            "allowed_system_modes": [SystemMode.MANAGED_LIVE.value],
+                            "allowed_symbols": [],
+                            "auto_sizing": {
+                                "enabled": True,
+                                "basis": "exploitable_capital",
+                                "regime_confidence_decay": {
+                                    "enabled": True,
+                                    "floor": 0.76,
+                                    "stale_after_hours": 12,
+                                    "stale_decay_per_hour": 0.01,
+                                    "drift_penalty": 0.14,
+                                    "negative_avg_penalty": 0.06,
+                                    "min_sample_count": 10,
+                                    "low_sample_penalty": 0.03,
+                                },
+                                "buckets": [
+                                    {"name": "standard", "min_confidence": 0.0, "notional_pct_of_exploitable_capital": 0.0025},
+                                    {"name": "premium", "min_confidence": 0.92, "notional_pct_of_exploitable_capital": 0.0035},
+                                ],
+                            },
+                            "hardening_overrides": {
+                                "drawdown_velocity": {
+                                    "enabled": True,
+                                    "lookback_minutes": 90,
+                                    "warn_loss_usd": 75.0,
+                                    "block_loss_usd": 100.0,
+                                    "warn_loss_pct_of_equity": 0.5,
+                                    "block_loss_pct_of_equity": 0.75,
+                                    "require_human_on_warning": True,
+                                },
+                            },
+                        }
+                    ],
                 },
             }
         },
@@ -6567,21 +8498,193 @@ def _go_live_hardening_policy() -> dict[str, Any]:
     policy = _load_live_execution_policy()
     hardening = policy.get("go_live_hardening") if isinstance(policy.get("go_live_hardening"), dict) else {}
     default_hardening = _default_live_execution_policy().get("go_live_hardening")
-    merged = dict(default_hardening) if isinstance(default_hardening, dict) else {}
-    merged.update({key: value for key, value in hardening.items() if key not in {"anti_loop", "watchdog"}})
-    default_anti_loop = merged.get("anti_loop") if isinstance(merged.get("anti_loop"), dict) else {}
-    hardening_anti_loop = hardening.get("anti_loop") if isinstance(hardening.get("anti_loop"), dict) else {}
-    merged["anti_loop"] = {**default_anti_loop, **hardening_anti_loop}
-    default_watchdog = merged.get("watchdog") if isinstance(merged.get("watchdog"), dict) else {}
-    hardening_watchdog = hardening.get("watchdog") if isinstance(hardening.get("watchdog"), dict) else {}
-    merged["watchdog"] = {**default_watchdog, **hardening_watchdog}
+    return _merge_go_live_hardening_policy(default_hardening, hardening)
+
+
+def _merge_go_live_hardening_policy(base: Any, override: Any) -> dict[str, Any]:
+    merged = dict(base) if isinstance(base, dict) else {}
+    override_view = override if isinstance(override, dict) else {}
+    merged.update(
+        {
+            key: value
+            for key, value in override_view.items()
+            if key not in {"anti_loop", "watchdog", "no_trade_policy", "drawdown_velocity", "oracle_stability"}
+        }
+    )
+    for key in ("anti_loop", "watchdog", "no_trade_policy", "drawdown_velocity", "oracle_stability"):
+        base_view = merged.get(key) if isinstance(merged.get(key), dict) else {}
+        override_sub = override_view.get(key) if isinstance(override_view.get(key), dict) else {}
+        merged[key] = {**base_view, **override_sub}
     return merged
+
+
+def _provider_go_live_hardening_policy(provider: str, policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    resolved_policy = policy if isinstance(policy, dict) else _load_live_execution_policy()
+    provider_norm = _normalize_connector_provider(provider)
+    merged = _merge_go_live_hardening_policy(
+        _default_live_execution_policy().get("go_live_hardening"),
+        resolved_policy.get("go_live_hardening") if isinstance(resolved_policy.get("go_live_hardening"), dict) else {},
+    )
+    providers = resolved_policy.get("providers") if isinstance(resolved_policy.get("providers"), dict) else {}
+    provider_policy = providers.get(provider_norm) if isinstance(providers.get(provider_norm), dict) else {}
+    merged = _merge_go_live_hardening_policy(merged, provider_policy.get("go_live_hardening_overrides"))
+    micro_live = _resolve_provider_micro_live(provider_norm, provider_policy, resolved_policy)
+    stage_config = micro_live.get("current_stage_config") if isinstance(micro_live.get("current_stage_config"), dict) else {}
+    return _merge_go_live_hardening_policy(merged, stage_config.get("hardening_overrides"))
+
+
+def _sanitize_auto_sizing_bucket(bucket: dict[str, Any], index: int) -> dict[str, Any]:
+    name = str(bucket.get("name") or f"bucket_{index + 1}").strip().lower() or f"bucket_{index + 1}"
+    return {
+        "name": name,
+        "min_confidence": _clamp(_to_float(bucket.get("min_confidence"), 0.0), 0.0, 1.0),
+        "notional_pct_of_exploitable_capital": max(0.0, _to_float(bucket.get("notional_pct_of_exploitable_capital"), 0.0)),
+        "max_order_notional_usd": max(0.0, _to_float(bucket.get("max_order_notional_usd"), 0.0)),
+    }
+
+
+def _sanitize_stage_auto_sizing(stage: dict[str, Any]) -> dict[str, Any]:
+    raw = stage.get("auto_sizing") if isinstance(stage.get("auto_sizing"), dict) else {}
+    buckets_raw = raw.get("buckets") if isinstance(raw.get("buckets"), list) else []
+    buckets = [
+        _sanitize_auto_sizing_bucket(bucket, index)
+        for index, bucket in enumerate(buckets_raw)
+        if isinstance(bucket, dict)
+    ]
+    buckets = [
+        bucket
+        for bucket in buckets
+        if bucket.get("notional_pct_of_exploitable_capital", 0.0) > 0 or bucket.get("max_order_notional_usd", 0.0) > 0
+    ]
+    buckets.sort(key=lambda item: (_to_float(item.get("min_confidence"), 0.0), str(item.get("name") or "")))
+    return {
+        "enabled": _bool_from_any(raw.get("enabled"), False) and len(buckets) > 0,
+        "basis": str(raw.get("basis") or "exploitable_capital").strip().lower() or "exploitable_capital",
+        "regime_confidence_decay": raw.get("regime_confidence_decay") if isinstance(raw.get("regime_confidence_decay"), dict) else {},
+        "buckets": buckets,
+    }
+
+
+def _sanitize_micro_live_stage(stage: dict[str, Any], index: int) -> dict[str, Any]:
+    name = str(stage.get("name") or f"stage_{index + 1}").strip().lower() or f"stage_{index + 1}"
+    return {
+        "name": name,
+        "max_order_notional_usd": max(0.0, _to_float(stage.get("max_order_notional_usd"), 0.0)),
+        "max_notional_pct_of_exploitable_capital": max(0.0, _to_float(stage.get("max_notional_pct_of_exploitable_capital"), 0.0)),
+        "default_order_notional_usd": max(0.0, _to_float(stage.get("default_order_notional_usd"), 0.0)),
+        "size_multiplier": _clamp(_to_float(stage.get("size_multiplier"), 1.0), 0.0, 1.0),
+        "allowed_system_modes": [
+            str(item).strip().lower()
+            for item in (stage.get("allowed_system_modes") if isinstance(stage.get("allowed_system_modes"), list) else [])
+            if str(item).strip()
+        ],
+        "allowed_symbols": [
+            _normalize_live_symbol(item)
+            for item in (stage.get("allowed_symbols") if isinstance(stage.get("allowed_symbols"), list) else [])
+            if _normalize_live_symbol(item)
+        ],
+        "auto_sizing": _sanitize_stage_auto_sizing(stage),
+        "hardening_overrides": stage.get("hardening_overrides") if isinstance(stage.get("hardening_overrides"), dict) else {},
+    }
+
+
+def _sanitize_micro_live_policy(provider_policy: dict[str, Any]) -> dict[str, Any]:
+    raw = provider_policy.get("micro_live") if isinstance(provider_policy.get("micro_live"), dict) else {}
+    stages_raw = raw.get("stages") if isinstance(raw.get("stages"), list) else []
+    stages = [
+        _sanitize_micro_live_stage(stage, index)
+        for index, stage in enumerate(stages_raw)
+        if isinstance(stage, dict)
+    ]
+    default_stage = str(raw.get("default_stage") or "").strip().lower()
+    if not default_stage and stages:
+        default_stage = str(stages[0].get("name") or "")
+    if default_stage and all(str(stage.get("name") or "") != default_stage for stage in stages):
+        default_stage = str(stages[0].get("name") or "") if stages else ""
+    return {
+        "enabled": _bool_from_any(raw.get("enabled"), False) and len(stages) > 0,
+        "default_stage": default_stage,
+        "allowed_symbols": [
+            _normalize_live_symbol(item)
+            for item in (raw.get("allowed_symbols") if isinstance(raw.get("allowed_symbols"), list) else [])
+            if _normalize_live_symbol(item)
+        ],
+        "stages": stages,
+    }
+
+
+def _default_micro_live_stage_state(policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    resolved_policy = policy if isinstance(policy, dict) else _load_live_execution_policy()
+    providers = resolved_policy.get("providers") if isinstance(resolved_policy.get("providers"), dict) else {}
+    provider_states: dict[str, Any] = {}
+    for provider_name, provider_policy in providers.items():
+        if not isinstance(provider_policy, dict):
+            continue
+        micro_live = _sanitize_micro_live_policy(provider_policy)
+        if not micro_live.get("enabled"):
+            continue
+        default_stage = str(micro_live.get("default_stage") or "")
+        provider_states[str(provider_name).strip().lower()] = {
+            "current_stage": default_stage,
+            "updated_at": None,
+            "promoted_at": None,
+            "history": [],
+        }
+    return {"providers": provider_states}
+
+
+def _micro_live_stage_state(policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    resolved_policy = policy if isinstance(policy, dict) else _load_live_execution_policy()
+    default_state = _default_micro_live_stage_state(resolved_policy)
+    stored = fetch_one("SELECT config_value FROM system_config WHERE config_key = 'micro_live_stage_state'")
+    raw_state = stored.get("config_value") if stored and isinstance(stored.get("config_value"), dict) else {}
+    merged_providers = dict(default_state.get("providers") or {})
+    raw_providers = raw_state.get("providers") if isinstance(raw_state.get("providers"), dict) else {}
+    for provider_name, provider_state in raw_providers.items():
+        if provider_name not in merged_providers or not isinstance(provider_state, dict):
+            continue
+        merged = dict(merged_providers.get(provider_name) or {})
+        merged.update(provider_state)
+        merged_providers[provider_name] = merged
+    return {"providers": merged_providers}
+
+
+def _save_micro_live_stage_state(state: dict[str, Any]) -> None:
+    execute(
+        """
+        INSERT INTO system_config (config_key, config_value)
+        VALUES ('micro_live_stage_state', %s::jsonb)
+        ON CONFLICT (config_key) DO UPDATE SET config_value = EXCLUDED.config_value, updated_at = NOW()
+        """,
+        (json_dumps(state),),
+    )
+
+
+def _resolve_provider_micro_live(provider_norm: str, provider_policy: dict[str, Any], policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    micro_live = _sanitize_micro_live_policy(provider_policy)
+    if not micro_live.get("enabled"):
+        return {**micro_live, "current_stage": "", "current_stage_config": {}, "state": {}}
+    stage_state = _micro_live_stage_state(policy)
+    provider_state = (stage_state.get("providers") if isinstance(stage_state.get("providers"), dict) else {}).get(provider_norm, {})
+    current_stage = str(provider_state.get("current_stage") or micro_live.get("default_stage") or "").strip().lower()
+    stages = micro_live.get("stages") if isinstance(micro_live.get("stages"), list) else []
+    current_stage_config = next((stage for stage in stages if str(stage.get("name") or "") == current_stage), stages[0] if stages else {})
+    current_stage = str((current_stage_config or {}).get("name") or current_stage or "")
+    return {
+        **micro_live,
+        "current_stage": current_stage,
+        "current_stage_config": current_stage_config if isinstance(current_stage_config, dict) else {},
+        "state": provider_state if isinstance(provider_state, dict) else {},
+    }
 
 
 def _sanitize_go_live_hardening_policy(policy: dict[str, Any] | None = None) -> dict[str, Any]:
     hardening = policy if isinstance(policy, dict) else _go_live_hardening_policy()
     anti_loop = hardening.get("anti_loop") if isinstance(hardening.get("anti_loop"), dict) else {}
     watchdog = hardening.get("watchdog") if isinstance(hardening.get("watchdog"), dict) else {}
+    no_trade_policy = hardening.get("no_trade_policy") if isinstance(hardening.get("no_trade_policy"), dict) else {}
+    drawdown_velocity = hardening.get("drawdown_velocity") if isinstance(hardening.get("drawdown_velocity"), dict) else {}
+    oracle_stability = hardening.get("oracle_stability") if isinstance(hardening.get("oracle_stability"), dict) else {}
     return {
         "enabled": _bool_from_any(hardening.get("enabled"), True),
         "min_live_confidence": _to_float(hardening.get("min_live_confidence"), 0.7),
@@ -6608,6 +8711,256 @@ def _sanitize_go_live_hardening_policy(policy: dict[str, Any] | None = None) -> 
             "max_partial_fill_ratio": _to_float(watchdog.get("max_partial_fill_ratio"), 0.55),
             "kill_on_consecutive_failures": int(_to_float(watchdog.get("kill_on_consecutive_failures"), 4.0)),
         },
+        "no_trade_policy": {
+            "block_on_no_trade": _bool_from_any(no_trade_policy.get("block_on_no_trade"), True),
+            "block_on_dominance": _bool_from_any(no_trade_policy.get("block_on_dominance"), True),
+            "blocked_states": [
+                str(item).strip().lower()
+                for item in (no_trade_policy.get("blocked_states") if isinstance(no_trade_policy.get("blocked_states"), list) else ["dominant_block", "blocked", "no_trade"])
+                if str(item).strip()
+            ],
+        },
+        "drawdown_velocity": {
+            "enabled": _bool_from_any(drawdown_velocity.get("enabled"), False),
+            "lookback_minutes": int(_to_float(drawdown_velocity.get("lookback_minutes"), 90.0)),
+            "warn_loss_usd": max(0.0, _to_float(drawdown_velocity.get("warn_loss_usd"), 0.0)),
+            "block_loss_usd": max(0.0, _to_float(drawdown_velocity.get("block_loss_usd"), 0.0)),
+            "warn_loss_pct_of_equity": max(0.0, _to_float(drawdown_velocity.get("warn_loss_pct_of_equity"), 0.0)),
+            "block_loss_pct_of_equity": max(0.0, _to_float(drawdown_velocity.get("block_loss_pct_of_equity"), 0.0)),
+            "require_human_on_warning": _bool_from_any(drawdown_velocity.get("require_human_on_warning"), True),
+        },
+        "oracle_stability": {
+            "enabled": _bool_from_any(oracle_stability.get("enabled"), False),
+            "lookback_minutes": int(_to_float(oracle_stability.get("lookback_minutes"), 120.0)),
+            "warn_below_score": _clamp(_to_float(oracle_stability.get("warn_below_score"), 0.72), 0.0, 1.0),
+            "block_below_score": _clamp(_to_float(oracle_stability.get("block_below_score"), 0.55), 0.0, 1.0),
+            "require_human_on_warning": _bool_from_any(oracle_stability.get("require_human_on_warning"), True),
+        },
+    }
+
+
+def _sanitize_regime_confidence_decay_policy(policy: dict[str, Any] | None) -> dict[str, Any]:
+    raw = policy if isinstance(policy, dict) else {}
+    return {
+        "enabled": _bool_from_any(raw.get("enabled"), False),
+        "floor": _clamp(_to_float(raw.get("floor"), 0.72), 0.0, 1.0),
+        "stale_after_hours": max(1.0, _to_float(raw.get("stale_after_hours"), 12.0)),
+        "stale_decay_per_hour": max(0.0, _to_float(raw.get("stale_decay_per_hour"), 0.015)),
+        "drift_penalty": _clamp(_to_float(raw.get("drift_penalty"), 0.18), 0.0, 0.5),
+        "negative_avg_penalty": _clamp(_to_float(raw.get("negative_avg_penalty"), 0.08), 0.0, 0.4),
+        "min_sample_count": max(1, int(_to_float(raw.get("min_sample_count"), 5.0))),
+        "low_sample_penalty": _clamp(_to_float(raw.get("low_sample_penalty"), 0.05), 0.0, 0.3),
+    }
+
+
+def _drawdown_velocity_snapshot(account_id: str, provider: str, lookback_minutes: int) -> dict[str, Any]:
+    safe_lookback = max(5, min(24 * 60, int(lookback_minutes or 90)))
+    account_key = _normalize_account_id(account_id)
+    provider_norm = _normalize_connector_provider(provider)
+    if not account_key or not provider_norm:
+        return {
+            "account_id": account_key,
+            "provider": provider_norm,
+            "lookback_minutes": safe_lookback,
+            "sample_count": 0,
+            "recent_loss_usd": 0.0,
+            "recent_net_result_usd": 0.0,
+        }
+
+    row = fetch_one(
+        """
+        SELECT COALESCE(SUM(CASE WHEN COALESCE(d.net_result_usd, 0) < 0 THEN ABS(COALESCE(d.net_result_usd, 0)) ELSE 0 END), 0) AS recent_loss_usd,
+               COALESCE(SUM(COALESCE(d.net_result_usd, 0)), 0) AS recent_net_result_usd,
+               COUNT(*) AS sample_count
+        FROM execution_telemetry t
+        JOIN decision_outcomes d ON d.decision_id = t.decision_id
+        WHERE COALESCE(t.account_id, '') = %s
+          AND t.created_at >= NOW() - (%s * INTERVAL '1 minute')
+          AND LOWER(COALESCE(d.provider, '')) LIKE %s
+        """,
+        (account_key, safe_lookback, f"{provider_norm}%"),
+    ) or {"recent_loss_usd": 0.0, "recent_net_result_usd": 0.0, "sample_count": 0}
+    return {
+        "account_id": account_key,
+        "provider": provider_norm,
+        "lookback_minutes": safe_lookback,
+        "sample_count": int(_to_float(row.get("sample_count"), 0.0)),
+        "recent_loss_usd": round(max(0.0, _to_float(row.get("recent_loss_usd"), 0.0)), 8),
+        "recent_net_result_usd": round(_to_float(row.get("recent_net_result_usd"), 0.0), 8),
+    }
+
+
+def _resolve_stage_auto_sizing(stage_config: dict[str, Any], confidence: float) -> dict[str, Any]:
+    auto_sizing = stage_config.get("auto_sizing") if isinstance(stage_config.get("auto_sizing"), dict) else {}
+    buckets = auto_sizing.get("buckets") if isinstance(auto_sizing.get("buckets"), list) else []
+    resolved_confidence = _clamp(_to_float(confidence, 0.0), 0.0, 1.0)
+    selected_bucket: dict[str, Any] = {}
+    for bucket in buckets:
+        if not isinstance(bucket, dict):
+            continue
+        if resolved_confidence + 1e-9 >= _clamp(_to_float(bucket.get("min_confidence"), 0.0), 0.0, 1.0):
+            selected_bucket = bucket
+    return {
+        "enabled": _bool_from_any(auto_sizing.get("enabled"), False) and len(buckets) > 0,
+        "basis": str(auto_sizing.get("basis") or "exploitable_capital").strip().lower() or "exploitable_capital",
+        "regime_confidence_decay": _sanitize_regime_confidence_decay_policy(auto_sizing.get("regime_confidence_decay") if isinstance(auto_sizing.get("regime_confidence_decay"), dict) else {}),
+        "selected_bucket": selected_bucket,
+    }
+
+
+def _oracle_stability_snapshot(
+    account_id: str,
+    symbol: str,
+    side: str,
+    source: str,
+    lookback_minutes: int,
+    *,
+    input_confidence: float,
+    pre_trade_memory_gate: dict[str, Any] | None = None,
+    no_trade_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    safe_lookback = max(5, min(24 * 60, int(lookback_minutes or 120)))
+    account_key = _normalize_account_id(account_id)
+    normalized_symbol = _normalize_symbol(symbol)
+    normalized_side = str(side or "buy").strip().lower() or "buy"
+    rows = fetch_all(
+        """
+        SELECT COALESCE(payload->>'status', '') AS status,
+               COALESCE(payload->>'source', '') AS source,
+               payload->'reasons' AS reasons,
+               created_at
+        FROM audit_events
+        WHERE category = 'go_live_hardening_decision'
+          AND created_at >= NOW() - (%s * INTERVAL '1 minute')
+          AND COALESCE(payload->>'account_id', '') = %s
+          AND COALESCE(payload->>'symbol', '') = %s
+          AND COALESCE(payload->>'side', '') = %s
+        ORDER BY created_at DESC
+        LIMIT 24
+        """,
+        (safe_lookback, account_key, normalized_symbol, normalized_side),
+    )
+    statuses = [str(row.get("status") or "approved").strip().lower() or "approved" for row in rows]
+    transition_count = sum(1 for idx in range(1, len(statuses)) if statuses[idx] != statuses[idx - 1])
+    same_source_count = sum(1 for row in rows if not source or str(row.get("source") or "").strip() == str(source or "").strip())
+    distinct_status_count = len({status for status in statuses if status})
+    reason_signatures = {
+        tuple(sorted(str(item) for item in (row.get("reasons") if isinstance(row.get("reasons"), list) else []) if str(item)))
+        for row in rows
+    }
+    reason_signature_count = len({signature for signature in reason_signatures if signature})
+    memory_gate = pre_trade_memory_gate if isinstance(pre_trade_memory_gate, dict) else {}
+    no_trade_view = no_trade_context if isinstance(no_trade_context, dict) else {}
+    memory_confidence = _clamp(_to_float(memory_gate.get("confidence"), input_confidence), 0.0, 1.0)
+    no_trade_confidence = _clamp(_to_float(no_trade_view.get("confidence"), input_confidence), 0.0, 1.0)
+    confidence_span = max(abs(memory_confidence - input_confidence), abs(no_trade_confidence - input_confidence))
+    score = 1.0
+    score -= min(0.36, transition_count * 0.18)
+    score -= min(0.16, max(0, distinct_status_count - 1) * 0.08)
+    score -= min(0.18, max(0, reason_signature_count - 1) * 0.06)
+    if _bool_from_any(memory_gate.get("block_execution"), False) and input_confidence >= 0.62:
+        score -= 0.16
+    if _bool_from_any(no_trade_view.get("no_trade"), False) and input_confidence >= 0.75:
+        score -= 0.08
+    if confidence_span > 0.18:
+        score -= min(0.18, (confidence_span - 0.18) * 0.6)
+    score = _clamp(score, 0.0, 1.0)
+    state = "nominal"
+    if score < 0.45:
+        state = "critical"
+    elif score < 0.6:
+        state = "degraded"
+    elif score < 0.8:
+        state = "watch"
+    return {
+        "account_id": account_key,
+        "symbol": normalized_symbol,
+        "side": normalized_side,
+        "lookback_minutes": safe_lookback,
+        "sample_count": len(rows),
+        "same_source_count": same_source_count,
+        "transition_count": transition_count,
+        "distinct_status_count": distinct_status_count,
+        "reason_signature_count": reason_signature_count,
+        "confidence_span": round(confidence_span, 6),
+        "score": round(score, 6),
+        "state": state,
+    }
+
+
+def _regime_confidence_decay_snapshot(regime: str, policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    regime_key = str(regime or "UNKNOWN").strip().lower() or "unknown"
+    decay_policy = _sanitize_regime_confidence_decay_policy(policy)
+    if not decay_policy.get("enabled"):
+        return {
+            "regime": regime_key.upper(),
+            "enabled": False,
+            "score": 1.0,
+            "state": "disabled",
+            "sample_count": 0,
+            "drift_detected": False,
+        }
+
+    rows = fetch_all(
+        """
+        SELECT regime, sample_count, avg_net_result_usd, drawdown_usd, drift_detected, updated_at
+        FROM strategy_health_state
+        WHERE LOWER(COALESCE(regime, 'unknown')) = %s
+          AND window_hours = %s
+        ORDER BY updated_at DESC
+        LIMIT 20
+        """,
+        (regime_key, _drift_window_hours()),
+    )
+    if not rows:
+        score = _clamp(max(0.82, _to_float(decay_policy.get("floor"), 0.72)), 0.0, 1.0)
+        return {
+            "regime": regime_key.upper(),
+            "enabled": True,
+            "score": round(score, 6),
+            "state": "unproven",
+            "sample_count": 0,
+            "drift_detected": False,
+            "updated_at": None,
+        }
+
+    sample_count = max(0, int(round(sum(_to_float(row.get("sample_count"), 0.0) for row in rows) / max(1, len(rows)))))
+    avg_net_result_usd = sum(_to_float(row.get("avg_net_result_usd"), 0.0) for row in rows) / max(1, len(rows))
+    drift_detected = any(_bool_from_any(row.get("drift_detected"), False) for row in rows)
+    updated_candidates = [_parse_iso_utc(str(row.get("updated_at") or "")) for row in rows]
+    updated_candidates = [candidate for candidate in updated_candidates if candidate is not None]
+    latest_updated_at = max(updated_candidates) if updated_candidates else None
+    score = 1.0
+    if drift_detected:
+        score -= _to_float(decay_policy.get("drift_penalty"), 0.18)
+    if avg_net_result_usd < 0:
+        score -= _to_float(decay_policy.get("negative_avg_penalty"), 0.08)
+    if sample_count < int(decay_policy.get("min_sample_count") or 5):
+        score -= _to_float(decay_policy.get("low_sample_penalty"), 0.05)
+    if latest_updated_at is not None:
+        age_hours = max(0.0, (_now_utc() - latest_updated_at).total_seconds() / 3600.0)
+        stale_after_hours = _to_float(decay_policy.get("stale_after_hours"), 12.0)
+        if age_hours > stale_after_hours:
+            score -= (age_hours - stale_after_hours) * _to_float(decay_policy.get("stale_decay_per_hour"), 0.015)
+    else:
+        age_hours = None
+    floor = _clamp(_to_float(decay_policy.get("floor"), 0.72), 0.0, 1.0)
+    score = _clamp(score, floor, 1.0)
+    state = "nominal"
+    if score <= floor + 0.04:
+        state = "degraded"
+    elif score < 0.9:
+        state = "watch"
+    return {
+        "regime": regime_key.upper(),
+        "enabled": True,
+        "score": round(score, 6),
+        "state": state,
+        "sample_count": sample_count,
+        "avg_net_result_usd": round(avg_net_result_usd, 8),
+        "drift_detected": drift_detected,
+        "updated_at": latest_updated_at.isoformat() if latest_updated_at else None,
+        "age_hours": round(age_hours, 6) if age_hours is not None else None,
     }
 
 
@@ -6644,12 +8997,13 @@ def _account_live_exposure_snapshot(account_id: str, symbol: str, requested_noti
         }
 
     balances = _latest_account_balances(account_key)
-    positions = _latest_account_positions(account_key)
+    positions = _annotated_account_positions(account_key)
+    live_positions = [item for item in positions if isinstance(item, dict) and bool(item.get("live_truth"))]
     equity_usd = sum(_to_float(item.get("equity_usd"), 0.0) for item in balances if isinstance(item, dict))
-    gross_exposure_usd = sum(abs(_to_float(item.get("notional_usd"), 0.0)) for item in positions if isinstance(item, dict))
+    gross_exposure_usd = sum(abs(_to_float(item.get("notional_usd"), 0.0)) for item in live_positions if isinstance(item, dict))
     symbol_gross_exposure_usd = sum(
         abs(_to_float(item.get("notional_usd"), 0.0))
-        for item in positions
+        for item in live_positions
         if isinstance(item, dict) and _normalize_symbol(str(item.get("symbol") or item.get("instrument") or "")) == normalized_symbol
     )
     gross_exposure_pct = (gross_exposure_usd / equity_usd * 100.0) if equity_usd > 0 else 0.0
@@ -6667,8 +9021,249 @@ def _account_live_exposure_snapshot(account_id: str, symbol: str, requested_noti
         "projected_symbol_exposure_pct": round(projected_symbol_exposure_pct, 4),
         "portfolio_ids": _portfolio_ids_for_account(account_key),
         "positions_count": len([item for item in positions if isinstance(item, dict)]),
+        "live_positions_count": len(live_positions),
+        "stale_positions_count": len([item for item in positions if isinstance(item, dict) and not bool(item.get("live_truth"))]),
+        "freshness_locked": any(isinstance(item, dict) and not bool(item.get("live_truth")) for item in positions),
         "exposure_known": equity_usd > 0,
     }
+
+
+async def _execute_live_position_governor_action(
+    account_id: str,
+    provider: str,
+    position: dict[str, Any],
+    governor: dict[str, Any],
+) -> dict[str, Any]:
+    action = str(governor.get("recommended_action") or "").strip().upper()
+    if action not in {"FORCE_CLOSE", "MOVE_STOP_TO_BREAKEVEN", "TRAIL_STOP", "ARM_STOP_LOSS", "ARM_TAKE_PROFIT"}:
+        return {
+            "status": "manual_required",
+            "recommended_action": action or "HOLD",
+            "capability": governor.get("execution_capability") or "none",
+        }
+
+    provider_key = str(provider or "").strip().lower()
+    if provider_key != "bingx":
+        return {
+            "status": "unsupported",
+            "recommended_action": action,
+            "capability": governor.get("execution_capability") or "pending_bridge_support",
+        }
+
+    try:
+        _, secret_payload = _bingx_secret_payload_for_account(account_id, require_trade=True)
+    except ValueError as exc:
+        return {
+            "status": "failed",
+            "recommended_action": action,
+            "error": str(exc),
+        }
+
+    if action in {"MOVE_STOP_TO_BREAKEVEN", "TRAIL_STOP", "ARM_STOP_LOSS", "ARM_TAKE_PROFIT"}:
+        position_side = "LONG" if str(position.get("side") or "").strip().lower() == "long" else "SHORT"
+        close_side = "sell" if position_side == "LONG" else "buy"
+        amend_payload = {
+            "provider": "bingx",
+            "account_id": _normalize_account_id(account_id),
+            "secret_payload": secret_payload,
+            "symbol": str(position.get("symbol") or position.get("instrument") or "").strip().upper(),
+            "side": close_side,
+            "position_side": position_side,
+            "quantity": _to_float(position.get("quantity"), 0.0),
+            "notional_usd": abs(_to_float(position.get("notional_usd"), 0.0)),
+            "active_protection": position.get("broker_active_protection") if isinstance(position.get("broker_active_protection"), dict) else {},
+            "protection": governor.get("suggested_protection") if isinstance(governor.get("suggested_protection"), dict) else {},
+        }
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            response = await client.post(f"{BROKER_ADAPTER_URL}/v1/live/orders/amend", json=amend_payload)
+        if response.status_code >= 400:
+            return {
+                "status": "failed",
+                "recommended_action": action,
+                "error": _flatten_downstream_error("live_position_governor_amend_failed", _http_error_detail(response)),
+                "request": amend_payload,
+            }
+        body = response.json()
+        result = body if isinstance(body, dict) else {"status": "unknown"}
+        append_audit(
+            "live_position_governor_protection_amended",
+            {
+                "provider": provider_key,
+                "account_id": _normalize_account_id(account_id),
+                "position_id": position.get("position_id"),
+                "symbol": position.get("symbol") or position.get("instrument"),
+                "recommended_action": action,
+                "governor_reason": governor.get("reason"),
+            },
+        )
+        return {
+            "status": "executed",
+            "recommended_action": action,
+            "amend": result,
+            "request": {
+                "symbol": amend_payload["symbol"],
+                "position_side": position_side,
+                "quantity": amend_payload["quantity"],
+                "protection": amend_payload["protection"],
+            },
+        }
+
+    side = str(position.get("side") or "").strip().lower()
+    close_side = "SELL" if side == "long" else "BUY"
+    position_side = "LONG" if side == "long" else "SHORT"
+    close_payload = {
+        "provider": "bingx",
+        "account_id": _normalize_account_id(account_id),
+        "secret_payload": secret_payload,
+        "symbol": str(position.get("symbol") or position.get("instrument") or "").strip().upper(),
+        "side": close_side,
+        "position_side": position_side,
+        "quantity": _to_float(position.get("quantity"), 0.0),
+        "order_type": "MARKET",
+    }
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        response = await client.post(f"{BROKER_ADAPTER_URL}/v1/live/orders", json=close_payload)
+    if response.status_code >= 400:
+        return {
+            "status": "failed",
+            "recommended_action": action,
+            "error": _flatten_downstream_error("live_position_governor_force_close_failed", _http_error_detail(response)),
+        }
+    body = response.json()
+    result = body if isinstance(body, dict) else {"status": "unknown"}
+    append_audit(
+        "live_position_governor_force_close_executed",
+        {
+            "provider": provider_key,
+            "account_id": _normalize_account_id(account_id),
+            "position_id": position.get("position_id"),
+            "symbol": position.get("symbol") or position.get("instrument"),
+            "close_side": close_side,
+            "quantity": _to_float(position.get("quantity"), 0.0),
+            "governor_reason": governor.get("reason"),
+        },
+    )
+    return {
+        "status": "executed",
+        "recommended_action": action,
+        "order": result,
+    }
+
+
+async def _reconcile_live_position_protection(
+    account_id: str,
+    account: dict | None = None,
+    *,
+    provider_override: str | None = None,
+    positions: list[dict] | None = None,
+    open_orders: list[dict] | None = None,
+    broker_truth_source: str | None = None,
+    execute_governor: bool = False,
+) -> dict[str, Any] | None:
+    account_row = account if isinstance(account, dict) else fetch_one(
+        "SELECT account_id, connector_type, metadata FROM accounts_registry WHERE account_id = %s",
+        (_normalize_account_id(account_id),),
+    )
+    provider = str(provider_override or (account_row or {}).get("connector_type") or "").strip().lower()
+    if provider not in {"bingx", "mt5"}:
+        return None
+
+    position_rows = [
+        {**item, "account_id": _normalize_account_id(account_id)}
+        for item in (positions if isinstance(positions, list) else _latest_account_positions(account_id))
+        if isinstance(item, dict)
+    ]
+    active_order_rows = [item for item in (open_orders if isinstance(open_orders, list) else []) if isinstance(item, dict)]
+    previous_rows = {
+        str(item.get("position_id") or "").strip(): item
+        for item in _latest_live_position_protection_rows(account_id, provider)
+        if str(item.get("position_id") or "").strip()
+    }
+
+    reconciled_rows: list[dict[str, Any]] = []
+    for position in position_rows:
+        position_id = str(position.get("position_id") or "").strip()
+        symbol = str(position.get("symbol") or position.get("instrument") or "").strip().upper()
+        known = previous_rows.get(position_id, {})
+        requested = known.get("requested_protection") if isinstance(known.get("requested_protection"), dict) else {}
+        accepted = known.get("broker_accepted_protection") if isinstance(known.get("broker_accepted_protection"), dict) else {}
+        if not requested:
+            requested = _latest_execution_telemetry_protection(account_id, symbol) if provider == "bingx" else _latest_mt5_execution_protection(account_id, symbol)
+        active = _bingx_active_protection_for_position(position, active_order_rows) if provider == "bingx" else _mt5_active_protection_for_position(position, active_order_rows)
+        if not accepted:
+            accepted = active or requested
+        effective_truth_source = str(
+            broker_truth_source
+            or ((position.get("payload") or {}).get("truth_source") if isinstance(position.get("payload"), dict) else "")
+            or position.get("source")
+            or provider
+        ).strip()
+        status_row = build_live_position_protection_status(
+            position,
+            provider=provider,
+            broker_truth_source=effective_truth_source,
+            requested_protection=requested,
+            broker_accepted_protection=accepted,
+            active_protection=active,
+            stale_after_seconds=_live_snapshot_stale_after_seconds(provider),
+        )
+        status_row["last_amend_request"] = known.get("last_amend_request") if isinstance(known.get("last_amend_request"), dict) else {}
+        governor = build_position_protection_governor(status_row)
+        status_row["governor_state"] = governor
+        if execute_governor and bool(governor.get("actionable")):
+            execution_result = await _execute_live_position_governor_action(account_id, provider, position, governor)
+            status_row["forced_action"] = str(execution_result.get("status") or "").strip() or None
+            status_row["governor_state"] = {
+                **governor,
+                "execution_result": execution_result,
+            }
+        else:
+            status_row["forced_action"] = None
+        reconciled_rows.append(status_row)
+
+    _persist_live_position_protection_rows(account_id, provider, reconciled_rows)
+    refreshed_rows = _latest_live_position_protection_rows(account_id, provider)
+    return {
+        "account_id": _normalize_account_id(account_id),
+        "provider": provider,
+        "items": refreshed_rows,
+        "summary": _live_position_protection_summary(refreshed_rows),
+        "truth_source": str(broker_truth_source or provider).strip() or provider,
+        "audit": _latest_live_position_protection_audit(account_id, provider, limit=10),
+    }
+
+
+async def _reconcile_live_position_protection_loop() -> None:
+    while True:
+        rows = fetch_all(
+            """
+            SELECT account_id, connector_type, status
+            FROM accounts_registry
+            WHERE connector_type = ANY(%s) AND status = 'active'
+            ORDER BY updated_at DESC, created_at DESC
+            """,
+            (["bingx", "mt5"],),
+        )
+        for row in rows:
+            account_id = str(row.get("account_id") or "").strip()
+            connector_type = str(row.get("connector_type") or "").strip().lower()
+            if not account_id or connector_type not in {"bingx", "mt5"}:
+                continue
+            try:
+                if connector_type == "mt5":
+                    await _sync_mt5_account_state(account_id)
+                else:
+                    await _sync_supported_connector_account_state(account_id, row)
+            except Exception as exc:
+                append_audit(
+                    "live_position_protection_reconcile_failed",
+                    {
+                        "account_id": account_id,
+                        "provider": connector_type,
+                        "detail": str(exc)[:500],
+                    },
+                )
+        await asyncio.sleep(_live_position_protection_loop_interval_sec())
 
 
 def _recent_pending_live_approval_count(account_id: str = "") -> int:
@@ -6735,9 +9330,11 @@ def _evaluate_go_live_hardening(
     live_requested: bool,
     purpose: str,
     pre_trade_memory_gate: dict[str, Any] | None = None,
+    no_trade_context: dict[str, Any] | None = None,
     governance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    policy = _sanitize_go_live_hardening_policy()
+    live_policy = _load_live_execution_policy()
+    policy = _sanitize_go_live_hardening_policy(_provider_go_live_hardening_policy(provider, live_policy))
     governance_view = governance if isinstance(governance, dict) else {
         "approved": False,
         "approver": "",
@@ -6779,6 +9376,28 @@ def _evaluate_go_live_hardening(
         if _bool_from_any(memory_gate.get("block_execution"), False):
             reasons.append("memory_pretrade_gate_blocked")
             status = _promote_go_live_status(status, "blocked")
+    else:
+        memory_gate = pre_trade_memory_gate if isinstance(pre_trade_memory_gate, dict) else {}
+
+    no_trade_view = no_trade_context if isinstance(no_trade_context, dict) else {}
+    no_trade_policy = policy.get("no_trade_policy") if isinstance(policy.get("no_trade_policy"), dict) else {}
+    no_trade_state = str(no_trade_view.get("no_trade_state") or "eligible").strip().lower() or "eligible"
+    blocked_states = {
+        str(item).strip().lower()
+        for item in (no_trade_policy.get("blocked_states") if isinstance(no_trade_policy.get("blocked_states"), list) else [])
+        if str(item).strip()
+    }
+    block_on_no_trade = _bool_from_any(no_trade_policy.get("block_on_no_trade"), True)
+    block_on_dominance = _bool_from_any(no_trade_policy.get("block_on_dominance"), True)
+    if active and (
+        (block_on_no_trade and _bool_from_any(no_trade_view.get("no_trade"), False))
+        or (block_on_dominance and _bool_from_any(no_trade_view.get("no_trade_dominance"), False))
+        or (blocked_states and no_trade_state in blocked_states)
+    ):
+        reasons.append("execution_context_no_trade")
+        if block_on_dominance and _bool_from_any(no_trade_view.get("no_trade_dominance"), False):
+            reasons.append("execution_context_no_trade_dominance")
+        status = _promote_go_live_status(status, "blocked")
 
     same_signal_limit = max(1, int(_to_float(anti_loop_policy.get("same_signal_limit"), 3.0)))
     block_after_repeats = max(same_signal_limit, int(_to_float(anti_loop_policy.get("block_after_repeats"), 5.0)))
@@ -6791,6 +9410,39 @@ def _evaluate_go_live_hardening(
     if active and anti_loop_blocked:
         reasons.append("anti_loop_repetition_blocked")
         status = _promote_go_live_status(status, "blocked")
+
+    oracle_stability_policy = policy.get("oracle_stability") if isinstance(policy.get("oracle_stability"), dict) else {}
+    oracle_stability = _oracle_stability_snapshot(
+        account_id,
+        normalized_symbol,
+        normalized_side,
+        source,
+        int(_to_float(oracle_stability_policy.get("lookback_minutes"), 120.0)),
+        input_confidence=effective_confidence,
+        pre_trade_memory_gate=memory_gate,
+        no_trade_context=no_trade_view,
+    ) if active and _bool_from_any(oracle_stability_policy.get("enabled"), False) else {
+        "account_id": _normalize_account_id(account_id),
+        "symbol": normalized_symbol,
+        "side": normalized_side,
+        "lookback_minutes": int(_to_float(oracle_stability_policy.get("lookback_minutes"), 120.0)),
+        "sample_count": 0,
+        "same_source_count": 0,
+        "transition_count": 0,
+        "distinct_status_count": 0,
+        "reason_signature_count": 0,
+        "confidence_span": 0.0,
+        "score": 1.0,
+        "state": "disabled",
+    }
+    oracle_warn_below_score = _clamp(_to_float(oracle_stability_policy.get("warn_below_score"), 0.72), 0.0, 1.0)
+    oracle_block_below_score = _clamp(_to_float(oracle_stability_policy.get("block_below_score"), 0.55), 0.0, 1.0)
+    if active and _to_float(oracle_stability.get("score"), 1.0) <= oracle_block_below_score:
+        reasons.append("oracle_stability_blocked")
+        status = _promote_go_live_status(status, "blocked")
+    elif active and _to_float(oracle_stability.get("score"), 1.0) <= oracle_warn_below_score and _bool_from_any(oracle_stability_policy.get("require_human_on_warning"), True) and not governance_view.get("approved"):
+        reasons.append("oracle_stability_requires_governance")
+        status = _promote_go_live_status(status, "require_human")
 
     min_live_confidence = _to_float(policy.get("min_live_confidence"), 0.7)
     if active and min_live_confidence > 0 and effective_confidence < min_live_confidence:
@@ -6820,6 +9472,40 @@ def _evaluate_go_live_hardening(
     drawdown_ratio = drawdown_intraday_usd / drawdown_threshold if drawdown_threshold > 0 else 0.0
     if active and drawdown_warning_ratio > 0 and drawdown_ratio >= drawdown_warning_ratio and not governance_view.get("approved"):
         reasons.append("drawdown_near_limit_requires_governance")
+        status = _promote_go_live_status(status, "require_human")
+
+    drawdown_velocity_policy = policy.get("drawdown_velocity") if isinstance(policy.get("drawdown_velocity"), dict) else {}
+    drawdown_velocity = _drawdown_velocity_snapshot(
+        account_id,
+        provider,
+        int(_to_float(drawdown_velocity_policy.get("lookback_minutes"), 90.0)),
+    ) if active and _bool_from_any(drawdown_velocity_policy.get("enabled"), False) else {
+        "account_id": _normalize_account_id(account_id),
+        "provider": _normalize_connector_provider(provider),
+        "lookback_minutes": int(_to_float(drawdown_velocity_policy.get("lookback_minutes"), 90.0)),
+        "sample_count": 0,
+        "recent_loss_usd": 0.0,
+        "recent_net_result_usd": 0.0,
+    }
+    equity_usd = max(0.0, _to_float(exposure.get("equity_usd"), 0.0))
+    drawdown_velocity_ratio_pct = (max(0.0, _to_float(drawdown_velocity.get("recent_loss_usd"), 0.0)) / equity_usd * 100.0) if equity_usd > 0 else 0.0
+    velocity_warn_loss_usd = max(0.0, _to_float(drawdown_velocity_policy.get("warn_loss_usd"), 0.0))
+    velocity_block_loss_usd = max(0.0, _to_float(drawdown_velocity_policy.get("block_loss_usd"), 0.0))
+    velocity_warn_pct = max(0.0, _to_float(drawdown_velocity_policy.get("warn_loss_pct_of_equity"), 0.0))
+    velocity_block_pct = max(0.0, _to_float(drawdown_velocity_policy.get("block_loss_pct_of_equity"), 0.0))
+    velocity_warning = (
+        (velocity_warn_loss_usd > 0 and _to_float(drawdown_velocity.get("recent_loss_usd"), 0.0) >= velocity_warn_loss_usd)
+        or (velocity_warn_pct > 0 and drawdown_velocity_ratio_pct >= velocity_warn_pct)
+    )
+    velocity_blocked = (
+        (velocity_block_loss_usd > 0 and _to_float(drawdown_velocity.get("recent_loss_usd"), 0.0) >= velocity_block_loss_usd)
+        or (velocity_block_pct > 0 and drawdown_velocity_ratio_pct >= velocity_block_pct)
+    )
+    if active and velocity_blocked:
+        reasons.append("drawdown_velocity_blocked")
+        status = _promote_go_live_status(status, "blocked")
+    elif active and velocity_warning and _bool_from_any(drawdown_velocity_policy.get("require_human_on_warning"), True) and not governance_view.get("approved"):
+        reasons.append("drawdown_velocity_requires_governance")
         status = _promote_go_live_status(status, "require_human")
 
     autonomous_sources = {str(item).strip() for item in policy.get("autonomous_sources", []) if str(item).strip()}
@@ -6856,10 +9542,18 @@ def _evaluate_go_live_hardening(
             "blocked": anti_loop_blocked,
             "degraded_confidence_multiplier": degraded_confidence_multiplier,
         },
+        "oracle_stability": oracle_stability,
         "drawdown_intraday_usd": round(drawdown_intraday_usd, 8),
         "drawdown_ratio": round(drawdown_ratio, 6),
+        "drawdown_velocity": {
+            **drawdown_velocity,
+            "loss_ratio_pct_of_equity": round(drawdown_velocity_ratio_pct, 6),
+            "warning": velocity_warning,
+            "blocked": velocity_blocked,
+        },
         "kill_switch_active": bool(kill_state.get("active")),
         "pending_live_approvals": pending_live_approvals,
+        "no_trade_context": no_trade_view,
         "purpose": purpose,
     }
     if active:
@@ -6877,7 +9571,10 @@ def _evaluate_go_live_hardening(
                 "reasons": result["reasons"],
                 "governance": governance_view,
                 "anti_loop": result["anti_loop"],
+                "oracle_stability": result["oracle_stability"],
                 "exposure": exposure,
+                "no_trade_context": no_trade_view,
+                "drawdown_velocity": result["drawdown_velocity"],
                 "purpose": purpose,
             },
         )
@@ -6924,10 +9621,14 @@ def _sanitize_live_execution_policy(provider_policy: dict[str, Any]) -> dict[str
         "allowed_system_modes": provider_policy.get("allowed_system_modes") if isinstance(provider_policy.get("allowed_system_modes"), list) else [],
         "allow_smoke_test_in_modes": provider_policy.get("allow_smoke_test_in_modes") if isinstance(provider_policy.get("allow_smoke_test_in_modes"), list) else [],
         "max_order_notional_usd": _to_float(provider_policy.get("max_order_notional_usd"), 0.0),
+        "max_notional_pct_of_exploitable_capital": _to_float(provider_policy.get("max_notional_pct_of_exploitable_capital"), 0.0),
         "default_order_notional_usd": _to_float(provider_policy.get("default_order_notional_usd"), 0.0),
         "smoke_test_notional_usd": _to_float(provider_policy.get("smoke_test_notional_usd"), 0.0),
         "smoke_limit_offset_bps": _to_float(provider_policy.get("smoke_limit_offset_bps"), 0.0),
         "primary_live_instrument": str(provider_policy.get("primary_live_instrument") or "").strip().upper(),
+        "micro_live": _sanitize_micro_live_policy(provider_policy),
+        "go_live_hardening_overrides": _sanitize_go_live_hardening_policy(provider_policy.get("go_live_hardening_overrides") if isinstance(provider_policy.get("go_live_hardening_overrides"), dict) else {}),
+        "ftmo_challenge": provider_policy.get("ftmo_challenge") if isinstance(provider_policy.get("ftmo_challenge"), dict) else {},
         "conditional_live_rules": provider_policy.get("conditional_live_rules") if isinstance(provider_policy.get("conditional_live_rules"), dict) else {},
     }
 
@@ -6986,6 +9687,7 @@ def _resolve_live_execution_request(
     symbol: str = "",
     regime: str = "UNKNOWN",
     confidence: float = 0.0,
+    preserve_requested_notional: bool = False,
 ) -> dict[str, Any]:
     provider_norm = _normalize_connector_provider(provider)
     account_key = _normalize_account_id(account_id)
@@ -6993,6 +9695,9 @@ def _resolve_live_execution_request(
     policy = _load_live_execution_policy()
     provider_policy = policy.get("providers", {}).get(provider_norm) if isinstance(policy.get("providers"), dict) else {}
     provider_policy = provider_policy if isinstance(provider_policy, dict) else {}
+    micro_live = _resolve_provider_micro_live(provider_norm, provider_policy, policy)
+    stage_config = micro_live.get("current_stage_config") if isinstance(micro_live.get("current_stage_config"), dict) else {}
+    stage_auto_sizing = _resolve_stage_auto_sizing(stage_config, confidence)
     reasons: list[str] = []
     if not _bool_from_any(exchange_capabilities.get("known"), False):
         reasons.append("unknown_provider")
@@ -7019,7 +9724,7 @@ def _resolve_live_execution_request(
 
     connector_degradation: dict[str, Any] = {}
     try:
-        connector_degradation = _connector_live_degradation_snapshot(provider_norm)
+        connector_degradation = _connector_live_degradation_snapshot(provider_norm, instrument=symbol)
     except Exception:
         connector_degradation = {
             "provider": provider_norm,
@@ -7036,6 +9741,13 @@ def _resolve_live_execution_request(
     health_action = str(connector_degradation.get("health_action") or "ok").strip().lower()
     size_multiplier = _clamp(_to_float(connector_degradation.get("size_multiplier"), 1.0), 0.0, 1.0)
     effective_notional_usd = round(requested_notional_usd * size_multiplier, 8)
+    auto_sizing_result = {
+        "enabled": _bool_from_any(stage_auto_sizing.get("enabled"), False),
+        "basis": str(stage_auto_sizing.get("basis") or "").strip().lower(),
+        "selected_bucket": stage_auto_sizing.get("selected_bucket") if isinstance(stage_auto_sizing.get("selected_bucket"), dict) else {},
+        "applied": False,
+        "suggested_notional_usd": 0.0,
+    }
     if health_action == "block":
         reasons.append("connector_health_score_blocked")
     elif health_action == "reduce_size" and requested_notional_usd > 0 and effective_notional_usd < requested_notional_usd:
@@ -7059,12 +9771,78 @@ def _resolve_live_execution_request(
     if purpose == "smoke":
         allowed_modes = provider_policy.get("allow_smoke_test_in_modes") if isinstance(provider_policy.get("allow_smoke_test_in_modes"), list) else []
         notional_limit = _to_float(provider_policy.get("smoke_test_notional_usd"), 0.0)
+        capital_limit_ratio = _to_float(provider_policy.get("max_notional_pct_of_exploitable_capital"), 0.0)
     else:
-        allowed_modes = provider_policy.get("allowed_system_modes") if isinstance(provider_policy.get("allowed_system_modes"), list) else []
+        allowed_modes = stage_config.get("allowed_system_modes") if isinstance(stage_config.get("allowed_system_modes"), list) and stage_config.get("allowed_system_modes") else provider_policy.get("allowed_system_modes") if isinstance(provider_policy.get("allowed_system_modes"), list) else []
         notional_limit = _to_float(provider_policy.get("max_order_notional_usd"), 0.0)
+        capital_limit_ratio = _to_float(
+            stage_config.get("max_notional_pct_of_exploitable_capital"),
+            _to_float(provider_policy.get("max_notional_pct_of_exploitable_capital"), 0.0),
+        )
+        if _bool_from_any(micro_live.get("enabled"), False):
+            normalized_symbol = _normalize_live_symbol(symbol)
+            allowed_symbols = stage_config.get("allowed_symbols") if isinstance(stage_config.get("allowed_symbols"), list) and stage_config.get("allowed_symbols") else micro_live.get("allowed_symbols") if isinstance(micro_live.get("allowed_symbols"), list) else []
+            if allowed_symbols and normalized_symbol and normalized_symbol not in {str(item) for item in allowed_symbols}:
+                reasons.append("micro_live_symbol_not_allowed")
+            stage_size_multiplier = _clamp(_to_float(stage_config.get("size_multiplier"), 1.0), 0.0, 1.0)
+            if stage_size_multiplier < 1.0 and requested_notional_usd > 0:
+                effective_notional_usd = round(effective_notional_usd * stage_size_multiplier, 8)
+                advisories.append("micro_live_stage_reduce_size")
+            stage_limit = max(0.0, _to_float(stage_config.get("max_order_notional_usd"), 0.0))
+            if stage_limit > 0:
+                if preserve_requested_notional and requested_notional_usd > stage_limit + 1e-9:
+                    advisories.append("micro_live_stage_cap_preserved")
+                else:
+                    notional_limit = min(notional_limit, stage_limit) if notional_limit > 0 else stage_limit
+                    if effective_notional_usd > stage_limit:
+                        effective_notional_usd = round(stage_limit, 8)
+                        advisories.append("micro_live_stage_cap_applied")
+    capital_snapshot = None
+    if (capital_limit_ratio > 0 or _bool_from_any(stage_auto_sizing.get("enabled"), False)) and account_key:
+        capital_snapshot = _account_exploitable_capital_snapshot(account_key)
+    if _bool_from_any(stage_auto_sizing.get("enabled"), False) and isinstance(capital_snapshot, dict):
+        selected_bucket = stage_auto_sizing.get("selected_bucket") if isinstance(stage_auto_sizing.get("selected_bucket"), dict) else {}
+        exploitable_capital_usd = _to_float(capital_snapshot.get("exploitable_capital_usd"), 0.0)
+        suggested_notional_usd = round(
+            exploitable_capital_usd * max(0.0, _to_float(selected_bucket.get("notional_pct_of_exploitable_capital"), 0.0)),
+            8,
+        )
+        bucket_limit = max(0.0, _to_float(selected_bucket.get("max_order_notional_usd"), 0.0))
+        if bucket_limit > 0:
+            suggested_notional_usd = min(suggested_notional_usd, bucket_limit) if suggested_notional_usd > 0 else bucket_limit
+        regime_confidence_decay = _regime_confidence_decay_snapshot(
+            regime,
+            stage_auto_sizing.get("regime_confidence_decay") if isinstance(stage_auto_sizing.get("regime_confidence_decay"), dict) else {},
+        )
+        regime_decay_score = _clamp(_to_float(regime_confidence_decay.get("score"), 1.0), 0.0, 1.0)
+        if suggested_notional_usd > 0 and regime_decay_score < 0.999999:
+            suggested_notional_usd = round(suggested_notional_usd * regime_decay_score, 8)
+            advisories.append("regime_confidence_decay_applied")
+        auto_sizing_result["suggested_notional_usd"] = suggested_notional_usd
+        auto_sizing_result["regime_confidence_decay"] = regime_confidence_decay
+        if suggested_notional_usd > 0 and effective_notional_usd > suggested_notional_usd + 1e-9:
+            effective_notional_usd = suggested_notional_usd
+            auto_sizing_result["applied"] = True
+            advisories.append("stage_auto_sizing_cap_applied")
+    elif _bool_from_any(stage_auto_sizing.get("enabled"), False):
+        auto_sizing_result["regime_confidence_decay"] = _regime_confidence_decay_snapshot(
+            regime,
+            stage_auto_sizing.get("regime_confidence_decay") if isinstance(stage_auto_sizing.get("regime_confidence_decay"), dict) else {},
+        )
+    if capital_limit_ratio > 0 and account_key:
+        exploitable_capital_usd = _to_float(capital_snapshot.get("exploitable_capital_usd"), 0.0)
+        capital_notional_limit = round(exploitable_capital_usd * capital_limit_ratio, 8)
+        if capital_notional_limit > 0:
+            if preserve_requested_notional and requested_notional_usd > capital_notional_limit + 1e-9:
+                advisories.append("exploitable_capital_cap_preserved")
+            else:
+                notional_limit = min(notional_limit, capital_notional_limit) if notional_limit > 0 else capital_notional_limit
+                if effective_notional_usd > capital_notional_limit + 1e-9:
+                    effective_notional_usd = round(capital_notional_limit, 8)
+                    advisories.append("exploitable_capital_cap_applied")
     if allowed_modes and CURRENT_SYSTEM_MODE.value not in {str(item) for item in allowed_modes}:
         reasons.append("system_mode_not_live_enabled")
-    if notional_limit > 0 and requested_notional_usd > notional_limit:
+    if notional_limit > 0 and effective_notional_usd > notional_limit:
         reasons.append("requested_notional_exceeds_live_limit")
 
     enabled = len(reasons) == 0
@@ -7082,7 +9860,12 @@ def _resolve_live_execution_request(
         "size_multiplier": size_multiplier,
         "requested_notional_usd": round(requested_notional_usd, 8),
         "effective_notional_usd": effective_notional_usd,
-        "policy": _sanitize_live_execution_policy(provider_policy),
+        "capital_snapshot": capital_snapshot,
+        "auto_sizing": auto_sizing_result,
+        "policy": {
+            **_sanitize_live_execution_policy(provider_policy),
+            "micro_live": micro_live,
+        },
         "connector_degradation": connector_degradation,
         "linked_account": _connector_account_public_view(linked_account),
         "secret_payload": secret_payload if enabled else None,
@@ -7095,14 +9878,61 @@ def _intent_live_execution_context(intent_payload: dict[str, Any]) -> dict[str, 
     provider = _normalize_connector_provider(live.get("provider") or intent_payload.get("venue") or "")
     account_id = _normalize_account_id(live.get("account_id") or explainability.get("account_id") or "")
     requested = _bool_from_any(live.get("enabled"), False) or _bool_from_any(live.get("requested"), False)
+    protection_payload = intent_payload.get("protection") if isinstance(intent_payload.get("protection"), dict) else live.get("protection")
+    protection: dict[str, Any] = {}
+    if isinstance(protection_payload, dict) and protection_payload:
+        try:
+            protection = TradeProtectionRequest.model_validate(protection_payload).model_dump(mode="json", exclude_none=True)
+        except Exception:
+            protection = {}
     return {
         "requested": requested and bool(provider) and bool(account_id),
         "provider": provider,
         "account_id": account_id,
+        "auto_size": _bool_from_any(live.get("auto_size"), True),
+        "auto_protection": _bool_from_any(
+            (live.get("dynamic_protection") if isinstance(live.get("dynamic_protection"), dict) else {}).get("enabled"),
+            _bool_from_any(live.get("auto_protection"), True),
+        ),
         "order_type": str(live.get("order_type") or "MARKET").strip().upper(),
         "position_side": str(live.get("position_side") or "").strip().upper(),
         "reduce_only": _bool_from_any(live.get("reduce_only"), False),
+        "dry_run": _bool_from_any(live.get("dry_run"), False),
+        "dry_run_accepted_legs": live.get("dry_run_accepted_legs") if isinstance(live.get("dry_run_accepted_legs"), (list, tuple, set, str)) else None,
+        "protection": protection,
     }
+
+
+async def _fetch_live_execution_constraints(intent_payload: dict[str, Any]) -> dict[str, Any]:
+    live_hint = _intent_live_execution_context(intent_payload)
+    if not bool(live_hint.get("requested")):
+        return {}
+    provider = str(live_hint.get("provider") or "").strip().lower()
+    if provider != "bingx":
+        return {}
+    symbol = str(intent_payload.get("instrument") or "").strip().upper().replace("/", "").replace("-", "")
+    if not symbol:
+        return {}
+    side = _normalize_trade_side(intent_payload.get("side"))
+    request_payload = {
+        "provider": provider,
+        "symbol": symbol,
+        "side": side,
+        "requested_notional_usd": _to_float(intent_payload.get("target_notional_usd"), 0.0),
+        "auto_adjust_notional": _bool_from_any(live_hint.get("auto_size"), True),
+    }
+    protection = live_hint.get("protection") if isinstance(live_hint.get("protection"), dict) else {}
+    if protection:
+        request_payload["protection"] = protection
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(f"{BROKER_ADAPTER_URL}/v1/live/execution-constraints", json=request_payload)
+        if response.status_code >= 400:
+            return {}
+        body = response.json()
+        return _normalize_live_execution_constraints(body, intent_payload) if isinstance(body, dict) else {}
+    except Exception:
+        return {}
 
 
 def _normalize_ui_preferences(payload: dict | None) -> dict:
@@ -9085,6 +11915,156 @@ def _sync_internal_portfolio_accounts(account_id: str | None = None) -> int:
     return _sync_accounts_registry_from_mt5(account_id)
 
 
+def _extract_mt5_external_broker_state_payload(payload: Any, payload_path: str | None = None) -> dict[str, Any] | None:
+    current = payload
+    if payload_path:
+        for part in [segment.strip() for segment in str(payload_path).split(".") if segment.strip()]:
+            if not isinstance(current, dict):
+                return None
+            current = current.get(part)
+
+    candidates: list[Any] = [current]
+    if isinstance(current, dict):
+        candidates.extend(
+            current.get(key)
+            for key in ("broker_state", "state", "account_state", "snapshot", "data")
+        )
+
+    for candidate in candidates:
+        if isinstance(candidate, list):
+            return {"positions": candidate}
+        if not isinstance(candidate, dict):
+            continue
+        if any(key in candidate for key in ("positions", "protective_orders", "balances", "session", "summary")):
+            return candidate
+        nested = candidate.get("broker_state") if isinstance(candidate.get("broker_state"), dict) else None
+        if isinstance(nested, dict) and any(key in nested for key in ("positions", "protective_orders", "balances", "session", "summary")):
+            return nested
+    return None
+
+
+async def _pull_mt5_broker_state_from_external_session(account_id: str) -> dict[str, Any] | None:
+    normalized_account_id = _normalize_account_id(account_id)
+    row = fetch_one("SELECT metadata FROM mt5_accounts WHERE account_id = %s", (normalized_account_id,))
+    metadata = row.get("metadata") if row and isinstance(row.get("metadata"), dict) else {}
+    broker_session = metadata.get("broker_session") if isinstance(metadata.get("broker_session"), dict) else {}
+    state_url = str(
+        broker_session.get("snapshot_url")
+        or broker_session.get("state_url")
+        or broker_session.get("url")
+        or ""
+    ).strip()
+    if not state_url:
+        return None
+    auto_sync_raw = broker_session.get("auto_sync")
+    if auto_sync_raw is not None and str(auto_sync_raw).strip().lower() in {"0", "false", "no", "off"}:
+        return None
+
+    min_poll_interval_seconds = max(5.0, _to_float(broker_session.get("min_poll_interval_seconds"), 20.0))
+    now = _now_utc()
+    last_pull_at = MT5_EXTERNAL_BROKER_STATE_LAST_PULL.get(normalized_account_id)
+    if last_pull_at and (now - last_pull_at).total_seconds() < min_poll_interval_seconds:
+        return None
+    MT5_EXTERNAL_BROKER_STATE_LAST_PULL[normalized_account_id] = now
+
+    method = str(broker_session.get("method") or "GET").strip().upper() or "GET"
+    headers = dict(broker_session.get("headers") or {}) if isinstance(broker_session.get("headers"), dict) else {}
+    query_params = dict(broker_session.get("query") or {}) if isinstance(broker_session.get("query"), dict) else None
+    request_payload = dict(broker_session.get("payload") or {}) if isinstance(broker_session.get("payload"), dict) else None
+    timeout_seconds = max(1.0, min(30.0, _to_float(broker_session.get("timeout_seconds"), 8.0)))
+    payload_path = str(broker_session.get("payload_path") or "").strip() or None
+    truth_source = str(broker_session.get("truth_source") or "mt5-external-broker-session").strip() or "mt5-external-broker-session"
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            response = await client.request(
+                method,
+                state_url,
+                headers=headers or None,
+                params=query_params,
+                json=request_payload if method in {"POST", "PUT", "PATCH"} else None,
+            )
+    except Exception as exc:
+        append_audit(
+            "mt5_external_broker_state_pull_failed",
+            {"account_id": normalized_account_id, "detail": str(exc)[:500]},
+        )
+        return None
+
+    if response.status_code >= 400:
+        append_audit(
+            "mt5_external_broker_state_pull_failed",
+            {
+                "account_id": normalized_account_id,
+                "status_code": response.status_code,
+                "detail": response.text[:500],
+            },
+        )
+        return None
+
+    try:
+        body = response.json()
+    except ValueError:
+        append_audit(
+            "mt5_external_broker_state_pull_failed",
+            {
+                "account_id": normalized_account_id,
+                "detail": "external session returned non-json payload",
+            },
+        )
+        return None
+
+    broker_state = _extract_mt5_external_broker_state_payload(body, payload_path=payload_path)
+    if not broker_state:
+        append_audit(
+            "mt5_external_broker_state_pull_failed",
+            {
+                "account_id": normalized_account_id,
+                "detail": "external session payload missing broker state fields",
+            },
+        )
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            ingest_response = await client.post(
+                f"{MT5_BRIDGE_URL}/v1/accounts/{normalized_account_id}/broker-state",
+                json={
+                    "broker_state": broker_state,
+                    "truth_source": truth_source,
+                },
+            )
+    except Exception as exc:
+        append_audit(
+            "mt5_external_broker_state_ingest_failed",
+            {"account_id": normalized_account_id, "detail": str(exc)[:500]},
+        )
+        return None
+
+    if ingest_response.status_code >= 400:
+        append_audit(
+            "mt5_external_broker_state_ingest_failed",
+            {
+                "account_id": normalized_account_id,
+                "status_code": ingest_response.status_code,
+                "detail": ingest_response.text[:500],
+            },
+        )
+        return None
+
+    append_audit(
+        "mt5_external_broker_state_ingested",
+        {
+            "account_id": normalized_account_id,
+            "truth_source": truth_source,
+            "position_count": len(broker_state.get("positions") or []) if isinstance(broker_state.get("positions"), list) else 0,
+            "protective_order_count": len(broker_state.get("protective_orders") or []) if isinstance(broker_state.get("protective_orders"), list) else 0,
+        },
+    )
+    body = ingest_response.json()
+    return body if isinstance(body, dict) else None
+
+
 async def _fetch_mt5_normalized_state(account_id: str) -> dict | None:
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -9111,6 +12091,7 @@ def _persist_mt5_account_state(account_id: str, payload: dict | None) -> dict | 
     summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
     balances = payload.get("balances") if isinstance(payload.get("balances"), list) else []
     positions = payload.get("positions") if isinstance(payload.get("positions"), list) else []
+    protective_orders = payload.get("protective_orders") if isinstance(payload.get("protective_orders"), list) else []
     as_of = str(payload.get("as_of") or _now_utc().isoformat())
 
     execute(
@@ -9211,6 +12192,10 @@ def _persist_mt5_account_state(account_id: str, payload: dict | None) -> dict | 
     return {
         "status": str(payload.get("status") or "ok"),
         "as_of": as_of,
+        "positions": positions,
+        "balances": balances,
+        "protective_orders": protective_orders,
+        "truth_source": str(payload.get("truth_source") or payload.get("positions_source") or "mt5-order-events-reconstructed"),
         "summary": {
             "equity_usd": _to_float(summary.get("equity_usd"), 0.0),
             "gross_exposure_usd": _to_float(summary.get("gross_exposure_usd"), 0.0),
@@ -9223,10 +12208,23 @@ def _persist_mt5_account_state(account_id: str, payload: dict | None) -> dict | 
 
 async def _sync_mt5_account_state(account_id: str) -> dict | None:
     _sync_accounts_registry_from_mt5(account_id)
+    await _pull_mt5_broker_state_from_external_session(account_id)
     normalized_state = await _fetch_mt5_normalized_state(account_id)
     persisted = _persist_mt5_account_state(account_id, normalized_state)
     if persisted:
         persisted["risk_snapshots"] = _refresh_portfolio_risk_snapshots_for_account(account_id)
+        account_row = fetch_one(
+            "SELECT account_id, connector_type, metadata FROM accounts_registry WHERE account_id = %s",
+            (_normalize_account_id(account_id),),
+        )
+        persisted["live_position_protection"] = await _reconcile_live_position_protection(
+            account_id,
+            account_row,
+            provider_override="mt5",
+            positions=persisted.get("positions") if isinstance(persisted.get("positions"), list) else [],
+            open_orders=persisted.get("protective_orders") if isinstance(persisted.get("protective_orders"), list) else [],
+            broker_truth_source=str(persisted.get("truth_source") or "mt5-order-events-reconstructed"),
+        )
     return persisted
 
 
@@ -9321,6 +12319,351 @@ def _latest_account_positions(account_id: str) -> list[dict]:
         (normalized_account_id,),
     )
     return _normalize_db_rows(rows)
+
+
+def _live_protection_provider_from_position(position: dict[str, Any]) -> str:
+    source = str(position.get("source") or "").strip().lower()
+    payload = position.get("payload") if isinstance(position.get("payload"), dict) else {}
+    truth_source = str(payload.get("truth_source") or payload.get("provider") or "").strip().lower()
+    haystacks = [source, truth_source]
+    for value in haystacks:
+        if value.startswith("bingx") or "bingx" in value:
+            return "bingx"
+        if value.startswith("mt5") or "mt5" in value:
+            return "mt5"
+    return "unknown"
+
+
+def _annotate_live_position_freshness(position: dict[str, Any]) -> dict[str, Any]:
+    provider = _live_protection_provider_from_position(position)
+    payload = position.get("payload") if isinstance(position.get("payload"), dict) else {}
+    truth_source = str(payload.get("truth_source") or position.get("source") or provider or "unknown").strip() or "unknown"
+    freshness = build_live_freshness_summary(
+        position.get("as_of"),
+        stale_after_seconds=_live_snapshot_stale_after_seconds(provider),
+    )
+    live_truth = bool(freshness.get("is_live_truth")) and "reconstructed" not in truth_source.lower()
+    return {
+        **position,
+        "provider": provider,
+        "freshness_status": freshness.get("status"),
+        "snapshot_age_seconds": freshness.get("age_seconds"),
+        "stale_after_seconds": freshness.get("stale_after_seconds"),
+        "live_truth": live_truth,
+        "broker_truth_source": truth_source,
+    }
+
+
+def _annotated_account_positions(account_id: str) -> list[dict[str, Any]]:
+    return [_annotate_live_position_freshness(item) for item in _latest_account_positions(account_id)]
+
+
+def _latest_live_position_protection_rows(account_id: str, provider: str | None = None) -> list[dict[str, Any]]:
+    normalized_account_id = _normalize_account_id(account_id)
+    params: list[Any] = [normalized_account_id]
+    where_sql = "WHERE LOWER(BTRIM(account_id)) = %s"
+    if provider:
+        where_sql += " AND provider = %s"
+        params.append(str(provider).strip().lower())
+    rows = fetch_all(
+        f"""
+        SELECT position_id, LOWER(BTRIM(account_id)) AS account_id, provider, symbol, side,
+               snapshot_source, broker_truth_source, freshness_status, live_truth,
+               snapshot_age_seconds, stale_after_seconds, position_as_of, protection_as_of,
+               requested_protection, broker_accepted_protection, broker_active_protection,
+               last_amend_request, governor_state, protection_status, forced_action, payload, updated_at
+        FROM live_position_protection_status
+        {where_sql}
+        ORDER BY updated_at DESC, symbol ASC
+        """,
+        tuple(params),
+    )
+    return _normalize_db_rows(rows)
+
+
+def _latest_live_position_protection_audit(account_id: str, provider: str | None = None, limit: int = 25) -> list[dict[str, Any]]:
+    normalized_account_id = _normalize_account_id(account_id)
+    safe_limit = max(1, min(limit, 100))
+    params: list[Any] = [normalized_account_id]
+    where_sql = "WHERE LOWER(BTRIM(account_id)) = %s"
+    if provider:
+        where_sql += " AND provider = %s"
+        params.append(str(provider).strip().lower())
+    params.append(safe_limit)
+    rows = fetch_all(
+        f"""
+        SELECT id, LOWER(BTRIM(account_id)) AS account_id, position_id, provider, symbol,
+               event_type, event_reason, event_payload, created_at
+        FROM live_position_protection_audit
+        {where_sql}
+        ORDER BY created_at DESC, id DESC
+        LIMIT %s
+        """,
+        tuple(params),
+    )
+    return _normalize_db_rows(rows)
+
+
+def _live_position_protection_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    protected_count = sum(1 for row in rows if str(row.get("protection_status") or "") == "protected")
+    stale_count = sum(1 for row in rows if str(row.get("freshness_status") or "") == "stale")
+    actionable_governor_count = sum(
+        1
+        for row in rows
+        if isinstance(row.get("governor_state"), dict) and bool((row.get("governor_state") or {}).get("actionable"))
+    )
+    return {
+        "position_count": len(rows),
+        "protected_count": protected_count,
+        "partial_or_unprotected_count": max(0, len(rows) - protected_count),
+        "stale_count": stale_count,
+        "actionable_governor_count": actionable_governor_count,
+        "live_truth_count": sum(1 for row in rows if bool(row.get("live_truth"))),
+    }
+
+
+def _record_live_position_protection_audit(
+    account_id: str,
+    provider: str,
+    position_id: str | None,
+    symbol: str | None,
+    event_type: str,
+    event_reason: str,
+    event_payload: dict[str, Any] | None = None,
+) -> None:
+    execute(
+        """
+        INSERT INTO live_position_protection_audit (account_id, position_id, provider, symbol, event_type, event_reason, event_payload)
+        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+        """,
+        (
+            _normalize_account_id(account_id),
+            str(position_id or "").strip() or None,
+            str(provider or "").strip().lower(),
+            str(symbol or "").strip().upper() or None,
+            str(event_type or "observed").strip().lower(),
+            str(event_reason or "").strip() or None,
+            json_dumps(event_payload if isinstance(event_payload, dict) else {}),
+        ),
+    )
+
+
+def _extract_protection_from_execution_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
+    raw = payload if isinstance(payload, dict) else {}
+    candidates = [
+        raw.get("protection"),
+        (raw.get("live_execution") if isinstance(raw.get("live_execution"), dict) else {}).get("protection"),
+        (raw.get("router_execution") if isinstance(raw.get("router_execution"), dict) else {}).get("protection"),
+        ((raw.get("payload") if isinstance(raw.get("payload"), dict) else {}).get("protection")),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, dict) and candidate:
+            return candidate
+    return {}
+
+
+def _latest_execution_telemetry_protection(account_id: str, symbol: str) -> dict[str, Any]:
+    row = fetch_one(
+        """
+        SELECT payload
+        FROM execution_telemetry
+        WHERE LOWER(BTRIM(account_id)) = %s AND UPPER(BTRIM(symbol)) = %s
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (_normalize_account_id(account_id), str(symbol or "").strip().upper()),
+    )
+    payload = row.get("payload") if isinstance(row, dict) and isinstance(row.get("payload"), dict) else {}
+    return _extract_protection_from_execution_payload(payload)
+
+
+def _latest_mt5_execution_protection(account_id: str, symbol: str) -> dict[str, Any]:
+    row = fetch_one(
+        """
+        SELECT execution_context
+        FROM mt5_order_events
+        WHERE LOWER(BTRIM(account_id)) = %s AND UPPER(BTRIM(symbol)) = %s
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (_normalize_account_id(account_id), str(symbol or "").strip().upper()),
+    )
+    payload = row.get("execution_context") if isinstance(row, dict) and isinstance(row.get("execution_context"), dict) else {}
+    return _extract_protection_from_execution_payload(payload)
+
+
+def _bingx_leg_from_open_order(order: dict[str, Any]) -> dict[str, Any]:
+    payload = order.get("payload") if isinstance(order.get("payload"), dict) else {}
+    return {
+        "trigger_price": _to_float(order.get("price"), 0.0),
+        "order_type": str(order.get("order_type") or "MARKET").strip() or "MARKET",
+        "working_type": str(payload.get("workingType") or "MARK_PRICE").strip() or "MARK_PRICE",
+        "order_id": str(order.get("order_id") or "").strip(),
+        "status": str(order.get("status") or "").strip(),
+        "as_of": str(order.get("as_of") or order.get("created_at") or "").strip(),
+    }
+
+
+def _bingx_active_protection_for_position(position: dict[str, Any], open_orders: list[dict[str, Any]]) -> dict[str, Any]:
+    symbol = str(position.get("symbol") or position.get("instrument") or "").strip().upper()
+    side = str(position.get("side") or "").strip().lower()
+    expected_close_side = "SELL" if side == "long" else "BUY"
+    expected_position_side = "LONG" if side == "long" else "SHORT"
+    protection: dict[str, Any] = {}
+    for order in open_orders:
+        if not isinstance(order, dict):
+            continue
+        if str(order.get("symbol") or "").strip().upper() != symbol:
+            continue
+        order_side = str(order.get("side") or "").strip().upper()
+        if order_side and order_side != expected_close_side:
+            continue
+        order_position_side = str(order.get("position_side") or "").strip().upper()
+        if order_position_side and order_position_side != expected_position_side:
+            continue
+        order_type = str(order.get("order_type") or "").strip().upper()
+        if "TAKE_PROFIT" in order_type or order_type in {"TP", "TAKEPROFIT"}:
+            protection.setdefault("take_profit", _bingx_leg_from_open_order(order))
+        elif "STOP" in order_type or "LOSS" in order_type or order_type in {"SL", "STOP_MARKET", "STOP_LOSS"}:
+            protection.setdefault("stop_loss", _bingx_leg_from_open_order(order))
+    return protection
+
+
+def _mt5_active_protection_for_position(position: dict[str, Any], protective_orders: list[dict[str, Any]]) -> dict[str, Any]:
+    symbol = str(position.get("symbol") or position.get("instrument") or "").strip().upper()
+    side = str(position.get("side") or "").strip().lower()
+    expected_position_side = "LONG" if side == "long" else "SHORT"
+    protection: dict[str, Any] = {}
+    for order in protective_orders:
+        if not isinstance(order, dict):
+            continue
+        if str(order.get("symbol") or "").strip().upper() != symbol:
+            continue
+        order_position_side = str(order.get("position_side") or "").strip().upper()
+        if order_position_side and order_position_side != expected_position_side:
+            continue
+        order_type = str(order.get("order_type") or "").strip().upper()
+        leg = {
+            "trigger_price": _to_float(order.get("trigger_price"), 0.0),
+            "order_type": order_type or "MARKET",
+            "working_type": str(order.get("working_type") or "MARK_PRICE").strip() or "MARK_PRICE",
+            "order_id": str(order.get("order_id") or "").strip(),
+            "status": str(order.get("status") or "").strip(),
+            "as_of": str(order.get("as_of") or "").strip(),
+        }
+        if leg["trigger_price"] <= 0:
+            continue
+        if "TP" in order_type or "TAKE_PROFIT" in order_type:
+            protection.setdefault("take_profit", leg)
+        elif "SL" in order_type or "STOP" in order_type:
+            protection.setdefault("stop_loss", leg)
+    return protection
+
+
+def _persist_live_position_protection_rows(account_id: str, provider: str, rows: list[dict[str, Any]]) -> None:
+    normalized_account_id = _normalize_account_id(account_id)
+    provider_key = str(provider or "").strip().lower()
+    existing_rows = {
+        str(item.get("position_id") or "").strip(): item
+        for item in _latest_live_position_protection_rows(normalized_account_id, provider_key)
+        if str(item.get("position_id") or "").strip()
+    }
+    seen_position_ids: set[str] = set()
+    for row in rows:
+        position_id = str(row.get("position_id") or "").strip()
+        if not position_id:
+            continue
+        seen_position_ids.add(position_id)
+        previous = existing_rows.get(position_id)
+        execute(
+            """
+            INSERT INTO live_position_protection_status (
+                position_id, account_id, provider, symbol, side, snapshot_source, broker_truth_source,
+                freshness_status, live_truth, snapshot_age_seconds, stale_after_seconds,
+                position_as_of, protection_as_of, requested_protection, broker_accepted_protection,
+                broker_active_protection, last_amend_request, governor_state, protection_status,
+                forced_action, payload, updated_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s,
+                %s::timestamptz, %s::timestamptz, %s::jsonb, %s::jsonb,
+                %s::jsonb, %s::jsonb, %s::jsonb, %s,
+                %s, %s::jsonb, NOW()
+            )
+            ON CONFLICT (position_id) DO UPDATE SET
+                account_id = EXCLUDED.account_id,
+                provider = EXCLUDED.provider,
+                symbol = EXCLUDED.symbol,
+                side = EXCLUDED.side,
+                snapshot_source = EXCLUDED.snapshot_source,
+                broker_truth_source = EXCLUDED.broker_truth_source,
+                freshness_status = EXCLUDED.freshness_status,
+                live_truth = EXCLUDED.live_truth,
+                snapshot_age_seconds = EXCLUDED.snapshot_age_seconds,
+                stale_after_seconds = EXCLUDED.stale_after_seconds,
+                position_as_of = EXCLUDED.position_as_of,
+                protection_as_of = EXCLUDED.protection_as_of,
+                requested_protection = EXCLUDED.requested_protection,
+                broker_accepted_protection = EXCLUDED.broker_accepted_protection,
+                broker_active_protection = EXCLUDED.broker_active_protection,
+                last_amend_request = EXCLUDED.last_amend_request,
+                governor_state = EXCLUDED.governor_state,
+                protection_status = EXCLUDED.protection_status,
+                forced_action = EXCLUDED.forced_action,
+                payload = EXCLUDED.payload,
+                updated_at = NOW()
+            """,
+            (
+                position_id,
+                normalized_account_id,
+                provider_key,
+                str(row.get("symbol") or "").strip().upper(),
+                str(row.get("side") or "").strip().lower(),
+                str(row.get("snapshot_source") or "").strip(),
+                str(row.get("broker_truth_source") or "").strip(),
+                str(row.get("freshness_status") or "unknown").strip().lower(),
+                bool(row.get("live_truth")),
+                _to_float(row.get("snapshot_age_seconds"), None),
+                int(_to_float(row.get("stale_after_seconds"), 900)),
+                str(row.get("position_as_of") or _now_utc().isoformat()),
+                str(row.get("protection_as_of") or row.get("position_as_of") or _now_utc().isoformat()),
+                json_dumps(row.get("requested_protection") if isinstance(row.get("requested_protection"), dict) else {}),
+                json_dumps(row.get("broker_accepted_protection") if isinstance(row.get("broker_accepted_protection"), dict) else {}),
+                json_dumps(row.get("broker_active_protection") if isinstance(row.get("broker_active_protection"), dict) else {}),
+                json_dumps(row.get("last_amend_request") if isinstance(row.get("last_amend_request"), dict) else {}),
+                json_dumps(row.get("governor_state") if isinstance(row.get("governor_state"), dict) else {}),
+                str(row.get("protection_status") or "unknown").strip().lower(),
+                str(row.get("forced_action") or "").strip() or None,
+                json_dumps(row.get("payload") if isinstance(row.get("payload"), dict) else {}),
+            ),
+        )
+        for event in detect_protection_status_events(previous, row):
+            _record_live_position_protection_audit(
+                normalized_account_id,
+                provider_key,
+                position_id,
+                str(row.get("symbol") or "").strip().upper(),
+                str(event.get("event_type") or "observed"),
+                str(event.get("event_reason") or "").strip() or "updated",
+                event.get("event_payload") if isinstance(event.get("event_payload"), dict) else {},
+            )
+
+    for position_id, previous in existing_rows.items():
+        if position_id in seen_position_ids:
+            continue
+        _record_live_position_protection_audit(
+            normalized_account_id,
+            provider_key,
+            position_id,
+            str(previous.get("symbol") or "").strip().upper(),
+            "position_closed",
+            "position_missing_from_latest_reconciliation",
+            previous,
+        )
+        execute(
+            "DELETE FROM live_position_protection_status WHERE position_id = %s",
+            (position_id,),
+        )
 
 
 def _portfolio_state_snapshot(portfolio_id: str) -> dict:
@@ -9705,6 +13048,159 @@ def _performance_sharpe_ratio(scope_type: str, scope_id: str, start: datetime, e
     return mean_daily / std_daily * math.sqrt(252.0)
 
 
+def _performance_capital_flow_rows(scope_type: str, scope_id: str, start: datetime, end: datetime) -> list[dict[str, Any]]:
+    normalized_scope = (scope_type or "").strip().lower()
+    query = """
+        SELECT cfe.account_id, cfe.portfolio_id, cfe.venue, cfe.connector_type, cfe.event_type,
+               cfe.flow_direction, cfe.asset_symbol, cfe.amount_usd, cfe.source, cfe.occurred_at,
+               cfe.created_at, ar.client_id
+        FROM capital_flow_events cfe
+        LEFT JOIN accounts_registry ar ON ar.account_id = cfe.account_id
+        WHERE cfe.occurred_at >= %s AND cfe.occurred_at <= %s
+    """
+    params: list[Any] = [start, end]
+    if normalized_scope == "account":
+        query += " AND cfe.account_id = %s"
+        params.append(scope_id)
+    elif normalized_scope == "portfolio":
+        query += " AND cfe.portfolio_id = %s"
+        params.append(scope_id)
+    elif normalized_scope == "client":
+        query += " AND ar.client_id = %s"
+        params.append(scope_id)
+    elif normalized_scope == "provider":
+        query += " AND LOWER(COALESCE(cfe.connector_type, cfe.venue, '')) = %s"
+        params.append(scope_id.strip().lower())
+    else:
+        return []
+    query += " ORDER BY cfe.occurred_at DESC, cfe.created_at DESC"
+    return _filter_capital_ledger_rows(_normalize_db_rows(fetch_all(query, tuple(params))))
+
+
+def _performance_ledger_summary_from_rows(
+    scope_type: str,
+    scope_id: str,
+    start: datetime,
+    end: datetime,
+    rows: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not rows:
+        return None
+    summary = _summarize_capital_ledger_rows(rows)
+    realized_rows = [row for row in rows if str(row.get("event_type") or "") == "realized_pnl"]
+    trade_count = len(realized_rows)
+    wins = sum(1 for row in realized_rows if _to_float(row.get("amount_usd"), 0.0) > 0)
+    gross_profit_usd = sum(max(_to_float(row.get("amount_usd"), 0.0), 0.0) for row in realized_rows)
+    gross_loss_usd = abs(sum(min(_to_float(row.get("amount_usd"), 0.0), 0.0) for row in realized_rows))
+    net_after_costs_usd = (
+        _to_float(summary.get("realized_pnl_usd"), 0.0)
+        + _to_float(summary.get("funding_fee_usd"), 0.0)
+        + _to_float(summary.get("trading_fee_usd"), 0.0)
+    )
+    return {
+        "scope_type": scope_type,
+        "scope_id": scope_id,
+        "period_start": start.isoformat(),
+        "period_end": end.isoformat(),
+        "trade_count": trade_count,
+        "event_count": int(summary.get("event_count") or 0),
+        "realized_pnl_usd": _to_float(summary.get("realized_pnl_usd"), 0.0),
+        "unrealized_pnl_usd": 0.0,
+        "fees_usd": _to_float(summary.get("trading_fee_usd"), 0.0),
+        "funding_fee_usd": _to_float(summary.get("funding_fee_usd"), 0.0),
+        "trading_fee_usd": _to_float(summary.get("trading_fee_usd"), 0.0),
+        "net_after_costs_usd": net_after_costs_usd,
+        "win_rate_pct": wins / trade_count * 100.0 if trade_count > 0 else 0.0,
+        "expectancy_usd": net_after_costs_usd / trade_count if trade_count > 0 else 0.0,
+        "gross_profit_usd": gross_profit_usd,
+        "gross_loss_usd": gross_loss_usd,
+        "profit_factor": gross_profit_usd / gross_loss_usd if gross_loss_usd > 0 else None,
+        "latest_event_at": summary.get("latest_event_at"),
+        "data_source": "capital_ledger",
+    }
+
+
+def _performance_ledger_attribution_from_rows(
+    scope_type: str,
+    scope_id: str,
+    start: datetime,
+    end: datetime,
+    rows: list[dict[str, Any]],
+    group_by: str | None = None,
+) -> list[dict[str, Any]]:
+    dimensions = _performance_group_dimensions(group_by)
+    requested_aliases = {alias for alias, _ in dimensions}
+    grouped: dict[tuple[str | None, str | None, str | None], list[dict[str, Any]]] = {}
+    for row in rows:
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else None
+        if metadata is None:
+            raw_metadata = row.get("metadata_json")
+            if isinstance(raw_metadata, str) and raw_metadata.strip():
+                try:
+                    parsed_metadata = json.loads(raw_metadata)
+                except Exception:
+                    parsed_metadata = None
+                if isinstance(parsed_metadata, dict):
+                    metadata = parsed_metadata
+        symbol = str(
+            (metadata or {}).get("symbol")
+            or (metadata or {}).get("instId")
+            or row.get("symbol")
+            or row.get("asset_symbol")
+            or ""
+        ).strip().upper() or None
+        venue = str(row.get("connector_type") or row.get("venue") or row.get("provider") or "").strip().lower() or None
+        grouped_key = (
+            None if "strategy_id" not in requested_aliases else None,
+            symbol if "symbol" in requested_aliases else None,
+            venue if "venue" in requested_aliases else None,
+        )
+        grouped.setdefault(grouped_key, []).append(row)
+    result: list[dict[str, Any]] = []
+    total_net = 0.0
+    for (strategy_id, symbol, venue), bucket in grouped.items():
+        summary = _performance_ledger_summary_from_rows(scope_type, scope_id, start, end, bucket)
+        if not summary:
+            continue
+        total_net += _to_float(summary.get("net_after_costs_usd"), 0.0)
+        result.append(
+            {
+                "scope_type": scope_type,
+                "scope_id": scope_id,
+                "period_start": start.isoformat(),
+                "period_end": end.isoformat(),
+                "strategy_id": strategy_id,
+                "symbol": symbol,
+                "venue": venue,
+                "realized_pnl_usd": _to_float(summary.get("realized_pnl_usd"), 0.0),
+                "unrealized_pnl_usd": 0.0,
+                "fees_usd": _to_float(summary.get("fees_usd"), 0.0),
+                "funding_fee_usd": _to_float(summary.get("funding_fee_usd"), 0.0),
+                "trading_fee_usd": _to_float(summary.get("trading_fee_usd"), 0.0),
+                "net_after_costs_usd": _to_float(summary.get("net_after_costs_usd"), 0.0),
+                "trade_count": int(summary.get("trade_count") or 0),
+                "win_rate_pct": _to_float(summary.get("win_rate_pct"), 0.0),
+                "expectancy_usd": _to_float(summary.get("expectancy_usd"), 0.0),
+                "avg_slippage_bps": 0.0,
+                "avg_latency_ms": 0.0,
+                "avg_score_pre_trade": 0.0,
+                "gross_profit_usd": _to_float(summary.get("gross_profit_usd"), 0.0),
+                "gross_loss_usd": _to_float(summary.get("gross_loss_usd"), 0.0),
+                "profit_factor": _to_float(summary.get("profit_factor"), None),
+                "pnl_contribution_pct": 0.0,
+                "avg_mae": 0.0,
+                "avg_mfe": 0.0,
+                "group_by": [alias for alias, _ in dimensions],
+                "sharpe_ratio": None,
+                "data_source": "capital_ledger",
+            }
+        )
+    for row in result:
+        net_after_costs_usd = _to_float(row.get("net_after_costs_usd"), 0.0)
+        row["pnl_contribution_pct"] = (net_after_costs_usd / total_net * 100.0) if abs(total_net) > 1e-12 else 0.0
+    return sorted(result, key=lambda row: (_to_float(row.get("net_after_costs_usd"), 0.0), int(row.get("trade_count") or 0)), reverse=True)[:200]
+
+
 def _performance_summary(scope_type: str, scope_id: str, start: datetime, end: datetime) -> dict[str, Any]:
     base_query, params = _performance_base_query(scope_type, scope_id, start, end)
     aggregate = _normalize_db_row(
@@ -9724,7 +13220,7 @@ def _performance_summary(scope_type: str, scope_id: str, start: datetime, end: d
     trade_count = int(aggregate.get("trade_count") or 0)
     realized_pnl_usd = _to_float(aggregate.get("realized_pnl_usd"), 0.0)
     wins = _to_float(aggregate.get("wins"), 0.0)
-    return {
+    summary = {
         "scope_type": scope_type,
         "scope_id": scope_id,
         "period_start": start.isoformat(),
@@ -9739,6 +13235,30 @@ def _performance_summary(scope_type: str, scope_id: str, start: datetime, end: d
         "avg_latency_ms": _to_float(aggregate.get("avg_latency_ms"), 0.0),
         "sharpe_ratio": _performance_sharpe_ratio(scope_type, scope_id, start, end),
     }
+    ledger_rows = _performance_capital_flow_rows(scope_type, scope_id, start, end)
+    ledger_summary = _performance_ledger_summary_from_rows(scope_type, scope_id, start, end, ledger_rows)
+    if ledger_summary:
+        summary["venue_truth_summary"] = ledger_summary
+        summary["funding_fee_usd"] = _to_float(ledger_summary.get("funding_fee_usd"), 0.0)
+        summary["trading_fee_usd"] = _to_float(ledger_summary.get("trading_fee_usd"), 0.0)
+        summary["net_after_costs_usd"] = _to_float(ledger_summary.get("net_after_costs_usd"), 0.0)
+        summary["profit_factor"] = _to_float(ledger_summary.get("profit_factor"), None)
+        summary["capital_event_count"] = int(ledger_summary.get("event_count") or 0)
+        prefer_ledger_truth = trade_count <= 0 or (
+            abs(realized_pnl_usd) <= 1e-12
+            and abs(_to_float(aggregate.get("fees_usd"), 0.0)) <= 1e-12
+            and int(ledger_summary.get("trade_count") or 0) > 0
+        )
+        if prefer_ledger_truth:
+            summary["trade_count"] = int(ledger_summary.get("trade_count") or 0)
+            summary["realized_pnl_usd"] = _to_float(ledger_summary.get("realized_pnl_usd"), 0.0)
+            summary["fees_usd"] = _to_float(ledger_summary.get("fees_usd"), 0.0)
+            summary["win_rate_pct"] = _to_float(ledger_summary.get("win_rate_pct"), 0.0)
+            summary["expectancy_usd"] = _to_float(ledger_summary.get("expectancy_usd"), 0.0)
+            summary["data_source"] = "capital_ledger"
+        else:
+            summary["data_source"] = "decision_outcomes+capital_ledger"
+    return summary
 
 
 def _performance_bucket_expr(bucket_granularity: str) -> str:
@@ -9850,7 +13370,7 @@ def _performance_attribution(scope_type: str, scope_id: str, start: datetime, en
             tuple(params),
         )
     )
-    return [
+    result = [
         {
             "scope_type": scope_type,
             "scope_id": scope_id,
@@ -9879,10 +13399,30 @@ def _performance_attribution(scope_type: str, scope_id: str, start: datetime, en
         }
         for row in rows
     ]
+    if result:
+        has_decision_truth = any(
+            abs(_to_float(row.get("realized_pnl_usd"), 0.0)) > 1e-12
+            or abs(_to_float(row.get("fees_usd"), 0.0)) > 1e-12
+            for row in result
+        )
+        if not has_decision_truth:
+            ledger_rows = _performance_capital_flow_rows(scope_type, scope_id, start, end)
+            ledger_result = _performance_ledger_attribution_from_rows(scope_type, scope_id, start, end, ledger_rows, group_by=group_by)
+            if ledger_result:
+                return ledger_result
+        for row in result:
+            row["net_after_costs_usd"] = _to_float(row.get("realized_pnl_usd"), 0.0) + _to_float(row.get("fees_usd"), 0.0)
+            row["funding_fee_usd"] = 0.0
+            row["trading_fee_usd"] = _to_float(row.get("fees_usd"), 0.0)
+            row["data_source"] = "decision_outcomes"
+        return result
+    ledger_rows = _performance_capital_flow_rows(scope_type, scope_id, start, end)
+    return _performance_ledger_attribution_from_rows(scope_type, scope_id, start, end, ledger_rows, group_by=group_by)
 
 
 def _execution_pnl_trade_from_row(row: dict[str, Any]) -> dict[str, Any]:
     payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
     router_execution = payload.get("router_execution") if isinstance(payload.get("router_execution"), dict) else {}
     route = router_execution.get("route") if isinstance(router_execution.get("route"), dict) else {}
     execution_context = route.get("execution_context") if isinstance(route.get("execution_context"), dict) else {}
@@ -9909,12 +13449,16 @@ def _execution_pnl_trade_from_row(row: dict[str, Any]) -> dict[str, Any]:
         "execution_mode": execution_mode,
         "status": str(row.get("status") or "unknown"),
         "net_result_usd": round(_to_float(row.get("net_result_usd"), 0.0), 6),
+        "net_after_costs_usd": round(_to_float(row.get("net_after_costs_usd"), _to_float(row.get("net_result_usd"), 0.0)), 6),
         "fees_usd": round(_to_float(row.get("fees_usd"), 0.0), 6),
         "score_pre_trade": round(_to_float(row.get("score_pre_trade"), 0.0), 6),
         "confidence": round(confidence, 6),
         "latency_ms": int(round(_to_float(row.get("latency_ms"), _to_float(row.get("latency_e2e_ms"), 0.0)))),
         "slippage_real_bps": round(_to_float(row.get("slippage_real_bps"), _to_float(row.get("realized_slippage_bps"), 0.0)), 6),
         "expected_slippage_bps": round(_to_float(row.get("expected_slippage_bps"), 0.0), 6),
+        "metadata": metadata,
+        "edge_eligibility_state": str(row.get("edge_eligibility_state") or "").strip().upper() or None,
+        "edge_eligibility_score_pct": round(_to_float(row.get("edge_eligibility_score_pct"), 0.0), 6),
         "fallback_mode": fallback_mode,
         "no_trade_dominance": bool(execution_context.get("no_trade_dominance") or policy.get("no_trade_dominance")),
         "no_trade_state": str(execution_context.get("no_trade_state") or policy.get("no_trade_state") or "eligible"),
@@ -9933,16 +13477,21 @@ def _execution_pnl_group_summary(trades: list[dict[str, Any]], field_name: str) 
     for key, items in grouped.items():
         trade_count = len(items)
         net_pnl_usd = sum(_to_float(item.get("net_result_usd"), 0.0) for item in items)
+        fees_usd = sum(_to_float(item.get("fees_usd"), 0.0) for item in items)
+        net_after_costs_usd = sum(_to_float(item.get("net_after_costs_usd"), _to_float(item.get("net_result_usd"), 0.0)) for item in items)
         rows.append(
             {
                 field_name: key,
                 "trade_count": trade_count,
                 "net_pnl_usd": round(net_pnl_usd, 6),
+                "fees_usd": round(fees_usd, 6),
+                "net_after_costs_usd": round(net_after_costs_usd, 6),
                 "avg_pnl_usd": round(net_pnl_usd / trade_count, 6) if trade_count > 0 else 0.0,
                 "win_rate_pct": round(sum(1 for item in items if _to_float(item.get("net_result_usd"), 0.0) > 0) / trade_count * 100.0, 6) if trade_count > 0 else 0.0,
                 "avg_latency_ms": round(sum(max(0.0, _to_float(item.get("latency_ms"), 0.0)) for item in items) / trade_count, 6) if trade_count > 0 else 0.0,
                 "avg_slippage_bps": round(sum(abs(_to_float(item.get("slippage_real_bps"), 0.0)) for item in items) / trade_count, 6) if trade_count > 0 else 0.0,
                 "high_confidence_losses": sum(1 for item in items if _to_float(item.get("net_result_usd"), 0.0) < 0 and _to_float(item.get("confidence"), 0.0) >= 0.7),
+                "no_trade_dominance_count": sum(1 for item in items if bool(item.get("no_trade_dominance"))),
             }
         )
     return sorted(rows, key=lambda item: (-_to_float(item.get("net_pnl_usd"), 0.0), -int(item.get("trade_count") or 0), str(item.get(field_name) or "")))
@@ -9961,6 +13510,7 @@ def _build_execution_pnl_analyzer_payload(
     trades = [_execution_pnl_trade_from_row(row) for row in rows]
     trades.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
     net_pnl_usd = sum(_to_float(trade.get("net_result_usd"), 0.0) for trade in trades)
+    net_after_costs_usd = sum(_to_float(trade.get("net_after_costs_usd"), _to_float(trade.get("net_result_usd"), 0.0)) for trade in trades)
     trade_count = len(trades)
     high_confidence_losses = [
         {
@@ -9971,6 +13521,7 @@ def _build_execution_pnl_analyzer_payload(
         if _to_float(trade.get("net_result_usd"), 0.0) < 0 and _to_float(trade.get("confidence"), 0.0) >= confidence_flag_threshold
     ]
     no_trade_dominance_trades = sum(1 for trade in trades if bool(trade.get("no_trade_dominance")))
+    by_regime = _execution_pnl_group_summary(trades, "regime")
     return {
         "scope_type": scope_type,
         "scope_id": scope_id,
@@ -9979,6 +13530,7 @@ def _build_execution_pnl_analyzer_payload(
         "summary": {
             "trade_count": trade_count,
             "net_pnl_usd": round(net_pnl_usd, 6),
+            "net_after_costs_usd": round(net_after_costs_usd, 6),
             "avg_pnl_usd": round(net_pnl_usd / trade_count, 6) if trade_count > 0 else 0.0,
             "fees_usd": round(sum(_to_float(trade.get("fees_usd"), 0.0) for trade in trades), 6),
             "win_rate_pct": round(sum(1 for trade in trades if _to_float(trade.get("net_result_usd"), 0.0) > 0) / trade_count * 100.0, 6) if trade_count > 0 else 0.0,
@@ -9986,8 +13538,13 @@ def _build_execution_pnl_analyzer_payload(
             "avg_slippage_bps": round(sum(abs(_to_float(trade.get("slippage_real_bps"), 0.0)) for trade in trades) / trade_count, 6) if trade_count > 0 else 0.0,
             "high_confidence_loss_count": len(high_confidence_losses),
             "no_trade_dominance_count": no_trade_dominance_trades,
+            "net_after_costs_per_truth_regime": {
+                str(row.get("regime") or "UNKNOWN"): _to_float(row.get("net_after_costs_usd"), 0.0)
+                for row in by_regime
+                if isinstance(row, dict)
+            },
         },
-        "by_regime": _execution_pnl_group_summary(trades, "regime"),
+        "by_regime": by_regime,
         "by_venue": _execution_pnl_group_summary(trades, "venue"),
         "by_execution_mode": _execution_pnl_group_summary(trades, "execution_mode"),
         "bad_model_flags": high_confidence_losses[: min(max(trade_limit, 1), 200)],
@@ -10013,6 +13570,9 @@ def _execution_pnl_analyzer(
                    d.provider,
                    d.regime,
                    d.score_pre_trade,
+                     d.metadata,
+                     d.edge_eligibility_state,
+                     d.edge_eligibility_score_pct,
                    d.slippage_real_bps,
                    d.latency_ms,
                    d.fees_usd,
@@ -10041,6 +13601,2370 @@ def _execution_pnl_analyzer(
         confidence_flag_threshold=_to_float(confidence_flag_threshold, 0.7),
         trade_limit=trade_limit,
     )
+
+
+def _trade_intelligence_trade_scope_clause(scope_type: str, scope_id: str) -> tuple[str, list[Any]]:
+    normalized_scope = (scope_type or "").strip().lower()
+    normalized_scope_id = (scope_id or "").strip()
+    if not normalized_scope_id:
+        raise HTTPException(status_code=400, detail="scope_id is required")
+    mapping = {
+        "client": ("p.client_id = %s", normalized_scope_id),
+        "portfolio": ("sr.portfolio_id = %s", normalized_scope_id),
+        "account": ("COALESCE(et.account_id, '') = %s", normalized_scope_id),
+        "strategy": ("d.strategy_id = %s", normalized_scope_id),
+        "symbol": ("UPPER(COALESCE(d.symbol, '')) = UPPER(%s)", normalized_scope_id),
+        "provider": ("LOWER(COALESCE(d.provider, '')) = LOWER(%s)", normalized_scope_id),
+    }
+    resolved = mapping.get(normalized_scope)
+    if resolved is None:
+        raise HTTPException(status_code=400, detail="unsupported scope_type")
+    clause, value = resolved
+    return clause, [value]
+
+
+def _trade_intelligence_intent_scope_clause(scope_type: str, scope_id: str) -> tuple[str, list[Any]]:
+    normalized_scope = (scope_type or "").strip().lower()
+    normalized_scope_id = (scope_id or "").strip()
+    if not normalized_scope_id:
+        raise HTTPException(status_code=400, detail="scope_id is required")
+    mapping = {
+        "client": ("p.client_id = %s", normalized_scope_id),
+        "portfolio": ("i.portfolio_id = %s", normalized_scope_id),
+        "account": ("COALESCE(i.explainability->'live_execution'->>'account_id', '') = %s", normalized_scope_id),
+        "strategy": ("i.strategy_id = %s", normalized_scope_id),
+        "symbol": ("UPPER(COALESCE(i.instrument, '')) = UPPER(%s)", normalized_scope_id),
+        "provider": ("LOWER(COALESCE(i.venue, '')) = LOWER(%s)", normalized_scope_id),
+    }
+    resolved = mapping.get(normalized_scope)
+    if resolved is None:
+        raise HTTPException(status_code=400, detail="unsupported scope_type")
+    clause, value = resolved
+    return clause, [value]
+
+
+def _trade_intelligence_rows(scope_type: str, scope_id: str, start: datetime, end: datetime, *, trade_limit: int) -> list[dict[str, Any]]:
+    scope_clause, scope_params = _trade_intelligence_trade_scope_clause(scope_type, scope_id)
+    safe_limit = max(1, min(trade_limit, 500))
+    return _normalize_db_rows(
+        fetch_all(
+            f"""
+            SELECT d.decision_id,
+                   d.strategy_id,
+                   d.symbol,
+                   d.provider,
+                   d.regime,
+                   d.score_pre_trade,
+                   d.slippage_real_bps,
+                   d.latency_ms,
+                   d.fees_usd,
+                   d.net_result_usd,
+                   d.status,
+                   d.created_at,
+                   et.account_id,
+                   et.route_chosen,
+                   et.expected_slippage_bps,
+                   et.realized_slippage_bps,
+                   et.latency_e2e_ms,
+                   et.payload AS telemetry_payload,
+                   i.explainability,
+                   i.target_notional_usd,
+                   i.status AS intent_status,
+                   o.order_id,
+                   o.requested_notional_usd,
+                   o.filled_notional_usd,
+                   o.avg_fill_price,
+                   o.execution_mode,
+                   o.status AS order_status
+            FROM decision_outcomes d
+            LEFT JOIN strategies_registry sr ON sr.strategy_id = d.strategy_id
+            LEFT JOIN portfolios p ON p.portfolio_id = sr.portfolio_id
+            LEFT JOIN LATERAL (
+                SELECT account_id, route_chosen, expected_slippage_bps, realized_slippage_bps, latency_e2e_ms, payload
+                FROM execution_telemetry
+                WHERE decision_id = d.decision_id
+                ORDER BY created_at DESC
+                LIMIT 1
+            ) et ON TRUE
+            LEFT JOIN intents i ON i.intent_id = d.decision_id
+            LEFT JOIN LATERAL (
+                SELECT order_id, requested_notional_usd, filled_notional_usd, avg_fill_price, execution_mode, status
+                FROM orders
+                WHERE intent_id = d.decision_id
+                ORDER BY created_at DESC
+                LIMIT 1
+            ) o ON TRUE
+            WHERE {scope_clause}
+              AND d.created_at >= %s
+              AND d.created_at <= %s
+              AND COALESCE(d.status, '') <> 'pending'
+            ORDER BY d.created_at DESC
+            LIMIT %s
+            """,
+            tuple([*scope_params, start, end, safe_limit]),
+        )
+    )
+
+
+def _trade_intelligence_intent_summary(scope_type: str, scope_id: str, start: datetime, end: datetime) -> dict[str, Any]:
+    scope_clause, scope_params = _trade_intelligence_intent_scope_clause(scope_type, scope_id)
+    row = _normalize_db_row(
+        fetch_one(
+            f"""
+            SELECT COUNT(*) AS total_intents,
+                   COALESCE(SUM(CASE WHEN i.status = 'executed' THEN 1 ELSE 0 END), 0) AS executed_intents,
+                   COALESCE(SUM(CASE WHEN i.status = 'rejected_preflight' THEN 1 ELSE 0 END), 0) AS rejected_preflight_count,
+                   COALESCE(SUM(CASE WHEN i.status = 'rejected_by_risk' THEN 1 ELSE 0 END), 0) AS rejected_by_risk_count,
+                   COALESCE(SUM(CASE WHEN i.status = 'rejected_by_memory' THEN 1 ELSE 0 END), 0) AS rejected_by_memory_count,
+                   COALESCE(SUM(CASE WHEN i.status = 'blocked_memory_unavailable' THEN 1 ELSE 0 END), 0) AS blocked_memory_count,
+                   COALESCE(SUM(CASE WHEN i.status = 'pending_approval' THEN 1 ELSE 0 END), 0) AS pending_approval_count,
+                   COALESCE(SUM(CASE WHEN i.status = 'pending_opportunity_gate' THEN 1 ELSE 0 END), 0) AS pending_opportunity_gate_count
+            FROM intents i
+            LEFT JOIN portfolios p ON p.portfolio_id = i.portfolio_id
+            WHERE {scope_clause}
+              AND i.created_at >= %s
+              AND i.created_at <= %s
+            """,
+            tuple([*scope_params, start, end]),
+        )
+    ) or {}
+    rejected_intents = (
+        int(row.get("rejected_preflight_count") or 0)
+        + int(row.get("rejected_by_risk_count") or 0)
+        + int(row.get("rejected_by_memory_count") or 0)
+        + int(row.get("blocked_memory_count") or 0)
+    )
+    return {
+        "total_intents": int(row.get("total_intents") or 0),
+        "executed_intents": int(row.get("executed_intents") or 0),
+        "rejected_intents": rejected_intents,
+        "rejected_preflight_count": int(row.get("rejected_preflight_count") or 0),
+        "rejected_by_risk_count": int(row.get("rejected_by_risk_count") or 0),
+        "rejected_by_memory_count": int(row.get("rejected_by_memory_count") or 0),
+        "blocked_memory_count": int(row.get("blocked_memory_count") or 0),
+        "pending_approval_count": int(row.get("pending_approval_count") or 0),
+        "pending_opportunity_gate_count": int(row.get("pending_opportunity_gate_count") or 0),
+    }
+
+
+def _trade_intelligence_trade_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    telemetry_payload = row.get("telemetry_payload") if isinstance(row.get("telemetry_payload"), dict) else {}
+    router_execution = telemetry_payload.get("router_execution") if isinstance(telemetry_payload.get("router_execution"), dict) else {}
+    explainability = row.get("explainability") if isinstance(row.get("explainability"), dict) else {}
+    live_execution = explainability.get("live_execution") if isinstance(explainability.get("live_execution"), dict) else {}
+    auto_adjustment = live_execution.get("auto_adjustment") if isinstance(live_execution.get("auto_adjustment"), dict) else {}
+
+    requested_notional_usd = max(
+        0.0,
+        _to_float(
+            live_execution.get("requested_notional_usd"),
+            _to_float(row.get("target_notional_usd"), _to_float(row.get("requested_notional_usd"), 0.0)),
+        ),
+    )
+    effective_notional_usd = max(
+        requested_notional_usd,
+        _to_float(live_execution.get("effective_notional_usd"), _to_float(row.get("requested_notional_usd"), requested_notional_usd)),
+    )
+    execution_mode = str(row.get("execution_mode") or router_execution.get("execution_mode") or "unknown").strip().lower() or "unknown"
+    order_status = str(row.get("order_status") or row.get("status") or "unknown").strip().lower() or "unknown"
+    live_requested = bool(live_execution.get("enabled")) or execution_mode.startswith("live")
+
+    protection = router_execution.get("protection") if isinstance(router_execution.get("protection"), dict) else {}
+    protection_status = str(
+        router_execution.get("protection_status")
+        or live_execution.get("protection_status")
+        or (protection.get("status") if isinstance(protection, dict) else "")
+        or ""
+    ).strip().lower()
+    protection_expected = live_requested and (bool(live_execution.get("auto_protection")) or bool(protection))
+    tp_missing = protection_expected and protection_status in {"", "not_requested", "rejected_preflight"}
+
+    size_adjustment = bool(auto_adjustment.get("applied")) or effective_notional_usd > requested_notional_usd + 1e-9
+    dry_run = order_status == "dry_run" or execution_mode == "dry_run" or bool(router_execution.get("dry_run"))
+
+    order_requested_notional_usd = _to_float(row.get("requested_notional_usd"), effective_notional_usd)
+    filled_notional_usd = _to_float(row.get("filled_notional_usd"), 0.0)
+    fill_ratio = 1.0
+    if not dry_run and order_requested_notional_usd > 0:
+        fill_ratio = _clamp(_safe_ratio(filled_notional_usd, order_requested_notional_usd, default=0.0), 0.0, 1.0)
+
+    latency_ms = max(0.0, _to_float(row.get("latency_ms"), _to_float(row.get("latency_e2e_ms"), 0.0)))
+    slippage_bps = abs(_to_float(row.get("slippage_real_bps"), _to_float(row.get("realized_slippage_bps"), 0.0)))
+
+    slippage_component = 1.0 if slippage_bps <= 0 else 1.0 - min(1.0, slippage_bps / 12.0)
+    latency_component = 1.0 if latency_ms <= 0 else 1.0 - min(1.0, latency_ms / 1200.0)
+    protection_component = 0.25 if tp_missing else 1.0
+    execution_quality = _clamp(
+        0.35 * slippage_component + 0.25 * latency_component + 0.2 * fill_ratio + 0.2 * protection_component,
+        0.0,
+        1.0,
+    )
+
+    trade_issues: list[str] = []
+    if tp_missing:
+        trade_issues.append("tp_missing")
+    if size_adjustment:
+        trade_issues.append("size_adjustment")
+    if slippage_bps >= 6.0:
+        trade_issues.append("high_slippage")
+    if latency_ms >= 450.0:
+        trade_issues.append("high_latency")
+
+    return {
+        "decision_id": str(row.get("decision_id") or ""),
+        "strategy_id": str(row.get("strategy_id") or ""),
+        "symbol": str(row.get("symbol") or ""),
+        "provider": str(row.get("provider") or row.get("route_chosen") or "unknown").strip() or "unknown",
+        "regime": str(row.get("regime") or "UNKNOWN").strip().upper() or "UNKNOWN",
+        "order_id": str(row.get("order_id") or ""),
+        "intent_status": str(row.get("intent_status") or "unknown"),
+        "order_status": order_status,
+        "execution_mode": execution_mode,
+        "live_requested": live_requested,
+        "protection_expected": protection_expected,
+        "protection_status": protection_status or ("not_requested" if protection_expected else "n/a"),
+        "requested_notional_usd": round(requested_notional_usd, 8),
+        "effective_notional_usd": round(effective_notional_usd, 8),
+        "order_requested_notional_usd": round(order_requested_notional_usd, 8),
+        "filled_notional_usd": round(filled_notional_usd, 8),
+        "fill_ratio": round(fill_ratio, 6),
+        "size_adjustment": size_adjustment,
+        "slippage_bps": round(slippage_bps, 6),
+        "latency_ms": round(latency_ms, 6),
+        "fees_usd": round(_to_float(row.get("fees_usd"), 0.0), 6),
+        "net_result_usd": round(_to_float(row.get("net_result_usd"), 0.0), 6),
+        "score_pre_trade": round(_to_float(row.get("score_pre_trade"), 0.0), 6),
+        "execution_quality": round(execution_quality, 6),
+        "issues": trade_issues,
+        "created_at": str(row.get("created_at") or ""),
+    }
+
+
+def _trade_intelligence_group_summary(trades: list[dict[str, Any]], field_name: str) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for trade in trades:
+        key = str(trade.get(field_name) or "unknown").strip() or "unknown"
+        grouped.setdefault(key, []).append(trade)
+
+    rows: list[dict[str, Any]] = []
+    for key, items in grouped.items():
+        trade_count = len(items)
+        protection_expected_count = sum(1 for item in items if bool(item.get("protection_expected")))
+        tp_missing_count = sum(1 for item in items if "tp_missing" in (item.get("issues") or []))
+        size_adjustment_count = sum(1 for item in items if bool(item.get("size_adjustment")))
+        rows.append(
+            {
+                field_name: key,
+                "trade_count": trade_count,
+                "execution_quality_avg": round(sum(_to_float(item.get("execution_quality"), 0.0) for item in items) / trade_count, 6) if trade_count > 0 else 0.0,
+                "slippage_avg_bps": round(sum(abs(_to_float(item.get("slippage_bps"), 0.0)) for item in items) / trade_count, 6) if trade_count > 0 else 0.0,
+                "latency_avg_ms": round(sum(max(0.0, _to_float(item.get("latency_ms"), 0.0)) for item in items) / trade_count, 6) if trade_count > 0 else 0.0,
+                "pnl_net_usd": round(sum(_to_float(item.get("net_result_usd"), 0.0) for item in items), 6),
+                "win_rate_pct": round(sum(1 for item in items if _to_float(item.get("net_result_usd"), 0.0) > 0) / trade_count * 100.0, 6) if trade_count > 0 else 0.0,
+                "tp_missing_count": tp_missing_count,
+                "protection_coverage_pct": round((1.0 - _safe_ratio(tp_missing_count, protection_expected_count, default=0.0)) * 100.0, 6) if protection_expected_count > 0 else 100.0,
+                "size_adjustment_count": size_adjustment_count,
+            }
+        )
+    return sorted(rows, key=lambda item: (-_to_float(item.get("execution_quality_avg"), 0.0), -int(item.get("trade_count") or 0), str(item.get(field_name) or "")))
+
+
+def _trade_intelligence_issue(code: str, severity: str, summary: str, **extra: Any) -> dict[str, Any]:
+    payload = {
+        "code": code,
+        "severity": severity,
+        "summary": summary,
+    }
+    payload.update({key: value for key, value in extra.items() if value is not None})
+    return payload
+
+
+def _build_trade_intelligence_payload(
+    rows: list[dict[str, Any]],
+    *,
+    scope_type: str,
+    scope_id: str,
+    start: datetime,
+    end: datetime,
+    intent_summary: dict[str, Any],
+    trade_limit: int,
+) -> dict[str, Any]:
+    trades = [_trade_intelligence_trade_from_row(row) for row in rows]
+    trades.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+
+    trade_count = len(trades)
+    net_pnl_usd = sum(_to_float(trade.get("net_result_usd"), 0.0) for trade in trades)
+    avg_pnl_usd = net_pnl_usd / trade_count if trade_count > 0 else 0.0
+    avg_slippage_bps = sum(abs(_to_float(trade.get("slippage_bps"), 0.0)) for trade in trades) / trade_count if trade_count > 0 else 0.0
+    avg_latency_ms = sum(max(0.0, _to_float(trade.get("latency_ms"), 0.0)) for trade in trades) / trade_count if trade_count > 0 else 0.0
+    avg_trade_quality = sum(_to_float(trade.get("execution_quality"), 0.0) for trade in trades) / trade_count if trade_count > 0 else 0.0
+    total_intents = int(intent_summary.get("total_intents") or 0)
+    rejected_intents = int(intent_summary.get("rejected_intents") or 0)
+    rejection_rate = _safe_ratio(rejected_intents, total_intents, default=0.0)
+    execution_quality = _clamp(avg_trade_quality * 0.8 + (1.0 - rejection_rate) * 0.2, 0.0, 1.0)
+
+    protection_expected_count = sum(1 for trade in trades if bool(trade.get("protection_expected")))
+    tp_missing_count = sum(1 for trade in trades if "tp_missing" in (trade.get("issues") or []))
+    size_adjustment_count = sum(1 for trade in trades if bool(trade.get("size_adjustment")))
+    protection_coverage_pct = (1.0 - _safe_ratio(tp_missing_count, protection_expected_count, default=0.0)) * 100.0 if protection_expected_count > 0 else 100.0
+    size_adjustment_rate = _safe_ratio(size_adjustment_count, trade_count, default=0.0)
+
+    issue_details: list[dict[str, Any]] = []
+    if trade_count == 0:
+        issue_details.append(
+            _trade_intelligence_issue(
+                "no_trade_samples",
+                "info",
+                "No finalized trades matched the requested scope and period.",
+            )
+        )
+    if execution_quality < 0.45 and trade_count > 0:
+        issue_details.append(
+            _trade_intelligence_issue(
+                "low_execution_quality",
+                "critical",
+                "Execution quality is materially degraded.",
+                execution_quality=round(execution_quality, 6),
+            )
+        )
+    elif execution_quality < 0.65 and trade_count > 0:
+        issue_details.append(
+            _trade_intelligence_issue(
+                "low_execution_quality",
+                "warn",
+                "Execution quality is below the operating target.",
+                execution_quality=round(execution_quality, 6),
+            )
+        )
+    if avg_slippage_bps >= 10.0:
+        issue_details.append(
+            _trade_intelligence_issue(
+                "high_slippage",
+                "critical",
+                "Average slippage is beyond the acceptable band.",
+                slippage_avg_bps=round(avg_slippage_bps, 6),
+            )
+        )
+    elif avg_slippage_bps >= 6.0:
+        issue_details.append(
+            _trade_intelligence_issue(
+                "high_slippage",
+                "warn",
+                "Average slippage is elevated.",
+                slippage_avg_bps=round(avg_slippage_bps, 6),
+            )
+        )
+    if avg_latency_ms >= 900.0:
+        issue_details.append(
+            _trade_intelligence_issue(
+                "high_latency",
+                "critical",
+                "Average execution latency is critically high.",
+                latency_avg_ms=round(avg_latency_ms, 6),
+            )
+        )
+    elif avg_latency_ms >= 450.0:
+        issue_details.append(
+            _trade_intelligence_issue(
+                "high_latency",
+                "warn",
+                "Average execution latency is elevated.",
+                latency_avg_ms=round(avg_latency_ms, 6),
+            )
+        )
+    if protection_expected_count > 0 and tp_missing_count > 0:
+        tp_missing_rate = _safe_ratio(tp_missing_count, protection_expected_count, default=0.0)
+        issue_details.append(
+            _trade_intelligence_issue(
+                "tp_missing",
+                "critical" if tp_missing_rate >= 0.2 else "warn",
+                "Protection was expected but not armed on part of the sample.",
+                tp_missing_count=tp_missing_count,
+                protection_expected_count=protection_expected_count,
+                protection_coverage_pct=round(protection_coverage_pct, 6),
+            )
+        )
+    if size_adjustment_count > 0:
+        issue_details.append(
+            _trade_intelligence_issue(
+                "size_adjustment",
+                "info" if size_adjustment_rate < 0.5 else "warn",
+                "Auto-sizing adjusted the requested size on part of the sample.",
+                size_adjustment_count=size_adjustment_count,
+                size_adjustment_rate=round(size_adjustment_rate, 6),
+            )
+        )
+    if total_intents >= 5 and rejection_rate >= 0.3:
+        issue_details.append(
+            _trade_intelligence_issue(
+                "rejection_pressure",
+                "critical",
+                "Intent rejection rate is too high.",
+                rejection_rate=round(rejection_rate, 6),
+                rejected_intents=rejected_intents,
+                total_intents=total_intents,
+            )
+        )
+    elif total_intents >= 5 and rejection_rate >= 0.15:
+        issue_details.append(
+            _trade_intelligence_issue(
+                "rejection_pressure",
+                "warn",
+                "Intent rejection rate is elevated.",
+                rejection_rate=round(rejection_rate, 6),
+                rejected_intents=rejected_intents,
+                total_intents=total_intents,
+            )
+        )
+    if trade_count >= 5 and avg_pnl_usd < 0:
+        issue_details.append(
+            _trade_intelligence_issue(
+                "negative_expectancy",
+                "warn",
+                "Average realized PnL is negative over the selected sample.",
+                pnl_avg_usd=round(avg_pnl_usd, 6),
+                pnl_net_usd=round(net_pnl_usd, 6),
+            )
+        )
+
+    severity_rank = {"critical": 0, "warn": 1, "info": 2}
+    issue_details.sort(key=lambda item: (severity_rank.get(str(item.get("severity") or "info"), 9), str(item.get("code") or "")))
+
+    return {
+        "status": "ok",
+        "analysis_mode": "controlled_read_only",
+        "scope_type": scope_type,
+        "scope_id": scope_id,
+        "period_start": start.isoformat(),
+        "period_end": end.isoformat(),
+        "summary": {
+            "trade_count": trade_count,
+            "intent_count": total_intents,
+            "executed_intent_count": int(intent_summary.get("executed_intents") or 0),
+            "rejected_intent_count": rejected_intents,
+            "rejection_rate": round(rejection_rate, 6),
+            "execution_quality": round(execution_quality, 6),
+            "slippage_avg_bps": round(avg_slippage_bps, 6),
+            "latency_avg_ms": round(avg_latency_ms, 6),
+            "pnl_net_usd": round(net_pnl_usd, 6),
+            "pnl_avg_usd": round(avg_pnl_usd, 6),
+            "win_rate_pct": round(sum(1 for trade in trades if _to_float(trade.get("net_result_usd"), 0.0) > 0) / trade_count * 100.0, 6) if trade_count > 0 else 0.0,
+            "protection_coverage_pct": round(protection_coverage_pct, 6),
+            "size_adjustment_rate": round(size_adjustment_rate, 6),
+        },
+        "rejections": intent_summary,
+        "issue_counts": {
+            "tp_missing": tp_missing_count,
+            "size_adjustment": size_adjustment_count,
+            "rejected_preflight": int(intent_summary.get("rejected_preflight_count") or 0),
+            "rejected_by_risk": int(intent_summary.get("rejected_by_risk_count") or 0),
+            "rejected_by_memory": int(intent_summary.get("rejected_by_memory_count") or 0),
+            "pending_approval": int(intent_summary.get("pending_approval_count") or 0),
+            "pending_opportunity_gate": int(intent_summary.get("pending_opportunity_gate_count") or 0),
+        },
+        "issues": [str(item.get("code") or "") for item in issue_details],
+        "issue_details": issue_details,
+        "by_venue": _trade_intelligence_group_summary(trades, "provider"),
+        "by_regime": _trade_intelligence_group_summary(trades, "regime"),
+        "trades": trades[: min(max(trade_limit, 1), 500)],
+    }
+
+
+def _trade_intelligence_engine(
+    scope_type: str,
+    scope_id: str,
+    start: datetime,
+    end: datetime,
+    *,
+    trade_limit: int = 100,
+) -> dict[str, Any]:
+    rows = _trade_intelligence_rows(scope_type, scope_id, start, end, trade_limit=trade_limit)
+    intent_summary = _trade_intelligence_intent_summary(scope_type, scope_id, start, end)
+    return _build_trade_intelligence_payload(
+        rows,
+        scope_type=scope_type,
+        scope_id=scope_id,
+        start=start,
+        end=end,
+        intent_summary=intent_summary,
+        trade_limit=trade_limit,
+    )
+
+
+def _median_numeric(values: list[float]) -> float:
+    sanitized = sorted(value for value in values if math.isfinite(value))
+    if not sanitized:
+        return 0.0
+    midpoint = len(sanitized) // 2
+    if len(sanitized) % 2 == 1:
+        return sanitized[midpoint]
+    return (sanitized[midpoint - 1] + sanitized[midpoint]) / 2.0
+
+
+def _trade_intelligence_best_venue(analytics: dict[str, Any]) -> dict[str, Any]:
+    venues = analytics.get("by_venue") if isinstance(analytics.get("by_venue"), list) else []
+    normalized = [venue for venue in venues if isinstance(venue, dict)]
+    if not normalized:
+        return {}
+    return max(
+        normalized,
+        key=lambda venue: (
+            _to_float(venue.get("execution_quality_avg"), 0.0),
+            -_to_float(venue.get("latency_avg_ms"), 0.0),
+            -int(venue.get("trade_count") or 0),
+            str(venue.get("provider") or ""),
+        ),
+    )
+
+
+def _trade_intelligence_dominant_venue(analytics: dict[str, Any]) -> dict[str, Any]:
+    venues = analytics.get("by_venue") if isinstance(analytics.get("by_venue"), list) else []
+    normalized = [venue for venue in venues if isinstance(venue, dict)]
+    if not normalized:
+        return {}
+    return max(
+        normalized,
+        key=lambda venue: (
+            int(venue.get("trade_count") or 0),
+            _to_float(venue.get("execution_quality_avg"), 0.0),
+            -_to_float(venue.get("latency_avg_ms"), 0.0),
+            str(venue.get("provider") or ""),
+        ),
+    )
+
+
+def _trade_intelligence_sizing_baseline(analytics: dict[str, Any]) -> tuple[float, float]:
+    trades = analytics.get("trades") if isinstance(analytics.get("trades"), list) else []
+    adjusted = [trade for trade in trades if isinstance(trade, dict) and bool(trade.get("size_adjustment"))]
+    if not adjusted:
+        return 0.0, 0.0
+    requested_values = [max(0.0, _to_float(trade.get("requested_notional_usd"), 0.0)) for trade in adjusted]
+    effective_values = [max(0.0, _to_float(trade.get("effective_notional_usd"), 0.0)) for trade in adjusted]
+    return round(_median_numeric(requested_values), 8), round(_median_numeric(effective_values), 8)
+
+
+def _trade_intelligence_top_issue_codes(analytics: dict[str, Any]) -> list[str]:
+    issues = analytics.get("issue_details") if isinstance(analytics.get("issue_details"), list) else []
+    return [str(item.get("code") or "") for item in issues if isinstance(item, dict) and str(item.get("code") or "")]
+
+
+def _build_improvement_proposals(analytics: dict[str, Any]) -> dict[str, Any]:
+    summary = analytics.get("summary") if isinstance(analytics.get("summary"), dict) else {}
+    issue_counts = analytics.get("issue_counts") if isinstance(analytics.get("issue_counts"), dict) else {}
+
+    execution_quality = _clamp(_to_float(summary.get("execution_quality"), 1.0), 0.0, 1.0)
+    slippage_avg_bps = max(0.0, _to_float(summary.get("slippage_avg_bps"), 0.0))
+    latency_avg_ms = max(0.0, _to_float(summary.get("latency_avg_ms"), 0.0))
+    rejection_rate = _clamp(_to_float(summary.get("rejection_rate"), 0.0), 0.0, 1.0)
+    protection_coverage_pct = _clamp(_to_float(summary.get("protection_coverage_pct"), 100.0), 0.0, 100.0)
+    protection_coverage = protection_coverage_pct / 100.0
+    size_adjustment_rate = _clamp(_to_float(summary.get("size_adjustment_rate"), 0.0), 0.0, 1.0)
+
+    current_venue = _trade_intelligence_dominant_venue(analytics)
+    best_venue = _trade_intelligence_best_venue(analytics)
+    current_default_notional, suggested_default_notional = _trade_intelligence_sizing_baseline(analytics)
+    proposals: list[dict[str, Any]] = []
+
+    if slippage_avg_bps > 7.0:
+        suggested_slippage = round(max(3.0, min(slippage_avg_bps - 2.0, slippage_avg_bps * 0.8)), 2)
+        proposals.append(
+            {
+                "proposal_id": "execution_optimization:reduce_max_slippage",
+                "type": "execution_optimization",
+                "action": "reduce_max_slippage",
+                "parameter": "max_slippage_bps",
+                "current_value": round(slippage_avg_bps, 6),
+                "suggested_value": suggested_slippage,
+                "unit": "bps",
+                "confidence": round(_clamp(0.7 + min(0.2, (slippage_avg_bps - 7.0) / 20.0), 0.0, 0.95), 3),
+                "impact": "execution_quality_improvement",
+                "reason": "high_slippage_detected",
+                "suggestion": f"Reduce max_slippage_bps guidance from observed {round(slippage_avg_bps, 2)} bps toward {suggested_slippage} bps.",
+                "evidence": {
+                    "execution_quality": round(execution_quality, 6),
+                    "slippage_avg_bps": round(slippage_avg_bps, 6),
+                    "rejection_rate": round(rejection_rate, 6),
+                },
+            }
+        )
+
+    if latency_avg_ms > 500.0:
+        current_provider = str(current_venue.get("provider") or "unknown")
+        suggested_provider = str(best_venue.get("provider") or current_provider or "unknown")
+        proposals.append(
+            {
+                "proposal_id": "routing_optimization:prefer_low_latency_venue",
+                "type": "routing_optimization",
+                "action": "prefer_low_latency_venue",
+                "current_value": current_provider,
+                "suggested_value": suggested_provider,
+                "confidence": round(_clamp(0.68 + min(0.15, (latency_avg_ms - 500.0) / 3000.0), 0.0, 0.9), 3),
+                "impact": "latency_reduction",
+                "reason": "high_latency_detected",
+                "suggestion": f"Bias routing toward the lowest-latency venue/path candidate ({suggested_provider}) while current average latency is {round(latency_avg_ms, 2)} ms.",
+                "evidence": {
+                    "latency_avg_ms": round(latency_avg_ms, 6),
+                    "current_provider": current_provider,
+                    "best_provider": suggested_provider,
+                    "best_provider_latency_ms": round(_to_float(best_venue.get("latency_avg_ms"), latency_avg_ms), 6),
+                    "best_provider_execution_quality": round(_to_float(best_venue.get("execution_quality_avg"), execution_quality), 6),
+                },
+            }
+        )
+
+    if rejection_rate > 0.2:
+        rejected_preflight_count = int(issue_counts.get("rejected_preflight") or 0)
+        rejected_by_risk_count = int(issue_counts.get("rejected_by_risk") or 0)
+        dominant_rejection = "preflight" if rejected_preflight_count >= rejected_by_risk_count else "risk"
+        proposals.append(
+            {
+                "proposal_id": "risk_adjustment:adjust_order_constraints",
+                "type": "risk_adjustment",
+                "action": "adjust_order_constraints",
+                "current_value": round(rejection_rate, 6),
+                "suggested_value": round(max(0.05, rejection_rate - 0.1), 6),
+                "unit": "ratio",
+                "confidence": round(_clamp(0.7 + min(0.15, rejection_rate), 0.0, 0.92), 3),
+                "impact": "rejection_reduction",
+                "reason": "high_rejection_rate",
+                "suggestion": f"Review order constraints to reduce rejection pressure, with {dominant_rejection} rejections currently dominant.",
+                "evidence": {
+                    "rejection_rate": round(rejection_rate, 6),
+                    "rejected_preflight_count": rejected_preflight_count,
+                    "rejected_by_risk_count": rejected_by_risk_count,
+                    "rejected_by_memory_count": int(issue_counts.get("rejected_by_memory") or 0),
+                },
+            }
+        )
+
+    if protection_coverage < 0.9:
+        proposals.append(
+            {
+                "proposal_id": "protection_improvement:enforce_tp_sl_generation",
+                "type": "protection_improvement",
+                "action": "enforce_tp_sl_generation",
+                "current_value": round(protection_coverage, 6),
+                "suggested_value": 0.98,
+                "unit": "ratio",
+                "confidence": round(_clamp(0.8 + min(0.15, (0.9 - protection_coverage)), 0.0, 0.97), 3),
+                "impact": "risk_control_improvement",
+                "reason": "tp_sl_missing",
+                "suggestion": f"Raise TP/SL coverage toward 98% because observed protection coverage is {round(protection_coverage_pct, 2)}%.",
+                "evidence": {
+                    "protection_coverage": round(protection_coverage, 6),
+                    "protection_coverage_pct": round(protection_coverage_pct, 6),
+                    "tp_missing_count": int(issue_counts.get("tp_missing") or 0),
+                },
+            }
+        )
+
+    if size_adjustment_rate > 0.5:
+        suggested_notional = suggested_default_notional or current_default_notional or 0.0
+        proposals.append(
+            {
+                "proposal_id": "sizing_optimization:increase_default_notional",
+                "type": "sizing_optimization",
+                "action": "increase_default_notional",
+                "parameter": "default_notional_usd",
+                "current_value": round(current_default_notional, 8),
+                "suggested_value": round(suggested_notional, 8),
+                "unit": "usd",
+                "confidence": round(_clamp(0.62 + min(0.18, size_adjustment_rate * 0.25), 0.0, 0.9), 3),
+                "impact": "execution_efficiency",
+                "reason": "frequent_auto_adjustment",
+                "suggestion": f"Increase default requested notional toward {round(suggested_notional, 4)} USD because auto-sizing corrected {round(size_adjustment_rate * 100, 2)}% of sampled trades.",
+                "evidence": {
+                    "size_adjustment_rate": round(size_adjustment_rate, 6),
+                    "observed_requested_notional_usd": round(current_default_notional, 8),
+                    "observed_effective_notional_usd": round(suggested_notional, 8),
+                },
+            }
+        )
+
+    return {
+        "status": "ok",
+        "engine": "ImprovementProposer",
+        "version": "v1_controlled",
+        "timestamp": _now_utc().isoformat(),
+        "analysis_mode": "controlled_proposal_only",
+        "scope_type": str(analytics.get("scope_type") or ""),
+        "scope_id": str(analytics.get("scope_id") or ""),
+        "period_start": str(analytics.get("period_start") or ""),
+        "period_end": str(analytics.get("period_end") or ""),
+        "proposal_count": len(proposals),
+        "issues": _trade_intelligence_top_issue_codes(analytics),
+        "analytics_summary": summary,
+        "issue_counts": issue_counts,
+        "proposals": proposals,
+    }
+
+
+def _improvement_proposer(
+    scope_type: str,
+    scope_id: str,
+    start: datetime,
+    end: datetime,
+    *,
+    trade_limit: int = 100,
+) -> dict[str, Any]:
+    analytics = _trade_intelligence_engine(scope_type, scope_id, start, end, trade_limit=trade_limit)
+    return _build_improvement_proposals(analytics)
+
+
+def _build_improvement_validation_context(analytics: dict[str, Any] | None = None, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    summary = analytics.get("summary") if isinstance((analytics or {}).get("summary"), dict) else {}
+    kill_switch_reason = "runtime_state"
+    try:
+        kill_state = _kill_switch_state()
+    except Exception:
+        kill_state = {"active": True}
+        kill_switch_reason = "kill_switch_state_unavailable"
+    context = {
+        "system_mode": CURRENT_SYSTEM_MODE.value,
+        "kill_switch_active": bool(kill_state.get("active")),
+        "kill_switch_reason": kill_switch_reason,
+        "rejection_rate": round(_clamp(_to_float(summary.get("rejection_rate"), 0.0), 0.0, 1.0), 6),
+        "execution_quality": round(_clamp(_to_float(summary.get("execution_quality"), 1.0), 0.0, 1.0), 6),
+        "slippage_avg_bps": round(max(0.0, _to_float(summary.get("slippage_avg_bps"), 0.0)), 6),
+        "latency_avg_ms": round(max(0.0, _to_float(summary.get("latency_avg_ms"), 0.0)), 6),
+        "protection_coverage": round(_clamp(_to_float(summary.get("protection_coverage_pct"), 100.0) / 100.0, 0.0, 1.0), 6),
+        "size_adjustment_rate": round(_clamp(_to_float(summary.get("size_adjustment_rate"), 0.0), 0.0, 1.0), 6),
+    }
+    if isinstance(overrides, dict):
+        context.update(overrides)
+    return context
+
+
+def _improvement_proposal_rule_check(proposal: dict[str, Any]) -> list[str]:
+    proposal_type = str(proposal.get("type") or "").strip().lower()
+    action = str(proposal.get("action") or "").strip().lower()
+    current_value = _to_float(proposal.get("current_value"), math.nan)
+    suggested_value = proposal.get("suggested_value")
+    suggested_numeric = _to_float(suggested_value, math.nan)
+
+    allowed_actions = {
+        "execution_optimization": {"reduce_max_slippage"},
+        "routing_optimization": {"prefer_low_latency_venue"},
+        "risk_adjustment": {"adjust_order_constraints"},
+        "protection_improvement": {"enforce_tp_sl_generation"},
+        "sizing_optimization": {"increase_default_notional"},
+    }
+    reasons: list[str] = []
+    if proposal_type not in allowed_actions:
+        reasons.append("unsupported_proposal_type")
+        return reasons
+    if action not in allowed_actions[proposal_type]:
+        reasons.append("unsupported_proposal_action")
+        return reasons
+
+    if action == "reduce_max_slippage":
+        if not math.isfinite(suggested_numeric) or suggested_numeric < 1.0:
+            reasons.append("invalid_slippage_value")
+        elif math.isfinite(current_value) and suggested_numeric >= current_value:
+            reasons.append("slippage_not_reduced")
+
+    if action == "increase_default_notional":
+        if not math.isfinite(suggested_numeric) or suggested_numeric <= 0.0:
+            reasons.append("invalid_default_notional")
+        elif math.isfinite(current_value) and current_value > 0 and suggested_numeric < current_value:
+            reasons.append("default_notional_not_increased")
+
+    if action == "enforce_tp_sl_generation":
+        if math.isfinite(suggested_numeric) and (suggested_numeric <= 0.0 or suggested_numeric > 1.0):
+            reasons.append("invalid_protection_target")
+
+    return reasons
+
+
+def _improvement_simulation_heuristic(proposal: dict[str, Any], context: dict[str, Any], analytics: dict[str, Any] | None = None) -> dict[str, Any]:
+    summary = analytics.get("summary") if isinstance((analytics or {}).get("summary"), dict) else {}
+    proposal_type = str(proposal.get("type") or "").strip().lower()
+    action = str(proposal.get("action") or "").strip().lower()
+    current_value = _to_float(proposal.get("current_value"), math.nan)
+    suggested_value = _to_float(proposal.get("suggested_value"), math.nan)
+    slippage_avg_bps = max(0.0, _to_float(context.get("slippage_avg_bps"), _to_float(summary.get("slippage_avg_bps"), 0.0)))
+    latency_avg_ms = max(0.0, _to_float(context.get("latency_avg_ms"), _to_float(summary.get("latency_avg_ms"), 0.0)))
+    rejection_rate = _clamp(_to_float(context.get("rejection_rate"), _to_float(summary.get("rejection_rate"), 0.0)), 0.0, 1.0)
+    protection_coverage = _clamp(_to_float(context.get("protection_coverage"), _to_float(summary.get("protection_coverage_pct"), 100.0) / 100.0), 0.0, 1.0)
+    size_adjustment_rate = _clamp(_to_float(context.get("size_adjustment_rate"), _to_float(summary.get("size_adjustment_rate"), 0.0)), 0.0, 1.0)
+    expected_gain = 0.02
+    risk_increase = 0.01
+
+    if proposal_type == "execution_optimization" and action == "reduce_max_slippage":
+        reduction_fraction = 0.0
+        if math.isfinite(current_value) and current_value > 0 and math.isfinite(suggested_value):
+            reduction_fraction = max(0.0, min(1.0, (current_value - suggested_value) / current_value))
+        expected_gain = _clamp(0.02 + reduction_fraction * 0.12, 0.0, 0.18)
+        risk_increase = _clamp(0.02 + reduction_fraction * 0.08 + rejection_rate * 0.08, 0.0, 0.25)
+    elif proposal_type == "routing_optimization" and action == "prefer_low_latency_venue":
+        best_venue = _trade_intelligence_best_venue(analytics or {})
+        best_latency = max(0.0, _to_float(best_venue.get("latency_avg_ms"), latency_avg_ms))
+        latency_gain_fraction = max(0.0, min(1.0, _safe_ratio(latency_avg_ms - best_latency, max(latency_avg_ms, 1.0), default=0.0)))
+        expected_gain = _clamp(0.03 + latency_gain_fraction * 0.12, 0.0, 0.16)
+        current_quality = _to_float(_trade_intelligence_dominant_venue(analytics or {}).get("execution_quality_avg"), _to_float(context.get("execution_quality"), 0.0))
+        best_quality = _to_float(best_venue.get("execution_quality_avg"), current_quality)
+        quality_gap = max(0.0, current_quality - best_quality)
+        risk_increase = _clamp(0.03 + quality_gap * 0.12, 0.0, 0.2)
+    elif proposal_type == "risk_adjustment" and action == "adjust_order_constraints":
+        expected_gain = _clamp(0.03 + rejection_rate * 0.2, 0.0, 0.14)
+        dominant_risk_rejections = int(((analytics or {}).get("issue_counts") or {}).get("rejected_by_risk") or 0)
+        dominant_preflight_rejections = int(((analytics or {}).get("issue_counts") or {}).get("rejected_preflight") or 0)
+        risk_increase = 0.1 if dominant_risk_rejections > dominant_preflight_rejections else 0.05
+    elif proposal_type == "protection_improvement" and action == "enforce_tp_sl_generation":
+        coverage_gap = max(0.0, 1.0 - protection_coverage)
+        expected_gain = _clamp(0.03 + coverage_gap * 0.18, 0.0, 0.16)
+        risk_increase = 0.01
+    elif proposal_type == "sizing_optimization" and action == "increase_default_notional":
+        notional_growth = 0.0
+        if math.isfinite(current_value) and current_value > 0 and math.isfinite(suggested_value):
+            notional_growth = max(0.0, min(2.0, (suggested_value - current_value) / current_value))
+        expected_gain = _clamp(0.02 + size_adjustment_rate * 0.12, 0.0, 0.16)
+        risk_increase = _clamp(0.04 + size_adjustment_rate * 0.08 + notional_growth * 0.06, 0.0, 0.22)
+
+    return {
+        "simulation_mode": "heuristic_fallback",
+        "sample_size": 0,
+        "baseline_pnl_usd": 0.0,
+        "candidate_pnl_usd": 0.0,
+        "delta_pnl_usd": 0.0,
+        "delta_pnl_pct": 0.0,
+        "baseline_drawdown_usd": 0.0,
+        "candidate_drawdown_usd": 0.0,
+        "drawdown_change_usd": 0.0,
+        "baseline_slippage_bps": round(slippage_avg_bps, 6),
+        "candidate_slippage_bps": round(slippage_avg_bps, 6),
+        "slippage_change_bps": 0.0,
+        "baseline_fill_probability": 1.0,
+        "candidate_fill_probability": 1.0,
+        "fill_probability_change": 0.0,
+        "baseline_latency_ms": round(latency_avg_ms, 6),
+        "candidate_latency_ms": round(latency_avg_ms, 6),
+        "latency_change_ms": 0.0,
+        "expected_gain": round(expected_gain, 6),
+        "risk_increase": round(risk_increase, 6),
+        "scenario_results": [],
+    }
+
+
+def _improvement_simulation_max_drawdown(pnls: list[float]) -> float:
+    running_total = 0.0
+    peak_total = 0.0
+    max_drawdown = 0.0
+    for pnl in pnls:
+        running_total += pnl
+        peak_total = max(peak_total, running_total)
+        max_drawdown = max(max_drawdown, peak_total - running_total)
+    return round(max_drawdown, 6)
+
+
+def _improvement_simulation_scenarios(trades: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
+    if not trades:
+        return []
+
+    slippage_values = [max(0.0, _to_float(trade.get("slippage_bps"), 0.0)) for trade in trades]
+    latency_values = [max(0.0, _to_float(trade.get("latency_ms"), 0.0)) for trade in trades]
+    median_slippage = _median_numeric(slippage_values)
+    median_latency = _median_numeric(latency_values)
+
+    trend = [trade for trade in trades if "TREND" in str(trade.get("regime") or "").upper()]
+    ranging = [trade for trade in trades if any(token in str(trade.get("regime") or "").upper() for token in ("CHOP", "RANGE", "SIDEWAYS"))]
+    high_volatility = [
+        trade
+        for trade in trades
+        if max(0.0, _to_float(trade.get("slippage_bps"), 0.0)) >= max(6.0, median_slippage * 1.35)
+        or max(0.0, _to_float(trade.get("latency_ms"), 0.0)) >= max(450.0, median_latency * 1.4)
+        or _to_float(trade.get("execution_quality"), 1.0) <= 0.45
+        or "high_slippage" in (trade.get("issues") or [])
+        or "high_latency" in (trade.get("issues") or [])
+    ]
+
+    scenarios = [("overall", trades)]
+    if trend:
+        scenarios.append(("trend", trend))
+    if ranging:
+        scenarios.append(("range", ranging))
+    if high_volatility:
+        scenarios.append(("high_volatility", high_volatility))
+    return scenarios
+
+
+def _simulate_trade_under_proposal(
+    trade: dict[str, Any],
+    proposal: dict[str, Any],
+    analytics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    analytics = analytics or {}
+    summary = analytics.get("summary") if isinstance(analytics.get("summary"), dict) else {}
+    best_venue = _trade_intelligence_best_venue(analytics)
+
+    proposal_type = str(proposal.get("type") or "").strip().lower()
+    action = str(proposal.get("action") or "").strip().lower()
+    current_value = _to_float(proposal.get("current_value"), math.nan)
+    suggested_value = _to_float(proposal.get("suggested_value"), math.nan)
+
+    baseline_pnl = _to_float(trade.get("net_result_usd"), 0.0)
+    baseline_slippage = max(0.0, _to_float(trade.get("slippage_bps"), 0.0))
+    baseline_latency = max(0.0, _to_float(trade.get("latency_ms"), 0.0))
+    baseline_fill = _clamp(_to_float(trade.get("fill_ratio"), 1.0), 0.0, 1.0)
+    requested_notional = max(0.0, _to_float(trade.get("requested_notional_usd"), 0.0))
+    effective_notional = max(requested_notional, _to_float(trade.get("effective_notional_usd"), requested_notional))
+    baseline_notional = effective_notional or requested_notional
+    regime = str(trade.get("regime") or "UNKNOWN").upper()
+    provider = str(trade.get("provider") or "unknown")
+    execution_quality = _clamp(_to_float(trade.get("execution_quality"), 0.0), 0.0, 1.0)
+    issues = trade.get("issues") if isinstance(trade.get("issues"), list) else []
+    tp_missing = "tp_missing" in issues
+    protection_expected = bool(trade.get("protection_expected"))
+    size_adjustment = bool(trade.get("size_adjustment"))
+
+    candidate_pnl = baseline_pnl
+    candidate_slippage = baseline_slippage
+    candidate_latency = baseline_latency
+    candidate_fill = baseline_fill
+    candidate_notional = baseline_notional
+    simulation_note = "replay_no_change"
+
+    if proposal_type == "execution_optimization" and action == "reduce_max_slippage":
+        target_slippage = max(1.0, suggested_value if math.isfinite(suggested_value) else baseline_slippage)
+        excess_slippage = max(0.0, baseline_slippage - target_slippage)
+        slippage_reduction = excess_slippage * 0.55
+        candidate_slippage = max(0.0, baseline_slippage - slippage_reduction)
+        passive_fill_penalty = min(0.12, _safe_ratio(excess_slippage, max(baseline_slippage, 1.0), default=0.0) * (0.06 if "TREND" in regime else 0.1))
+        candidate_fill = _clamp(baseline_fill - passive_fill_penalty, 0.0, 1.0)
+        candidate_latency = baseline_latency + excess_slippage * 4.0
+        slippage_credit = candidate_notional * max(0.0, baseline_slippage - candidate_slippage) / 10000.0
+        fill_penalty = candidate_notional * max(0.0, baseline_fill - candidate_fill) * 0.01
+        candidate_pnl = baseline_pnl + slippage_credit - fill_penalty
+        simulation_note = "replay_slippage_tightening"
+    elif proposal_type == "routing_optimization" and action == "prefer_low_latency_venue":
+        best_latency = max(0.0, _to_float(best_venue.get("latency_avg_ms"), baseline_latency))
+        current_quality = execution_quality
+        best_quality = _clamp(_to_float(best_venue.get("execution_quality_avg"), current_quality), 0.0, 1.0)
+        latency_delta = max(0.0, baseline_latency - best_latency)
+        candidate_latency = max(best_latency, baseline_latency - latency_delta * 0.75)
+        candidate_slippage = max(0.0, baseline_slippage * (1.0 - min(0.28, _safe_ratio(latency_delta, max(baseline_latency, 1.0), default=0.0) * 0.35)))
+        fill_boost = min(0.08, _safe_ratio(latency_delta, max(baseline_latency, 1.0), default=0.0) * 0.08 + max(0.0, best_quality - current_quality) * 0.05)
+        if str(best_venue.get("provider") or provider) == provider:
+            fill_boost *= 0.5
+        candidate_fill = _clamp(baseline_fill + fill_boost, 0.0, 1.0)
+        slippage_credit = candidate_notional * max(0.0, baseline_slippage - candidate_slippage) / 10000.0
+        fill_credit = candidate_notional * max(0.0, candidate_fill - baseline_fill) * 0.008
+        candidate_pnl = baseline_pnl + slippage_credit + fill_credit
+        simulation_note = "replay_low_latency_routing"
+    elif proposal_type == "risk_adjustment" and action == "adjust_order_constraints":
+        rejection_rate = _clamp(_to_float(summary.get("rejection_rate"), current_value if math.isfinite(current_value) else 0.0), 0.0, 1.0)
+        candidate_fill = _clamp(baseline_fill + min(0.06, rejection_rate * 0.14), 0.0, 1.0)
+        candidate_slippage = baseline_slippage + (0.7 if "high_slippage" in issues else 0.25)
+        candidate_latency = baseline_latency + (20.0 if "CHOP" in regime or "RANGE" in regime else 10.0)
+        fill_credit = candidate_notional * max(0.0, candidate_fill - baseline_fill) * 0.009
+        slippage_drag = candidate_notional * max(0.0, candidate_slippage - baseline_slippage) / 10000.0
+        regime_penalty = candidate_notional * 0.0015 if "CHOP" in regime or "RANGE" in regime else 0.0
+        candidate_pnl = baseline_pnl + fill_credit - slippage_drag - regime_penalty
+        simulation_note = "replay_constraint_relaxation"
+    elif proposal_type == "protection_improvement" and action == "enforce_tp_sl_generation":
+        if protection_expected and tp_missing:
+            candidate_pnl = baseline_pnl * 0.45 if baseline_pnl < 0 else baseline_pnl * 0.97
+            simulation_note = "replay_tp_sl_backfill"
+        elif protection_expected:
+            candidate_pnl = baseline_pnl * 0.997 if baseline_pnl > 0 else baseline_pnl
+            simulation_note = "replay_tp_sl_already_present"
+        else:
+            simulation_note = "replay_protection_not_expected"
+    elif proposal_type == "sizing_optimization" and action == "increase_default_notional":
+        target_requested_notional = max(0.0, suggested_value)
+        baseline_requested = requested_notional or baseline_notional
+        scale = 1.0
+        if baseline_requested > 0 and target_requested_notional > 0:
+            scale = max(1.0, min(2.0, target_requested_notional / baseline_requested))
+        elif size_adjustment:
+            scale = 1.15
+        if not size_adjustment:
+            scale = 1.0 + (scale - 1.0) * 0.5
+        candidate_notional = baseline_notional * scale
+        candidate_slippage = baseline_slippage * (1.0 + min(0.22, (scale - 1.0) * 0.35))
+        candidate_latency = baseline_latency * (1.0 + min(0.1, (scale - 1.0) * 0.1))
+        candidate_fill = _clamp(baseline_fill - min(0.08, (scale - 1.0) * 0.08), 0.0, 1.0)
+        pnl_scale = _safe_ratio(candidate_notional, max(baseline_notional, 1e-9), default=1.0)
+        slippage_drag = candidate_notional * max(0.0, candidate_slippage - baseline_slippage) / 10000.0
+        fill_penalty = candidate_notional * max(0.0, baseline_fill - candidate_fill) * 0.01
+        candidate_pnl = baseline_pnl * pnl_scale - slippage_drag - fill_penalty
+        simulation_note = "replay_notional_rescaling"
+
+    return {
+        "decision_id": str(trade.get("decision_id") or ""),
+        "baseline_pnl_usd": round(baseline_pnl, 6),
+        "candidate_pnl_usd": round(candidate_pnl, 6),
+        "baseline_slippage_bps": round(baseline_slippage, 6),
+        "candidate_slippage_bps": round(candidate_slippage, 6),
+        "baseline_latency_ms": round(baseline_latency, 6),
+        "candidate_latency_ms": round(candidate_latency, 6),
+        "baseline_fill_ratio": round(baseline_fill, 6),
+        "candidate_fill_ratio": round(candidate_fill, 6),
+        "baseline_notional_usd": round(baseline_notional, 8),
+        "candidate_notional_usd": round(candidate_notional, 8),
+        "provider": provider,
+        "regime": regime,
+        "note": simulation_note,
+    }
+
+
+def _aggregate_improvement_simulation_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    sample_size = len(rows)
+    if sample_size <= 0:
+        return {
+            "sample_size": 0,
+            "baseline_pnl_usd": 0.0,
+            "candidate_pnl_usd": 0.0,
+            "delta_pnl_usd": 0.0,
+            "delta_pnl_pct": 0.0,
+            "baseline_drawdown_usd": 0.0,
+            "candidate_drawdown_usd": 0.0,
+            "drawdown_change_usd": 0.0,
+            "baseline_slippage_bps": 0.0,
+            "candidate_slippage_bps": 0.0,
+            "slippage_change_bps": 0.0,
+            "baseline_fill_probability": 0.0,
+            "candidate_fill_probability": 0.0,
+            "fill_probability_change": 0.0,
+            "baseline_latency_ms": 0.0,
+            "candidate_latency_ms": 0.0,
+            "latency_change_ms": 0.0,
+            "baseline_notional_usd": 0.0,
+            "candidate_notional_usd": 0.0,
+            "risk_score": 0.0,
+            "expected_gain": 0.0,
+            "risk_increase": 0.0,
+        }
+
+    baseline_pnls = [_to_float(row.get("baseline_pnl_usd"), 0.0) for row in rows]
+    candidate_pnls = [_to_float(row.get("candidate_pnl_usd"), 0.0) for row in rows]
+    baseline_pnl = sum(baseline_pnls)
+    candidate_pnl = sum(candidate_pnls)
+    delta_pnl = candidate_pnl - baseline_pnl
+    baseline_notional = sum(max(0.0, _to_float(row.get("baseline_notional_usd"), 0.0)) for row in rows)
+    candidate_notional = sum(max(0.0, _to_float(row.get("candidate_notional_usd"), 0.0)) for row in rows)
+    baseline_drawdown = _improvement_simulation_max_drawdown(baseline_pnls)
+    candidate_drawdown = _improvement_simulation_max_drawdown(candidate_pnls)
+    drawdown_change = candidate_drawdown - baseline_drawdown
+    baseline_slippage = sum(max(0.0, _to_float(row.get("baseline_slippage_bps"), 0.0)) for row in rows) / sample_size
+    candidate_slippage = sum(max(0.0, _to_float(row.get("candidate_slippage_bps"), 0.0)) for row in rows) / sample_size
+    baseline_fill = sum(_clamp(_to_float(row.get("baseline_fill_ratio"), 0.0), 0.0, 1.0) for row in rows) / sample_size
+    candidate_fill = sum(_clamp(_to_float(row.get("candidate_fill_ratio"), 0.0), 0.0, 1.0) for row in rows) / sample_size
+    baseline_latency = sum(max(0.0, _to_float(row.get("baseline_latency_ms"), 0.0)) for row in rows) / sample_size
+    candidate_latency = sum(max(0.0, _to_float(row.get("candidate_latency_ms"), 0.0)) for row in rows) / sample_size
+    expected_gain = _clamp(max(0.0, delta_pnl) / max(baseline_notional * 0.08, 1.0), 0.0, 0.25)
+    risk_increase = _clamp(
+        max(0.0, drawdown_change) / max(baseline_notional * 0.1, 1.0)
+        + max(0.0, candidate_slippage - baseline_slippage) / 24.0
+        + max(0.0, baseline_fill - candidate_fill) / 0.45
+        + max(0.0, candidate_notional - baseline_notional) / max(baseline_notional * 3.0, 1.0),
+        0.0,
+        0.3,
+    )
+    risk_score = _clamp(0.5 + expected_gain * 1.2 - risk_increase * 1.5, 0.0, 1.0)
+
+    return {
+        "sample_size": sample_size,
+        "baseline_pnl_usd": round(baseline_pnl, 6),
+        "candidate_pnl_usd": round(candidate_pnl, 6),
+        "delta_pnl_usd": round(delta_pnl, 6),
+        "delta_pnl_pct": round(_safe_ratio(delta_pnl, max(abs(baseline_pnl), 1.0), default=0.0) * 100.0, 6),
+        "baseline_drawdown_usd": round(baseline_drawdown, 6),
+        "candidate_drawdown_usd": round(candidate_drawdown, 6),
+        "drawdown_change_usd": round(drawdown_change, 6),
+        "baseline_slippage_bps": round(baseline_slippage, 6),
+        "candidate_slippage_bps": round(candidate_slippage, 6),
+        "slippage_change_bps": round(candidate_slippage - baseline_slippage, 6),
+        "baseline_fill_probability": round(baseline_fill, 6),
+        "candidate_fill_probability": round(candidate_fill, 6),
+        "fill_probability_change": round(candidate_fill - baseline_fill, 6),
+        "baseline_latency_ms": round(baseline_latency, 6),
+        "candidate_latency_ms": round(candidate_latency, 6),
+        "latency_change_ms": round(candidate_latency - baseline_latency, 6),
+        "baseline_notional_usd": round(baseline_notional, 8),
+        "candidate_notional_usd": round(candidate_notional, 8),
+        "risk_score": round(risk_score, 6),
+        "expected_gain": round(expected_gain, 6),
+        "risk_increase": round(risk_increase, 6),
+    }
+
+
+def _simulate_improvement_proposal_impact(proposal: dict[str, Any], context: dict[str, Any], analytics: dict[str, Any] | None = None) -> dict[str, Any]:
+    analytics = analytics or {}
+    trades = analytics.get("trades") if isinstance(analytics.get("trades"), list) else []
+    normalized_trades = [trade for trade in trades if isinstance(trade, dict)]
+    if not normalized_trades:
+        return _improvement_simulation_heuristic(proposal, context, analytics)
+
+    replay_rows = [_simulate_trade_under_proposal(trade, proposal, analytics) for trade in normalized_trades]
+    overall = _aggregate_improvement_simulation_rows(replay_rows)
+    scenario_results: list[dict[str, Any]] = []
+    for scenario_name, scenario_trades in _improvement_simulation_scenarios(normalized_trades):
+        scenario_ids = {str(trade.get("decision_id") or "") for trade in scenario_trades}
+        scenario_rows = [row for row in replay_rows if str(row.get("decision_id") or "") in scenario_ids] if scenario_ids else []
+        if not scenario_rows:
+            continue
+        scenario_summary = _aggregate_improvement_simulation_rows(scenario_rows)
+        scenario_summary["scenario"] = scenario_name
+        scenario_results.append(scenario_summary)
+
+    scenario_coverage = _safe_ratio(len(scenario_results), 4, default=0.0)
+    confidence = _clamp(0.45 + min(0.35, len(normalized_trades) / 20.0 * 0.35) + scenario_coverage * 0.2, 0.0, 0.95)
+    return {
+        "simulation_mode": "contextual_replay",
+        **overall,
+        "confidence": round(confidence, 6),
+        "scenario_results": scenario_results,
+    }
+
+
+def _build_improvement_validation_result(
+    proposal: dict[str, Any],
+    decision: str,
+    reasons: list[str],
+    confidence_score: float,
+    simulation: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    return {
+        "proposal": proposal,
+        "decision": decision,
+        "confidence_score": round(_clamp(confidence_score, 0.0, 1.0), 3),
+        "reasons": sorted(set(reason for reason in reasons if reason)),
+        "simulation": simulation or {},
+    }
+
+
+def _validate_improvement_proposals(
+    proposals: list[dict[str, Any]],
+    *,
+    context: dict[str, Any],
+    analytics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    results: list[dict[str, Any]] = []
+    for raw_proposal in proposals:
+        proposal = raw_proposal if isinstance(raw_proposal, dict) else {}
+        decision = "REJECT"
+        reasons = _improvement_proposal_rule_check(proposal)
+        if reasons:
+            results.append(_build_improvement_validation_result(proposal, decision, reasons, 0.0, simulation={}))
+            continue
+
+        simulation = _simulate_improvement_proposal_impact(proposal, context, analytics)
+        confidence = _clamp(_to_float(proposal.get("confidence"), 0.5), 0.0, 1.0)
+        expected_gain = _to_float(simulation.get("expected_gain"), 0.0)
+        risk_increase = _to_float(simulation.get("risk_increase"), 0.0)
+        confidence_score = confidence * 0.4 + _clamp(expected_gain / 0.2, 0.0, 1.0) * 0.4 + _clamp(1.0 - risk_increase / 0.25, 0.0, 1.0) * 0.2
+
+        if bool(context.get("kill_switch_active")):
+            reasons.append("kill_switch_active")
+            decision = "REJECT"
+        elif risk_increase > 0.2:
+            reasons.append("risk_increase_too_high")
+            decision = "REJECT"
+        elif str(context.get("system_mode") or "").strip().lower() != SystemMode.MANAGED_LIVE.value:
+            reasons.append("system_not_live_mode")
+            decision = "TEST"
+        elif expected_gain >= 0.05 and risk_increase <= 0.12:
+            reasons.append("expected_gain_supportive")
+            decision = "ACCEPT"
+        else:
+            reasons.append("simulation_requires_test")
+            decision = "TEST"
+
+        results.append(
+            _build_improvement_validation_result(
+                proposal,
+                decision,
+                reasons,
+                confidence_score,
+                simulation=simulation,
+            )
+        )
+
+    decision_counts = {
+        "ACCEPT": sum(1 for result in results if str(result.get("decision") or "") == "ACCEPT"),
+        "TEST": sum(1 for result in results if str(result.get("decision") or "") == "TEST"),
+        "REJECT": sum(1 for result in results if str(result.get("decision") or "") == "REJECT"),
+    }
+    return {
+        "status": "ok",
+        "engine": "ValidationEngine",
+        "version": "v1_controlled_validation",
+        "timestamp": _now_utc().isoformat(),
+        "validation_mode": "controlled",
+        "context": context,
+        "result_count": len(results),
+        "decision_counts": decision_counts,
+        "results": results,
+    }
+
+
+def _improvement_proposals_validation(
+    *,
+    proposals: list[dict[str, Any]],
+    analytics: dict[str, Any] | None = None,
+    context_overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    context = _build_improvement_validation_context(analytics or {}, overrides=context_overrides)
+    return _validate_improvement_proposals(proposals, context=context, analytics=analytics)
+
+
+def _simulate_improvement_proposals(
+    proposals: list[dict[str, Any]],
+    *,
+    analytics: dict[str, Any] | None = None,
+    context_overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    context = _build_improvement_validation_context(analytics or {}, overrides=context_overrides)
+    results: list[dict[str, Any]] = []
+    for raw_proposal in proposals:
+        proposal = raw_proposal if isinstance(raw_proposal, dict) else {}
+        simulation = _simulate_improvement_proposal_impact(proposal, context=context, analytics=analytics)
+        results.append(
+            {
+                "proposal": proposal,
+                "simulation": simulation,
+            }
+        )
+
+    return {
+        "status": "ok",
+        "engine": "SimulationEngine",
+        "version": "v1_contextual_replay",
+        "timestamp": _now_utc().isoformat(),
+        "simulation_mode": "contextual_replay",
+        "context": context,
+        "result_count": len(results),
+        "results": results,
+    }
+
+
+def _default_controlled_deployment_state() -> dict[str, Any]:
+    return {
+        "version": 1,
+        "updated_at": _now_utc().isoformat(),
+        "deployments": [],
+    }
+
+
+def _normalize_controlled_deployment_record(record: dict[str, Any]) -> dict[str, Any]:
+    monitoring = record.get("monitoring") if isinstance(record.get("monitoring"), dict) else {}
+    rollout = record.get("rollout") if isinstance(record.get("rollout"), dict) else {}
+    rollback = record.get("rollback") if isinstance(record.get("rollback"), dict) else {}
+    promotion = record.get("promotion") if isinstance(record.get("promotion"), dict) else {}
+    status = str(record.get("status") or "CANARY").upper()
+    default_phase = str(
+        rollout.get("phase")
+        or (
+            "CONFIRMED"
+            if status == "CONFIRMED"
+            else "ROLLED_BACK"
+            if "ROLLED_BACK" in status
+            else "CANARY"
+        )
+    ).upper()
+    default_canary_trade_share_pct = 100.0 if default_phase == "CONFIRMED" else 0.0 if default_phase == "ROLLED_BACK" else 5.0
+    canary_trade_share_pct = round(_clamp(_to_float(rollout.get("canary_trade_share_pct"), default_canary_trade_share_pct), 0.0, 100.0), 4)
+    remaining_trade_share_pct = round(_clamp(_to_float(rollout.get("remaining_trade_share_pct"), max(0.0, 100.0 - canary_trade_share_pct)), 0.0, 100.0), 4)
+    minimum_canary_trade_share_pct = round(
+        _clamp(
+            _to_float(
+                rollout.get("minimum_canary_trade_share_pct"),
+                max(1.0, canary_trade_share_pct * 0.25 if 0.0 < canary_trade_share_pct < 100.0 else 1.0),
+            ),
+            1.0,
+            25.0,
+        ),
+        4,
+    )
+    default_scale_down_step_pct = max(1.0, round(canary_trade_share_pct * 0.5, 4)) if 0.0 < canary_trade_share_pct < 100.0 else 1.0
+    scale_down_step_pct = round(_clamp(_to_float(rollout.get("scale_down_step_pct"), default_scale_down_step_pct), 1.0, 50.0), 4)
+    return {
+        "deployment_id": str(record.get("deployment_id") or f"deploy_{uuid4().hex[:12]}"),
+        "config_version": str(record.get("config_version") or f"cfg_{uuid4().hex[:12]}"),
+        "scope_type": str(record.get("scope_type") or ""),
+        "scope_id": str(record.get("scope_id") or ""),
+        "proposal_id": str(record.get("proposal_id") or ""),
+        "proposal_type": str(record.get("proposal_type") or ""),
+        "status": status,
+        "deployed_at": str(record.get("deployed_at") or _now_utc().isoformat()),
+        "deployed_by": str(record.get("deployed_by") or "system"),
+        "applied_config": record.get("applied_config") if isinstance(record.get("applied_config"), dict) else {},
+        "baseline_metrics": record.get("baseline_metrics") if isinstance(record.get("baseline_metrics"), dict) else {},
+        "simulation": record.get("simulation") if isinstance(record.get("simulation"), dict) else {},
+        "validation": record.get("validation") if isinstance(record.get("validation"), dict) else {},
+        "monitoring": {
+            "status": str(monitoring.get("status") or "active"),
+            "window_minutes": max(15, min(24 * 60, int(monitoring.get("window_minutes") or 90))),
+            "min_trade_samples": max(1, min(200, int(monitoring.get("min_trade_samples") or 3))),
+            "min_promotion_trade_samples": max(3, min(500, int(monitoring.get("min_promotion_trade_samples") or 50))),
+            "auto_rollback": bool(monitoring.get("auto_rollback", True)),
+            "auto_confirm": bool(monitoring.get("auto_confirm", True)),
+            "started_at": str(monitoring.get("started_at") or record.get("deployed_at") or _now_utc().isoformat()),
+            "last_checked_at": monitoring.get("last_checked_at") if isinstance(monitoring.get("last_checked_at"), str) else None,
+            "check_count": max(0, int(monitoring.get("check_count") or 0)),
+            "thresholds": monitoring.get("thresholds") if isinstance(monitoring.get("thresholds"), dict) else {},
+            "last_observation": monitoring.get("last_observation") if isinstance(monitoring.get("last_observation"), dict) else None,
+        },
+        "rollout": {
+            "phase": default_phase,
+            "canary_trade_share_pct": canary_trade_share_pct,
+            "remaining_trade_share_pct": remaining_trade_share_pct,
+            "minimum_canary_trade_share_pct": minimum_canary_trade_share_pct,
+            "scale_down_step_pct": scale_down_step_pct,
+            "adjustments": [item for item in rollout.get("adjustments", []) if isinstance(item, dict)][:10],
+        },
+        "rollback": {
+            "ready": bool(rollback.get("ready", True)),
+            "reason": rollback.get("reason") if isinstance(rollback.get("reason"), str) else None,
+            "mode": rollback.get("mode") if isinstance(rollback.get("mode"), str) else None,
+            "rolled_back_at": rollback.get("rolled_back_at") if isinstance(rollback.get("rolled_back_at"), str) else None,
+            "rolled_back_by": rollback.get("rolled_back_by") if isinstance(rollback.get("rolled_back_by"), str) else None,
+            "restore_config": rollback.get("restore_config") if isinstance(rollback.get("restore_config"), dict) else {},
+        },
+        "promotion": {
+            "ready": bool(promotion.get("ready", False)),
+            "decision": str(promotion.get("decision") or "WATCH").upper(),
+            "status": str(promotion.get("status") or "watch"),
+            "score": round(_clamp(_to_float(promotion.get("score"), 0.0), 0.0, 1.0), 6),
+            "effective_score": round(_clamp(_to_float(promotion.get("effective_score"), _to_float(promotion.get("score"), 0.0)), 0.0, 1.0), 6),
+            "risk_adjustment": round(_clamp(_to_float(promotion.get("risk_adjustment"), 1.0), 0.0, 1.05), 6),
+            "confidence_decay": round(_clamp(_to_float(promotion.get("confidence_decay"), 1.0), 0.0, 1.0), 6),
+            "confidence_adjustment": round(_clamp(_to_float(promotion.get("confidence_adjustment"), 1.0), 0.0, 1.0), 6),
+            "validation_confidence": round(_clamp(_to_float(promotion.get("validation_confidence"), 0.0), 0.0, 1.0), 6),
+            "risk_pressure": round(_clamp(_to_float(promotion.get("risk_pressure"), 0.0), 0.0, 2.0), 6),
+            "score_breakdown": promotion.get("score_breakdown") if isinstance(promotion.get("score_breakdown"), dict) else {},
+            "reasons": [item for item in promotion.get("reasons", []) if isinstance(item, str)][:12],
+            "last_action": str(promotion.get("last_action") or "watch"),
+            "promoted_at": promotion.get("promoted_at") if isinstance(promotion.get("promoted_at"), str) else None,
+            "promoted_by": promotion.get("promoted_by") if isinstance(promotion.get("promoted_by"), str) else None,
+            "target_canary_trade_share_pct": round(_clamp(_to_float(promotion.get("target_canary_trade_share_pct"), canary_trade_share_pct), 0.0, 100.0), 4),
+            "suggested_canary_trade_share_pct": round(_clamp(_to_float(promotion.get("suggested_canary_trade_share_pct"), canary_trade_share_pct), 0.0, 100.0), 4),
+            "suggested_promotion_trade_share_pct": round(_clamp(_to_float(promotion.get("suggested_promotion_trade_share_pct"), canary_trade_share_pct), 0.0, 100.0), 4),
+            "suggested_scale_down_trade_share_pct": round(_clamp(_to_float(promotion.get("suggested_scale_down_trade_share_pct"), canary_trade_share_pct), 0.0, 100.0), 4),
+            "promotion_mode": str(promotion.get("promotion_mode") or promotion.get("decision") or "WATCH").upper(),
+        },
+        "confirmed_at": record.get("confirmed_at") if isinstance(record.get("confirmed_at"), str) else None,
+    }
+
+
+def _normalize_controlled_deployment_state(state: dict[str, Any] | None) -> dict[str, Any]:
+    candidate = state if isinstance(state, dict) else {}
+    deployments_raw = candidate.get("deployments") if isinstance(candidate.get("deployments"), list) else []
+    deployments = [
+        _normalize_controlled_deployment_record(item)
+        for item in deployments_raw
+        if isinstance(item, dict)
+    ][:100]
+    deployments.sort(key=lambda item: str(item.get("deployed_at") or ""), reverse=True)
+    return {
+        "version": max(1, int(candidate.get("version") or 1)),
+        "updated_at": str(candidate.get("updated_at") or _now_utc().isoformat()),
+        "deployments": deployments,
+    }
+
+
+def _controlled_deployment_state() -> dict[str, Any]:
+    stored = fetch_one("SELECT config_value FROM system_config WHERE config_key = 'controlled_improvement_deployments_v1'")
+    if stored and isinstance(stored.get("config_value"), dict):
+        return _normalize_controlled_deployment_state(stored.get("config_value"))
+    return _default_controlled_deployment_state()
+
+
+def _save_controlled_deployment_state(state: dict[str, Any]) -> dict[str, Any]:
+    normalized = _normalize_controlled_deployment_state({
+        **state,
+        "updated_at": _now_utc().isoformat(),
+    })
+    execute(
+        """
+        INSERT INTO system_config (config_key, config_value)
+        VALUES ('controlled_improvement_deployments_v1', %s::jsonb)
+        ON CONFLICT (config_key) DO UPDATE SET config_value = EXCLUDED.config_value, updated_at = NOW()
+        """,
+        (json_dumps(normalized),),
+    )
+    return normalized
+
+
+def _controlled_deployment_baseline_metrics(analytics: dict[str, Any], simulation: dict[str, Any]) -> dict[str, Any]:
+    summary = analytics.get("summary") if isinstance(analytics.get("summary"), dict) else {}
+    return {
+        "trade_count": int(summary.get("trade_count") or 0),
+        "rejection_rate": round(_clamp(_to_float(summary.get("rejection_rate"), 0.0), 0.0, 1.0), 6),
+        "execution_quality": round(_clamp(_to_float(summary.get("execution_quality"), 0.0), 0.0, 1.0), 6),
+        "slippage_avg_bps": round(max(0.0, _to_float(summary.get("slippage_avg_bps"), 0.0)), 6),
+        "latency_avg_ms": round(max(0.0, _to_float(summary.get("latency_avg_ms"), 0.0)), 6),
+        "pnl_net_usd": round(_to_float(summary.get("pnl_net_usd"), 0.0), 6),
+        "drawdown_proxy_usd": round(max(0.0, _to_float(simulation.get("candidate_drawdown_usd"), _to_float(simulation.get("baseline_drawdown_usd"), 0.0))), 6),
+    }
+
+
+def _controlled_deployment_thresholds(simulation: dict[str, Any], baseline_metrics: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "max_slippage_increase_bps": round(max(1.0, abs(_to_float(simulation.get("slippage_change_bps"), 0.0)) * 1.5 + 1.0), 6),
+        "max_latency_increase_ms": round(max(50.0, abs(_to_float(simulation.get("latency_change_ms"), 0.0)) * 1.5 + 50.0), 6),
+        "max_rejection_rate_increase": round(max(0.03, _to_float(baseline_metrics.get("rejection_rate"), 0.0) * 0.5 + 0.03), 6),
+        "max_drawdown_increase_usd": round(max(5.0, abs(_to_float(simulation.get("drawdown_change_usd"), 0.0)) * 1.5 + 5.0), 6),
+        "min_pnl_delta_usd": round(-max(5.0, max(0.0, _to_float(simulation.get("delta_pnl_usd"), 0.0)) * 0.5 + 2.5), 6),
+        "min_execution_quality": round(max(0.2, _to_float(baseline_metrics.get("execution_quality"), 0.0) - 0.08), 6),
+        "min_promotion_score": 0.72,
+        "scale_down_on_score_below": 0.58,
+        "severe_regression_ratio": 1.35,
+    }
+
+
+def _next_controlled_deployment_canary_share(deployment: dict[str, Any]) -> float:
+    rollout = deployment.get("rollout") if isinstance(deployment.get("rollout"), dict) else {}
+    current_share = round(_clamp(_to_float(rollout.get("canary_trade_share_pct"), 0.0), 0.0, 100.0), 4)
+    minimum_share = round(_clamp(_to_float(rollout.get("minimum_canary_trade_share_pct"), 1.0), 1.0, 25.0), 4)
+    scale_down_step = round(_clamp(_to_float(rollout.get("scale_down_step_pct"), max(1.0, current_share * 0.5)), 1.0, 50.0), 4)
+    if current_share <= minimum_share:
+        return current_share
+    return round(max(minimum_share, current_share - scale_down_step), 4)
+
+
+def _controlled_deployment_elapsed_minutes(started_at_value: Any, *, fallback_minutes: float = 0.0) -> float:
+    started_at = str(started_at_value or "")
+    if not started_at:
+        return max(0.0, float(fallback_minutes))
+    try:
+        start_dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+    except ValueError:
+        return max(0.0, float(fallback_minutes))
+    if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=timezone.utc)
+    return max(0.0, (_now_utc() - start_dt.astimezone(timezone.utc)).total_seconds() / 60.0)
+
+
+def _next_controlled_deployment_promotion_share(
+    deployment: dict[str, Any],
+    *,
+    promotion_velocity: str = "slow",
+) -> float:
+    rollout = deployment.get("rollout") if isinstance(deployment.get("rollout"), dict) else {}
+    current_share = round(_clamp(_to_float(rollout.get("canary_trade_share_pct"), 0.0), 0.0, 100.0), 4)
+    if current_share >= 99.9999:
+        return 100.0
+    schedule = [5.0, 10.0, 25.0, 50.0, 100.0]
+    current_index = -1
+    for idx, share in enumerate(schedule):
+        if share <= current_share + 0.0001:
+            current_index = idx
+    step_count = 2 if str(promotion_velocity or "").strip().lower() == "fast" else 1
+    next_index = min(len(schedule) - 1, current_index + step_count)
+    target_share = schedule[max(0, next_index)]
+    return round(max(current_share, target_share), 4)
+
+
+def _controlled_deployment_score_zone(score: float) -> str:
+    normalized_score = _clamp(_to_float(score, 0.0), 0.0, 1.0)
+    if normalized_score > 0.9:
+        return "PROMOTE"
+    if normalized_score >= 0.75:
+        return "POTENTIAL"
+    if normalized_score >= 0.6:
+        return "WATCH"
+    return "WEAK"
+
+
+def _build_controlled_deployment_records(
+    validation_result: dict[str, Any],
+    analytics: dict[str, Any],
+    *,
+    deployed_by: str,
+    canary_trade_share_pct: float = 5.0,
+    monitoring_window_minutes: int = 90,
+    auto_rollback: bool = True,
+) -> list[dict[str, Any]]:
+    context = validation_result.get("context") if isinstance(validation_result.get("context"), dict) else {}
+    if bool(context.get("kill_switch_active")):
+        return []
+
+    results = validation_result.get("results") if isinstance(validation_result.get("results"), list) else []
+    deployments: list[dict[str, Any]] = []
+    deployed_at = _now_utc().isoformat()
+    normalized_canary_pct = round(_clamp(_to_float(canary_trade_share_pct, 5.0), 1.0, 25.0), 4)
+    monitoring_window = max(15, min(24 * 60, int(monitoring_window_minutes or 90)))
+
+    for item in results:
+        if not isinstance(item, dict) or str(item.get("decision") or "").upper() != "ACCEPT":
+            continue
+        proposal = item.get("proposal") if isinstance(item.get("proposal"), dict) else {}
+        if not proposal:
+            continue
+        simulation = item.get("simulation") if isinstance(item.get("simulation"), dict) else _simulate_improvement_proposal_impact(proposal, context, analytics)
+        baseline_metrics = _controlled_deployment_baseline_metrics(analytics, simulation)
+        thresholds = _controlled_deployment_thresholds(simulation, baseline_metrics)
+        deployments.append(
+            _normalize_controlled_deployment_record(
+                {
+                    "deployment_id": f"deploy_{uuid4().hex[:12]}",
+                    "config_version": f"cfg_{uuid4().hex[:12]}",
+                    "scope_type": str(analytics.get("scope_type") or ""),
+                    "scope_id": str(analytics.get("scope_id") or ""),
+                    "proposal_id": str(proposal.get("proposal_id") or ""),
+                    "proposal_type": str(proposal.get("type") or ""),
+                    "status": "CANARY",
+                    "deployed_at": deployed_at,
+                    "deployed_by": deployed_by,
+                    "applied_config": proposal,
+                    "baseline_metrics": baseline_metrics,
+                    "simulation": simulation,
+                    "validation": {
+                        "decision": "ACCEPT",
+                        "confidence_score": round(_clamp(_to_float(item.get("confidence_score"), 0.0), 0.0, 1.0), 3),
+                        "reasons": item.get("reasons") if isinstance(item.get("reasons"), list) else [],
+                    },
+                    "monitoring": {
+                        "status": "active",
+                        "window_minutes": monitoring_window,
+                        "min_trade_samples": 3,
+                        "min_promotion_trade_samples": 50,
+                        "auto_rollback": auto_rollback,
+                        "auto_confirm": True,
+                        "started_at": deployed_at,
+                        "thresholds": thresholds,
+                    },
+                    "rollout": {
+                        "phase": "CANARY",
+                        "canary_trade_share_pct": normalized_canary_pct,
+                        "remaining_trade_share_pct": round(100.0 - normalized_canary_pct, 4),
+                        "minimum_canary_trade_share_pct": round(max(1.0, normalized_canary_pct * 0.25), 4),
+                        "scale_down_step_pct": round(max(1.0, normalized_canary_pct * 0.5), 4),
+                        "adjustments": [],
+                    },
+                    "rollback": {
+                        "ready": True,
+                        "restore_config": {
+                            "proposal_id": str(proposal.get("proposal_id") or ""),
+                            "parameter": proposal.get("parameter"),
+                            "current_value": proposal.get("current_value"),
+                        },
+                    },
+                    "promotion": {
+                        "ready": False,
+                        "decision": "WATCH",
+                        "status": "watch",
+                        "score": 0.0,
+                        "effective_score": 0.0,
+                        "risk_adjustment": 1.0,
+                        "confidence_decay": 1.0,
+                        "confidence_adjustment": 1.0,
+                        "validation_confidence": round(_clamp(_to_float(item.get("confidence_score"), 0.0), 0.0, 1.0), 6),
+                        "risk_pressure": 0.0,
+                        "score_breakdown": {},
+                        "reasons": [],
+                        "last_action": "watch",
+                        "target_canary_trade_share_pct": normalized_canary_pct,
+                        "suggested_canary_trade_share_pct": normalized_canary_pct,
+                        "suggested_promotion_trade_share_pct": normalized_canary_pct,
+                        "suggested_scale_down_trade_share_pct": normalized_canary_pct,
+                        "promotion_mode": "WATCH",
+                    },
+                }
+            )
+        )
+    return deployments
+
+
+def _score_controlled_deployment_observation(
+    deployment: dict[str, Any],
+    analytics: dict[str, Any],
+    observation: dict[str, Any],
+    *,
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    baseline = deployment.get("baseline_metrics") if isinstance(deployment.get("baseline_metrics"), dict) else {}
+    monitoring = deployment.get("monitoring") if isinstance(deployment.get("monitoring"), dict) else {}
+    thresholds = monitoring.get("thresholds") if isinstance(monitoring.get("thresholds"), dict) else {}
+    rollout = deployment.get("rollout") if isinstance(deployment.get("rollout"), dict) else {}
+    validation = deployment.get("validation") if isinstance(deployment.get("validation"), dict) else {}
+    summary = analytics.get("summary") if isinstance(analytics.get("summary"), dict) else {}
+    deltas = observation.get("deltas") if isinstance(observation.get("deltas"), dict) else {}
+    ratios = observation.get("ratios") if isinstance(observation.get("ratios"), dict) else {}
+    current_execution_quality = _clamp(_to_float(summary.get("execution_quality"), _to_float(baseline.get("execution_quality"), 0.0)), 0.0, 1.0)
+    baseline_execution_quality = _clamp(_to_float(baseline.get("execution_quality"), current_execution_quality), 0.0, 1.0)
+    min_execution_quality = _clamp(_to_float(thresholds.get("min_execution_quality"), max(0.2, baseline_execution_quality - 0.08)), 0.0, 1.0)
+    pnl_floor = abs(_to_float(thresholds.get("min_pnl_delta_usd"), -5.0))
+    pnl_delta = _to_float(deltas.get("pnl_delta_usd"), 0.0)
+    pnl_score = _clamp((pnl_delta + pnl_floor) / max(1.0, pnl_floor + max(5.0, pnl_floor)), 0.0, 1.0)
+    risk_ratio_values = [
+        _clamp(_to_float(ratios.get("slippage"), 0.0), 0.0, 2.0),
+        _clamp(_to_float(ratios.get("rejection"), 0.0), 0.0, 2.0),
+        _clamp(_to_float(ratios.get("drawdown"), 0.0), 0.0, 2.0),
+    ]
+    risk_score = _clamp(1.0 - sum(risk_ratio_values) / max(1, len(risk_ratio_values)), 0.0, 1.0)
+    quality_headroom = max(0.05, 1.0 - min_execution_quality)
+    execution_quality_score = _clamp((current_execution_quality - min_execution_quality) / quality_headroom, 0.0, 1.0)
+    latency_score = _clamp(1.0 - _clamp(_to_float(ratios.get("latency"), 0.0), 0.0, 1.5), 0.0, 1.0)
+    execution_score = _clamp(execution_quality_score * 0.65 + latency_score * 0.35, 0.0, 1.0)
+    score_weights = {
+        "pnl_weight": 0.45,
+        "risk_weight": 0.35,
+        "execution_weight": 0.2,
+    }
+    deployment_score = round(
+        pnl_score * score_weights["pnl_weight"]
+        + risk_score * score_weights["risk_weight"]
+        + execution_score * score_weights["execution_weight"],
+        6,
+    )
+    validation_confidence = _clamp(_to_float(validation.get("confidence_score"), 0.75), 0.0, 1.0)
+    monitoring_window_minutes = max(15, int(monitoring.get("window_minutes") or 90))
+    elapsed_minutes = _controlled_deployment_elapsed_minutes(
+        monitoring.get("started_at") or deployment.get("deployed_at"),
+        fallback_minutes=0.0,
+    )
+    overtime_ratio = max(0.0, elapsed_minutes - float(monitoring_window_minutes)) / max(15.0, float(monitoring_window_minutes))
+    confidence_decay = round(_clamp(math.exp(-0.6 * overtime_ratio), 0.7, 1.0), 6)
+    drawdown_pressure = _clamp(_to_float(ratios.get("drawdown"), 0.0), 0.0, 2.0) / 2.0
+    friction_pressure = (
+        _clamp(_to_float(ratios.get("slippage"), 0.0), 0.0, 2.0) / 2.0 * 0.4
+        + _clamp(_to_float(ratios.get("latency"), 0.0), 0.0, 1.5) / 1.5 * 0.25
+        + _clamp(_to_float(ratios.get("rejection"), 0.0), 0.0, 2.0) / 2.0 * 0.35
+    )
+    pnl_pressure = _clamp(max(0.0, -pnl_delta) / max(1.0, pnl_floor), 0.0, 1.0)
+    risk_pressure = round(_clamp(drawdown_pressure * 0.45 + friction_pressure * 0.4 + pnl_pressure * 0.15, 0.0, 1.5), 6)
+    risk_adjustment = round(_clamp(1.05 - risk_pressure * 0.35, 0.55, 1.05), 6)
+    confidence_adjustment = round(_clamp((0.8 + validation_confidence * 0.2) * confidence_decay, 0.55, 1.0), 6)
+    effective_score = round(_clamp(deployment_score * confidence_adjustment * risk_adjustment, 0.0, 1.0), 6)
+    severe_regression_ratio = max(1.0, _to_float(thresholds.get("severe_regression_ratio"), 1.35))
+    max_ratio = max([_to_float(item, 0.0) for item in ratios.values()] or [0.0])
+    severe_regression = bool(context.get("kill_switch_active")) or max_ratio >= severe_regression_ratio
+    current_canary_share = _clamp(_to_float(rollout.get("canary_trade_share_pct"), 0.0), 0.0, 100.0)
+    next_scale_down_share = _next_controlled_deployment_canary_share(deployment)
+    can_scale_down = next_scale_down_share < current_canary_share - 0.0001
+    min_promotion_score = _clamp(_to_float(thresholds.get("min_promotion_score"), 0.72), 0.0, 1.0)
+    min_trade_samples = max(1, int(monitoring.get("min_trade_samples") or 3))
+    min_promotion_trade_samples = max(min_trade_samples, int(monitoring.get("min_promotion_trade_samples") or 50))
+    scale_down_on_score_below = _clamp(_to_float(thresholds.get("scale_down_on_score_below"), 0.58), 0.0, 1.0)
+    reasons = [item for item in observation.get("reasons", []) if isinstance(item, str)]
+    observed_trade_count = int(observation.get("trade_count") or 0)
+    insufficient_data = observed_trade_count < min_promotion_trade_samples
+    score_zone = _controlled_deployment_score_zone(effective_score)
+    operator_message = (
+        f"Observation valid but insufficient for promotion ({observed_trade_count}/{min_promotion_trade_samples} trades)."
+        if insufficient_data
+        else (
+            f"Score zone {score_zone}: keep monitoring before any promotion."
+            if score_zone in {"WATCH", "POTENTIAL"}
+            else (
+                "Score zone PROMOTE: signal strong enough for promotion review."
+                if score_zone == "PROMOTE"
+                else "Score zone WEAK: no edge strong enough for promotion."
+            )
+        )
+    )
+    promotion_reasons = [*reasons]
+    if insufficient_data:
+        promotion_reasons.append(f"insufficient_data:{observed_trade_count}/{min_promotion_trade_samples}")
+    promotion_ready = (
+        not reasons
+        and observed_trade_count >= min_promotion_trade_samples
+        and pnl_delta > 0.0
+        and current_execution_quality >= min_execution_quality
+        and effective_score >= min_promotion_score
+    )
+    promotion_velocity = "fast" if effective_score >= min_promotion_score + 0.12 and risk_adjustment >= 0.94 and confidence_decay >= 0.92 else "slow"
+    next_promotion_share = _next_controlled_deployment_promotion_share(deployment, promotion_velocity=promotion_velocity)
+    should_scale_down = bool(reasons) and not severe_regression and can_scale_down and effective_score >= scale_down_on_score_below
+    decision = "ROLLBACK" if severe_regression else "SCALE_DOWN" if should_scale_down else "PROMOTE" if promotion_ready else "INSUFFICIENT_DATA" if insufficient_data else "WATCH"
+    status = "rollback_recommended" if decision == "ROLLBACK" else "scale_down_recommended" if decision == "SCALE_DOWN" else "promotion_ready" if decision == "PROMOTE" else "insufficient_data" if decision == "INSUFFICIENT_DATA" else "watch"
+    return {
+        "ready": promotion_ready,
+        "decision": decision,
+        "promotion_mode": "ROLLBACK" if decision == "ROLLBACK" else "SCALE_DOWN" if decision == "SCALE_DOWN" else f"PROMOTE_{promotion_velocity.upper()}" if decision == "PROMOTE" else "INSUFFICIENT_DATA" if decision == "INSUFFICIENT_DATA" else "WATCH",
+        "status": status,
+        "score": deployment_score,
+        "effective_score": effective_score,
+        "score_zone": score_zone,
+        "confidence_decay": confidence_decay,
+        "confidence_adjustment": confidence_adjustment,
+        "validation_confidence": round(validation_confidence, 6),
+        "risk_adjustment": risk_adjustment,
+        "risk_pressure": risk_pressure,
+        "trade_count": observed_trade_count,
+        "min_trade_samples": min_trade_samples,
+        "min_promotion_trade_samples": min_promotion_trade_samples,
+        "insufficient_data": insufficient_data,
+        "operator_message": operator_message,
+        "score_breakdown": {
+            "pnl_score": round(pnl_score, 6),
+            "risk_score": round(risk_score, 6),
+            "execution_score": round(execution_score, 6),
+            "current_execution_quality": round(current_execution_quality, 6),
+            "baseline_execution_quality": round(baseline_execution_quality, 6),
+            "min_execution_quality": round(min_execution_quality, 6),
+            "effective_score": effective_score,
+            "confidence_decay": confidence_decay,
+            "confidence_adjustment": confidence_adjustment,
+            "validation_confidence": round(validation_confidence, 6),
+            "risk_adjustment": risk_adjustment,
+            "risk_pressure": risk_pressure,
+            "score_zone": score_zone,
+            "trade_count": observed_trade_count,
+            "min_promotion_trade_samples": min_promotion_trade_samples,
+            **score_weights,
+        },
+        "reasons": promotion_reasons,
+        "last_action": decision.lower(),
+        "should_promote": promotion_ready,
+        "should_scale_down": should_scale_down,
+        "severe_regression": severe_regression,
+        "suggested_canary_trade_share_pct": next_promotion_share if promotion_ready else next_scale_down_share if should_scale_down else round(current_canary_share, 4),
+        "suggested_promotion_trade_share_pct": next_promotion_share,
+        "suggested_scale_down_trade_share_pct": next_scale_down_share,
+    }
+
+
+def _evaluate_controlled_deployment_monitoring_record(
+    deployment: dict[str, Any],
+    analytics: dict[str, Any],
+    *,
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    baseline = deployment.get("baseline_metrics") if isinstance(deployment.get("baseline_metrics"), dict) else {}
+    monitoring = deployment.get("monitoring") if isinstance(deployment.get("monitoring"), dict) else {}
+    thresholds = monitoring.get("thresholds") if isinstance(monitoring.get("thresholds"), dict) else {}
+    summary = analytics.get("summary") if isinstance(analytics.get("summary"), dict) else {}
+    trade_count = int(summary.get("trade_count") or 0)
+    current_drawdown = abs(min(0.0, _to_float(summary.get("pnl_net_usd"), 0.0)))
+    baseline_drawdown = max(0.0, _to_float(baseline.get("drawdown_proxy_usd"), 0.0))
+    pnl_delta_usd = round(_to_float(summary.get("pnl_net_usd"), 0.0) - _to_float(baseline.get("pnl_net_usd"), 0.0), 6)
+    slippage_increase_bps = round(max(0.0, _to_float(summary.get("slippage_avg_bps"), 0.0) - _to_float(baseline.get("slippage_avg_bps"), 0.0)), 6)
+    latency_increase_ms = round(max(0.0, _to_float(summary.get("latency_avg_ms"), 0.0) - _to_float(baseline.get("latency_avg_ms"), 0.0)), 6)
+    rejection_rate_increase = round(max(0.0, _to_float(summary.get("rejection_rate"), 0.0) - _to_float(baseline.get("rejection_rate"), 0.0)), 6)
+    drawdown_increase_usd = round(max(0.0, current_drawdown - baseline_drawdown), 6)
+    observation = {
+        "deployment_id": str(deployment.get("deployment_id") or ""),
+        "status": "healthy",
+        "trade_count": trade_count,
+        "deltas": {
+            "pnl_delta_usd": pnl_delta_usd,
+            "slippage_increase_bps": slippage_increase_bps,
+            "latency_increase_ms": latency_increase_ms,
+            "rejection_rate_increase": rejection_rate_increase,
+            "drawdown_increase_usd": drawdown_increase_usd,
+        },
+        "current_metrics": {
+            "pnl_net_usd": round(_to_float(summary.get("pnl_net_usd"), 0.0), 6),
+            "slippage_avg_bps": round(max(0.0, _to_float(summary.get("slippage_avg_bps"), 0.0)), 6),
+            "latency_avg_ms": round(max(0.0, _to_float(summary.get("latency_avg_ms"), 0.0)), 6),
+            "rejection_rate": round(_clamp(_to_float(summary.get("rejection_rate"), 0.0), 0.0, 1.0), 6),
+            "execution_quality": round(_clamp(_to_float(summary.get("execution_quality"), 0.0), 0.0, 1.0), 6),
+            "drawdown_proxy_usd": round(current_drawdown, 6),
+        },
+        "ratios": {
+            "slippage": round(slippage_increase_bps / max(1.0, _to_float(thresholds.get("max_slippage_increase_bps"), 1.0)), 6),
+            "latency": round(latency_increase_ms / max(1.0, _to_float(thresholds.get("max_latency_increase_ms"), 1.0)), 6),
+            "rejection": round(rejection_rate_increase / max(0.000001, _to_float(thresholds.get("max_rejection_rate_increase"), 0.03)), 6),
+            "drawdown": round(drawdown_increase_usd / max(1.0, _to_float(thresholds.get("max_drawdown_increase_usd"), 1.0)), 6),
+            "pnl": round(max(0.0, (_to_float(thresholds.get("min_pnl_delta_usd"), -5.0) - pnl_delta_usd) / max(1.0, abs(_to_float(thresholds.get("min_pnl_delta_usd"), -5.0)))), 6),
+        },
+        "thresholds": thresholds,
+        "reasons": [],
+        "should_rollback": False,
+        "should_scale_down": False,
+        "should_promote": False,
+        "promotion": {},
+    }
+    if bool(context.get("kill_switch_active")):
+        observation["reasons"].append(str(context.get("kill_switch_reason") or "kill_switch_active"))
+    if trade_count < max(1, int(monitoring.get("min_trade_samples") or 3)):
+        observation["status"] = "warming_up"
+        return observation
+    if _to_float(observation["deltas"].get("slippage_increase_bps"), 0.0) > _to_float(thresholds.get("max_slippage_increase_bps"), 9999.0):
+        observation["reasons"].append("slippage_regressed")
+    if _to_float(observation["deltas"].get("latency_increase_ms"), 0.0) > _to_float(thresholds.get("max_latency_increase_ms"), 999999.0):
+        observation["reasons"].append("latency_regressed")
+    if _to_float(observation["deltas"].get("rejection_rate_increase"), 0.0) > _to_float(thresholds.get("max_rejection_rate_increase"), 9999.0):
+        observation["reasons"].append("rejection_rate_regressed")
+    if _to_float(observation["deltas"].get("drawdown_increase_usd"), 0.0) > _to_float(thresholds.get("max_drawdown_increase_usd"), 999999.0):
+        observation["reasons"].append("drawdown_regressed")
+    if _to_float(observation["deltas"].get("pnl_delta_usd"), 0.0) < _to_float(thresholds.get("min_pnl_delta_usd"), -999999.0):
+        observation["reasons"].append("pnl_regressed")
+    if observation["reasons"]:
+        observation["status"] = "regression_detected"
+    promotion = _score_controlled_deployment_observation(deployment, analytics, observation, context=context)
+    observation["promotion"] = promotion
+    observation["should_rollback"] = bool(promotion.get("severe_regression"))
+    observation["should_promote"] = bool(promotion.get("should_promote"))
+    observation["should_scale_down"] = bool(promotion.get("should_scale_down"))
+    if observation["should_rollback"]:
+        observation["status"] = "rollback_recommended"
+    else:
+        if observation["should_scale_down"]:
+            observation["status"] = "scale_down_recommended"
+        elif observation["should_promote"]:
+            observation["status"] = "promotion_ready"
+        elif bool(promotion.get("insufficient_data")):
+            observation["status"] = "insufficient_data"
+        else:
+            observation["status"] = "watch"
+    return observation
+
+
+def _apply_controlled_deployment_promotion(
+    deployment: dict[str, Any],
+    *,
+    promoted_by: str,
+    score: float,
+    score_breakdown: dict[str, Any],
+    reason: str,
+    mode: str,
+    target_canary_trade_share_pct: float | None = None,
+    promotion_mode: str | None = None,
+) -> dict[str, Any]:
+    updated = _normalize_controlled_deployment_record(deployment)
+    promoted_at = _now_utc().isoformat()
+    current_share = _clamp(_to_float(updated.get("rollout", {}).get("canary_trade_share_pct"), 0.0), 0.0, 100.0)
+    target_share = round(_clamp(_to_float(target_canary_trade_share_pct, 100.0), current_share, 100.0), 4)
+    normalized_promotion_mode = str(promotion_mode or "PROMOTE_SLOW").upper()
+    if target_share < 99.9999:
+        adjustments = updated.get("rollout", {}).get("adjustments") if isinstance(updated.get("rollout", {}).get("adjustments"), list) else []
+        updated["status"] = "CANARY"
+        updated["monitoring"] = {
+            **updated["monitoring"],
+            "status": "active",
+            "started_at": promoted_at,
+            "last_checked_at": None,
+            "check_count": 0,
+            "last_observation": None,
+        }
+        updated["rollout"] = {
+            **updated["rollout"],
+            "phase": "PROMOTED_STEP",
+            "canary_trade_share_pct": target_share,
+            "remaining_trade_share_pct": round(max(0.0, 100.0 - target_share), 4),
+            "adjustments": [
+                {
+                    "mode": mode,
+                    "reason": reason,
+                    "adjusted_by": promoted_by,
+                    "adjusted_at": promoted_at,
+                    "from_canary_trade_share_pct": round(current_share, 4),
+                    "to_canary_trade_share_pct": target_share,
+                    "direction": "scale_up",
+                    "promotion_mode": normalized_promotion_mode,
+                },
+                *[item for item in adjustments if isinstance(item, dict)],
+            ][:10],
+        }
+        updated["promotion"] = {
+            **updated.get("promotion", {}),
+            "ready": False,
+            "decision": "PROMOTE",
+            "status": "scaled_up",
+            "score": round(_clamp(_to_float(score, 0.0), 0.0, 1.0), 6),
+            "score_breakdown": score_breakdown if isinstance(score_breakdown, dict) else {},
+            "reasons": [reason] if reason else [],
+            "last_action": "promote",
+            "promoted_at": promoted_at,
+            "promoted_by": promoted_by,
+            "target_canary_trade_share_pct": target_share,
+            "promotion_mode": normalized_promotion_mode,
+        }
+        return updated
+    updated["status"] = "CONFIRMED"
+    updated["confirmed_at"] = promoted_at
+    updated["monitoring"] = {
+        **updated["monitoring"],
+        "status": "completed",
+    }
+    updated["rollout"] = {
+        **updated["rollout"],
+        "phase": "CONFIRMED",
+        "canary_trade_share_pct": 100.0,
+        "remaining_trade_share_pct": 0.0,
+    }
+    updated["promotion"] = {
+        **updated.get("promotion", {}),
+        "ready": True,
+        "decision": "PROMOTE",
+        "status": "auto_confirmed" if mode == "automatic" else "confirmed",
+        "score": round(_clamp(_to_float(score, 0.0), 0.0, 1.0), 6),
+        "score_breakdown": score_breakdown if isinstance(score_breakdown, dict) else {},
+        "reasons": [reason] if reason else [],
+        "last_action": "promote",
+        "promoted_at": promoted_at,
+        "promoted_by": promoted_by,
+        "target_canary_trade_share_pct": 100.0,
+        "promotion_mode": normalized_promotion_mode,
+    }
+    return updated
+
+
+def _apply_controlled_deployment_rollback(
+    deployment: dict[str, Any],
+    *,
+    reason: str,
+    rolled_back_by: str,
+    mode: str,
+) -> dict[str, Any]:
+    updated = _normalize_controlled_deployment_record(deployment)
+    updated["status"] = "AUTO_ROLLED_BACK" if mode == "automatic" else "ROLLED_BACK"
+    updated["monitoring"] = {
+        **updated["monitoring"],
+        "status": "rolled_back",
+    }
+    updated["rollout"] = {
+        **updated["rollout"],
+        "phase": "ROLLED_BACK",
+        "canary_trade_share_pct": 0.0,
+        "remaining_trade_share_pct": 100.0,
+    }
+    updated["rollback"] = {
+        **updated["rollback"],
+        "ready": False,
+        "reason": reason,
+        "mode": mode,
+        "rolled_back_at": _now_utc().isoformat(),
+        "rolled_back_by": rolled_back_by,
+    }
+    updated["promotion"] = {
+        **updated.get("promotion", {}),
+        "ready": False,
+        "decision": "ROLLBACK",
+        "status": "rolled_back",
+        "reasons": [reason],
+        "last_action": "rollback",
+    }
+    return updated
+
+
+def _apply_controlled_deployment_scale_down(
+    deployment: dict[str, Any],
+    *,
+    reason: str,
+    adjusted_by: str,
+    mode: str,
+) -> dict[str, Any]:
+    updated = _normalize_controlled_deployment_record(deployment)
+    current_share = _clamp(_to_float(updated.get("rollout", {}).get("canary_trade_share_pct"), 0.0), 0.0, 100.0)
+    next_share = _next_controlled_deployment_canary_share(updated)
+    if next_share >= current_share - 0.0001:
+        return updated
+    adjusted_at = _now_utc().isoformat()
+    adjustments = updated.get("rollout", {}).get("adjustments") if isinstance(updated.get("rollout", {}).get("adjustments"), list) else []
+    updated["status"] = "CANARY"
+    updated["rollout"] = {
+        **updated["rollout"],
+        "phase": "SCALED_DOWN",
+        "canary_trade_share_pct": next_share,
+        "remaining_trade_share_pct": round(max(0.0, 100.0 - next_share), 4),
+        "adjustments": [
+            {
+                "mode": mode,
+                "reason": reason,
+                "adjusted_by": adjusted_by,
+                "adjusted_at": adjusted_at,
+                "from_canary_trade_share_pct": round(current_share, 4),
+                "to_canary_trade_share_pct": round(next_share, 4),
+            },
+            *[item for item in adjustments if isinstance(item, dict)],
+        ][:10],
+    }
+    updated["monitoring"] = {
+        **updated["monitoring"],
+        "status": "active",
+    }
+    updated["promotion"] = {
+        **updated.get("promotion", {}),
+        "ready": False,
+        "decision": "SCALE_DOWN",
+        "status": "scaled_down",
+        "reasons": [reason],
+        "last_action": "scale_down",
+        "target_canary_trade_share_pct": round(next_share, 4),
+        "promotion_mode": "SCALE_DOWN",
+    }
+    return updated
+
+
+def _monitor_controlled_deployment_records(
+    state: dict[str, Any],
+    *,
+    deployment_id: str | None = None,
+    actor: str,
+    persist_changes: bool,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    normalized_state = _normalize_controlled_deployment_state(state)
+    results: list[dict[str, Any]] = []
+    updated_deployments: list[dict[str, Any]] = []
+    for record in normalized_state.get("deployments", []):
+        deployment = _normalize_controlled_deployment_record(record)
+        record_id = str(deployment.get("deployment_id") or "")
+        if deployment_id and record_id != deployment_id:
+            updated_deployments.append(deployment)
+            continue
+        if str(deployment.get("status") or "") not in {"CANARY", "CONFIRMED"}:
+            updated_deployments.append(deployment)
+            continue
+
+        started_at = str(deployment.get("monitoring", {}).get("started_at") or deployment.get("deployed_at") or "")
+        end_dt = _now_utc()
+        try:
+            start_dt = datetime.fromisoformat(started_at.replace("Z", "+00:00")) if started_at else end_dt - timedelta(minutes=90)
+        except ValueError:
+            start_dt = end_dt - timedelta(minutes=90)
+        analytics = _trade_intelligence_engine(
+            str(deployment.get("scope_type") or "strategy"),
+            str(deployment.get("scope_id") or ""),
+            start_dt if start_dt.tzinfo else start_dt.replace(tzinfo=timezone.utc),
+            end_dt,
+            trade_limit=120,
+        )
+        context = _build_improvement_validation_context(analytics, overrides=None)
+        observation = _evaluate_controlled_deployment_monitoring_record(deployment, analytics, context=context)
+        updated = _normalize_controlled_deployment_record(
+            {
+                **deployment,
+                "monitoring": {
+                    **deployment.get("monitoring", {}),
+                    "last_checked_at": _now_utc().isoformat(),
+                    "check_count": int(deployment.get("monitoring", {}).get("check_count") or 0) + 1,
+                    "last_observation": observation,
+                },
+                "promotion": observation.get("promotion") if isinstance(observation.get("promotion"), dict) else deployment.get("promotion"),
+            }
+        )
+        elapsed_minutes = max(0.0, (_now_utc() - start_dt.astimezone(timezone.utc)).total_seconds() / 60.0)
+        observation["applied_action"] = "watch"
+        if observation.get("should_rollback") and bool(updated.get("monitoring", {}).get("auto_rollback")) and bool(updated.get("rollback", {}).get("ready")):
+            updated = _apply_controlled_deployment_rollback(
+                updated,
+                reason=",".join(observation.get("reasons") or ["monitoring_regression"]),
+                rolled_back_by=actor,
+                mode="automatic",
+            )
+            observation["applied_action"] = "rollback"
+        elif str(updated.get("status") or "") == "CANARY" and observation.get("should_scale_down") and bool(updated.get("rollback", {}).get("ready")):
+            updated = _apply_controlled_deployment_scale_down(
+                updated,
+                reason=",".join(observation.get("reasons") or ["monitoring_regression"]),
+                adjusted_by=actor,
+                mode="automatic",
+            )
+            observation["applied_action"] = "scale_down"
+        elif (
+            str(updated.get("status") or "") == "CANARY"
+            and bool(updated.get("monitoring", {}).get("auto_confirm", True))
+            and elapsed_minutes >= max(15, int(updated.get("monitoring", {}).get("window_minutes") or 90))
+            and observation.get("should_promote")
+        ):
+            promotion = observation.get("promotion") if isinstance(observation.get("promotion"), dict) else {}
+            updated = _apply_controlled_deployment_promotion(
+                updated,
+                promoted_by=actor,
+                score=_to_float(promotion.get("score"), 0.0),
+                score_breakdown=promotion.get("score_breakdown") if isinstance(promotion.get("score_breakdown"), dict) else {},
+                reason=f"score_gate_passed:{str(promotion.get('promotion_mode') or 'PROMOTE_SLOW').lower()}",
+                mode="automatic",
+                target_canary_trade_share_pct=_to_float(promotion.get("suggested_promotion_trade_share_pct"), 100.0),
+                promotion_mode=str(promotion.get("promotion_mode") or "PROMOTE_SLOW"),
+            )
+            observation["applied_action"] = "promote"
+
+        results.append(
+            {
+                "deployment": updated,
+                "analytics_summary": analytics.get("summary") if isinstance(analytics.get("summary"), dict) else {},
+                "observation": observation,
+            }
+        )
+        updated_deployments.append(updated)
+
+    next_state = _normalize_controlled_deployment_state({
+        **normalized_state,
+        "deployments": updated_deployments,
+    })
+    if persist_changes:
+        next_state = _save_controlled_deployment_state(next_state)
+    return next_state, results
+
+
+def _controlled_deployment_portfolio_governor(
+    state: dict[str, Any],
+    monitoring_results: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    normalized_state = _normalize_controlled_deployment_state(state)
+    monitoring_index: dict[str, dict[str, Any]] = {}
+    for item in monitoring_results or []:
+        if not isinstance(item, dict):
+            continue
+        deployment = item.get("deployment") if isinstance(item.get("deployment"), dict) else {}
+        normalized_deployment = _normalize_controlled_deployment_record(deployment)
+        deployment_id = str(normalized_deployment.get("deployment_id") or "")
+        if not deployment_id:
+            continue
+        monitoring_index[deployment_id] = {
+            "deployment": normalized_deployment,
+            "observation": item.get("observation") if isinstance(item.get("observation"), dict) else {},
+        }
+
+    scope_rows: dict[str, dict[str, Any]] = {}
+    active_deployment_count = 0
+    blocked_deployment_count = 0
+
+    def _action_priority(action: str) -> int:
+        normalized = str(action or "WATCH").upper()
+        if normalized == "ROLLBACK":
+            return 5
+        if normalized == "SCALE_DOWN":
+            return 4
+        if normalized == "PROMOTE_FAST":
+            return 3
+        if normalized == "PROMOTE_SLOW":
+            return 2
+        if normalized == "PROMOTE":
+            return 2
+        return 1
+
+    for record in normalized_state.get("deployments", []):
+        deployment = _normalize_controlled_deployment_record(record if isinstance(record, dict) else {})
+        status = str(deployment.get("status") or "").upper()
+        if status not in {"CANARY", "CONFIRMED"}:
+            continue
+        active_deployment_count += 1
+
+        deployment_id = str(deployment.get("deployment_id") or "")
+        envelope = monitoring_index.get(deployment_id, {})
+        effective_deployment = envelope.get("deployment") if isinstance(envelope.get("deployment"), dict) else deployment
+        observation = envelope.get("observation") if isinstance(envelope.get("observation"), dict) else {}
+        promotion = observation.get("promotion") if isinstance(observation.get("promotion"), dict) else effective_deployment.get("promotion") if isinstance(effective_deployment.get("promotion"), dict) else {}
+        rollout = effective_deployment.get("rollout") if isinstance(effective_deployment.get("rollout"), dict) else {}
+
+        scope_type = str(effective_deployment.get("scope_type") or "strategy")
+        scope_id = str(effective_deployment.get("scope_id") or effective_deployment.get("proposal_id") or deployment_id)
+        scope_key = f"{scope_type}:{scope_id}"
+
+        reasons = [item for item in observation.get("reasons", []) if isinstance(item, str)]
+        reasons.extend(item for item in promotion.get("reasons", []) if isinstance(item, str))
+        unique_reasons = list(dict.fromkeys(reasons))[:8]
+
+        should_rollback = bool(observation.get("should_rollback")) or str(promotion.get("decision") or "").upper() == "ROLLBACK"
+        should_scale_down = bool(observation.get("should_scale_down")) or str(promotion.get("promotion_mode") or "").upper() == "SCALE_DOWN"
+        blocked = should_rollback
+        if blocked:
+            blocked_deployment_count += 1
+
+        promotion_mode = str(promotion.get("promotion_mode") or promotion.get("decision") or "WATCH").upper()
+        if blocked:
+            recommended_action = "ROLLBACK"
+        elif should_scale_down:
+            recommended_action = "SCALE_DOWN"
+        elif promotion_mode in {"PROMOTE_FAST", "PROMOTE_SLOW"}:
+            recommended_action = promotion_mode
+        elif str(promotion.get("decision") or "").upper() == "PROMOTE":
+            recommended_action = "PROMOTE_SLOW"
+        else:
+            recommended_action = "WATCH"
+
+        base_score = _clamp(_to_float(promotion.get("score"), 0.0), 0.0, 1.0)
+        effective_score = _clamp(_to_float(promotion.get("effective_score"), base_score), 0.0, 1.0)
+        risk_adjustment = _clamp(_to_float(promotion.get("risk_adjustment"), 1.0), 0.0, 1.05)
+        confidence_decay = _clamp(_to_float(promotion.get("confidence_decay"), 1.0), 0.0, 1.0)
+        current_share_pct = _clamp(_to_float(rollout.get("canary_trade_share_pct"), 0.0), 0.0, 100.0)
+        target_share_pct = _clamp(
+            _to_float(
+                promotion.get("target_canary_trade_share_pct"),
+                _to_float(promotion.get("suggested_canary_trade_share_pct"), current_share_pct),
+            ),
+            0.0,
+            100.0,
+        )
+        maturity_multiplier = _clamp(0.35 + max(current_share_pct, target_share_pct) / 100.0 * 0.65, 0.35, 1.0)
+        velocity_bonus = 1.05 if recommended_action == "PROMOTE_FAST" else 1.0
+        reduction_penalty = 0.8 if should_scale_down else 1.0
+        raw_weight = 0.0 if blocked else round(max(0.0, effective_score * risk_adjustment * confidence_decay * maturity_multiplier * velocity_bonus * reduction_penalty), 6)
+
+        row = scope_rows.get(scope_key)
+        if not row:
+            row = {
+                "scope_type": scope_type,
+                "scope_id": scope_id,
+                "deployment_ids": [],
+                "deploy_count": 0,
+                "status": status,
+                "phase": str(rollout.get("phase") or status).upper(),
+                "recommended_action": recommended_action,
+                "blocked": blocked,
+                "allocation_pct": 0.0,
+                "target_allocation_pct": 0.0,
+                "raw_weight": 0.0,
+                "effective_score_sum": 0.0,
+                "base_score_sum": 0.0,
+                "risk_adjustment_sum": 0.0,
+                "confidence_decay_sum": 0.0,
+                "current_canary_trade_share_pct": current_share_pct,
+                "target_canary_trade_share_pct": target_share_pct,
+                "reasons": [],
+            }
+            scope_rows[scope_key] = row
+
+        row["deployment_ids"].append(deployment_id)
+        row["deploy_count"] = int(row.get("deploy_count") or 0) + 1
+        row["blocked"] = bool(row.get("blocked")) and blocked if int(row.get("deploy_count") or 0) > 1 else blocked
+        row["raw_weight"] = round(_to_float(row.get("raw_weight"), 0.0) + raw_weight, 6)
+        row["effective_score_sum"] = round(_to_float(row.get("effective_score_sum"), 0.0) + effective_score, 6)
+        row["base_score_sum"] = round(_to_float(row.get("base_score_sum"), 0.0) + base_score, 6)
+        row["risk_adjustment_sum"] = round(_to_float(row.get("risk_adjustment_sum"), 0.0) + risk_adjustment, 6)
+        row["confidence_decay_sum"] = round(_to_float(row.get("confidence_decay_sum"), 0.0) + confidence_decay, 6)
+        row["current_canary_trade_share_pct"] = round(max(_to_float(row.get("current_canary_trade_share_pct"), 0.0), current_share_pct), 4)
+        row["target_canary_trade_share_pct"] = round(max(_to_float(row.get("target_canary_trade_share_pct"), 0.0), target_share_pct), 4)
+        row["phase"] = str(rollout.get("phase") or row.get("phase") or status).upper()
+        row["status"] = status if _action_priority(status) >= _action_priority(str(row.get("status") or "")) else str(row.get("status") or status)
+        if _action_priority(recommended_action) >= _action_priority(str(row.get("recommended_action") or "WATCH")):
+            row["recommended_action"] = recommended_action
+        row["reasons"] = list(dict.fromkeys([*(row.get("reasons") if isinstance(row.get("reasons"), list) else []), *unique_reasons]))[:8]
+
+    strategy_rows: list[dict[str, Any]] = []
+    for row in scope_rows.values():
+        deploy_count = max(1, int(row.get("deploy_count") or 1))
+        strategy_rows.append(
+            {
+                "scope_type": row.get("scope_type"),
+                "scope_id": row.get("scope_id"),
+                "deployment_ids": row.get("deployment_ids") if isinstance(row.get("deployment_ids"), list) else [],
+                "deploy_count": deploy_count,
+                "status": str(row.get("status") or "CANARY").upper(),
+                "phase": str(row.get("phase") or "CANARY").upper(),
+                "recommended_action": str(row.get("recommended_action") or "WATCH").upper(),
+                "blocked": bool(row.get("blocked")),
+                "allocation_pct": 0.0,
+                "target_allocation_pct": 0.0,
+                "raw_weight": round(_to_float(row.get("raw_weight"), 0.0), 6),
+                "effective_score": round(_to_float(row.get("effective_score_sum"), 0.0) / deploy_count, 6),
+                "base_score": round(_to_float(row.get("base_score_sum"), 0.0) / deploy_count, 6),
+                "risk_adjustment": round(_to_float(row.get("risk_adjustment_sum"), 0.0) / deploy_count, 6),
+                "confidence_decay": round(_to_float(row.get("confidence_decay_sum"), 0.0) / deploy_count, 6),
+                "current_canary_trade_share_pct": round(_to_float(row.get("current_canary_trade_share_pct"), 0.0), 4),
+                "target_canary_trade_share_pct": round(_to_float(row.get("target_canary_trade_share_pct"), 0.0), 4),
+                "reasons": row.get("reasons") if isinstance(row.get("reasons"), list) else [],
+            }
+        )
+
+    active_rows = [row for row in strategy_rows if not bool(row.get("blocked"))]
+    total_raw_weight = sum(_to_float(row.get("raw_weight"), 0.0) for row in active_rows)
+    equal_weight = 100.0 / len(active_rows) if active_rows else 0.0
+    for row in active_rows:
+        row["allocation_pct"] = round(
+            (_to_float(row.get("raw_weight"), 0.0) / total_raw_weight * 100.0) if total_raw_weight > 0 else equal_weight,
+            4,
+        )
+        row["target_allocation_pct"] = row["allocation_pct"]
+
+    concentration_capped = False
+    max_strategy_allocation_pct = 55.0 if len(active_rows) > 1 else 100.0
+    if len(active_rows) > 1:
+        capped = [row for row in active_rows if _to_float(row.get("allocation_pct"), 0.0) > max_strategy_allocation_pct]
+        if capped:
+            concentration_capped = True
+            capped_total = 0.0
+            uncapped_rows: list[dict[str, Any]] = []
+            uncapped_weight = 0.0
+            for row in active_rows:
+                if _to_float(row.get("allocation_pct"), 0.0) > max_strategy_allocation_pct:
+                    row["target_allocation_pct"] = max_strategy_allocation_pct
+                    capped_total += max_strategy_allocation_pct
+                else:
+                    uncapped_rows.append(row)
+                    uncapped_weight += max(0.0, _to_float(row.get("raw_weight"), 0.0))
+            remaining_pct = max(0.0, 100.0 - capped_total)
+            equal_remaining = remaining_pct / len(uncapped_rows) if uncapped_rows else 0.0
+            for row in uncapped_rows:
+                row["target_allocation_pct"] = round(
+                    (max(0.0, _to_float(row.get("raw_weight"), 0.0)) / uncapped_weight * remaining_pct) if uncapped_weight > 0 else equal_remaining,
+                    4,
+                )
+            for row in capped:
+                reasons = row.get("reasons") if isinstance(row.get("reasons"), list) else []
+                row["reasons"] = list(dict.fromkeys([*reasons, "portfolio_concentration_cap"]))[:8]
+
+    for row in strategy_rows:
+        if bool(row.get("blocked")):
+            row["allocation_pct"] = 0.0
+            row["target_allocation_pct"] = 0.0
+
+    strategy_rows.sort(
+        key=lambda item: (
+            -_to_float(item.get("target_allocation_pct"), 0.0),
+            -_to_float(item.get("effective_score"), 0.0),
+            str(item.get("scope_id") or ""),
+        )
+    )
+
+    largest_allocation_pct = max((_to_float(row.get("target_allocation_pct"), 0.0) for row in strategy_rows), default=0.0)
+    weighted_effective = sum(_to_float(row.get("effective_score"), 0.0) * _to_float(row.get("target_allocation_pct"), 0.0) / 100.0 for row in strategy_rows)
+    weighted_risk_adjustment = sum(_to_float(row.get("risk_adjustment"), 0.0) * _to_float(row.get("target_allocation_pct"), 0.0) / 100.0 for row in strategy_rows)
+    weighted_confidence_decay = sum(_to_float(row.get("confidence_decay"), 0.0) * _to_float(row.get("target_allocation_pct"), 0.0) / 100.0 for row in strategy_rows)
+
+    if not strategy_rows:
+        portfolio_action = "IDLE"
+    elif any(str(row.get("recommended_action") or "").upper() == "ROLLBACK" for row in strategy_rows):
+        portfolio_action = "REDUCE"
+    elif any(str(row.get("recommended_action") or "").upper() == "SCALE_DOWN" for row in strategy_rows) or concentration_capped:
+        portfolio_action = "REDUCE"
+    elif any(str(row.get("recommended_action") or "").upper().startswith("PROMOTE") for row in strategy_rows):
+        portfolio_action = "PROMOTE"
+    else:
+        portfolio_action = "STABLE"
+
+    return {
+        "status": "ok",
+        "engine": "ControlledDeploymentPortfolioGovernor",
+        "version": "v2_controlled_deploy_portfolio",
+        "generated_at": _now_utc().isoformat(),
+        "portfolio_action": portfolio_action,
+        "summary": {
+            "active_deployment_count": active_deployment_count,
+            "blocked_deployment_count": blocked_deployment_count,
+            "active_scope_count": len(active_rows),
+            "blocked_scope_count": sum(1 for row in strategy_rows if bool(row.get("blocked"))),
+            "largest_allocation_pct": round(largest_allocation_pct, 4),
+            "concentration_capped": concentration_capped,
+            "portfolio_effective_score": round(weighted_effective, 6),
+            "portfolio_risk_adjustment": round(weighted_risk_adjustment, 6),
+            "portfolio_confidence_decay": round(weighted_confidence_decay, 6),
+            "max_strategy_allocation_pct": max_strategy_allocation_pct,
+        },
+        "strategies": strategy_rows,
+    }
+
+
+def _controlled_deployment_engine(
+    validation_result: dict[str, Any],
+    *,
+    analytics: dict[str, Any],
+    deployed_by: str,
+    canary_trade_share_pct: float = 5.0,
+    monitoring_window_minutes: int = 90,
+    auto_rollback: bool = True,
+) -> dict[str, Any]:
+    new_deployments = _build_controlled_deployment_records(
+        validation_result,
+        analytics,
+        deployed_by=deployed_by,
+        canary_trade_share_pct=canary_trade_share_pct,
+        monitoring_window_minutes=monitoring_window_minutes,
+        auto_rollback=auto_rollback,
+    )
+    state = _controlled_deployment_state()
+    next_state = _save_controlled_deployment_state({
+        **state,
+        "deployments": [*new_deployments, *(state.get("deployments") if isinstance(state.get("deployments"), list) else [])],
+    })
+    return {
+        "status": "ok",
+        "engine": "ControlledDeploymentEngine",
+        "version": "v1_controlled_deploy",
+        "timestamp": _now_utc().isoformat(),
+        "deploy_count": len(new_deployments),
+        "deployments": new_deployments,
+        "state": next_state,
+        "portfolio_governor": _controlled_deployment_portfolio_governor(next_state),
+    }
 
 
 def _coerce_report_month(report_month: str | None) -> tuple[str, datetime, datetime]:
@@ -10290,9 +16214,9 @@ def _portfolio_capital_integration(portfolio_id: str) -> dict[str, Any]:
         sleeve["actual_equivalent_usd"] = _to_float(sleeve.get("actual_equivalent_usd"), 0.0) + _to_float(cash_vs_equivalent.get("total_equivalent_usd"), 0.0)
         sleeve["actual_raw_cash_usd"] = _to_float(sleeve.get("actual_raw_cash_usd"), 0.0) + _to_float(cash_vs_equivalent.get("total_raw_cash_usd"), 0.0)
         sleeve["target_cap_usd"] = _to_float(sleeve.get("target_cap_usd"), 0.0) + target_cap_usd
-        sleeve["realized_pnl_usd"] = _to_float(sleeve.get("realized_pnl_usd"), 0.0) + sum(_position_metric_value(item, "pnl_realized_usd") for item in positions)
-        sleeve["unrealized_pnl_usd"] = _to_float(sleeve.get("unrealized_pnl_usd"), 0.0) + sum(_position_metric_value(item, "pnl_unrealized_usd") for item in positions)
         ledger_summary = ledger.get("summary") if isinstance(ledger.get("summary"), dict) else {}
+        sleeve["realized_pnl_usd"] = _to_float(sleeve.get("realized_pnl_usd"), 0.0) + _to_float(ledger_summary.get("realized_pnl_usd"), 0.0)
+        sleeve["unrealized_pnl_usd"] = _to_float(sleeve.get("unrealized_pnl_usd"), 0.0) + sum(_position_metric_value(item, "pnl_unrealized_usd") for item in positions)
         sleeve["net_external_cashflow_usd"] = _to_float(sleeve.get("net_external_cashflow_usd"), 0.0) + _to_float(ledger_summary.get("net_external_cashflow_usd"), 0.0)
         sleeve["funding_fee_usd"] = _to_float(sleeve.get("funding_fee_usd"), 0.0) + _to_float(ledger_summary.get("funding_fee_usd"), 0.0)
         sleeve["internal_transfer_usd"] = _to_float(sleeve.get("internal_transfer_usd"), 0.0) + _to_float(ledger_summary.get("internal_transfer_usd"), 0.0)
@@ -10558,7 +16482,7 @@ def persist_intent(intent_payload: dict, status: str, risk_decision: RiskDecisio
 
 @app.on_event("startup")
 async def startup() -> None:
-    global CURRENT_SYSTEM_MODE
+    global CURRENT_SYSTEM_MODE, OPPORTUNITY_GATE_TASK, LIVE_POSITION_PROTECTION_TASK
     ensure_schema()
     await seed_default_users()
     _bootstrap_phase1_registry()
@@ -10574,6 +16498,27 @@ async def startup() -> None:
         persist_system_mode()
     _upsert_default_regime_thresholds()
     _save_kill_switch_state(_kill_switch_state())
+    _save_opportunity_gate_state(_opportunity_gate_state())
+    _save_micro_live_stage_state(_micro_live_stage_state())
+    if OPPORTUNITY_GATE_TASK is None or OPPORTUNITY_GATE_TASK.done():
+        OPPORTUNITY_GATE_TASK = asyncio.create_task(_opportunity_gate_loop())
+    if LIVE_POSITION_PROTECTION_TASK is None or LIVE_POSITION_PROTECTION_TASK.done():
+        LIVE_POSITION_PROTECTION_TASK = asyncio.create_task(_reconcile_live_position_protection_loop())
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    global OPPORTUNITY_GATE_TASK, LIVE_POSITION_PROTECTION_TASK
+    if OPPORTUNITY_GATE_TASK is not None:
+        OPPORTUNITY_GATE_TASK.cancel()
+        with suppress(asyncio.CancelledError):
+            await OPPORTUNITY_GATE_TASK
+        OPPORTUNITY_GATE_TASK = None
+    if LIVE_POSITION_PROTECTION_TASK is not None:
+        LIVE_POSITION_PROTECTION_TASK.cancel()
+        with suppress(asyncio.CancelledError):
+            await LIVE_POSITION_PROTECTION_TASK
+        LIVE_POSITION_PROTECTION_TASK = None
 
 
 async def seed_default_users() -> None:
@@ -10837,6 +16782,7 @@ async def health() -> dict:
         "system_mode": CURRENT_SYSTEM_MODE,
         "audit_events": len(AUDIT_LOG),
         "pending_intents": len(PENDING_INTENTS),
+        "opportunity_gate": _opportunity_gate_state(),
     }
 
 
@@ -10869,6 +16815,162 @@ async def get_system_config(auth: AuthContext = Depends(viewer_auth)) -> dict:
         "risk_gateway_url": RISK_GATEWAY_URL,
         "execution_router_url": EXECUTION_ROUTER_URL,
         "pending_intents": len(PENDING_INTENTS),
+        "opportunity_gate": _opportunity_gate_state(),
+        "micro_live": _micro_live_stage_state(),
+    }
+
+
+@app.get("/v1/system/micro-live-stage")
+async def get_micro_live_stage(provider: str | None = None, auth: AuthContext = Depends(viewer_auth)) -> dict:
+    del auth
+    policy = _load_live_execution_policy()
+    state = _micro_live_stage_state(policy)
+    providers_policy = policy.get("providers") if isinstance(policy.get("providers"), dict) else {}
+    sanitized_policy = _sanitize_live_execution_policy(policy)
+    sanitized_providers = sanitized_policy.get("providers") if isinstance(sanitized_policy.get("providers"), dict) else {}
+    if provider:
+        provider_norm = _normalize_connector_provider(provider)
+        provider_policy = providers_policy.get(provider_norm) if isinstance(providers_policy.get(provider_norm), dict) else {}
+        sanitized_provider_policy = sanitized_providers.get(provider_norm) if isinstance(sanitized_providers.get(provider_norm), dict) else {}
+        ftmo_challenge = sanitized_provider_policy.get("ftmo_challenge") if isinstance(sanitized_provider_policy.get("ftmo_challenge"), dict) else {}
+        return {
+            "status": "ok",
+            "provider": provider_norm,
+            "micro_live": _resolve_provider_micro_live(provider_norm, provider_policy, policy),
+            "provider_policy": sanitized_provider_policy,
+            "ftmo_challenge": ftmo_challenge,
+            "go_live_hardening": _sanitize_go_live_hardening_policy(_provider_go_live_hardening_policy(provider_norm, policy)),
+        }
+    return {
+        "status": "ok",
+        "providers": {
+            str(provider_name): _resolve_provider_micro_live(str(provider_name), provider_policy if isinstance(provider_policy, dict) else {}, policy)
+            for provider_name, provider_policy in providers_policy.items()
+            if isinstance(provider_policy, dict) and _sanitize_micro_live_policy(provider_policy).get("enabled")
+        },
+        "state": state,
+    }
+
+
+@app.post("/v1/system/micro-live-stage")
+async def set_micro_live_stage(payload: dict | None = None, auth: AuthContext = Depends(operator_auth)) -> dict:
+    request_payload = payload if isinstance(payload, dict) else {}
+    provider_norm = _normalize_connector_provider(request_payload.get("provider") or "")
+    requested_stage = str(request_payload.get("stage") or "").strip().lower()
+    note = str(request_payload.get("note") or "").strip()
+    if not provider_norm:
+        raise HTTPException(status_code=400, detail="provider is required")
+    if not requested_stage:
+        raise HTTPException(status_code=400, detail="stage is required")
+    policy = _load_live_execution_policy()
+    providers_policy = policy.get("providers") if isinstance(policy.get("providers"), dict) else {}
+    provider_policy = providers_policy.get(provider_norm) if isinstance(providers_policy.get(provider_norm), dict) else {}
+    micro_live = _resolve_provider_micro_live(provider_norm, provider_policy, policy)
+    if not micro_live.get("enabled"):
+        raise HTTPException(status_code=404, detail="micro_live policy not enabled for provider")
+    valid_stage_names = {str(stage.get("name") or "") for stage in (micro_live.get("stages") or []) if isinstance(stage, dict)}
+    if requested_stage not in valid_stage_names:
+        raise HTTPException(status_code=400, detail={"status": "invalid_stage", "allowed_stages": sorted(valid_stage_names)})
+    state = _micro_live_stage_state(policy)
+    providers_state = state.get("providers") if isinstance(state.get("providers"), dict) else {}
+    provider_state = providers_state.get(provider_norm) if isinstance(providers_state.get(provider_norm), dict) else {
+        "current_stage": str(micro_live.get("default_stage") or ""),
+        "updated_at": None,
+        "promoted_at": None,
+        "history": [],
+    }
+    now_iso = _now_utc().isoformat()
+    history = provider_state.get("history") if isinstance(provider_state.get("history"), list) else []
+    previous_stage = str(provider_state.get("current_stage") or "")
+    provider_state.update(
+        {
+            "current_stage": requested_stage,
+            "updated_at": now_iso,
+            "promoted_at": now_iso,
+            "history": [
+                {
+                    "from": previous_stage,
+                    "to": requested_stage,
+                    "by": auth.username,
+                    "note": note,
+                    "at": now_iso,
+                },
+                *history,
+            ][:20],
+        }
+    )
+    providers_state[provider_norm] = provider_state
+    state["providers"] = providers_state
+    _save_micro_live_stage_state(state)
+    append_audit(
+        "micro_live_stage_changed",
+        {
+            "provider": provider_norm,
+            "from": previous_stage,
+            "to": requested_stage,
+            "by": auth.username,
+            "note": note,
+        },
+    )
+    return {
+        "status": "updated",
+        "provider": provider_norm,
+        "micro_live": _resolve_provider_micro_live(provider_norm, provider_policy, policy),
+    }
+
+
+@app.post("/v1/system/micro-live/preview")
+async def preview_micro_live(payload: dict | None = None, auth: AuthContext = Depends(operator_auth)) -> dict:
+    del auth
+    request_payload = payload if isinstance(payload, dict) else {}
+    provider = str(request_payload.get("provider") or "").strip()
+    account_id = str(request_payload.get("account_id") or "").strip()
+    requested_notional_usd = _to_float(request_payload.get("requested_notional_usd"), 0.0)
+    if not provider:
+        raise HTTPException(status_code=400, detail="provider is required")
+    if not account_id:
+        raise HTTPException(status_code=400, detail="account_id is required")
+    if requested_notional_usd <= 0:
+        raise HTTPException(status_code=400, detail="requested_notional_usd must be > 0")
+    resolution = _resolve_live_execution_request(
+        provider,
+        account_id,
+        requested_notional_usd=requested_notional_usd,
+        explicit_flag=_bool_from_any(request_payload.get("explicit_flag"), True),
+        purpose=str(request_payload.get("purpose") or "execute").strip().lower() or "execute",
+        paper_only=_bool_from_any(request_payload.get("paper_only"), False),
+        symbol=str(request_payload.get("symbol") or "").strip(),
+        regime=str(request_payload.get("regime") or "UNKNOWN").strip().upper() or "UNKNOWN",
+        confidence=_clamp(_to_float(request_payload.get("confidence"), 0.0), 0.0, 1.0),
+    )
+    hardening = _evaluate_go_live_hardening(
+        source=str(request_payload.get("source") or "mission-control-ui").strip() or "mission-control-ui",
+        provider=provider,
+        account_id=account_id,
+        symbol=str(request_payload.get("symbol") or "").strip(),
+        side=str(request_payload.get("side") or "buy").strip().lower() or "buy",
+        requested_notional_usd=requested_notional_usd,
+        confidence=_clamp(_to_float(request_payload.get("confidence"), 0.0), 0.0, 1.0),
+        live_requested=True,
+        purpose=str(request_payload.get("purpose") or "execute").strip().lower() or "execute",
+        governance=request_payload.get("governance") if isinstance(request_payload.get("governance"), dict) else None,
+    )
+    return {
+        "status": "ok",
+        "system_mode": CURRENT_SYSTEM_MODE.value,
+        "resolution": resolution,
+        "hardening": hardening,
+    }
+
+
+@app.get("/v1/system/opportunity-gate")
+async def get_opportunity_gate(auth: AuthContext = Depends(viewer_auth)) -> dict:
+    del auth
+    return {
+        "status": "ok",
+        "system_mode": CURRENT_SYSTEM_MODE.value,
+        "gate": _opportunity_gate_state(),
+        "kill_switch": _kill_switch_state(),
     }
 
 
@@ -11192,7 +17294,152 @@ async def list_account_balances(account_id: str, auth: AuthContext = Depends(any
 @app.get("/v1/accounts/{account_id}/positions")
 async def list_account_positions(account_id: str, auth: AuthContext = Depends(any_read_auth)) -> list[dict]:
     _assert_account_visible(auth, account_id)
-    return _latest_account_positions(account_id)
+    return _annotated_account_positions(account_id)
+
+
+async def _refresh_live_position_protection_state(account_id: str, account: dict, *, execute_governor: bool = False) -> dict[str, Any] | None:
+    provider = str(account.get("connector_type") or "").strip().lower()
+    if provider == "mt5":
+        synced = await _sync_mt5_account_state(account_id)
+    elif provider == "bingx":
+        synced = await _sync_supported_connector_account_state(account_id, account)
+    else:
+        return None
+
+    if not execute_governor or not isinstance(synced, dict):
+        return synced if isinstance(synced, dict) else None
+
+    reconcile = await _reconcile_live_position_protection(
+        account_id,
+        account,
+        provider_override=provider,
+        positions=synced.get("positions") if isinstance(synced.get("positions"), list) else _latest_account_positions(account_id),
+        open_orders=(
+            synced.get("open_orders")
+            if provider == "bingx" and isinstance(synced.get("open_orders"), list)
+            else synced.get("protective_orders") if provider == "mt5" and isinstance(synced.get("protective_orders"), list) else []
+        ),
+        broker_truth_source=str(
+            synced.get("truth_source")
+            or ("bingx-open-orders+positions" if provider == "bingx" else "mt5-order-events-reconstructed")
+        ),
+        execute_governor=True,
+    )
+    if isinstance(reconcile, dict):
+        synced["live_position_protection"] = reconcile
+        executed_actions = [
+            item
+            for item in (reconcile.get("items") if isinstance(reconcile.get("items"), list) else [])
+            if isinstance(item, dict)
+            and isinstance(item.get("governor_state"), dict)
+            and isinstance((item.get("governor_state") or {}).get("execution_result"), dict)
+            and str(((item.get("governor_state") or {}).get("execution_result") or {}).get("status") or "").strip().lower() == "executed"
+        ]
+        if executed_actions:
+            if provider == "mt5":
+                refreshed = await _sync_mt5_account_state(account_id)
+            else:
+                refreshed = await _sync_supported_connector_account_state(account_id, account)
+            if isinstance(refreshed, dict):
+                return refreshed
+    return synced
+
+
+@app.get("/v1/accounts/{account_id}/live-position-protection-status")
+async def get_live_position_protection_status(
+    account_id: str,
+    refresh: bool = True,
+    audit_limit: int = 25,
+    auth: AuthContext = Depends(any_read_auth),
+) -> dict:
+    account = _assert_account_visible(auth, account_id)
+    if refresh:
+        await _refresh_live_position_protection_state(account_id, account, execute_governor=False)
+    provider = str(account.get("connector_type") or "").strip().lower() or None
+    items = _latest_live_position_protection_rows(account_id, provider)
+    return {
+        "status": "ok",
+        "account": _normalize_db_row(account),
+        "provider": provider,
+        "items": items,
+        "summary": _live_position_protection_summary(items),
+        "audit": _latest_live_position_protection_audit(account_id, provider, limit=audit_limit),
+    }
+
+
+@app.post("/v1/accounts/{account_id}/position-governor")
+async def run_position_governor(account_id: str, payload: dict | None = None, auth: AuthContext = Depends(operator_auth)) -> dict:
+    account = _assert_account_visible(auth, account_id)
+    request_payload = payload if isinstance(payload, dict) else {}
+    refresh = _bool_from_any(request_payload.get("refresh"), True)
+    execute_actions = _bool_from_any(request_payload.get("execute_actions"), False)
+    if refresh:
+        synced = await _refresh_live_position_protection_state(account_id, account, execute_governor=execute_actions)
+    elif execute_actions:
+        synced = await _reconcile_live_position_protection(account_id, account, provider_override=str(account.get("connector_type") or "").strip().lower(), execute_governor=True)
+    else:
+        synced = None
+
+    provider = str(account.get("connector_type") or "").strip().lower() or None
+    items = _latest_live_position_protection_rows(account_id, provider)
+    actionable = [
+        item
+        for item in items
+        if isinstance(item.get("governor_state"), dict) and bool((item.get("governor_state") or {}).get("actionable"))
+    ]
+    append_audit(
+        "live_position_governor_run",
+        {
+            "account_id": _normalize_account_id(account_id),
+            "provider": provider,
+            "operator": auth.username,
+            "refresh": refresh,
+            "execute_actions": execute_actions,
+            "actionable_count": len(actionable),
+        },
+    )
+    return {
+        "status": "ok",
+        "account": _normalize_db_row(account),
+        "provider": provider,
+        "execute_actions": execute_actions,
+        "sync": synced,
+        "items": items,
+        "summary": _live_position_protection_summary(items),
+        "actionable": actionable,
+        "audit": _latest_live_position_protection_audit(account_id, provider, limit=15),
+    }
+
+
+@app.post("/v1/accounts/{account_id}/mt5/broker-state")
+async def ingest_mt5_broker_state(account_id: str, payload: dict | None = None, auth: AuthContext = Depends(operator_auth)) -> dict:
+    account = _assert_account_visible(auth, account_id)
+    if str(account.get("connector_type") or "").strip().lower() != "mt5":
+        raise HTTPException(status_code=400, detail="account is not an MT5 connector account")
+
+    request_payload = payload if isinstance(payload, dict) else {}
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.post(f"{MT5_BRIDGE_URL}/v1/accounts/{_normalize_account_id(account_id)}/broker-state", json=request_payload)
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail=_flatten_downstream_error("mt5_broker_state_ingest_failed", _http_error_detail(response)))
+    bridge_result = response.json()
+    normalized_state = await _sync_mt5_account_state(account_id)
+    append_audit(
+        "mt5_broker_state_ingested",
+        {
+            "account_id": _normalize_account_id(account_id),
+            "operator": auth.username,
+            "positions_count": len(request_payload.get("positions") if isinstance(request_payload.get("positions"), list) else []),
+            "protective_order_count": len(request_payload.get("protective_orders") if isinstance(request_payload.get("protective_orders"), list) else []),
+            "truth_source": str(request_payload.get("truth_source") or "mt5-broker-state"),
+        },
+    )
+    return {
+        "status": "ok",
+        "account": _normalize_db_row(account),
+        "bridge": bridge_result if isinstance(bridge_result, dict) else {"status": "unknown"},
+        "normalized_state": normalized_state,
+    }
 
 
 @app.get("/v1/accounts/{account_id}/capital-flows")
@@ -11494,6 +17741,330 @@ async def get_execution_pnl_analyzer(
         trade_limit=limit,
         confidence_flag_threshold=confidence_flag_threshold,
     )
+
+
+@app.get("/v1/execution/trade-intelligence")
+async def get_trade_intelligence(
+    scope_type: str,
+    scope_id: str,
+    limit: int = 100,
+    start: str | None = None,
+    end: str | None = None,
+    auth: AuthContext = Depends(any_read_auth),
+) -> dict[str, Any]:
+    del auth
+    start_dt, end_dt = _coerce_period_bounds(start, end)
+    return _trade_intelligence_engine(
+        scope_type,
+        scope_id,
+        start_dt,
+        end_dt,
+        trade_limit=limit,
+    )
+
+
+@app.get("/v1/system/improvement-proposals")
+async def get_improvement_proposals(
+    scope_type: str,
+    scope_id: str,
+    limit: int = 100,
+    start: str | None = None,
+    end: str | None = None,
+    auth: AuthContext = Depends(any_read_auth),
+) -> dict[str, Any]:
+    del auth
+    start_dt, end_dt = _coerce_period_bounds(start, end)
+    return _improvement_proposer(
+        scope_type,
+        scope_id,
+        start_dt,
+        end_dt,
+        trade_limit=limit,
+    )
+
+
+@app.post("/v1/system/improvement-validations")
+async def validate_improvement_proposals(payload: dict, auth: AuthContext = Depends(any_read_auth)) -> dict[str, Any]:
+    scope_type = str(payload.get("scope_type") or "").strip()
+    scope_id = str(payload.get("scope_id") or "").strip()
+    analytics = payload.get("analytics") if isinstance(payload.get("analytics"), dict) else None
+    proposals = payload.get("proposals") if isinstance(payload.get("proposals"), list) else None
+    context_overrides = payload.get("context") if isinstance(payload.get("context"), dict) else None
+
+    if analytics is None and scope_type and scope_id:
+        start_dt, end_dt = _coerce_period_bounds(payload.get("start"), payload.get("end"))
+        analytics = _trade_intelligence_engine(
+            scope_type,
+            scope_id,
+            start_dt,
+            end_dt,
+            trade_limit=max(1, min(int(payload.get("limit") or 100), 500)),
+        )
+
+    if proposals is None:
+        if analytics is None:
+            raise HTTPException(status_code=400, detail="scope_type/scope_id or analytics/proposals are required")
+        proposal_bundle = _build_improvement_proposals(analytics)
+        proposals = proposal_bundle.get("proposals") if isinstance(proposal_bundle.get("proposals"), list) else []
+
+    result = _improvement_proposals_validation(
+        proposals=[proposal for proposal in proposals if isinstance(proposal, dict)],
+        analytics=analytics,
+        context_overrides=context_overrides,
+    )
+    append_audit(
+        "improvement_proposals_validated",
+        {
+            "scope_type": scope_type,
+            "scope_id": scope_id,
+            "proposal_count": len(proposals),
+            "decision_counts": result.get("decision_counts"),
+            "by": auth.username,
+        },
+    )
+    return result
+
+
+@app.post("/v1/system/improvement-simulations")
+async def simulate_improvement_proposals(payload: dict, auth: AuthContext = Depends(any_read_auth)) -> dict[str, Any]:
+    scope_type = str(payload.get("scope_type") or "").strip()
+    scope_id = str(payload.get("scope_id") or "").strip()
+    analytics = payload.get("analytics") if isinstance(payload.get("analytics"), dict) else None
+    proposals = payload.get("proposals") if isinstance(payload.get("proposals"), list) else None
+    context_overrides = payload.get("context") if isinstance(payload.get("context"), dict) else None
+
+    if analytics is None and scope_type and scope_id:
+        start_dt, end_dt = _coerce_period_bounds(payload.get("start"), payload.get("end"))
+        analytics = _trade_intelligence_engine(
+            scope_type,
+            scope_id,
+            start_dt,
+            end_dt,
+            trade_limit=max(1, min(int(payload.get("limit") or 100), 500)),
+        )
+
+    if proposals is None:
+        if analytics is None:
+            raise HTTPException(status_code=400, detail="scope_type/scope_id or analytics/proposals are required")
+        proposal_bundle = _build_improvement_proposals(analytics)
+        proposals = proposal_bundle.get("proposals") if isinstance(proposal_bundle.get("proposals"), list) else []
+
+    result = _simulate_improvement_proposals(
+        [proposal for proposal in proposals if isinstance(proposal, dict)],
+        analytics=analytics,
+        context_overrides=context_overrides,
+    )
+    append_audit(
+        "improvement_proposals_simulated",
+        {
+            "scope_type": scope_type,
+            "scope_id": scope_id,
+            "proposal_count": len(proposals),
+            "simulation_mode": result.get("simulation_mode"),
+            "by": auth.username,
+        },
+    )
+    return result
+
+
+@app.get("/v1/system/improvement-deployments")
+async def list_improvement_deployments(
+    active_only: bool = False,
+    auth: AuthContext = Depends(any_read_auth),
+) -> dict[str, Any]:
+    del auth
+    state = _controlled_deployment_state()
+    deployments = state.get("deployments") if isinstance(state.get("deployments"), list) else []
+    normalized = [item for item in deployments if isinstance(item, dict)]
+    if active_only:
+        normalized = [item for item in normalized if str(item.get("status") or "") in {"CANARY", "CONFIRMED"}]
+    return {
+        "status": "ok",
+        "engine": "ControlledDeploymentEngine",
+        "version": "v1_controlled_deploy",
+        "active_count": sum(1 for item in normalized if str(item.get("status") or "") in {"CANARY", "CONFIRMED"}),
+        "total_count": len(normalized),
+        "deployments": normalized,
+        "portfolio_governor": _controlled_deployment_portfolio_governor({
+            **state,
+            "deployments": normalized,
+        }),
+        "updated_at": state.get("updated_at"),
+    }
+
+
+@app.post("/v1/system/improvement-deployments")
+async def deploy_improvement_proposals(payload: dict, auth: AuthContext = Depends(operator_auth)) -> dict[str, Any]:
+    scope_type = str(payload.get("scope_type") or "").strip()
+    scope_id = str(payload.get("scope_id") or "").strip()
+    analytics = payload.get("analytics") if isinstance(payload.get("analytics"), dict) else None
+    validation = payload.get("validation") if isinstance(payload.get("validation"), dict) else None
+    if analytics is None and scope_type and scope_id:
+        start_dt, end_dt = _coerce_period_bounds(payload.get("start"), payload.get("end"))
+        analytics = _trade_intelligence_engine(
+            scope_type,
+            scope_id,
+            start_dt,
+            end_dt,
+            trade_limit=max(1, min(int(payload.get("limit") or 100), 500)),
+        )
+    if validation is None:
+        if analytics is None:
+            raise HTTPException(status_code=400, detail="scope_type/scope_id or analytics/validation are required")
+        proposal_bundle = _build_improvement_proposals(analytics)
+        validation = _improvement_proposals_validation(
+            proposals=[proposal for proposal in proposal_bundle.get("proposals", []) if isinstance(proposal, dict)],
+            analytics=analytics,
+            context_overrides=payload.get("context") if isinstance(payload.get("context"), dict) else None,
+        )
+    if analytics is None:
+        raise HTTPException(status_code=400, detail="analytics are required for deployment")
+
+    result = _controlled_deployment_engine(
+        validation,
+        analytics=analytics,
+        deployed_by=auth.username,
+        canary_trade_share_pct=_to_float(payload.get("canary_trade_share_pct"), 5.0),
+        monitoring_window_minutes=int(payload.get("monitoring_window_minutes") or 90),
+        auto_rollback=bool(payload.get("auto_rollback", True)),
+    )
+    append_audit(
+        "improvement_deployments_started",
+        {
+            "scope_type": scope_type or analytics.get("scope_type"),
+            "scope_id": scope_id or analytics.get("scope_id"),
+            "deploy_count": result.get("deploy_count"),
+            "by": auth.username,
+        },
+    )
+    return result
+
+
+@app.get("/v1/system/improvement-deployments/monitor")
+async def preview_improvement_deployment_monitoring(
+    deployment_id: str = "",
+    auth: AuthContext = Depends(any_read_auth),
+) -> dict[str, Any]:
+    state, results = _monitor_controlled_deployment_records(
+        _controlled_deployment_state(),
+        deployment_id=deployment_id.strip() or None,
+        actor=auth.username,
+        persist_changes=False,
+    )
+    return {
+        "status": "ok",
+        "engine": "ControlledDeploymentEngine",
+        "version": "v1_controlled_deploy",
+        "mode": "preview",
+        "result_count": len(results),
+        "results": results,
+        "portfolio_governor": _controlled_deployment_portfolio_governor(state, results),
+        "updated_at": state.get("updated_at"),
+    }
+
+
+@app.get("/v1/system/improvement-deployments/governor")
+async def preview_improvement_deployment_governor(
+    fresh: bool = True,
+    deployment_id: str = "",
+    auth: AuthContext = Depends(any_read_auth),
+) -> dict[str, Any]:
+    state = _controlled_deployment_state()
+    results: list[dict[str, Any]] = []
+    mode = "state"
+    if fresh:
+        state, results = _monitor_controlled_deployment_records(
+            state,
+            deployment_id=deployment_id.strip() or None,
+            actor=auth.username,
+            persist_changes=False,
+        )
+        mode = "preview"
+    governor = _controlled_deployment_portfolio_governor(state, results if fresh else None)
+    return {
+        "status": "ok",
+        "engine": "ControlledDeploymentPortfolioGovernor",
+        "version": "v2_controlled_deploy_portfolio",
+        "mode": mode,
+        "result_count": len(results),
+        "governor": governor,
+        "updated_at": state.get("updated_at"),
+    }
+
+
+@app.post("/v1/system/improvement-deployments/monitor")
+async def monitor_improvement_deployments(payload: dict | None = None, auth: AuthContext = Depends(operator_auth)) -> dict[str, Any]:
+    body = payload if isinstance(payload, dict) else {}
+    state, results = _monitor_controlled_deployment_records(
+        _controlled_deployment_state(),
+        deployment_id=str(body.get("deployment_id") or "").strip() or None,
+        actor=auth.username,
+        persist_changes=True,
+    )
+    append_audit(
+        "improvement_deployments_monitored",
+        {
+            "deployment_id": str(body.get("deployment_id") or "").strip() or None,
+            "result_count": len(results),
+            "by": auth.username,
+        },
+    )
+    return {
+        "status": "ok",
+        "engine": "ControlledDeploymentEngine",
+        "version": "v1_controlled_deploy",
+        "mode": "persisted",
+        "result_count": len(results),
+        "results": results,
+        "state": state,
+        "portfolio_governor": _controlled_deployment_portfolio_governor(state, results),
+    }
+
+
+@app.post("/v1/system/improvement-deployments/{deployment_id}/rollback")
+async def rollback_improvement_deployment(
+    deployment_id: str,
+    payload: dict | None = None,
+    auth: AuthContext = Depends(operator_auth),
+) -> dict[str, Any]:
+    body = payload if isinstance(payload, dict) else {}
+    state = _controlled_deployment_state()
+    deployments = state.get("deployments") if isinstance(state.get("deployments"), list) else []
+    updated_rows: list[dict[str, Any]] = []
+    rolled_back: dict[str, Any] | None = None
+    for item in deployments:
+        record = item if isinstance(item, dict) else {}
+        if str(record.get("deployment_id") or "") != deployment_id:
+            updated_rows.append(record)
+            continue
+        rolled_back = _apply_controlled_deployment_rollback(
+            record,
+            reason=str(body.get("reason") or "manual_operator_rollback").strip() or "manual_operator_rollback",
+            rolled_back_by=auth.username,
+            mode="manual",
+        )
+        updated_rows.append(rolled_back)
+    if rolled_back is None:
+        raise HTTPException(status_code=404, detail="deployment not found")
+    next_state = _save_controlled_deployment_state({
+        **state,
+        "deployments": updated_rows,
+    })
+    append_audit(
+        "improvement_deployment_rolled_back",
+        {
+            "deployment_id": deployment_id,
+            "proposal_id": rolled_back.get("proposal_id"),
+            "by": auth.username,
+            "reason": rolled_back.get("rollback", {}).get("reason"),
+        },
+    )
+    return {
+        "status": "ok",
+        "deployment": rolled_back,
+        "state": next_state,
+        "portfolio_governor": _controlled_deployment_portfolio_governor(next_state),
+    }
 
 
 @app.get("/v1/investor-reports")
@@ -11842,6 +18413,14 @@ async def proxy_execution_optimizer_live_state(auth: AuthContext = Depends(any_r
         return _proxy_json_response(response)
 
 
+@app.get("/v1/execution-ai/v6/state")
+async def proxy_execution_ai_v6_state(auth: AuthContext = Depends(any_read_auth)) -> dict:
+    del auth
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(f"{EXECUTION_ROUTER_URL}/v1/execution-ai/v6/state")
+        return _proxy_json_response(response)
+
+
 async def _fetch_market_quotes() -> list[dict]:
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.get(f"{MARKET_DATA_URL}/v1/quotes")
@@ -11947,6 +18526,27 @@ async def proxy_market_session_state(instrument: str = "BTCUSDT", auth: AuthCont
         return _proxy_json_response(response)
 
 
+@app.get("/v1/market/trades/preprocessor/analytics")
+async def proxy_market_trade_preprocessor_analytics(
+    venue: str | None = None,
+    instrument: str | None = None,
+    limit: int = 24,
+    auth: AuthContext = Depends(viewer_auth),
+) -> dict:
+    del auth
+    params: dict[str, Any] = {"limit": max(1, min(limit, 100))}
+    if isinstance(venue, str) and venue.strip():
+        params["venue"] = venue.strip()
+    if isinstance(instrument, str) and instrument.strip():
+        params["instrument"] = _market_data_symbol(params.get("venue", "binance-public"), instrument)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(
+            f"{MARKET_DATA_URL}/v1/market/trades/preprocessor/analytics",
+            params=params,
+        )
+        return _proxy_json_response(response)
+
+
 @app.get("/v1/market/bus/snapshot")
 async def market_bus_snapshot(
     instrument: str,
@@ -12006,8 +18606,21 @@ async def market_bus_snapshot(
     async with httpx.AsyncClient(timeout=10.0) as client:
         responses = await asyncio.gather(
             client.get(
-                f"{MARKET_DATA_URL}/v1/market/trades",
-                params={"instrument": market_symbol, "venue": venue, "limit": safe_trade_limit},
+                f"{MARKET_DATA_URL}/v1/market/trades/preprocessed",
+                params={
+                    "instrument": market_symbol,
+                    "venue": venue,
+                    "limit": safe_trade_limit,
+                    "target_count": min(80, safe_trade_limit),
+                },
+            ),
+            client.get(
+                f"{MARKET_DATA_URL}/v1/market/trades/preprocessor/journal",
+                params={"instrument": market_symbol, "venue": venue, "hours": 12, "limit": 24},
+            ),
+            client.get(
+                f"{MARKET_DATA_URL}/v1/market/trades/preprocessor/analytics",
+                params={"instrument": market_symbol, "venue": venue, "limit": 12},
             ),
             client.get(
                 f"{MARKET_DATA_URL}/v1/market/microstructure",
@@ -12047,13 +18660,68 @@ async def market_bus_snapshot(
             return fallback
         return payload if payload is not None else fallback
 
-    trades = parse_result(0, [])
-    microstructure = parse_result(1, None)
-    session_state = parse_result(2, None)
-    orderbook = parse_result(3, None)
-    routing_score = parse_result(4, None)
-    ohlcv_rows = parse_result(5, [])
-    depth_snapshot = parse_result(6, None)
+    trades_payload = parse_result(0, {"items": []})
+    trades = trades_payload.get("items") if isinstance(trades_payload, dict) and isinstance(trades_payload.get("items"), list) else (trades_payload if isinstance(trades_payload, list) else [])
+    trade_preprocessor = trades_payload.get("preprocessor") if isinstance(trades_payload, dict) and isinstance(trades_payload.get("preprocessor"), dict) else None
+    trade_preprocessor_journal_payload = parse_result(1, {"items": [], "summary": {}})
+    trade_preprocessor_journal = trade_preprocessor_journal_payload.get("items") if isinstance(trade_preprocessor_journal_payload, dict) and isinstance(trade_preprocessor_journal_payload.get("items"), list) else []
+    trade_preprocessor_journal_summary = trade_preprocessor_journal_payload.get("summary") if isinstance(trade_preprocessor_journal_payload, dict) and isinstance(trade_preprocessor_journal_payload.get("summary"), dict) else None
+    trade_preprocessor_analytics = parse_result(2, {"windows": {}, "thresholds": {}})
+    trade_preprocessor_alert = ((trade_preprocessor_analytics.get("thresholds") if isinstance(trade_preprocessor_analytics, dict) else None) and isinstance(trade_preprocessor, dict))
+    microstructure = parse_result(3, None)
+    session_state = parse_result(4, None)
+    orderbook = parse_result(5, None)
+    routing_score = parse_result(6, None)
+    ohlcv_rows = parse_result(7, [])
+    depth_snapshot = parse_result(8, None)
+
+    current_saved_pct = _float(trade_preprocessor.get("compression_saved_pct"), 0.0) if isinstance(trade_preprocessor, dict) else 0.0
+    current_raw_count = int(trade_preprocessor.get("raw_count") or 0) if isinstance(trade_preprocessor, dict) else 0
+    current_regime = str(trade_preprocessor.get("market_regime") or "unknown") if isinstance(trade_preprocessor, dict) else "unknown"
+    thresholds = trade_preprocessor_analytics.get("thresholds") if isinstance(trade_preprocessor_analytics, dict) and isinstance(trade_preprocessor_analytics.get("thresholds"), dict) else {}
+    threshold_saved_pct = _float((thresholds or {}).get("price_discovery_saved_pct"), 30.0)
+    threshold_raw_count = int((thresholds or {}).get("price_discovery_min_raw_count") or 40)
+    analytics_windows = trade_preprocessor_analytics.get("windows") if isinstance(trade_preprocessor_analytics, dict) and isinstance(trade_preprocessor_analytics.get("windows"), dict) else {}
+    analytics_24h_rows = analytics_windows.get("last_24h") if isinstance(analytics_windows.get("last_24h"), list) else []
+    price_discovery_24h = next((row for row in analytics_24h_rows if isinstance(row, dict) and str(row.get("market_regime") or "") == "price_discovery"), None)
+    aggressive_buckets_24h = int((price_discovery_24h or {}).get("aggressive_bucket_count") or 0) if isinstance(price_discovery_24h, dict) else 0
+    if current_regime == "price_discovery" and current_raw_count >= threshold_raw_count and current_saved_pct >= threshold_saved_pct:
+        trade_preprocessor_alert = {
+            "state": "warn",
+            "triggered": True,
+            "reason_code": "price-discovery-compression-too-high",
+            "threshold_saved_pct": threshold_saved_pct,
+            "threshold_raw_count": threshold_raw_count,
+            "summary": f"Price discovery compression too aggressive: {current_saved_pct:.1f}% saved on raw {current_raw_count}.",
+            "current_saved_pct": round(current_saved_pct, 4),
+            "current_raw_count": current_raw_count,
+            "aggressive_buckets_24h": aggressive_buckets_24h,
+        }
+    elif aggressive_buckets_24h > 0:
+        max_saved_pct_24h = _float((price_discovery_24h or {}).get("max_saved_pct"), 0.0) if isinstance(price_discovery_24h, dict) else 0.0
+        trade_preprocessor_alert = {
+            "state": "watch",
+            "triggered": True,
+            "reason_code": "price-discovery-buckets-over-threshold-24h",
+            "threshold_saved_pct": threshold_saved_pct,
+            "threshold_raw_count": threshold_raw_count,
+            "summary": f"24h price discovery alert buckets: {aggressive_buckets_24h} (max saved {max_saved_pct_24h:.1f}%).",
+            "current_saved_pct": round(current_saved_pct, 4),
+            "current_raw_count": current_raw_count,
+            "aggressive_buckets_24h": aggressive_buckets_24h,
+        }
+    else:
+        trade_preprocessor_alert = {
+            "state": "ok",
+            "triggered": False,
+            "reason_code": "within-threshold",
+            "threshold_saved_pct": threshold_saved_pct,
+            "threshold_raw_count": threshold_raw_count,
+            "summary": f"Compression within price discovery threshold ({current_saved_pct:.1f}% / raw {current_raw_count}).",
+            "current_saved_pct": round(current_saved_pct, 4),
+            "current_raw_count": current_raw_count,
+            "aggressive_buckets_24h": aggressive_buckets_24h,
+        }
 
     latest_trade_at = None
     if isinstance(trades, list) and trades:
@@ -12106,6 +18774,10 @@ async def market_bus_snapshot(
             "status": "ok" if isinstance(trades, list) and len(trades) > 0 else "degraded",
             "freshness_ms": _freshness_ms(latest_trade_at),
             "count": len(trades) if isinstance(trades, list) else 0,
+            "raw_count": int(trade_preprocessor.get("raw_count") or 0) if isinstance(trade_preprocessor, dict) else None,
+            "compression_ratio": trade_preprocessor.get("compression_ratio") if isinstance(trade_preprocessor, dict) else None,
+            "market_regime": trade_preprocessor.get("market_regime") if isinstance(trade_preprocessor, dict) else None,
+            "alert_state": trade_preprocessor_alert.get("state") if isinstance(trade_preprocessor_alert, dict) else None,
         },
         "microstructure": {
             "status": "ok" if isinstance(microstructure, dict) else "degraded",
@@ -12168,6 +18840,16 @@ async def market_bus_snapshot(
                 "trades": {
                     "latest_trade_at": latest_trade_at,
                     "count": len(trades) if isinstance(trades, list) else 0,
+                    "raw_count": int(trade_preprocessor.get("raw_count") or 0) if isinstance(trade_preprocessor, dict) else None,
+                },
+            },
+            "preprocessor": {
+                "trades": {
+                    **(trade_preprocessor or {}),
+                    "journal": trade_preprocessor_journal,
+                    "journal_summary": trade_preprocessor_journal_summary,
+                    "analytics": trade_preprocessor_analytics,
+                    "alert": trade_preprocessor_alert,
                 },
             },
         },
@@ -12703,6 +19385,101 @@ async def proxy_mt5_connect_account(payload: dict, auth: AuthContext = Depends(c
         return {**body, "credential_id": credential_id, "client_id": client_id}
 
 
+@app.patch("/v1/mt5/accounts/{account_id}/broker-session")
+async def update_mt5_broker_session(account_id: str, payload: dict | None = None, auth: AuthContext = Depends(connector_manage_auth)) -> dict:
+    account = _assert_account_visible(auth, account_id)
+    if str(account.get("connector_type") or "").strip().lower() != "mt5":
+        raise HTTPException(status_code=400, detail="account is not an MT5 connector account")
+
+    request_payload = payload if isinstance(payload, dict) else {}
+    refresh = request_payload.get("refresh") is not False
+    bridge_payload = {
+        "broker_session": request_payload.get("broker_session") if isinstance(request_payload.get("broker_session"), dict) else {},
+        "merge": request_payload.get("merge") is not False,
+    }
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.patch(
+            f"{MT5_BRIDGE_URL}/v1/accounts/{_normalize_account_id(account_id)}/broker-session",
+            json=bridge_payload,
+        )
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail=_flatten_downstream_error("mt5_broker_session_update_failed", _http_error_detail(response)))
+
+    bridge_result = response.json()
+    _sync_accounts_registry_from_mt5(account_id)
+    _sync_internal_portfolio_accounts(account_id)
+    normalized_state = await _sync_mt5_account_state(account_id) if refresh else None
+    append_audit(
+        "mt5_broker_session_updated",
+        {
+            "account_id": _normalize_account_id(account_id),
+            "operator": auth.username,
+            "refresh": refresh,
+            "snapshot_url": str(bridge_payload["broker_session"].get("snapshot_url") or bridge_payload["broker_session"].get("state_url") or bridge_payload["broker_session"].get("url") or ""),
+        },
+    )
+    return {
+        "status": "ok",
+        "account": _normalize_db_row(account),
+        "bridge": bridge_result if isinstance(bridge_result, dict) else {"status": "unknown"},
+        "normalized_state": normalized_state,
+    }
+
+
+def _extract_final_decision_truth_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    direct = payload.get("final_decision_truth")
+    if isinstance(direct, dict) and direct:
+        return direct
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    metadata_direct = metadata.get("final_decision_truth")
+    if isinstance(metadata_direct, dict) and metadata_direct:
+        return metadata_direct
+    order_intent = payload.get("order_intent") if isinstance(payload.get("order_intent"), dict) else {}
+    order_direct = order_intent.get("final_decision_truth")
+    if isinstance(order_direct, dict) and order_direct:
+        return order_direct
+    return {}
+
+
+def _extract_edge_eligibility_payload(payload: Any, final_decision_truth: dict[str, Any] | None = None) -> dict[str, Any]:
+    resolved_final_decision_truth = final_decision_truth if isinstance(final_decision_truth, dict) else _extract_final_decision_truth_payload(payload)
+    nested = resolved_final_decision_truth.get("edge_eligibility") if isinstance(resolved_final_decision_truth.get("edge_eligibility"), dict) else {}
+    if nested:
+        return nested
+    if not isinstance(payload, dict):
+        return {}
+    direct = payload.get("edge_eligibility")
+    if isinstance(direct, dict) and direct:
+        return direct
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    metadata_direct = metadata.get("edge_eligibility")
+    if isinstance(metadata_direct, dict) and metadata_direct:
+        return metadata_direct
+    order_intent = payload.get("order_intent") if isinstance(payload.get("order_intent"), dict) else {}
+    order_direct = order_intent.get("edge_eligibility")
+    if isinstance(order_direct, dict) and order_direct:
+        return order_direct
+    return {}
+
+
+def _build_decision_outcome_metadata(payload: Any, *, existing: dict[str, Any] | None = None) -> tuple[dict[str, Any], str | None, float | None]:
+    merged: dict[str, Any] = dict(existing or {})
+    final_decision_truth = _extract_final_decision_truth_payload(payload)
+    edge_eligibility = _extract_edge_eligibility_payload(payload, final_decision_truth)
+    if final_decision_truth:
+        merged["final_decision_truth"] = final_decision_truth
+    if edge_eligibility:
+        merged["edge_eligibility"] = edge_eligibility
+    raw_state = str(edge_eligibility.get("state") or "").strip().upper()
+    edge_eligibility_state = raw_state if raw_state in {"ELIGIBLE", "OBSERVE", "BLOCKED"} else None
+    raw_score = _to_float(edge_eligibility.get("score_pct"), math.nan)
+    edge_eligibility_score_pct = round(max(0.0, min(100.0, raw_score)), 3) if math.isfinite(raw_score) else None
+    return merged, edge_eligibility_state, edge_eligibility_score_pct
+
+
 @app.post("/v1/mt5/orders/filter")
 async def proxy_mt5_filtered_order(payload: dict, auth: AuthContext = Depends(operator_auth)) -> dict:
     _assert_kill_switch_allows_execution()
@@ -12811,6 +19588,8 @@ async def proxy_mt5_filtered_order(payload: dict, auth: AuthContext = Depends(op
 
     payload.setdefault("metadata", {})
     if isinstance(payload.get("metadata"), dict):
+        payload_metadata, _, _ = _build_decision_outcome_metadata(payload, existing=payload.get("metadata"))
+        payload["metadata"] = payload_metadata
         payload["metadata"]["go_live_target"] = account_mode
         payload["metadata"]["go_live_hardening"] = hardening_snapshot
 
@@ -12878,8 +19657,9 @@ async def execution_telemetry_recent(limit: int = 50, auth: AuthContext = Depend
 @app.post("/v1/execution/replay/seed/kairos-harness")
 async def execution_replay_seed_kairos_harness(payload: dict | None = None, auth: AuthContext = Depends(operator_auth)) -> dict:
     request_payload = payload if isinstance(payload, dict) else {}
-    apply_calibration = bool(request_payload.get("apply_calibration", False))
+    apply_calibration_requested = bool(request_payload.get("apply_calibration", False))
     train_brain = bool(request_payload.get("train_brain", False))
+    apply_calibration, calibration_guard = _apply_runtime_calibration_guard(apply_calibration_requested)
     decision_id, harness, replay_payload, sample, seed_meta = _seed_kairos_harness_replay(request_payload, auth.username)
     predictor_result = await _forward_reality_gap_to_predictor(sample, apply_calibration=apply_calibration, train_brain=train_brain)
     normalized_sample = predictor_result.get("samples", [sample])[0] if isinstance(predictor_result.get("samples"), list) and predictor_result.get("samples") else sample
@@ -12891,6 +19671,7 @@ async def execution_replay_seed_kairos_harness(payload: dict | None = None, auth
             "sample_id": normalized_sample.get("sample_id"),
             "telemetry_id": seed_meta.get("telemetry_id"),
             "validation_source": seed_meta.get("validation_source"),
+            "apply_calibration_requested": apply_calibration_requested,
             "apply_calibration": apply_calibration,
             "train_brain": train_brain,
             "by": auth.username,
@@ -12902,6 +19683,7 @@ async def execution_replay_seed_kairos_harness(payload: dict | None = None, auth
         "harness": harness,
         "sample": normalized_sample,
         "predictor": predictor_result,
+        "calibration_guard": calibration_guard,
         "replay": replay_payload,
     }
 
@@ -12976,12 +19758,14 @@ async def execution_reality_gap_ingest(decision_id: str, payload: dict | None = 
     if isinstance(request_payload.get("sample"), dict):
         validated = RealityGapIngestRequest.model_validate(request_payload)
         sample = validated.sample.model_dump(mode="json")
-        apply_calibration = validated.apply_calibration
+        apply_calibration_requested = validated.apply_calibration
         train_brain = validated.train_brain
     else:
         sample = _build_reality_gap_sample_from_replay(decision_id, replay_payload, request_payload)
-        apply_calibration = bool(request_payload.get("apply_calibration", True))
+        apply_calibration_requested = bool(request_payload.get("apply_calibration", True))
         train_brain = bool(request_payload.get("train_brain", True))
+
+    apply_calibration, calibration_guard = _apply_runtime_calibration_guard(apply_calibration_requested)
 
     predictor_result = await _forward_reality_gap_to_predictor(sample, apply_calibration=apply_calibration, train_brain=train_brain)
     normalized_sample = predictor_result.get("samples", [sample])[0] if isinstance(predictor_result.get("samples"), list) and predictor_result.get("samples") else sample
@@ -12992,6 +19776,7 @@ async def execution_reality_gap_ingest(decision_id: str, payload: dict | None = 
             "decision_id": decision_id,
             "sample_id": normalized_sample.get("sample_id"),
             "failure_source": normalized_sample.get("failure_source"),
+            "apply_calibration_requested": apply_calibration_requested,
             "apply_calibration": apply_calibration,
             "train_brain": train_brain,
             "by": auth.username,
@@ -13001,6 +19786,7 @@ async def execution_reality_gap_ingest(decision_id: str, payload: dict | None = 
         "decision_id": decision_id,
         "sample": normalized_sample,
         "predictor": predictor_result,
+        "calibration_guard": calibration_guard,
         "replay": replay_payload,
     }
 
@@ -13136,7 +19922,8 @@ async def _auto_ingest_reality_gap_for_decision(
                 overrides["metadata"]["net_result_usd"] = _to_float(outcome_payload.get("net_result_usd"), 0.0)
 
         sample = _build_reality_gap_sample_from_replay(decision_id, replay_payload, overrides)
-    predictor_result = await _forward_reality_gap_to_predictor(sample, apply_calibration=True, train_brain=True)
+    apply_calibration, calibration_guard = _apply_runtime_calibration_guard(True)
+    predictor_result = await _forward_reality_gap_to_predictor(sample, apply_calibration=apply_calibration, train_brain=True)
     normalized_sample = predictor_result.get("samples", [sample])[0] if isinstance(predictor_result.get("samples"), list) and predictor_result.get("samples") else sample
     _persist_reality_gap_artifacts(normalized_sample, predictor_result.get("profiles") if isinstance(predictor_result.get("profiles"), list) else [])
     append_audit(
@@ -13145,6 +19932,7 @@ async def _auto_ingest_reality_gap_for_decision(
             "decision_id": decision_id,
             "sample_id": normalized_sample.get("sample_id"),
             "predictor_status": predictor_result.get("status"),
+            "apply_calibration": apply_calibration,
         },
     )
     return {
@@ -13153,6 +19941,7 @@ async def _auto_ingest_reality_gap_for_decision(
         "sample_id": normalized_sample.get("sample_id"),
         "profile_count": len(predictor_result.get("profiles") or []) if isinstance(predictor_result.get("profiles"), list) else 0,
         "brain_trained": bool(((predictor_result.get("brain") or {}) if isinstance(predictor_result.get("brain"), dict) else {}).get("trained")),
+        "calibration_guard": calibration_guard,
     }
 
 
@@ -13999,6 +20788,9 @@ async def _compute_route_plan(
         "failure_reasons": failure_attribution.get("failure_reasons"),
         "failure_blocking": bool(failure_attribution.get("failure_blocking")),
         "candidates": candidates,
+        "bus_seq": None,
+        "consistency": None,
+        "flags": ["FALLBACK_ROUTE"],
     }
 
 
@@ -14139,12 +20931,13 @@ async def _execute_mt5_filtered_order(payload: dict) -> dict:
         latency_e2e_ms = int((ts_fill_final - ts_decision).total_seconds() * 1000)
         expected_slippage_bps = float(routed_execution_result.get("expected_slippage_bps", float(payload.get("max_spread_bps", 0.0)) * 0.8))
         realized_slippage_bps = float(result.get("realized_slippage_bps", 0.0))
+        outcome_metadata, edge_eligibility_state, edge_eligibility_score_pct = _build_decision_outcome_metadata(payload)
 
         execute(
             """
             INSERT INTO decision_outcomes (decision_id, source, strategy_id, symbol, provider, regime, score_pre_trade,
-                                           slippage_real_bps, latency_ms, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending')
+                                           slippage_real_bps, latency_ms, status, metadata, edge_eligibility_state, edge_eligibility_score_pct)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s::jsonb, %s, %s)
             ON CONFLICT (decision_id) DO NOTHING
             """,
             (
@@ -14157,6 +20950,9 @@ async def _execute_mt5_filtered_order(payload: dict) -> dict:
                 payload.get("score_pre_trade"),
                 float(result.get("realized_slippage_bps", 0.0)),
                 int(result.get("latency_ms", 0)),
+                json_dumps(outcome_metadata),
+                edge_eligibility_state,
+                edge_eligibility_score_pct,
             ),
         )
 
@@ -14374,12 +21170,31 @@ async def _compute_connectors_snapshot(auth: AuthContext | None = None) -> dict:
 
 @app.post("/v1/outcomes/{decision_id}/update")
 async def update_outcome(decision_id: str, payload: dict, auth: AuthContext = Depends(operator_auth)) -> dict:
+    existing_outcome = fetch_one(
+        """
+        SELECT metadata, edge_eligibility_state, edge_eligibility_score_pct
+        FROM decision_outcomes
+        WHERE decision_id = %s
+        """,
+        (decision_id,),
+    ) or {}
+    outcome_metadata, edge_eligibility_state, edge_eligibility_score_pct = _build_decision_outcome_metadata(
+        payload,
+        existing=existing_outcome.get("metadata") if isinstance(existing_outcome.get("metadata"), dict) else {},
+    )
+    if edge_eligibility_state is None:
+        existing_state = str(existing_outcome.get("edge_eligibility_state") or "").strip().upper()
+        edge_eligibility_state = existing_state or None
+    if edge_eligibility_score_pct is None:
+        existing_score = _to_float(existing_outcome.get("edge_eligibility_score_pct"), math.nan)
+        if math.isfinite(existing_score):
+            edge_eligibility_score_pct = round(max(0.0, min(100.0, existing_score)), 3)
     execute(
         """
         INSERT INTO decision_outcomes (decision_id, source, strategy_id, symbol, provider, regime, score_pre_trade,
-                                       pnl_5m, pnl_1h, pnl_24h, mae, mfe, slippage_real_bps, latency_ms, fees_usd, net_result_usd, status, updated_at)
+                                       pnl_5m, pnl_1h, pnl_24h, mae, mfe, slippage_real_bps, latency_ms, fees_usd, net_result_usd, status, metadata, edge_eligibility_state, edge_eligibility_score_pct, updated_at)
         VALUES (%s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, NOW())
         ON CONFLICT (decision_id) DO UPDATE SET
             pnl_5m = EXCLUDED.pnl_5m,
             pnl_1h = EXCLUDED.pnl_1h,
@@ -14391,6 +21206,9 @@ async def update_outcome(decision_id: str, payload: dict, auth: AuthContext = De
             fees_usd = EXCLUDED.fees_usd,
             net_result_usd = EXCLUDED.net_result_usd,
             status = EXCLUDED.status,
+            metadata = EXCLUDED.metadata,
+            edge_eligibility_state = EXCLUDED.edge_eligibility_state,
+            edge_eligibility_score_pct = EXCLUDED.edge_eligibility_score_pct,
             updated_at = NOW()
         """,
         (
@@ -14411,6 +21229,9 @@ async def update_outcome(decision_id: str, payload: dict, auth: AuthContext = De
             payload.get("fees_usd"),
             payload.get("net_result_usd"),
             payload.get("status", "finalized"),
+            json_dumps(outcome_metadata),
+            edge_eligibility_state,
+            edge_eligibility_score_pct,
         ),
     )
     _recompute_drawdown_guard()
@@ -14454,7 +21275,7 @@ async def recent_outcomes(limit: int = 50, auth: AuthContext = Depends(viewer_au
         SELECT decision_id, source, strategy_id, symbol, provider, regime,
                score_pre_trade, pnl_5m, pnl_1h, pnl_24h, mae, mfe,
                slippage_real_bps, latency_ms, fees_usd, net_result_usd,
-               status, created_at, updated_at
+             status, metadata, edge_eligibility_state, edge_eligibility_score_pct, created_at, updated_at
         FROM decision_outcomes
         ORDER BY updated_at DESC
         LIMIT %s
@@ -14479,7 +21300,53 @@ async def outcomes_calibration(auth: AuthContext = Depends(viewer_auth)) -> dict
         ORDER BY score_bucket
         """
     )
-    return {"status": "ok", "buckets": rows}
+    edge_state_rows = fetch_all(
+        """
+        SELECT
+            COALESCE(NULLIF(edge_eligibility_state, ''), 'UNKNOWN') AS state,
+            COUNT(*) AS sample_count,
+            AVG(COALESCE(net_result_usd, 0)) AS avg_net_result_usd,
+            AVG(CASE WHEN COALESCE(net_result_usd, 0) > 0 THEN 1 ELSE 0 END) AS win_rate,
+            AVG(COALESCE(edge_eligibility_score_pct, 0)) AS avg_edge_score_pct,
+            AVG(COALESCE(score_pre_trade, 0) * 100.0) AS avg_score_pre_trade_pct
+        FROM decision_outcomes
+        WHERE edge_eligibility_state IS NOT NULL OR edge_eligibility_score_pct IS NOT NULL
+        GROUP BY state
+        ORDER BY CASE COALESCE(NULLIF(edge_eligibility_state, ''), 'UNKNOWN')
+            WHEN 'ELIGIBLE' THEN 1
+            WHEN 'OBSERVE' THEN 2
+            WHEN 'BLOCKED' THEN 3
+            ELSE 4
+        END
+        """
+    )
+    edge_score_rows = fetch_all(
+        """
+        SELECT
+            COALESCE(NULLIF(edge_eligibility_state, ''), 'UNKNOWN') AS state,
+            FLOOR(COALESCE(edge_eligibility_score_pct, 0) / 10.0) * 10.0 AS score_bucket_pct,
+            COUNT(*) AS sample_count,
+            AVG(COALESCE(net_result_usd, 0)) AS avg_net_result_usd,
+            AVG(CASE WHEN COALESCE(net_result_usd, 0) > 0 THEN 1 ELSE 0 END) AS win_rate,
+            AVG(COALESCE(score_pre_trade, 0) * 100.0) AS avg_score_pre_trade_pct
+        FROM decision_outcomes
+        WHERE edge_eligibility_score_pct IS NOT NULL
+        GROUP BY state, score_bucket_pct
+        ORDER BY CASE COALESCE(NULLIF(edge_eligibility_state, ''), 'UNKNOWN')
+            WHEN 'ELIGIBLE' THEN 1
+            WHEN 'OBSERVE' THEN 2
+            WHEN 'BLOCKED' THEN 3
+            ELSE 4
+        END,
+        score_bucket_pct DESC
+        """
+    )
+    return {
+        "status": "ok",
+        "buckets": rows,
+        "edge_state_buckets": edge_state_rows,
+        "edge_score_buckets": edge_score_rows,
+    }
 
 
 @app.get("/v1/strategies/drift")
@@ -15261,6 +22128,18 @@ async def connectors_accounts(auth: AuthContext = Depends(any_read_auth)) -> dic
     return {"status": "ok", "accounts": redacted}
 
 
+@app.get("/v1/connectors/okx/auth-debug/latest")
+async def connectors_okx_auth_debug_latest(auth: AuthContext = Depends(viewer_auth)) -> dict:
+    del auth
+    return _latest_okx_auth_debug_report()
+
+
+@app.get("/v1/connectors/okx/auth-debug/recent")
+async def connectors_okx_auth_debug_recent(limit: int = 5, auth: AuthContext = Depends(viewer_auth)) -> dict:
+    del auth
+    return _recent_okx_auth_debug_report(limit=limit)
+
+
 @app.post("/v1/connectors/accounts/link")
 async def connectors_link_account(payload: dict, auth: AuthContext = Depends(connector_manage_auth)) -> dict:
     provider = str(payload.get("provider") or "").strip().lower()
@@ -15836,6 +22715,7 @@ async def _handle_signal_webhook(source: str, payload: dict, provided_secret: st
         resolved_preferred_venue = _preferred_execution_venue(provider, live_enabled=False)
 
     pre_trade_memory_gate = _extract_pre_trade_memory_gate(payload)
+    no_trade_context = _extract_no_trade_guard(payload)
     governance_snapshot = _extract_trade_governance(payload)
     hardening_snapshot = None
     if live_requested:
@@ -15850,6 +22730,7 @@ async def _handle_signal_webhook(source: str, payload: dict, provided_secret: st
             live_requested=True,
             purpose="execute",
             pre_trade_memory_gate=pre_trade_memory_gate,
+            no_trade_context=no_trade_context,
             governance=governance_snapshot,
         )
         if hardening_snapshot.get("status") != "approved":
@@ -16319,6 +23200,75 @@ async def cancel_live_order(payload: dict, auth: AuthContext = Depends(operator_
     }
 
 
+@app.post("/v1/live/orders/amend")
+async def amend_live_order(payload: dict, auth: AuthContext = Depends(operator_auth)) -> dict:
+    provider = str(payload.get("provider") or "bingx").strip().lower()
+    if provider != "bingx":
+        raise HTTPException(status_code=400, detail="unsupported live provider")
+
+    account_id = _normalize_account_id(payload.get("account_id"))
+    if not account_id:
+        raise HTTPException(status_code=400, detail="account_id is required")
+    _assert_account_visible(auth, account_id)
+
+    symbol = str(payload.get("symbol") or "").strip().upper().replace("/", "").replace("-", "")
+    if not symbol:
+        raise HTTPException(status_code=400, detail="symbol is required")
+    quantity = _to_float(payload.get("quantity"), 0.0)
+    if quantity <= 0:
+        raise HTTPException(status_code=400, detail="quantity must be > 0")
+    position_side = str(payload.get("position_side") or "").strip().upper()
+    if position_side not in {"LONG", "SHORT"}:
+        raise HTTPException(status_code=400, detail="position_side must be LONG or SHORT")
+    protection = payload.get("protection") if isinstance(payload.get("protection"), dict) else {}
+    if not protection:
+        raise HTTPException(status_code=400, detail="protection is required")
+
+    try:
+        linked_account, secret_payload = _bingx_secret_payload_for_account(account_id, require_trade=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    amend_payload = {
+        "provider": provider,
+        "account_id": account_id,
+        "secret_payload": secret_payload,
+        "symbol": symbol,
+        "side": str(payload.get("side") or ("sell" if position_side == "LONG" else "buy")).strip().lower(),
+        "position_side": position_side,
+        "quantity": quantity,
+        "notional_usd": _to_float(payload.get("notional_usd"), 0.0),
+        "active_protection": payload.get("active_protection") if isinstance(payload.get("active_protection"), dict) else {},
+        "protection": protection,
+    }
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        response = await client.post(f"{BROKER_ADAPTER_URL}/v1/live/orders/amend", json=amend_payload)
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail=_flatten_downstream_error("live_amend_failed", _http_error_detail(response)))
+    body = response.json()
+    amend_result = body if isinstance(body, dict) else {"status": "unknown"}
+
+    append_audit(
+        "live_order_amended",
+        {
+            "provider": provider,
+            "account_id": account_id,
+            "symbol": symbol,
+            "position_side": position_side,
+            "quantity": quantity,
+            "operator": auth.username,
+            "protection_status": amend_result.get("protection_status"),
+        },
+    )
+    return {
+        "status": "ok",
+        "provider": provider,
+        "account_id": account_id,
+        "linked_account": _connector_account_public_view(linked_account),
+        "amend": amend_result,
+    }
+
+
 @app.post("/v1/connectors/bingx/live-smoke")
 async def bingx_live_smoke(payload: dict, auth: AuthContext = Depends(operator_auth)) -> dict:
     account_id = _normalize_account_id(payload.get("account_id"))
@@ -16638,6 +23588,7 @@ async def fetch_policy() -> dict:
 async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecision) -> OrderResult:
     _assert_kill_switch_allows_execution()
     effective_intent_payload = dict(intent_payload)
+    normalized_side = _normalize_trade_side(effective_intent_payload.get("side"))
     live_hint = _intent_live_execution_context(effective_intent_payload)
     memory_query_payload = await _build_intent_memory_v2_query_payload(effective_intent_payload, risk_decision, live_hint)
     memory_lookup = await _call_predictor_v8("/brain/memory-v2/query", memory_query_payload)
@@ -16663,6 +23614,8 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
         },
     )
     applied_overrides = memory_pretrade.get("applied") if isinstance(memory_pretrade.get("applied"), dict) else {}
+    effective_intent_payload, live_execution_constraints = await _prepare_live_execution_intent(effective_intent_payload)
+    live_hint = _intent_live_execution_context(effective_intent_payload)
     if bool(applied_overrides.get("block_execution")):
         persist_intent(effective_intent_payload, "rejected_by_memory", risk_decision)
         raise HTTPException(
@@ -16700,6 +23653,7 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
                 or "UNKNOWN"
             ).strip().upper() or "UNKNOWN",
             confidence=_clamp(_to_float(effective_intent_payload.get("confidence"), 0.0), 0.0, 1.0),
+            preserve_requested_notional=True,
         )
         if not live_execution.get("enabled"):
             raise HTTPException(
@@ -16720,7 +23674,7 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
             provider=str(live_execution.get("provider") or ""),
             account_id=_normalize_account_id(live_execution.get("account_id")),
             symbol=str(effective_intent_payload.get("instrument") or ""),
-            side=str(effective_intent_payload.get("side") or "buy"),
+            side=normalized_side,
             requested_notional_usd=effective_live_notional,
             confidence=_clamp(_to_float(effective_intent_payload.get("confidence"), 0.0), 0.0, 1.0),
             live_requested=True,
@@ -16748,7 +23702,7 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
             "decision_id": str(effective_intent_payload.get("intent_id") or uuid4()),
             "intent_id": str(effective_intent_payload.get("intent_id") or "").strip() or None,
             "symbol": str(effective_intent_payload.get("instrument") or "").strip(),
-            "side": str(effective_intent_payload.get("side") or "buy").strip().lower(),
+            "side": normalized_side,
             "estimated_notional_usd": effective_live_notional,
             "preferred_venue": str(live_execution.get("execution_venue") or _preferred_execution_venue(str(live_hint.get("provider") or ""), live_enabled=True)).strip(),
             "route_mode_override": applied_overrides.get("route_mode_override"),
@@ -16760,9 +23714,13 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
                 "provider": live_execution.get("provider"),
                 "account_id": live_execution.get("account_id"),
                 "secret_payload": live_execution.get("secret_payload"),
+                "auto_adjust_notional": _bool_from_any(live_hint.get("auto_size"), True),
                 "order_type": live_hint.get("order_type"),
                 "position_side": live_hint.get("position_side"),
                 "reduce_only": live_hint.get("reduce_only"),
+                "dry_run": _bool_from_any(live_hint.get("dry_run"), False),
+                "dry_run_accepted_legs": live_hint.get("dry_run_accepted_legs"),
+                "protection": live_hint.get("protection"),
             },
             "metadata": {
                 "origin": "approved-intent",
@@ -16788,9 +23746,12 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
 
         if execution_response.status_code >= 400:
             _record_api_error("execution-router", "intent_execution_failed")
+            detail = _upstream_json_payload(execution_response)
+            if live_execution_constraints:
+                detail = _attach_live_execution_constraints(detail, live_execution_constraints)
             raise HTTPException(
                 status_code=502 if execution_response.status_code >= 500 else execution_response.status_code,
-                detail=_upstream_json_payload(execution_response),
+                detail=detail,
             )
 
         response_body = execution_response.json()
@@ -16808,6 +23769,8 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
                     "filled_notional_usd": _to_float(response_body.get("filled_notional_usd"), 0.0),
                     "avg_fill_price": _to_float(response_body.get("avg_fill_price"), 0.0),
                     "execution_mode": str(response_body.get("execution_mode") or execution_body.get("execution_mode") or "live-intent"),
+                    "protection_status": str(response_body.get("protection_status") or "not_requested"),
+                    "protection": response_body.get("protection") if isinstance(response_body.get("protection"), dict) else {},
                 }
             )
         else:
@@ -16841,12 +23804,13 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
                 "memory_v2_pretrade": memory_pretrade,
             },
         )
+        outcome_metadata, edge_eligibility_state, edge_eligibility_score_pct = _build_decision_outcome_metadata(effective_intent_payload)
         execute(
             """
             INSERT INTO decision_outcomes (decision_id, source, strategy_id, symbol, provider, regime, score_pre_trade,
-                                           slippage_real_bps, latency_ms, fees_usd, net_result_usd, status)
+                                           slippage_real_bps, latency_ms, fees_usd, net_result_usd, status, metadata, edge_eligibility_state, edge_eligibility_score_pct)
             VALUES (%s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s)
+                    %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
             ON CONFLICT (decision_id) DO NOTHING
             """,
             (
@@ -16862,6 +23826,9 @@ async def execute_approved_intent(intent_payload: dict, risk_decision: RiskDecis
                 0.0,
                 0.0,
                 "pending",
+                json_dumps(outcome_metadata),
+                edge_eligibility_state,
+                edge_eligibility_score_pct,
             ),
         )
         return order
@@ -16885,7 +23852,34 @@ async def approve_pending_intent(intent_id: str, request: ApprovalRequest, auth:
     if risk_decision.decision != "accept":
         raise HTTPException(status_code=400, detail="Only accepted intents can be approved")
 
-    order = await execute_approved_intent(pending["intent"], risk_decision)
+    effective_pending_intent, live_execution_constraints = await _prepare_live_execution_intent(pending["intent"])
+    pending["intent"] = effective_pending_intent
+    if _live_execution_preflight_rejected(live_execution_constraints):
+        persist_intent(effective_pending_intent, "rejected_preflight", risk_decision)
+        del PENDING_INTENTS[intent_id]
+        append_audit(
+            "intent_rejected_preflight",
+            {
+                "intent_id": intent_id,
+                "approver": auth.principal,
+                "role": auth.role,
+                "live_execution_constraints": live_execution_constraints,
+            },
+        )
+        return IntentSubmissionResponse(
+            intent_id=intent_id,
+            system_mode=CURRENT_SYSTEM_MODE,
+            status="rejected_preflight",
+            risk_decision=risk_decision,
+            live_execution_constraints=live_execution_constraints,
+        )
+    try:
+        order = await execute_approved_intent(effective_pending_intent, risk_decision)
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=_attach_live_execution_constraints(exc.detail, live_execution_constraints),
+        ) from exc
     del PENDING_INTENTS[intent_id]
     append_audit("intent_approved", {"intent_id": intent_id, "approver": auth.principal, "role": auth.role})
     return IntentSubmissionResponse(
@@ -16894,12 +23888,17 @@ async def approve_pending_intent(intent_id: str, request: ApprovalRequest, auth:
         status="approved_and_executed",
         risk_decision=risk_decision,
         order=order,
+        live_execution_constraints=live_execution_constraints,
     )
 
 
 @app.post("/v1/intents/submit", response_model=IntentSubmissionResponse)
 async def submit_intent(request: IntentSubmissionRequest, auth: AuthContext = Depends(operator_auth)) -> IntentSubmissionResponse:
-    del auth
+    intent_payload = request.intent.model_dump(mode="json")
+    live_hint = _intent_live_execution_context(intent_payload)
+    if bool(live_hint.get("requested")):
+        _assert_account_visible(auth, str(live_hint.get("account_id") or ""))
+    effective_intent_payload, live_execution_constraints = await _prepare_live_execution_intent(intent_payload)
     append_audit(
         "intent_received",
         {"intent_id": request.intent.intent_id, "strategy_id": request.intent.strategy_id},
@@ -16908,7 +23907,7 @@ async def submit_intent(request: IntentSubmissionRequest, auth: AuthContext = De
     async with httpx.AsyncClient(timeout=10.0) as client:
         risk_response = await client.post(
             f"{RISK_GATEWAY_URL}/v1/checks/pre-trade",
-            json=RiskCheckRequest(intent=request.intent, system_mode=CURRENT_SYSTEM_MODE).model_dump(),
+            json=RiskCheckRequest(intent=TradeIntent.model_validate(effective_intent_payload), system_mode=CURRENT_SYSTEM_MODE).model_dump(mode="json"),
         )
 
         if risk_response.status_code >= 400:
@@ -16925,20 +23924,66 @@ async def submit_intent(request: IntentSubmissionRequest, auth: AuthContext = De
         )
 
         if risk_decision.decision != "accept":
-            persist_intent(request.intent.model_dump(), "rejected_by_risk", risk_decision)
+            persist_intent(effective_intent_payload, "rejected_by_risk", risk_decision)
             return IntentSubmissionResponse(
                 intent_id=request.intent.intent_id,
                 system_mode=CURRENT_SYSTEM_MODE,
                 status="rejected_by_risk",
                 risk_decision=risk_decision,
+                live_execution_constraints=live_execution_constraints,
+            )
+
+        if _live_execution_preflight_rejected(live_execution_constraints):
+            persist_intent(effective_intent_payload, "rejected_preflight", risk_decision)
+            append_audit(
+                "intent_rejected_preflight",
+                {
+                    "intent_id": request.intent.intent_id,
+                    "strategy_id": request.intent.strategy_id,
+                    "live_execution_constraints": live_execution_constraints,
+                },
+            )
+            return IntentSubmissionResponse(
+                intent_id=request.intent.intent_id,
+                system_mode=CURRENT_SYSTEM_MODE,
+                status="rejected_preflight",
+                risk_decision=risk_decision,
+                live_execution_constraints=live_execution_constraints,
+            )
+
+        gate_state = _opportunity_gate_state()
+        auto_gate_blocked = request.auto_execute and CURRENT_SYSTEM_MODE in {SystemMode.GUARDED_AUTO, SystemMode.MANAGED_LIVE} and not bool(gate_state.get("opportunity_enabled"))
+        if auto_gate_blocked:
+            PENDING_INTENTS[request.intent.intent_id] = {
+                "intent": effective_intent_payload,
+                "risk_decision": risk_decision.model_dump(),
+                "opportunity_gate": gate_state,
+            }
+            persist_intent(effective_intent_payload, "pending_opportunity_gate", risk_decision)
+            append_audit(
+                "intent_blocked_by_opportunity_gate",
+                {
+                    "intent_id": request.intent.intent_id,
+                    "mode": CURRENT_SYSTEM_MODE.value,
+                    "gate_status": gate_state.get("status"),
+                    "gate_reasons": gate_state.get("reasons"),
+                    "health_score": gate_state.get("health_score"),
+                },
+            )
+            return IntentSubmissionResponse(
+                intent_id=request.intent.intent_id,
+                system_mode=CURRENT_SYSTEM_MODE,
+                status="accepted_waiting_opportunity_gate",
+                risk_decision=risk_decision,
+                live_execution_constraints=live_execution_constraints,
             )
 
         if not request.auto_execute or CURRENT_SYSTEM_MODE in {SystemMode.OBSERVE, SystemMode.SUGGEST}:
             PENDING_INTENTS[request.intent.intent_id] = {
-                "intent": request.intent.model_dump(),
+                "intent": effective_intent_payload,
                 "risk_decision": risk_decision.model_dump(),
             }
-            persist_intent(request.intent.model_dump(), "pending_approval", risk_decision)
+            persist_intent(effective_intent_payload, "pending_approval", risk_decision)
             append_audit(
                 "intent_queued_for_approval",
                 {"intent_id": request.intent.intent_id, "mode": CURRENT_SYSTEM_MODE},
@@ -16948,15 +23993,23 @@ async def submit_intent(request: IntentSubmissionRequest, auth: AuthContext = De
                 system_mode=CURRENT_SYSTEM_MODE,
                 status="accepted_waiting_human_or_higher_mode",
                 risk_decision=risk_decision,
+                live_execution_constraints=live_execution_constraints,
             )
 
-        order = await execute_approved_intent(request.intent.model_dump(), risk_decision)
+        try:
+            order = await execute_approved_intent(effective_intent_payload, risk_decision)
+        except HTTPException as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=_attach_live_execution_constraints(exc.detail, live_execution_constraints),
+            ) from exc
         return IntentSubmissionResponse(
             intent_id=request.intent.intent_id,
             system_mode=CURRENT_SYSTEM_MODE,
-            status="executed_in_paper_mode",
+            status="executed_in_live_mode" if str(order.execution_mode).strip().lower().startswith("live") else "executed_in_paper_mode",
             risk_decision=risk_decision,
             order=order,
+            live_execution_constraints=live_execution_constraints,
         )
 
 

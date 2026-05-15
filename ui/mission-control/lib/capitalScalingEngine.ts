@@ -1,3 +1,14 @@
+export type CapitalScalingGovernanceBalanceOutput = {
+  multiplier: number;
+  reasons: string[];
+  no_trade: boolean;
+  state: string;
+  aggression_budget_pct: number;
+  cadence_budget_pct: number;
+  exposure_budget_pct: number;
+  reacceleration_readiness_pct: number;
+};
+
 export type CapitalScalingInputs = {
   accountEquity: number;
   intentScore: number;
@@ -11,10 +22,12 @@ export type CapitalScalingInputs = {
   recentWinrate: number;
   openTradeCount: number;
   unrealizedPnlPct?: number;
+  governanceBalanceOutput?: CapitalScalingGovernanceBalanceOutput;
   hardBlock?: boolean;
 };
 
 export type CapitalScalingDecision = {
+  schema_version?: "capital-scaling/v1";
   allow: boolean;
   status: "BLOCKED" | "DEFENSIVE" | "BALANCED" | "AGGRESSIVE";
   baseRiskPct: number;
@@ -24,6 +37,8 @@ export type CapitalScalingDecision = {
   performanceFactor: number;
   portfolioHeatFactor: number;
   scaleAdjustmentFactor: number;
+  governanceBalanceFactor?: number;
+  governanceBalanceState?: string;
   multiplier: number;
   recommendedRiskUsd: number;
   reasons: string[];
@@ -53,7 +68,20 @@ function computeEdgeMultiplier(score: number): number {
   return 0.3;
 }
 
+function assertNoLegacyGovernanceInputs(input: CapitalScalingInputs & Record<string, unknown>): void {
+  const forbiddenKeys = [
+    "governanceBalanceMultiplier",
+    "governanceBalanceReasons",
+    "governanceBalanceBlock",
+    "governanceBalanceState",
+  ].filter((key) => Object.prototype.hasOwnProperty.call(input, key));
+  if (forbiddenKeys.length) {
+    throw new Error(`capitalScalingEngine legacy governance inputs forbidden: ${forbiddenKeys.join(", ")}. Use governanceBalanceOutput only.`);
+  }
+}
+
 export function computeCapitalScalingDecision(input: CapitalScalingInputs): CapitalScalingDecision {
+  assertNoLegacyGovernanceInputs(input as CapitalScalingInputs & Record<string, unknown>);
   const baseRiskPct = 0.01;
   const accountEquity = Math.max(0, input.accountEquity);
   const edgeScore = clamp01(
@@ -64,10 +92,17 @@ export function computeCapitalScalingDecision(input: CapitalScalingInputs): Capi
       + clamp01(input.desyncAlphaScore) * 0.1,
   );
   const reasons: string[] = [];
+  const governanceBalanceOutput = input.governanceBalanceOutput;
 
-  if (input.hardBlock || input.attentionScore < 0.3 || input.temporalStability < 0.3) {
+  if (input.hardBlock || governanceBalanceOutput?.no_trade || input.attentionScore < 0.3 || input.temporalStability < 0.3) {
     reasons.push("capital_engine_hard_block");
+    if (governanceBalanceOutput?.no_trade) {
+      reasons.push(...(governanceBalanceOutput.reasons?.length
+        ? governanceBalanceOutput.reasons
+        : ["governance_balance_blocked"]));
+    }
     return {
+      schema_version: "capital-scaling/v1",
       allow: false,
       status: "BLOCKED",
       baseRiskPct,
@@ -77,6 +112,8 @@ export function computeCapitalScalingDecision(input: CapitalScalingInputs): Capi
       performanceFactor: 0,
       portfolioHeatFactor: 0,
       scaleAdjustmentFactor: 0,
+      governanceBalanceFactor: governanceBalanceOutput?.no_trade ? 0 : undefined,
+      governanceBalanceState: governanceBalanceOutput?.state,
       multiplier: 0,
       recommendedRiskUsd: 0,
       reasons,
@@ -137,6 +174,14 @@ export function computeCapitalScalingDecision(input: CapitalScalingInputs): Capi
     reasons.push("execution_quality_scale_down");
   }
 
+  const governanceBalanceFactor = clamp(governanceBalanceOutput?.multiplier ?? 1, 0, 1.4);
+  if (governanceBalanceFactor !== 1) {
+    scaleAdjustmentFactor *= governanceBalanceFactor;
+    reasons.push(...(governanceBalanceOutput?.reasons?.length
+      ? governanceBalanceOutput.reasons
+      : [`governance_balance_factor:${governanceBalanceFactor.toFixed(2)}`]));
+  }
+
   const baseRiskUsd = accountEquity * baseRiskPct;
   const recommendedRiskUsd = baseRiskUsd * edgeMultiplier * riskFactor * portfolioHeatFactor * performanceFactor * scaleAdjustmentFactor;
   const multiplier = clamp(
@@ -145,13 +190,16 @@ export function computeCapitalScalingDecision(input: CapitalScalingInputs): Capi
     2.4,
   );
 
-  const status: CapitalScalingDecision["status"] = multiplier >= 1.4
-    ? "AGGRESSIVE"
-    : multiplier >= 0.85
-      ? "BALANCED"
-      : "DEFENSIVE";
+  const status: CapitalScalingDecision["status"] = multiplier <= 0
+    ? "BLOCKED"
+    : multiplier >= 1.4
+      ? "AGGRESSIVE"
+      : multiplier >= 0.85
+        ? "BALANCED"
+        : "DEFENSIVE";
 
   return {
+    schema_version: "capital-scaling/v1",
     allow: multiplier > 0,
     status,
     baseRiskPct,
@@ -161,6 +209,8 @@ export function computeCapitalScalingDecision(input: CapitalScalingInputs): Capi
     performanceFactor,
     portfolioHeatFactor,
     scaleAdjustmentFactor,
+    governanceBalanceFactor,
+    governanceBalanceState: governanceBalanceOutput?.state,
     multiplier,
     recommendedRiskUsd,
     reasons,

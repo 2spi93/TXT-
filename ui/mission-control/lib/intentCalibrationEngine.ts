@@ -161,7 +161,34 @@ function extractCapitalScaling(entry: CalibrationJournalEntry): JsonMap {
   return metadataCapitalScaling;
 }
 
+function extractFinalDecisionTruth(entry: CalibrationJournalEntry): JsonMap {
+  const meta = asRecord(entry.meta);
+  const tradeResult = asRecord(meta.trade_result);
+  const tradeMetadata = asRecord(tradeResult.metadata);
+  const orderIntent = asRecord(tradeResult.order_intent);
+  const direct = asRecord(meta.final_decision_truth);
+  const nested = asRecord(tradeResult.final_decision_truth);
+  const metadataNested = asRecord(tradeMetadata.final_decision_truth);
+  const orderNested = asRecord(orderIntent.final_decision_truth);
+  if (Object.keys(direct).length > 0) {
+    return direct;
+  }
+  if (Object.keys(nested).length > 0) {
+    return nested;
+  }
+  if (Object.keys(metadataNested).length > 0) {
+    return metadataNested;
+  }
+  return orderNested;
+}
+
 function extractExecutionScore(entry: CalibrationJournalEntry, outcomeClass: "alpha" | "risk" | "neutral"): number {
+  const finalDecisionTruth = extractFinalDecisionTruth(entry);
+  const edgeEligibility = asRecord(finalDecisionTruth.edge_eligibility);
+  const canonicalScorePct = toNumber(edgeEligibility.score_pct, Number.NaN);
+  if (Number.isFinite(canonicalScorePct)) {
+    return clamp01(canonicalScorePct / 100);
+  }
   const meta = asRecord(entry.meta);
   const executionFeedback = asRecord(meta.execution_feedback);
   const executionV7 = asRecord(meta.execution_v7_lite);

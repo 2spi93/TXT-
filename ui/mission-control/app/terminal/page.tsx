@@ -3,7 +3,7 @@
 import Link from "next/link";
 import dynamic from "next/dynamic";
 import JSZip from "jszip";
-import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ComponentProps, ReactNode } from "react";
 import { Panel, PanelGroup, PanelResizeHandle, type ImperativePanelGroupHandle } from "react-resizable-panels";
 
@@ -12,6 +12,7 @@ import HelpTooltip from "../../components/ui/HelpTooltip";
 import ModuleGuide from "../../components/ui/ModuleGuide";
 import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
 import PanelShell from "../../components/ui/PanelShell";
+import RuntimeStabilityDebugView from "../../components/ui/RuntimeStabilityDebugView";
 import { openOpsCopilotPrompt } from "../../lib/opsCopilot";
 import {
   applyLocalUserUiPreferences,
@@ -52,7 +53,7 @@ import {
   buildTapeFromTrades,
   resolveSignalCalibration,
 } from "../../lib/chartViewTransforms";
-import { analyzeOhlcvRows, normalizeOhlcvRows } from "../../lib/ohlcvIntegrity";
+import { DEFAULT_MIN_RENDERABLE_BARS, analyzeOhlcvRows, normalizeOhlcvRows, type NormalizedOhlcvBar, type OhlcvRenderabilityAnalysis } from "../../lib/ohlcvIntegrity";
 import { isTimeframeSupported, SUPPORTED_TIMEFRAMES, timeframeToMs } from "../../lib/ohlcvDataEngine";
 import {
   DomTapeSidecarCard,
@@ -145,11 +146,12 @@ import {
   computeTripleValidationGate,
 } from "./desyncEngine";
 import { buildExecutionMicrostructureControl } from "./executionMicrostructureControl";
+import { buildAutoExecutionOracleGate } from "./autoExecutionOracleGate";
 import { buildPersistentIntentSignal, detectMarketIntent } from "./intentEngine";
 import { applyIntentTargetToBracket, buildIntentTargetSignal } from "./intentTargetEngine";
 import { detectLiquidityTrap } from "./liquidityTrapEngine";
 import { detectPredictiveTrap } from "./predictiveTrapEngine";
-import { buildLocalTerminalRuntimeCapture, type LocalRoutingDiagnostics, type LocalTerminalRuntimeCapture } from "../../lib/localTerminalCapture";
+import { buildLocalTerminalRuntimeCapture, type LocalIntegrityState, type LocalMultiChartIntegrity, type LocalRoutingDiagnostics, type LocalTerminalRuntimeCapture, type LocalV5Observation } from "../../lib/localTerminalCapture";
 import ChartExecutionHud from "./ChartExecutionHud";
 import { buildChartOrderTicketPriceLabels, buildChartSnapEnabledLabel } from "./chartHudHelpers";
 import ChartHudOrderRiskPanel from "./ChartHudOrderRiskPanel";
@@ -203,6 +205,37 @@ import {
   snapshotTerminalComputePerf,
   type TerminalComputePerfEntry,
 } from "./terminalComputePerf";
+import { buildCapitalScarMemorySummary } from "./capitalScarMemory";
+import { buildCapitalAgingGovernanceSummary } from "./capitalAgingGovernance";
+import { buildCrossMarketTruthSummary, CROSS_MARKET_MINIMAL_BASKET, type CrossMarketTruthSummary } from "./crossMarketTruth";
+import { buildContagionMemorySummary } from "./contagionMemory";
+import { buildCrossVenueExecutionIntelligenceSummary, resolveCrossVenueLocalRoutingDirective } from "./crossVenueExecutionIntelligence";
+import { buildDynamicCapitalPressureSummary } from "./dynamicCapitalPressure";
+import { buildExecutionAttributionSummary } from "./executionAttributionLayer";
+import { buildExecutionRealityMemoryEvent, buildExecutionRealityMemorySnapshot, type ExecutionRealityMemorySnapshot } from "./executionRealityMemory";
+import { buildExecutionRealityGovernanceSummary } from "./executionRealityGovernance";
+import { buildExecutionRealitySummary } from "./executionRealityScore";
+import { buildExecutionRealityTemporalSizingSummary } from "./executionRealityTemporalSizing";
+import { buildFinalDecisionOracleExecutionView, buildFinalDecisionOracleObservabilityView, buildFinalDecisionTruth, type FinalDecisionTruth } from "./finalDecisionTruth";
+import { buildFreezeV1ContractsSummary } from "./freezeV1Contracts";
+import GovernanceBalanceEnginePanel from "./GovernanceBalanceEnginePanel";
+import { buildGovernanceBalanceSummary } from "./governanceBalanceEngine";
+import { buildGlobalConfidenceDecaySummary } from "./globalConfidenceDecay";
+import { buildGovernanceReplayDetailedTimeline, buildGovernanceReplaySummary } from "./governanceReplay";
+import GovernanceReplayTimelinePanel from "./GovernanceReplayTimelinePanel";
+import CrossMarketPressureGraphPanel from "./CrossMarketPressureGraphPanel";
+import type { GovernanceReplayArchiveContractsSummary, GovernanceReplayViewSummary } from "./governanceReplayView";
+import { buildMarketRegimeArchiveSummary } from "./marketRegimeArchive";
+import { buildOracleStabilityMemoryEvent, buildOracleStabilitySnapshot, type OracleStabilitySnapshot } from "./oracleStabilityMemory";
+import { buildRecoveryMomentumSummary } from "./recoveryMomentumEngine";
+import { buildSelfHealingRecoveryMemoryEvent, buildSelfHealingRecoverySnapshot, type SelfHealingRecoverySnapshot } from "./selfHealingRecoveryMemory";
+import { buildSelfPreservationSummary } from "./selfPreservation";
+import StructuralMemoryLayersPanel from "./StructuralMemoryLayersPanel";
+import { buildExecutionTcaFoundationSummary } from "./executionTcaFoundation";
+import ExecutionAttributionLayerPanel from "./ExecutionAttributionLayerPanel";
+import ExecutionTcaFoundationPanel from "./ExecutionTcaFoundationPanel";
+import { buildVenueDecayMemorySummary } from "./venueDecayMemory";
+import { buildTradabilityAnalyticsSummary } from "../../lib/tradabilityAnalytics";
 import { isWebGL2Available } from "../../lib/engine/gpu-chart/context";
 import {
   AttentionContextMonitoringPanel,
@@ -210,6 +243,7 @@ import {
   ExecutionPnlTruthMonitoringPanel,
   ExecutionSmartTrackerPanel,
   ExecutionContextMonitoringPanel,
+  TradabilitySurfaceMonitoringPanel,
   ExecutionAiV6ObservabilityPanel,
   ExecutionOptimizerMonitoringPanel,
   BlotterDockPanel,
@@ -229,6 +263,7 @@ import {
 } from "./TerminalSecondaryPanels";
 import TerminalCoachOverlay from "./TerminalCoachOverlay";
 import type { SmartDecisionHudShape } from "./chartHudTypes";
+import type { TerminalAutoTraderV5Observation } from "./TerminalChartV2";
 import { buildFeedbackSummary } from "./feedbackEngine";
 import { buildTerminalAdaptiveGuide, type TerminalAdaptiveGuideMode, type TerminalAdaptiveGuideTargetId } from "./terminalAdaptiveGuide";
 import { barArrayHash, type Bar } from "../../lib/dataEngine";
@@ -263,7 +298,7 @@ import { riskGate } from "../../lib/riskAI";
 import { routeOrder } from "../../lib/smartRouter";
 import { SelfLearningSchedulerController, type ShadowSchedulerSnapshot } from "../../lib/selfLearningScheduler";
 import { createMarketDataBus, type MarketDataBusKernelTelemetry, type OhlcvBar } from "../../lib/marketDataBus";
-import { clearChartFrame, subscribeChartFrameBatch, type LiveChartFrameMeta } from "../../lib/chartFrameFeed";
+import { clearChartFrame, subscribeChartFrame, subscribeChartFrameBatch, type LiveChartCandle, type LiveChartFrameMeta } from "../../lib/chartFrameFeed";
 import { DomHistoryBuffer, type DomHistoryFrame } from "../../lib/domHistoryBuffer";
 import type { SyncedMarketFrame } from "../../lib/syncedMarketFrame";
 import type { OrderflowDomSnapshot as RuntimeOrderflowDomSnapshot, OrderflowFootprintSnapshot as RuntimeOrderflowFootprintSnapshot, OrderflowRuntimeSnapshot } from "../../lib/orderflowRuntimeEngine";
@@ -288,6 +323,40 @@ type LockedDatasetRuntime = {
 
 function isGuideJournalPayloadEntry(value: unknown): value is JsonMap {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isGovernanceReplayViewPayload(value: unknown): value is GovernanceReplayViewSummary {
+  const record = toJsonMap(value);
+  return (record.schema_version === "governance-replay-view/v1" || record.schema_version === "governance-replay-view/v2" || record.schema_version === "governance-replay-view/v3")
+    && Boolean(record.archive)
+    && Boolean(record.replay)
+    && Boolean(record.freeze);
+}
+
+function toJsonMap(value: unknown): JsonMap {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as JsonMap : {};
+}
+
+function humanizeTerminalReasonLabel(value: string): string {
+  const normalized = String(value || "").trim().replace(/[_-]+/g, " ").replace(/\s+/g, " ");
+  if (!normalized) {
+    return "";
+  }
+  return normalized.replace(/\b\w/g, (match) => match.toUpperCase());
+}
+
+function formatArchiveContractOperatorLabel(value: "market_regime_archive" | "governance_replay"): string {
+  return value === "market_regime_archive" ? "archive" : "replay";
+}
+
+function buildTerminalMt5ReviewSignature(input: { accountId: string; symbol: string; side: string; notional: number }): string {
+  const normalizedNotional = Number.isFinite(input.notional) ? Number(input.notional).toFixed(2) : "0.00";
+  return [
+    String(input.accountId || "").trim(),
+    String(input.symbol || "").trim().toUpperCase(),
+    String(input.side || "buy").trim().toLowerCase() || "buy",
+    normalizedNotional,
+  ].join("::");
 }
 
 const V8_PREDICTOR_STORAGE_KEY = "gtixt.terminal.v8.predictor.v1";
@@ -694,6 +763,14 @@ type LocalTerminalCapturePersistenceStatus = {
   autoIncidentStatus: string | null;
   captureHistory: LocalTerminalRuntimeCapture[];
 };
+const DEFAULT_AUTO_TRADER_V5_OBSERVATION: TerminalAutoTraderV5Observation = {
+  enabled: false,
+  mode: "standby",
+  drawdownPaused: false,
+  blockedReasons: [],
+  currentDrawdownPct: 0,
+  lastAction: null,
+};
 type MarketMetricsUniverseEntry = {
   symbolKey: string;
   venue: string;
@@ -1036,6 +1113,7 @@ const AUTO_TUNING_WRITEBACK_ENABLED = process.env.NEXT_PUBLIC_AUTO_TUNING_WRITEB
 const ROLLBACK_GUARD_WINDOW_MIN = Number(process.env.NEXT_PUBLIC_ROLLBACK_GUARD_WINDOW_MIN || 90);
 const ROLLBACK_GUARD_HEALTH_DROP = Number(process.env.NEXT_PUBLIC_ROLLBACK_GUARD_HEALTH_DROP || 0.08);
 const ROLLBACK_GUARD_BRIER_RISE = Number(process.env.NEXT_PUBLIC_ROLLBACK_GUARD_BRIER_RISE || 0.035);
+const TERMINAL_TRUTH_XCH_STALE_THRESHOLD_MS = Number(process.env.NEXT_PUBLIC_TERMINAL_TRUTH_XCH_STALE_THRESHOLD_MS || 180_000);
 const TERMINAL_V2_DEFAULT = process.env.NEXT_PUBLIC_TERMINAL_V2 === "1";
 const TERMINAL_CHART_ENGINE_DEFAULT: "v3" | "v4" = process.env.NEXT_PUBLIC_TERMINAL_ENGINE_V4 === "1" ? "v4" : "v3";
 const TERMINAL_SMOOTHING_DEFAULT_MS: 0 | 80 | 140 | 220 = 140;
@@ -1087,6 +1165,9 @@ const TERMINAL_ONBOARDING_WALKTHROUGH_DONE_STORAGE_KEY = "txt.terminal.onboardin
 const TERMINAL_ONBOARDING_WALKTHROUGH_VERSION_STORAGE_KEY = "txt.terminal.onboarding.walkthrough.version";
 const TERMINAL_ONBOARDING_WALKTHROUGH_VERSION = "2";
 const TERMINAL_BOOT_PROFILE_STORAGE_KEY = "txt.terminal.boot-profile";
+const TERMINAL_OPS_SURFACE_MODE_STORAGE_KEY = "txt.terminal.ops-surface.v1";
+const TERMINAL_UI_DEBUG_STORAGE_KEY = "txt.terminal.ui-debug.v1";
+const TERMINAL_OPS_TRANSITION_LOCK_MS = 180;
 const TERMINAL_LIGHT_BOOT_CHART_DELAY_MS = 140;
 const TERMINAL_LIGHT_BOOT_DECKS_DELAY_MS = 900;
 const DEFAULT_BROWSER_LONG_TASK_TELEMETRY: BrowserLongTaskTelemetry = {
@@ -1099,6 +1180,114 @@ const DEFAULT_BROWSER_LONG_TASK_TELEMETRY: BrowserLongTaskTelemetry = {
 };
 type TerminalBootProfile = "light" | "full";
 type TerminalBootStage = "shell" | "chart" | "decks";
+type TerminalDensityMode = "focus" | "full";
+type TerminalOpsSurfaceMode = "context" | "diagnostic";
+type TerminalOpsSurfaceRuntimeState = "hidden" | "context" | "diagnostic";
+type TerminalOpsTransitionPhase = "stable" | "showing-deck" | "hiding-deck" | "switching-context" | "switching-diagnostic";
+type TerminalOpsTransitionSource = "hydrate" | "surface-button" | "layout-edit" | "focus-toggle" | "runtime";
+type TerminalDensityTransitionPhase = "stable" | "switching-focus" | "switching-full";
+type TerminalDensityTransitionSource = "hydrate" | "toolbar" | "adaptive-guide" | "runtime";
+type TerminalFloatingTransitionPhase = "stable" | "detaching" | "docking" | "resetting" | "syncing-layout";
+type TerminalFloatingTransitionSource = "layout-edit" | "toolbar" | "runtime" | "adaptive-guide";
+type TerminalFloatingTransitionAction = "idle" | "detach" | "dock" | "reset" | "layout-sync";
+type TerminalFloatingSurfaceId = DockPanelId | ChartSidecarId;
+type TerminalChartRuntimeSelection = {
+  terminalV2Enabled: boolean;
+  requestedEngine: "v3" | "v4";
+  chartEngineMode: "v3" | "v4";
+  webgl2: boolean;
+  automationOverride: boolean;
+};
+const TERMINAL_CONTEXT_PANEL_IDS: DockPanelId[] = ["pnltruth", "marketcontext", "tradability", "venues", "readiness"];
+const TERMINAL_DIAGNOSTIC_PANEL_IDS: DockPanelId[] = MONITORING_PANEL_IDS.filter((id) => !TERMINAL_CONTEXT_PANEL_IDS.includes(id));
+
+function resolveTerminalOpsSurfaceRuntimeState(
+  monitoringDeckVisible: boolean,
+  surfaceMode: TerminalOpsSurfaceMode,
+): TerminalOpsSurfaceRuntimeState {
+  if (!monitoringDeckVisible) {
+    return "hidden";
+  }
+  return surfaceMode === "diagnostic" ? "diagnostic" : "context";
+}
+
+function transitionPhaseForSurfaceMode(surfaceMode: TerminalOpsSurfaceMode): TerminalOpsTransitionPhase {
+  return surfaceMode === "diagnostic" ? "switching-diagnostic" : "switching-context";
+}
+
+function transitionPhaseForDensityMode(densityMode: TerminalDensityMode): TerminalDensityTransitionPhase {
+  return densityMode === "full" ? "switching-full" : "switching-focus";
+}
+
+function readTerminalStorageValue(key: string): string | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function resolveTerminalPassiveModeQueryValue(query: URLSearchParams): boolean {
+  const forcedPassiveMode = query.get("terminal_passive_mode") || query.get("passiveTerminal") || query.get("passive");
+  return forcedPassiveMode === "1" || forcedPassiveMode === "true";
+}
+
+function resolveInitialTerminalPassiveMode(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return resolveTerminalPassiveModeQueryValue(new URLSearchParams(window.location.search));
+}
+
+function resolveTerminalChartRuntimeSelection(): TerminalChartRuntimeSelection {
+  if (typeof window === "undefined") {
+    return {
+      terminalV2Enabled: TERMINAL_V2_DEFAULT,
+      requestedEngine: TERMINAL_CHART_ENGINE_DEFAULT,
+      chartEngineMode: TERMINAL_CHART_ENGINE_DEFAULT,
+      webgl2: false,
+      automationOverride: false,
+    };
+  }
+
+  const query = new URLSearchParams(window.location.search);
+  const forcedV2 = query.get("v2");
+  const forcedEngine = query.get("engine");
+  const persistedV2 = readTerminalStorageValue("txt.terminal.v2");
+  const persistedEngine = readTerminalStorageValue("txt.terminal.engine");
+  const webgl2 = isWebGL2Available();
+  const automationOverride = Boolean(navigator.webdriver);
+  const requestedEngine = forcedEngine === "v4" || persistedEngine === "v4"
+    ? "v4"
+    : forcedEngine === "v3" || persistedEngine === "v3"
+      ? "v3"
+      : TERMINAL_CHART_ENGINE_DEFAULT;
+  const chartEngineMode = requestedEngine === "v4" && !webgl2 && !automationOverride
+    ? "v3"
+    : requestedEngine;
+  const terminalV2Enabled = forcedV2 === "1"
+    ? true
+    : forcedV2 === "0"
+      ? false
+      : forcedEngine === "v4" || forcedEngine === "v3"
+        ? true
+        : persistedV2 === "1"
+          ? true
+          : persistedV2 === "0"
+            ? false
+            : TERMINAL_V2_DEFAULT;
+
+  return {
+    terminalV2Enabled,
+    requestedEngine,
+    chartEngineMode,
+    webgl2,
+    automationOverride,
+  };
+}
 
 function ChartSurfaceLoadingFallback() {
   return (
@@ -1212,6 +1401,100 @@ function cloneIndicatorPreset(preset: ActiveIndicator[]): ActiveIndicator[] {
 
 function normalizeInstrument(symbol: string): string {
   return symbol.replace("-PERP", "").replace("/", "").replace(/-/g, "").toUpperCase();
+}
+
+function buildQuoteHistoryKey(symbol: string, venue?: string | null): string {
+  const normalizedSymbol = normalizeInstrument(String(symbol || ""));
+  const normalizedVenue = String(venue || "").trim().toLowerCase();
+  return normalizedVenue ? `${normalizedSymbol}@@${normalizedVenue}` : normalizedSymbol;
+}
+
+function buildNormalizedQuoteVenueKey(quote: JsonMap): string {
+  const normalizedSymbol = normalizeInstrument(String(quote.instrument || instrumentLabel(quote)));
+  const venue = String(quote.venue || "").trim().toLowerCase();
+  return `${normalizedSymbol}@@${venue}`;
+}
+
+function isSyntheticGapFillBar(bar: OhlcvBar): boolean {
+  const source = String(bar.source || "").toLowerCase();
+  return source.includes("gap-fill");
+}
+
+function sanitizeChartDisplayBars(bars: OhlcvBar[], timeframe: string): OhlcvBar[] {
+  if (!Array.isArray(bars) || bars.length === 0) {
+    return [];
+  }
+  if (timeframeToMs(timeframe) < 60_000) {
+    return bars;
+  }
+
+  const recentWindow = bars.slice(-Math.min(48, Math.max(12, bars.length)));
+  if (recentWindow.length < 12) {
+    return bars;
+  }
+
+  const recentGapFillCount = recentWindow.filter(isSyntheticGapFillBar).length;
+  const recentGapFillRatio = recentGapFillCount / recentWindow.length;
+  if (recentGapFillRatio < 0.34) {
+    return bars;
+  }
+
+  const filteredBars = bars.filter((bar) => !isSyntheticGapFillBar(bar));
+  return filteredBars.length >= Math.max(12, Math.floor(bars.length * 0.25)) ? filteredBars : bars;
+}
+
+function quoteHistoryPriority(quote: JsonMap): number {
+  const venue = String(quote.venue || "").toLowerCase();
+  const source = String(quote.source || "").toLowerCase();
+  let score = 0;
+  if (venue === "binance-public") {
+    score += 40;
+  } else if (venue === "bybit-public") {
+    score += 34;
+  } else if (venue === "okx-public") {
+    score += 30;
+  } else if (venue === "bingx-public") {
+    score += 26;
+  } else if (venue.startsWith("paper-")) {
+    score -= 20;
+  }
+  if (source.includes("binance")) {
+    score += 4;
+  }
+  if (toNumber(quote.last, 0) > 0) {
+    score += 2;
+  }
+  return score;
+}
+
+function appendQuoteHistorySnapshot(current: QuoteHistoryMap, nextQuotes: JsonMap[], maxLength: number): QuoteHistoryMap {
+  const updated: QuoteHistoryMap = { ...current };
+  const label = new Date().toISOString();
+  const bestBySymbol = new Map<string, JsonMap>();
+
+  for (const quote of nextQuotes) {
+    const quoteSymbol = normalizeInstrument(String(quote.instrument || instrumentLabel(quote)));
+    if (!quoteSymbol) {
+      continue;
+    }
+    const nextPoint = { label, value: toNumber(quote.last, 0) };
+    const venueKey = buildQuoteHistoryKey(quoteSymbol, String(quote.venue || ""));
+    const venueExisting = updated[venueKey] || [];
+    updated[venueKey] = [...venueExisting, nextPoint].slice(-maxLength);
+
+    const previous = bestBySymbol.get(quoteSymbol);
+    if (!previous || quoteHistoryPriority(quote) > quoteHistoryPriority(previous)) {
+      bestBySymbol.set(quoteSymbol, quote);
+    }
+  }
+
+  for (const [quoteSymbol, quote] of bestBySymbol.entries()) {
+    const nextPoint = { label, value: toNumber(quote.last, 0) };
+    const existing = updated[quoteSymbol] || [];
+    updated[quoteSymbol] = [...existing, nextPoint].slice(-maxLength);
+  }
+
+  return updated;
 }
 
 function normalizeVenueKey(value: unknown): string {
@@ -3536,6 +3819,173 @@ function parseTimestampLike(value: string | null | undefined): number | null {
   return now.getTime();
 }
 
+function buildTerminalPassiveFallbackFrame(
+  bars: OhlcvBar[],
+  timeframe: string,
+  kernelTelemetry: MarketDataBusKernelTelemetry,
+  lastSyncAt: string | null,
+  marketBusMeta: JsonMap | null,
+  syncedFrame: SyncedMarketFrame | null,
+  fallbackQuote?: { price: number | null; timestampMs: number | null } | null,
+): { candles: LiveChartCandle[]; meta: LiveChartFrameMeta | null } {
+  const seededBars = Array.isArray(bars) && bars.length > 0
+    ? bars
+    : syncedFrame?.candle
+      ? [syncedFrame.candle]
+      : [];
+  const synthesizedQuoteCandle = seededBars.length === 0 && fallbackQuote && Number.isFinite(fallbackQuote.price) && Number(fallbackQuote.price) > 0
+    ? [{
+      t: new Date(fallbackQuote.timestampMs ?? Date.now()).toISOString(),
+      o: Number(fallbackQuote.price),
+      h: Number(fallbackQuote.price),
+      l: Number(fallbackQuote.price),
+      c: Number(fallbackQuote.price),
+      v: 0,
+      tf: timeframe,
+    } as OhlcvBar]
+    : [];
+  const effectiveBars = seededBars.length > 0 ? seededBars : synthesizedQuoteCandle;
+  if (effectiveBars.length === 0) {
+    return { candles: [], meta: null };
+  }
+
+  const candles = effectiveBars
+    .map((bar): LiveChartCandle | null => {
+      const label = String(bar.t || "").trim();
+      const open = toNumber(bar.o, Number.NaN);
+      const high = toNumber(bar.h, Number.NaN);
+      const low = toNumber(bar.l, Number.NaN);
+      const close = toNumber(bar.c, Number.NaN);
+      const volume = toNumber(bar.v, 0);
+      if (!label || !(open > 0) || !(high > 0) || !(low > 0) || !(close > 0)) {
+        return null;
+      }
+      return {
+        label,
+        open,
+        high: Math.max(high, open, close),
+        low: Math.min(low, open, close),
+        close,
+        volume: Number.isFinite(volume) ? Math.max(0, volume) : 0,
+      };
+    })
+    .filter((candle): candle is LiveChartCandle => Boolean(candle));
+
+  if (candles.length === 0) {
+    return { candles: [], meta: null };
+  }
+
+  const now = Date.now();
+  const reconstruction = asJsonMap(marketBusMeta?.reconstruction);
+  const hydrationTrace = asJsonMap(marketBusMeta?.hydration_trace);
+  const tradeWsTrace = asJsonMap(hydrationTrace.trade_ws);
+  const depthWsTrace = asJsonMap(hydrationTrace.depth_ws);
+  const latestLabel = candles[candles.length - 1]?.label || "";
+  const latestBarTs = parseTimestampLike(latestLabel);
+  const sourceAgeMs = Number.isFinite(reconstruction.sourceAgeMs)
+    ? Math.max(0, Number(reconstruction.sourceAgeMs))
+    : latestBarTs != null
+      ? Math.max(0, now - latestBarTs)
+      : null;
+  const timeframeMs = Math.max(1_000, timeframeToMs(timeframe));
+  const freshWindowMs = Math.max(30_000, timeframeMs * 2);
+  const agingWindowMs = Math.max(120_000, timeframeMs * 4);
+  const observationContinuity = reconstruction.observationContinuity === "continuous" || reconstruction.observationContinuity === "resumed"
+    ? reconstruction.observationContinuity
+    : "unknown";
+  const reconstructionReason = typeof reconstruction.reconstructionReason === "string"
+    ? reconstruction.reconstructionReason.trim()
+    : "";
+  const partial = kernelTelemetry.frameSyncStatus === "loose-sync" || kernelTelemetry.partialFrameRate > 0;
+  const coalesced = kernelTelemetry.frameSyncStatus === "coalesced";
+  const syncStatus: LiveChartFrameMeta["syncStatus"] = kernelTelemetry.frameSyncStatus === "loose-sync" || kernelTelemetry.frameSyncStatus === "coalesced"
+    ? kernelTelemetry.frameSyncStatus
+    : "atomic";
+  const truthFreshness: LiveChartFrameMeta["truth"] extends infer T
+    ? T extends { freshness: infer F }
+      ? F
+      : never
+    : never = sourceAgeMs == null
+    ? "unknown"
+    : sourceAgeMs <= freshWindowMs
+      ? "fresh"
+      : sourceAgeMs <= agingWindowMs
+        ? "aging"
+        : "stale";
+  let integrityStatus: "clean" | "degraded" | "invalid" = "clean";
+  if (candles.length < 2) {
+    integrityStatus = "degraded";
+  }
+  const reconstructionFlag: "none" | "reconstructed" | "observer_resumed" | "source_gap" = observationContinuity === "resumed"
+    ? "observer_resumed"
+    : /gap|stale|missing/i.test(reconstructionReason)
+      ? "source_gap"
+      : "none";
+  const truthSyncStatus: "live" | "delayed" | "stale" | "resumed" | "unknown" = observationContinuity === "resumed"
+    ? "resumed"
+    : truthFreshness === "stale"
+      ? "stale"
+      : partial || syncStatus !== "atomic"
+        ? "delayed"
+        : "live";
+  const reasons = [
+    integrityStatus !== "clean" ? "thin_frame" : "",
+    truthFreshness === "unknown" ? "source_age_unknown" : truthFreshness !== "fresh" ? `source_${truthFreshness}` : "",
+    truthSyncStatus !== "live" ? `sync_${truthSyncStatus}` : "",
+    reconstructionFlag === "observer_resumed" ? "observer_resumed" : reconstructionFlag === "source_gap" ? "source_gap" : "",
+  ].filter(Boolean);
+  const penalty = (integrityStatus === "degraded" ? 0.35 : 0)
+    + (truthFreshness === "stale" ? 0.4 : truthFreshness === "aging" ? 0.18 : truthFreshness === "unknown" ? 0.22 : 0)
+    + (truthSyncStatus === "stale" ? 0.38 : truthSyncStatus === "resumed" ? 0.26 : truthSyncStatus === "delayed" ? 0.16 : 0)
+    + (reconstructionFlag === "source_gap" ? 0.3 : reconstructionFlag === "observer_resumed" ? 0.22 : 0);
+  const baseConfidence = Number.isFinite(kernelTelemetry.frameSyncConfidence) ? Number(kernelTelemetry.frameSyncConfidence) : 1;
+  const truthConfidence = clamp(baseConfidence - penalty, 0, 1);
+  const lastSyncMs = parseTimestampLike(lastSyncAt);
+  const tradeEventTs = parseTimestampLike(String(tradeWsTrace.last_message_at || "")) ?? syncedFrame?.ts ?? latestBarTs ?? lastSyncMs;
+  const depthEventTs = parseTimestampLike(String(depthWsTrace.last_message_at || "")) ?? syncedFrame?.ts ?? latestBarTs ?? lastSyncMs;
+  const viewportUpdatedAt = lastSyncMs ?? now;
+
+  return {
+    candles,
+    meta: {
+      syncStatus,
+      partial,
+      coalesced,
+      confidence: clamp(baseConfidence, 0, 1),
+      dynamicBufferMs: Math.max(0, Math.round(toNumber(kernelTelemetry.dynamicBufferMs, 50))),
+      stallAgeMs: partial ? Math.max(0, Math.round(toNumber(kernelTelemetry.maxFrameStallMs, 0))) : 0,
+      depthSequence: null,
+      depthEventTs,
+      tradeEventTs,
+      batchSkewMs: null,
+      batchPublishedAt: lastSyncMs ?? now,
+      batchFrameCount: 1,
+      viewportUpdatedAt,
+      observerSessionId: typeof hydrationTrace.instance_id === "string" ? hydrationTrace.instance_id : null,
+      observerStartedAt: typeof reconstruction.observerStartedAt === "string" ? reconstruction.observerStartedAt : null,
+      observerUptimeMs: Number.isFinite(reconstruction.observerUptimeMs) ? Math.max(0, Math.round(Number(reconstruction.observerUptimeMs))) : null,
+      observerResetCount: Number.isFinite(reconstruction.observerResetCount) ? Math.max(0, Math.round(Number(reconstruction.observerResetCount))) : 0,
+      observerLastResetReason: typeof reconstruction.observerLastResetReason === "string" ? reconstruction.observerLastResetReason : null,
+      observerLastResetAt: typeof reconstruction.observerLastResetAt === "string" ? reconstruction.observerLastResetAt : null,
+      observationGapMs: Number.isFinite(reconstruction.observationGapMs) ? Math.max(0, Math.round(Number(reconstruction.observationGapMs))) : null,
+      observationContinuity,
+      sourceAgeMs,
+      sourceFreshness: truthFreshness === "fresh" ? "fresh" : truthFreshness === "stale" ? "stale" : "unknown",
+      reconstructionReason: reconstructionReason || null,
+      truth: {
+        integrity_status: integrityStatus,
+        sync_status: truthSyncStatus,
+        freshness: truthFreshness,
+        reconstruction_flag: reconstructionFlag,
+        confidence: truthConfidence,
+        tradable: integrityStatus === "clean" && truthSyncStatus === "live" && truthFreshness === "fresh" && reconstructionFlag === "none",
+        decision_allowed: truthSyncStatus !== "stale" && truthFreshness !== "stale",
+        reasons,
+      },
+    },
+  };
+}
+
 function toTimeBucketKey(value: string | number, timeframe: string): string {
   const stepMs = timeframeSeconds(timeframe) * 1000;
   const parsed = typeof value === "number" ? value : parseTimestampLike(value);
@@ -4488,6 +4938,10 @@ function TradingTerminalPageHydrated() {
   const [shadowMetricsPayload, setShadowMetricsPayload] = useState<JsonMap | null>(null);
   const [externalKillSwitchPayload, setExternalKillSwitchPayload] = useState<JsonMap | null>(null);
   const [liveOpsPayload, setLiveOpsPayload] = useState<JsonMap | null>(null);
+  const [mt5GovernancePayload, setMt5GovernancePayload] = useState<JsonMap | null>(null);
+  const [mt5TicketPreviewPayload, setMt5TicketPreviewPayload] = useState<JsonMap | null>(null);
+  const [mt5OracleTimelineRows, setMt5OracleTimelineRows] = useState<JsonMap[]>([]);
+  const [mt5ReviewAckSignature, setMt5ReviewAckSignature] = useState<string | null>(null);
   const [executionPnlAnalyzerPayload, setExecutionPnlAnalyzerPayload] = useState<JsonMap | null>(null);
   const [executionOptimizerLivePayload, setExecutionOptimizerLivePayload] = useState<JsonMap | null>(null);
   const [executionAiV6Payload, setExecutionAiV6Payload] = useState<JsonMap | null>(null);
@@ -4525,6 +4979,7 @@ function TradingTerminalPageHydrated() {
   const [replayLoading, setReplayLoading] = useState(false);
   const [replayError, setReplayError] = useState<string | null>(null);
   const [authStatus, setAuthStatus] = useState<AuthSessionStatus>("unknown");
+  const [authOperatorUsername, setAuthOperatorUsername] = useState("");
   const [authSessionRequired, setAuthSessionRequired] = useState(true);
   const [marketBusGateTrace, setMarketBusGateTrace] = useState({
     evaluations: 0,
@@ -4559,12 +5014,29 @@ function TradingTerminalPageHydrated() {
   const [tradeResult, setTradeResult] = useState<JsonMap | null>(null);
   const [chartKernelPerf, setChartKernelPerf] = useState({ fps: 60, frameTimeMs: 16.7, cpuLoad: 1, workerLatencyMs: 0 });
   const [chartIsolationMode, setChartIsolationMode] = useState(false);
+  const [terminalPassiveMode, setTerminalPassiveMode] = useState(resolveInitialTerminalPassiveMode);
+  const [terminalPassiveFrameCandles, setTerminalPassiveFrameCandles] = useState<LiveChartCandle[]>([]);
+  const [terminalPassiveFrameMeta, setTerminalPassiveFrameMeta] = useState<LiveChartFrameMeta | null>(null);
   const [browserLongTaskTelemetry, setBrowserLongTaskTelemetry] = useState<BrowserLongTaskTelemetry>(DEFAULT_BROWSER_LONG_TASK_TELEMETRY);
   const [chartPerceptualTelemetry, setChartPerceptualTelemetry] = useState<ChartPerceptualTelemetry | null>(null);
   const [gpuPerceptualTelemetry, setGpuPerceptualTelemetry] = useState<GpuPerceptualTelemetry | null>(null);
   const [smartDecisionHud, setSmartDecisionHud] = useState<SmartDecisionHudShape | null>(null);
 
   const [gpuViewportFrameMeta, setGpuViewportFrameMeta] = useState<Record<string, LiveChartFrameMeta>>({});
+  const handleGpuViewportFrameMetaChange = useCallback((payload: Record<string, LiveChartFrameMeta>) => {
+    const viewportUpdatedAt = Date.now();
+    setGpuViewportFrameMeta(
+      Object.fromEntries(
+        Object.entries(payload).map(([viewportId, meta]) => [
+          viewportId,
+          {
+            ...meta,
+            viewportUpdatedAt,
+          },
+        ]),
+      ),
+    );
+  }, []);
   const [gpuGlobalGridBatch, setGpuGlobalGridBatch] = useState<GlobalGridBatchState | null>(null);
   const [chartPerceptualDebugOpen, setChartPerceptualDebugOpen] = useState(false);
   const [terminalComputePerfEnabled, setTerminalComputePerfEnabled] = useState(false);
@@ -4610,7 +5082,16 @@ function TradingTerminalPageHydrated() {
   const [chartReleaseSendMode, setChartReleaseSendMode] = useChartReleaseSendMode();
   const [chartHapticMode, setChartHapticMode] = useChartHapticMode();
   const [layoutPreset, setLayoutPreset] = useState<LayoutPreset>("swing");
-  const [terminalDensityMode, setTerminalDensityMode] = useState<"focus" | "full">("focus");
+  const [terminalDensityMode, setTerminalDensityMode] = useState<TerminalDensityMode>("focus");
+  const [terminalDensityTransitionPhase, setTerminalDensityTransitionPhase] = useState<TerminalDensityTransitionPhase>("stable");
+  const [terminalDensityTransitionSource, setTerminalDensityTransitionSource] = useState<TerminalDensityTransitionSource>("hydrate");
+  const [terminalDensityTransitionLocked, setTerminalDensityTransitionLocked] = useState(false);
+  const [terminalDensityTransitionCount, setTerminalDensityTransitionCount] = useState(0);
+  const [terminalOpsSurfaceMode, setTerminalOpsSurfaceMode] = useState<TerminalOpsSurfaceMode>("context");
+  const [terminalOpsTransitionPhase, setTerminalOpsTransitionPhase] = useState<TerminalOpsTransitionPhase>("stable");
+  const [terminalOpsTransitionSource, setTerminalOpsTransitionSource] = useState<TerminalOpsTransitionSource>("hydrate");
+  const [terminalOpsTransitionLocked, setTerminalOpsTransitionLocked] = useState(false);
+  const [terminalOpsTransitionCount, setTerminalOpsTransitionCount] = useState(0);
   const [terminalBootProfile, setTerminalBootProfile] = useState<TerminalBootProfile>("light");
   const [terminalBootStage, setTerminalBootStage] = useState<TerminalBootStage>("shell");
   const [terminalOnboardingLoaded, setTerminalOnboardingLoaded] = useState(false);
@@ -4625,6 +5106,99 @@ function TradingTerminalPageHydrated() {
   const [coachOverlayVisible, setCoachOverlayVisible] = useState(false);
   const [focusDecks, setFocusDecks] = useState<TerminalFocusDeckId[]>([]);
   const [layoutWorkspaceName, setLayoutWorkspaceName] = useState(DEFAULT_LAYOUT_WORKSPACE_NAME);
+  const [terminalUiDebugVisible, setTerminalUiDebugVisible] = useState(false);
+  const terminalOpsTransitionTimerRef = useRef<number | null>(null);
+  const terminalOpsTransitionLockedRef = useRef(false);
+  const terminalOpsSurfaceModeRef = useRef<TerminalOpsSurfaceMode>("context");
+  const terminalOpsRenderCycleRef = useRef(0);
+  const previousShowMonitoringDeckRef = useRef<boolean | null>(null);
+  const terminalDensityTransitionTimerRef = useRef<number | null>(null);
+  const terminalDensityTransitionLockedRef = useRef(false);
+  const terminalFloatingTransitionTimerRef = useRef<number | null>(null);
+  const terminalFloatingTransitionLockedRef = useRef(false);
+
+  const armTerminalOpsTransition = useCallback((phase: TerminalOpsTransitionPhase, source: TerminalOpsTransitionSource) => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    if (terminalOpsTransitionTimerRef.current != null) {
+      window.clearTimeout(terminalOpsTransitionTimerRef.current);
+    }
+    setTerminalOpsTransitionPhase(phase);
+    setTerminalOpsTransitionSource(source);
+    setTerminalOpsTransitionLocked(true);
+    setTerminalOpsTransitionCount((current) => current + 1);
+    terminalOpsTransitionTimerRef.current = window.setTimeout(() => {
+      terminalOpsTransitionTimerRef.current = null;
+      setTerminalOpsTransitionLocked(false);
+      setTerminalOpsTransitionPhase("stable");
+    }, TERMINAL_OPS_TRANSITION_LOCK_MS);
+  }, []);
+
+  const requestTerminalOpsSurfaceMode = useCallback((nextMode: TerminalOpsSurfaceMode, source: TerminalOpsTransitionSource, options?: { force?: boolean }) => {
+    if (terminalOpsTransitionLockedRef.current && !options?.force) {
+      return;
+    }
+    if (terminalOpsSurfaceModeRef.current === nextMode && !options?.force) {
+      return;
+    }
+    armTerminalOpsTransition(transitionPhaseForSurfaceMode(nextMode), source);
+    setTerminalOpsSurfaceMode(nextMode);
+  }, [armTerminalOpsTransition]);
+
+  const armTerminalDensityTransition = useCallback((phase: TerminalDensityTransitionPhase, source: TerminalDensityTransitionSource) => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    if (terminalDensityTransitionTimerRef.current != null) {
+      window.clearTimeout(terminalDensityTransitionTimerRef.current);
+    }
+    setTerminalDensityTransitionPhase(phase);
+    setTerminalDensityTransitionSource(source);
+    setTerminalDensityTransitionLocked(true);
+    setTerminalDensityTransitionCount((current) => current + 1);
+    terminalDensityTransitionTimerRef.current = window.setTimeout(() => {
+      terminalDensityTransitionTimerRef.current = null;
+      setTerminalDensityTransitionLocked(false);
+      setTerminalDensityTransitionPhase("stable");
+    }, TERMINAL_OPS_TRANSITION_LOCK_MS);
+  }, []);
+
+  const requestTerminalDensityMode = useCallback((nextMode: TerminalDensityMode, source: TerminalDensityTransitionSource, options?: { force?: boolean }) => {
+    if (terminalDensityTransitionLockedRef.current && !options?.force) {
+      return;
+    }
+    if (terminalDensityModeRef.current === nextMode && !options?.force) {
+      return;
+    }
+    armTerminalDensityTransition(transitionPhaseForDensityMode(nextMode), source);
+    setTerminalDensityMode(nextMode);
+  }, [armTerminalDensityTransition]);
+
+  const armTerminalFloatingTransition = useCallback((
+    phase: TerminalFloatingTransitionPhase,
+    source: TerminalFloatingTransitionSource,
+    action: TerminalFloatingTransitionAction,
+    panelId?: TerminalFloatingSurfaceId,
+  ) => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    if (terminalFloatingTransitionTimerRef.current != null) {
+      window.clearTimeout(terminalFloatingTransitionTimerRef.current);
+    }
+    setTerminalFloatingTransitionPhase(phase);
+    setTerminalFloatingTransitionSource(source);
+    setTerminalFloatingLastAction(action);
+    setTerminalFloatingLastPanelId(panelId || null);
+    setTerminalFloatingTransitionLocked(true);
+    setTerminalFloatingTransitionCount((current) => current + 1);
+    terminalFloatingTransitionTimerRef.current = window.setTimeout(() => {
+      terminalFloatingTransitionTimerRef.current = null;
+      setTerminalFloatingTransitionLocked(false);
+      setTerminalFloatingTransitionPhase("stable");
+    }, TERMINAL_OPS_TRANSITION_LOCK_MS);
+  }, []);
 
   const setTerminalBootProfilePreference = useCallback((nextProfile: TerminalBootProfile) => {
     setTerminalBootProfile(nextProfile);
@@ -4693,6 +5267,23 @@ function TradingTerminalPageHydrated() {
       setTerminalOnboardingExpanded(false);
     }
   }, [terminalOnboardingPinned]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return undefined;
+    }
+
+    const handleGlobalWalkthroughStart = () => {
+      setTerminalOnboardingFirstVisit(false);
+      setTerminalOnboardingExpanded(true);
+    };
+
+    window.addEventListener("txt-global-walkthrough-start", handleGlobalWalkthroughStart);
+    return () => {
+      window.removeEventListener("txt-global-walkthrough-start", handleGlobalWalkthroughStart);
+    };
+  }, []);
+
   const focusAdaptiveGuideTarget = useCallback((targetId: TerminalAdaptiveGuideTargetId) => {
     if (typeof document === "undefined") {
       return;
@@ -4719,12 +5310,19 @@ function TradingTerminalPageHydrated() {
     autoIncidentStatus: null,
     captureHistory: [],
   });
+  const [localAutoTraderV5Observation, setLocalAutoTraderV5Observation] = useState<TerminalAutoTraderV5Observation>(DEFAULT_AUTO_TRADER_V5_OBSERVATION);
   const [layoutScreenProfile, setLayoutScreenProfile] = useState<"sm" | "md" | "lg" | "xl">("lg");
   const [layoutCoreSplit, setLayoutCoreSplit] = useState(uiMode === "novice" ? 72 : 78);
   const [layoutMicroOrder, setLayoutMicroOrder] = useState<DockPanelId[]>([...MICRO_PANEL_IDS]);
   const [layoutLowerOrder, setLayoutLowerOrder] = useState<DockPanelId[]>([...LOWER_PANEL_IDS]);
   const [layoutMonitoringOrder, setLayoutMonitoringOrder] = useState<DockPanelId[]>([...MONITORING_PANEL_IDS]);
   const [floatingPanels, setFloatingPanels] = useState<FloatingPanelState[]>([]);
+  const [terminalFloatingTransitionPhase, setTerminalFloatingTransitionPhase] = useState<TerminalFloatingTransitionPhase>("stable");
+  const [terminalFloatingTransitionSource, setTerminalFloatingTransitionSource] = useState<TerminalFloatingTransitionSource>("runtime");
+  const [terminalFloatingTransitionLocked, setTerminalFloatingTransitionLocked] = useState(false);
+  const [terminalFloatingTransitionCount, setTerminalFloatingTransitionCount] = useState(0);
+  const [terminalFloatingLastAction, setTerminalFloatingLastAction] = useState<TerminalFloatingTransitionAction>("idle");
+  const [terminalFloatingLastPanelId, setTerminalFloatingLastPanelId] = useState<TerminalFloatingSurfaceId | null>(null);
   const [performancePanelsExpanded, setPerformancePanelsExpanded] = useState(uiMode === "expert");
   const [layoutDropPreview, setLayoutDropPreview] = useState<{ zone: DockZone; targetId?: DockPanelId; mode: "zone" | "panel" } | null>(null);
   const [selectedChartSymbol, setSelectedChartSymbol] = useState("BTCUSD");
@@ -4735,8 +5333,8 @@ function TradingTerminalPageHydrated() {
   const [chartLinkTimeframeEnabled, setChartLinkTimeframeEnabled] = useState(true);
   const [chartPerfMode, setChartPerfMode] = useState<"auto" | "balanced" | "ultra">("auto");
   const [chartVisualMode, setChartVisualMode] = useState<"auto" | "clean" | "full">("auto");
-  const [terminalV2Enabled, setTerminalV2Enabled] = useState(TERMINAL_V2_DEFAULT);
-  const [chartEngineMode, setChartEngineMode] = useState<"v3" | "v4">(TERMINAL_CHART_ENGINE_DEFAULT);
+  const [terminalV2Enabled, setTerminalV2Enabled] = useState<boolean>(() => resolveTerminalChartRuntimeSelection().terminalV2Enabled);
+  const [chartEngineMode, setChartEngineMode] = useState<"v3" | "v4">(() => resolveTerminalChartRuntimeSelection().chartEngineMode);
   const [gpuViewportGrid, setGpuViewportGrid] = useState<1 | 4 | 16 | "auto">("auto");
   const [chartSmoothingMs, setChartSmoothingMs] = useState<0 | 80 | 140 | 220>(TERMINAL_SMOOTHING_DEFAULT_MS);
   const [chartHeatmapMode, setChartHeatmapMode] = useState<ChartHeatmapMode>("bookmap");
@@ -4765,7 +5363,7 @@ function TradingTerminalPageHydrated() {
   const mlAbsorptionLogSignatureRef = useRef("");
   const domHistoryBufferRef = useRef(new DomHistoryBuffer(96, 20));
   const domHistoryPushSignatureRef = useRef("");
-  const terminalDensityModeRef = useRef<"focus" | "full">("focus");
+  const terminalDensityModeRef = useRef<TerminalDensityMode>("focus");
   const focusDecksRef = useRef<TerminalFocusDeckId[]>([]);
   const focusDeckFeedUpdatedAtRef = useRef<Record<string, number>>({});
 
@@ -4835,16 +5433,42 @@ function TradingTerminalPageHydrated() {
   }), [chartOrderTicket.preset, chartTimeframe, selectedChartSymbol]);
   const [terminalGuideJournalEntries, setTerminalGuideJournalEntries] = useState<JsonMap[]>([]);
   const [terminalCalibrationEntries, setTerminalCalibrationEntries] = useState<JsonMap[]>([]);
+  const [persistedGovernanceReplayView, setPersistedGovernanceReplayView] = useState<GovernanceReplayViewSummary | null>(null);
+  const [crossMarketTruthSummary, setCrossMarketTruthSummary] = useState<CrossMarketTruthSummary | null>(null);
   const [terminalGuideJournalError, setTerminalGuideJournalError] = useState<string | null>(null);
+  const [persistedGovernanceReplayError, setPersistedGovernanceReplayError] = useState<string | null>(null);
+  const finalDecisionTruthRef = useRef<FinalDecisionTruth | null>(null);
   const attentionJournalSignatureRef = useRef("");
   const microstructureJournalSignatureRef = useRef("");
+  const marketMicrostructureAnomalySignatureRef = useRef("");
   const capitalScalingJournalSignatureRef = useRef("");
   const executionLockJournalSignatureRef = useRef("");
+  const tradabilityJournalSignatureRef = useRef("");
+  const marketMemorySnapshotSignatureRef = useRef("");
+  const marketExecutionDegradationSignatureRef = useRef("");
+  const marketTransitionContextRef = useRef<{
+    regime: string;
+    marketTruthState: string;
+    truthQualityPct: number;
+    admissibilityState: string;
+    densityState: string;
+    edgeState: string;
+    blockingLayer: string;
+  } | null>(null);
+  const oracleStabilityMemoryContextRef = useRef<OracleStabilitySnapshot | null>(null);
+  const selfHealingRecoveryMemoryContextRef = useRef<SelfHealingRecoverySnapshot | null>(null);
+  const executionRealityMemoryContextRef = useRef<ExecutionRealityMemorySnapshot | null>(null);
 
   useEffect(() => {
     const symbolKey = terminalGuideJournalContext.symbol.trim().toUpperCase();
     const timeframeKey = terminalGuideJournalContext.timeframe.trim();
     const strategyKey = terminalGuideJournalContext.strategy.trim();
+    if (terminalPassiveMode) {
+      setTerminalGuideJournalEntries([]);
+      setTerminalCalibrationEntries([]);
+      setTerminalGuideJournalError(null);
+      return;
+    }
     if (!symbolKey || !timeframeKey || !strategyKey) {
       setTerminalGuideJournalEntries([]);
       setTerminalCalibrationEntries([]);
@@ -4881,7 +5505,7 @@ function TradingTerminalPageHydrated() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [terminalGuideJournalContext]);
+  }, [terminalGuideJournalContext, terminalPassiveMode]);
 
   const appendTerminalGuideJournalEntry = useCallback(async (action: string, detail: string, meta?: JsonMap): Promise<void> => {
     const symbolKey = terminalGuideJournalContext.symbol.trim().toUpperCase();
@@ -4899,7 +5523,10 @@ function TradingTerminalPageHydrated() {
         strategy: strategyKey,
         action,
         detail,
-        meta: meta || {},
+        meta: {
+          ...(meta || {}),
+          ...(finalDecisionTruthRef.current ? { final_decision_truth: finalDecisionTruthRef.current } : {}),
+        },
       }),
     }).catch(() => null);
     const payload = response ? await response.json().catch(() => null) : null;
@@ -4925,7 +5552,22 @@ function TradingTerminalPageHydrated() {
   }), [smartDecisionHud, terminalFeedbackSummary, terminalGuideJournalEntries]);
   const activeAdaptiveGuideMode = terminalAdaptiveGuideMode || terminalAdaptiveGuide.recommendedMode;
   const activeAdaptiveGuidePlan = terminalAdaptiveGuide.plans.find((plan) => plan.mode === activeAdaptiveGuideMode) || terminalAdaptiveGuide.plans[0];
+  const activeAdaptiveGuideCompletedSteps = activeAdaptiveGuidePlan.steps.filter((step) => step.completed).length;
   const activeAdaptiveGuideStep = activeAdaptiveGuidePlan.steps[Math.min(terminalAdaptiveGuideStepIndex, Math.max(activeAdaptiveGuidePlan.steps.length - 1, 0))] || activeAdaptiveGuidePlan.steps[0] || null;
+  const terminalGuideHealthTone = terminalFeedbackSummary.modelHealth === "BROKEN" || terminalFeedbackSummary.modelHealth === "DEGRADING"
+    ? "warn"
+    : terminalFeedbackSummary.modelHealth === "ADAPTING"
+      ? "subtle"
+      : "good";
+  const terminalGuideDriftTone = terminalFeedbackSummary.driftState === "LOCK" || terminalFeedbackSummary.driftState === "DRIFT"
+    ? "warn"
+    : terminalFeedbackSummary.driftState === "WATCH"
+      ? "subtle"
+      : "good";
+  const terminalGuideDisciplineTone = terminalAdaptiveGuide.disciplineLock ? "warn" : "good";
+  const terminalGuideDisciplineLabel = terminalAdaptiveGuide.disciplineLock
+    ? `Discipline verrouillee${terminalAdaptiveGuide.disciplineReason ? `: ${terminalAdaptiveGuide.disciplineReason}` : ""}`
+    : "Discipline ouverte";
   const terminalJournalCalibration = useMemo(() => buildIntentCalibrationSummary(terminalCalibrationEntries, { windowDaysList: [7, 14] }), [terminalCalibrationEntries]);
   const activeIntentCalibrationWindow = terminalJournalCalibration.windows["14d"] || terminalJournalCalibration.windows["7d"] || null;
   const journalWindowScalingRecommendation = useMemo(
@@ -5016,44 +5658,16 @@ function TradingTerminalPageHydrated() {
     if (!plan) {
       return;
     }
-    openOpsCopilotPrompt({ message: plan.commandPrompt, autoSend: true });
+    openOpsCopilotPrompt({
+      message: plan.commandPrompt,
+      autoSend: true,
+    });
   }, [terminalAdaptiveGuide.plans]);
-  const [chartSnapState, setChartSnapState] = useState<ChartSnapState>(null);
-  const [chartActiveSnapLine, setChartActiveSnapLine] = useState<ChartOrderLineKey | null>(null);
-  const [chartSnapPulseLine, setChartSnapPulseLine] = useState<ChartOrderLineKey | null>(null);
-  const [chartReleaseTicket, setChartReleaseTicket] = useState<ChartReleaseTicketState>(null);
-  const [chartReleaseValidationPulse, setChartReleaseValidationPulse] = useState(false);
-  const [chartOrderPreviewOpen, setChartOrderPreviewOpen] = useState(false);
-  const [chartRiskGuardEnabled, setChartRiskGuardEnabled] = useState(true);
-  const [chartMaxLossUsd, setChartMaxLossUsd] = useState(uiMode === "novice" ? 120 : 250);
-  const [chartTargetGainUsd, setChartTargetGainUsd] = useState(uiMode === "novice" ? 220 : 500);
-  const [signalDisplayMode, setSignalDisplayMode] = useState<SignalDisplayMode>("augmented");
-  const [confluenceWeights, setConfluenceWeights] = useState<MarketConfluenceWeights>({ ...DEFAULT_CONFLUENCE_WEIGHTS });
-  const [showReasonLegend, setShowReasonLegend] = useState(false);
-  const [showConfluenceTune, setShowConfluenceTune] = useState(false);
-  const [showDecisionSecondary, setShowDecisionSecondary] = useState(false);
-  const [showExecutionLaneAdvanced, setShowExecutionLaneAdvanced] = useState(false);
-  const [executionAdaptMode, setExecutionAdaptMode] = useState<ExecutionAdaptMode>("auto");
-  const [autoExecutionMode, setAutoExecutionMode] = useState<AutoExecutionMode>("semi-auto");
-  const [profitOptimizerMode, setProfitOptimizerMode] = useState<AiDeploymentMode>("shadow");
-  const [riskAiMode, setRiskAiMode] = useState<AiDeploymentMode>("shadow");
-  const [miroFishMode, setMiroFishMode] = useState<AiDeploymentMode>("shadow");
-  const [hedgingAiMode, setHedgingAiMode] = useState<AiDeploymentMode>("shadow");
-  const [autoExecutionKillSwitch, setAutoExecutionKillSwitch] = useState(false);
-  const [autoSessionGuardEnabled, setAutoSessionGuardEnabled] = useState(true);
-  const [autoSessionStartHour, setAutoSessionStartHour] = useState(7);
-  const [autoSessionEndHour, setAutoSessionEndHour] = useState(22);
-  const [autoSymbolLossCapUsd, setAutoSymbolLossCapUsd] = useState(600);
-  const [autoSymbolAutoDisabled, setAutoSymbolAutoDisabled] = useState<Record<string, string>>({});
-  const [autoExecutionAuditTrail, setAutoExecutionAuditTrail] = useState<AutoExecutionAuditEvent[]>([]);
-  const [autoExecutionAuditStateFilter, setAutoExecutionAuditStateFilter] = useState<"all" | "READY" | "BLOCKED" | "KILLED">("all");
-  const [autoExecutionAuditReasonSearch, setAutoExecutionAuditReasonSearch] = useState("");
-  const [profitOptimizerPeakPnlPctByPosition, setProfitOptimizerPeakPnlPctByPosition] = useState<Record<string, number>>({});
   const [selfLearningV4Enabled, setSelfLearningV4Enabled] = useState(true);
   const [selfLearningAutoAdaptEnabled, setSelfLearningAutoAdaptEnabled] = useState(true);
   const [selfLearningModelUpdatedAt, setSelfLearningModelUpdatedAt] = useState<string | null>(null);
   const [selfLearningDriftAutoDemotedAt, setSelfLearningDriftAutoDemotedAt] = useState<string | null>(null);
-  const [selfLearningJournalV4Trail, setSelfLearningJournalV4Trail] = useState<SelfLearningJournalEventV4[]>([]);
+  const [selfLearningJournalV4Trail, setSelfLearningJournalV4Trail] = useState<any[]>([]);
   const [selfLearningJournalV4RegimeFilter, setSelfLearningJournalV4RegimeFilter] = useState<"all" | LearningRegimeV4>("all");
   const [selfLearningJournalV4ScenarioFilter, setSelfLearningJournalV4ScenarioFilter] = useState<"all" | MarketDecisionScenario>("all");
   const [selfLearningV4ScopeSummaries, setSelfLearningV4ScopeSummaries] = useState<SelfLearningV4ScopeSummary[]>([]);
@@ -5064,7 +5678,7 @@ function TradingTerminalPageHydrated() {
     stateSavedAt: null,
     scopesLoadedAt: null,
     scopeCount: 0,
-    message: "init",
+    message: "state not loaded",
   });
   const [selfLearningV5State, setSelfLearningV5State] = useState<SelfLearningV5State | null>(null);
   const [selfLearningV5ScopeSummaries, setSelfLearningV5ScopeSummaries] = useState<SelfLearningV5ScopeSummary[]>([]);
@@ -5072,8 +5686,8 @@ function TradingTerminalPageHydrated() {
     storage: "unknown",
     healthy: false,
     stateLoadedAt: null,
-    scopesLoadedAt: null,
     stateSavedAt: null,
+    scopesLoadedAt: null,
     scopeCount: 0,
     message: "init",
   });
@@ -5082,7 +5696,17 @@ function TradingTerminalPageHydrated() {
   const [selfLearningV5Status, setSelfLearningV5Status] = useState("");
   const [selfLearningShadowSchedulerEnabled, setSelfLearningShadowSchedulerEnabled] = useState(false);
   const [selfLearningShadowSchedulerIntervalMin, setSelfLearningShadowSchedulerIntervalMin] = useState(15);
-  const [selfLearningShadowSchedulerSnapshot, setSelfLearningShadowSchedulerSnapshot] = useState<ShadowSchedulerSnapshot>({
+  const [selfLearningShadowSchedulerSnapshot, setSelfLearningShadowSchedulerSnapshot] = useState<{
+    state: string;
+    enabled: boolean;
+    intervalMs: number;
+    runCount: number;
+    lastStartedAt: string | null;
+    lastSuccessAt: string | null;
+    lastErrorAt: string | null;
+    lastError: string | null;
+    inFlight: boolean;
+  }>({
     state: "stopped",
     enabled: false,
     intervalMs: 15 * 60 * 1000,
@@ -5093,31 +5717,6 @@ function TradingTerminalPageHydrated() {
     lastError: null,
     inFlight: false,
   });
-  const [miroFishShadowAuditTrail, setMiroFishShadowAuditTrail] = useState<MiroFishShadowAuditEvent[]>([]);
-  const [hedgingShadowAuditTrail, setHedgingShadowAuditTrail] = useState<HedgingShadowAuditEvent[]>([]);
-  const [mlWeightTelemetryTrail, setMlWeightTelemetryTrail] = useState<MlWeightTelemetryEvent[]>([]);
-  const [pendingExecutionAdaptation, setPendingExecutionAdaptation] = useState<{
-    signature: string;
-    plan: MarketDecisionSnapshot["executionPlan"];
-  } | null>(null);
-  const [chartHudConfirmArmed, setChartHudConfirmArmed] = useState(false);
-  const [schedulerE2eScenario, setSchedulerE2eScenario] = useState<"cancel-replace" | null>(null);
-  const selfLearningShadowSchedulerRef = useRef<SelfLearningSchedulerController | null>(null);
-  const selfLearningShadowSchedulerRunnerRef = useRef<() => Promise<void>>(async () => {});
-
-  if (!selfLearningShadowSchedulerRef.current) {
-    selfLearningShadowSchedulerRef.current = new SelfLearningSchedulerController();
-  }
-
-  const handleV2AutoReduce = useCallback(() => {
-    setNotional((value) => Math.max(1000, Math.round(value * 0.75)));
-  }, []);
-
-  const handleV2AutoClose = useCallback(() => {
-    setChartOrderTicket((current) => ({ ...current, active: false }));
-    setAutoExecutionKillSwitch(true);
-  }, []);
-
   const handleV2DomEntryFromLevel = useCallback((price: number, sideLabel: "bid" | "ask") => {
     const entry = Math.max(0.0000001, Number(price));
     const ticketSide: "buy" | "sell" = sideLabel === "ask" ? "buy" : "sell";
@@ -5281,6 +5880,58 @@ function TradingTerminalPageHydrated() {
     timeframe: "1m",
   });
   const chartSidecarDragRef = useRef<{ id: ChartSidecarId; startX: number; startY: number; origX: number; origY: number } | null>(null);
+  const [chartOrderPreviewOpen, setChartOrderPreviewOpen] = useState(false);
+  const [chartRiskGuardEnabled, setChartRiskGuardEnabled] = useState(true);
+  const [chartMaxLossUsd, setChartMaxLossUsd] = useState(uiMode === "novice" ? 120 : 250);
+  const [chartTargetGainUsd, setChartTargetGainUsd] = useState(uiMode === "novice" ? 220 : 500);
+  const [signalDisplayMode, setSignalDisplayMode] = useState<SignalDisplayMode>("augmented");
+  const [confluenceWeights, setConfluenceWeights] = useState<MarketConfluenceWeights>({ ...DEFAULT_CONFLUENCE_WEIGHTS });
+  const [showReasonLegend, setShowReasonLegend] = useState(false);
+  const [showConfluenceTune, setShowConfluenceTune] = useState(false);
+  const [showDecisionSecondary, setShowDecisionSecondary] = useState(false);
+  const [showExecutionLaneAdvanced, setShowExecutionLaneAdvanced] = useState(false);
+  const [executionAdaptMode, setExecutionAdaptMode] = useState<ExecutionAdaptMode>("auto");
+  const [autoExecutionMode, setAutoExecutionMode] = useState<AutoExecutionMode>("semi-auto");
+  const [profitOptimizerMode, setProfitOptimizerMode] = useState<AiDeploymentMode>("shadow");
+  const [riskAiMode, setRiskAiMode] = useState<AiDeploymentMode>("shadow");
+  const [miroFishMode, setMiroFishMode] = useState<AiDeploymentMode>("shadow");
+  const [hedgingAiMode, setHedgingAiMode] = useState<AiDeploymentMode>("shadow");
+  const [autoExecutionKillSwitch, setAutoExecutionKillSwitch] = useState(false);
+  const [autoSessionGuardEnabled, setAutoSessionGuardEnabled] = useState(true);
+  const [autoSessionStartHour, setAutoSessionStartHour] = useState(7);
+  const [autoSessionEndHour, setAutoSessionEndHour] = useState(22);
+  const [autoSymbolLossCapUsd, setAutoSymbolLossCapUsd] = useState(600);
+  const [autoSymbolAutoDisabled, setAutoSymbolAutoDisabled] = useState<Record<string, string>>({});
+  const [autoExecutionAuditTrail, setAutoExecutionAuditTrail] = useState<any[]>([]);
+  const [autoExecutionAuditStateFilter, setAutoExecutionAuditStateFilter] = useState<"all" | "READY" | "BLOCKED" | "KILLED">("all");
+  const [autoExecutionAuditReasonSearch, setAutoExecutionAuditReasonSearch] = useState("");
+  const [profitOptimizerPeakPnlPctByPosition, setProfitOptimizerPeakPnlPctByPosition] = useState<Record<string, number>>({});
+  const [hedgingShadowAuditTrail, setHedgingShadowAuditTrail] = useState<HedgingShadowAuditEvent[]>([]);
+  const [miroFishShadowAuditTrail, setMiroFishShadowAuditTrail] = useState<any[]>([]);
+  const [mlWeightTelemetryTrail, setMlWeightTelemetryTrail] = useState<MlWeightTelemetryEvent[]>([]);
+  const [pendingExecutionAdaptation, setPendingExecutionAdaptation] = useState<{
+    signature: string;
+    plan: MarketDecisionSnapshot["executionPlan"];
+  } | null>(null);
+  const [chartHudConfirmArmed, setChartHudConfirmArmed] = useState(false);
+  const [schedulerE2eScenario, setSchedulerE2eScenario] = useState<"cancel-replace" | null>(null);
+  const selfLearningShadowSchedulerRef = useRef<SelfLearningSchedulerController | null>(null);
+  const selfLearningShadowSchedulerRunnerRef = useRef<() => Promise<void>>(async () => {});
+  if (!selfLearningShadowSchedulerRef.current) {
+    selfLearningShadowSchedulerRef.current = new SelfLearningSchedulerController();
+  }
+  const handleV2AutoReduce = useCallback(() => {
+    setNotional((value) => Math.max(1000, Math.round(value * 0.75)));
+  }, []);
+  const handleV2AutoClose = useCallback(() => {
+    setChartOrderTicket((current) => ({
+      ...current,
+      active: false,
+    }));
+    setChartReleaseTicket(null);
+    setChartActiveSnapLine(null);
+    setChartSnapState(null);
+  }, []);
 
   const {
     chartHudBounds,
@@ -5403,43 +6054,44 @@ function TradingTerminalPageHydrated() {
     }
     const query = new URLSearchParams(window.location.search);
     const forced = query.get("v2");
-    const persisted = window.localStorage.getItem("txt.terminal.v2");
     const forcedEngine = query.get("engine");
-    const persistedEngine = window.localStorage.getItem("txt.terminal.engine");
     const forcedGpuGrid = query.get("gpuGrid");
-    const persistedGpuGrid = window.localStorage.getItem("txt.terminal.gpu-grid");
+    const persistedGpuGrid = readTerminalStorageValue("txt.terminal.gpu-grid");
     const forcedSmoothing = query.get("smoothingMs");
-    const persistedSmoothing = window.localStorage.getItem("txt.terminal.smoothing-ms");
+    const persistedSmoothing = readTerminalStorageValue("txt.terminal.smoothing-ms");
     const forcedHeatmapMode = query.get("heatmapMode") || (query.get("bookmap") === "1" ? "bookmap" : query.get("bookmap") === "0" ? "normal" : null);
-    const persistedHeatmapMode = window.localStorage.getItem(TERMINAL_BOOKMAP_MODE_STORAGE_KEY);
+    const persistedHeatmapMode = readTerminalStorageValue(TERMINAL_BOOKMAP_MODE_STORAGE_KEY);
     const forcedHeatIntensity = query.get("heatIntensity");
-    const persistedHeatIntensity = window.localStorage.getItem(TERMINAL_BOOKMAP_HEAT_INTENSITY_STORAGE_KEY);
+    const persistedHeatIntensity = readTerminalStorageValue(TERMINAL_BOOKMAP_HEAT_INTENSITY_STORAGE_KEY);
     const forcedDiscardThreshold = query.get("discardThreshold");
-    const persistedDiscardThreshold = window.localStorage.getItem(TERMINAL_BOOKMAP_DISCARD_THRESHOLD_STORAGE_KEY);
+    const persistedDiscardThreshold = readTerminalStorageValue(TERMINAL_BOOKMAP_DISCARD_THRESHOLD_STORAGE_KEY);
     const forcedMlAbsorptionMode = query.get("mlAbsorption");
-    const persistedMlAbsorptionMode = window.localStorage.getItem(TERMINAL_ML_ABSORPTION_MODE_STORAGE_KEY);
+    const persistedMlAbsorptionMode = readTerminalStorageValue(TERMINAL_ML_ABSORPTION_MODE_STORAGE_KEY);
     const forcedDataMode = query.get(TERMINAL_DATA_MODE_QUERY_KEY);
-    const persistedDataMode = window.localStorage.getItem(TERMINAL_DATA_MODE_STORAGE_KEY);
+    const persistedDataMode = readTerminalStorageValue(TERMINAL_DATA_MODE_STORAGE_KEY);
     const forcedDatasetProfile = query.get(TERMINAL_DATASET_PROFILE_QUERY_KEY);
-    const persistedDatasetProfile = window.localStorage.getItem(TERMINAL_DATASET_PROFILE_STORAGE_KEY);
+    const persistedDatasetProfile = readTerminalStorageValue(TERMINAL_DATASET_PROFILE_STORAGE_KEY);
     const forcedTruthLock = query.get(TERMINAL_TRUTH_LOCK_QUERY_KEY);
-    const persistedTruthLock = window.localStorage.getItem(TERMINAL_TRUTH_LOCK_STORAGE_KEY);
-    const persistedConfidenceMode = window.localStorage.getItem(TERMINAL_CONFIDENCE_MODE_STORAGE_KEY);
+    const persistedTruthLock = readTerminalStorageValue(TERMINAL_TRUTH_LOCK_STORAGE_KEY);
+    const persistedConfidenceMode = readTerminalStorageValue(TERMINAL_CONFIDENCE_MODE_STORAGE_KEY);
     const forcedPerfDebug = query.get("perfDebug");
-    const persistedPerfDebug = window.localStorage.getItem(TERMINAL_COMPUTE_PERF_STORAGE_KEY);
+    const persistedPerfDebug = readTerminalStorageValue(TERMINAL_COMPUTE_PERF_STORAGE_KEY);
     const forcedChartIsolation = query.get("chartIsolation") || query.get("isolateChart");
-    const persistedChartIsolation = window.localStorage.getItem(TERMINAL_CHART_ISOLATION_STORAGE_KEY);
+    const persistedChartIsolation = readTerminalStorageValue(TERMINAL_CHART_ISOLATION_STORAGE_KEY);
     const forcedSchedulerScenario = query.get("e2eScheduler");
     const forcedBootProfile = query.get("boot");
-    const persistedBootProfile = window.localStorage.getItem(TERMINAL_BOOT_PROFILE_STORAGE_KEY);
-    const webgl2 = isWebGL2Available();
+    const persistedBootProfile = readTerminalStorageValue(TERMINAL_BOOT_PROFILE_STORAGE_KEY);
+    const persistedOpsSurfaceMode = readTerminalStorageValue(TERMINAL_OPS_SURFACE_MODE_STORAGE_KEY);
+    const chartRuntimeSelection = resolveTerminalChartRuntimeSelection();
     const allowAutomationOverride = Boolean(navigator.webdriver)
       || ["127.0.0.1", "localhost"].includes(window.location.hostname);
-    const allowEngineAutomationOverride = Boolean(navigator.webdriver);
-    if (forced === "1" || persisted === "1") {
-      setTerminalV2Enabled(true);
-    } else if (forced === "0" || persisted === "0") {
-      setTerminalV2Enabled(false);
+    setTerminalV2Enabled(chartRuntimeSelection.terminalV2Enabled);
+    if ((forcedEngine === "v4" || forcedEngine === "v3") && forced !== "0") {
+      try {
+        window.localStorage.setItem("txt.terminal.v2", "1");
+      } catch {
+        // noop
+      }
     }
 
     if (forcedChartIsolation === "1" || persistedChartIsolation === "1") {
@@ -5448,23 +6100,18 @@ function TradingTerminalPageHydrated() {
       setChartIsolationMode(false);
     }
 
+    setTerminalPassiveMode(resolveTerminalPassiveModeQueryValue(query));
+
     setSchedulerE2eScenario(
       allowAutomationOverride && forcedSchedulerScenario === "cancel-replace"
         ? "cancel-replace"
         : null,
     );
 
-    const requestedEngine = forcedEngine === "v4" || persistedEngine === "v4"
-      ? "v4"
-      : forcedEngine === "v3" || persistedEngine === "v3"
-        ? "v3"
-        : TERMINAL_CHART_ENGINE_DEFAULT;
+    setChartEngineMode(chartRuntimeSelection.chartEngineMode);
 
-    const effectiveEngine = requestedEngine === "v4" && !webgl2 && !allowEngineAutomationOverride ? "v3" : requestedEngine;
-    setChartEngineMode(effectiveEngine);
-
-    if (effectiveEngine !== requestedEngine) {
-      window.localStorage.setItem("txt.terminal.engine", effectiveEngine);
+    if (chartRuntimeSelection.chartEngineMode !== chartRuntimeSelection.requestedEngine) {
+      window.localStorage.setItem("txt.terminal.engine", chartRuntimeSelection.chartEngineMode);
     }
 
     if (forcedPerfDebug === "1" || persistedPerfDebug === "1") {
@@ -5484,16 +6131,19 @@ function TradingTerminalPageHydrated() {
     } catch {
       // noop
     }
+    if (persistedOpsSurfaceMode === "context" || persistedOpsSurfaceMode === "diagnostic") {
+      setTerminalOpsSurfaceMode(persistedOpsSurfaceMode);
+    }
     if (allowAutomationOverride && resolvedBootProfile === "light") {
-      setTerminalDensityMode("focus");
+      requestTerminalDensityMode("focus", "runtime", { force: true });
       setFocusDecks([]);
     }
 
     console.info("[terminal] engine runtime selection", {
-      requestedEngine,
-      effectiveEngine,
-      webgl2,
-      automationOverride: allowEngineAutomationOverride,
+      requestedEngine: chartRuntimeSelection.requestedEngine,
+      effectiveEngine: chartRuntimeSelection.chartEngineMode,
+      webgl2: chartRuntimeSelection.webgl2,
+      automationOverride: chartRuntimeSelection.automationOverride,
     });
 
     const parsedGrid = parseGpuViewportGrid(forcedGpuGrid) ?? parseGpuViewportGrid(persistedGpuGrid);
@@ -5553,7 +6203,29 @@ function TradingTerminalPageHydrated() {
       : "standard";
     setConfidencePolicyMode(requestedConfidenceMode);
     window.localStorage.setItem(TERMINAL_CONFIDENCE_MODE_STORAGE_KEY, requestedConfidenceMode);
+  }, [requestTerminalDensityMode]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    try {
+      setTerminalUiDebugVisible(window.localStorage.getItem(TERMINAL_UI_DEBUG_STORAGE_KEY) === "1");
+    } catch {
+      setTerminalUiDebugVisible(false);
+    }
   }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    try {
+      window.localStorage.setItem(TERMINAL_UI_DEBUG_STORAGE_KEY, terminalUiDebugVisible ? "1" : "0");
+    } catch {
+      // noop
+    }
+  }, [terminalUiDebugVisible]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -5633,15 +6305,34 @@ function TradingTerminalPageHydrated() {
     if (typeof window === "undefined") {
       return;
     }
+    try {
+      window.localStorage.setItem(TERMINAL_OPS_SURFACE_MODE_STORAGE_KEY, terminalOpsSurfaceMode);
+    } catch {
+      // noop
+    }
+  }, [terminalOpsSurfaceMode]);
+
+  useEffect(() => {
+    if (layoutEditMode) {
+      requestTerminalOpsSurfaceMode("diagnostic", "layout-edit", { force: true });
+    }
+  }, [layoutEditMode, requestTerminalOpsSurfaceMode]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
     window.localStorage.setItem(TERMINAL_CHART_ISOLATION_STORAGE_KEY, chartIsolationMode ? "1" : "0");
     if (!chartIsolationMode) {
       return;
     }
-    setTerminalDensityMode("focus");
+    armTerminalOpsTransition("hiding-deck", "runtime");
+    requestTerminalDensityMode("focus", "runtime", { force: true });
+    armTerminalFloatingTransition("resetting", "runtime", "reset");
     setFocusDecks([]);
     setFloatingPanels([]);
     setTerminalV2Enabled(false);
-  }, [chartIsolationMode]);
+  }, [armTerminalFloatingTransition, armTerminalOpsTransition, chartIsolationMode, requestTerminalDensityMode]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -5668,6 +6359,10 @@ function TradingTerminalPageHydrated() {
   }, []);
 
   const toggleChartEngineMode = useCallback(() => {
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem("txt.terminal.v2", "1");
+    }
+    setTerminalV2Enabled(true);
     setChartEngineMode((current) => {
       const next = current === "v4" ? "v3" : "v4";
       if (typeof window !== "undefined") {
@@ -5731,6 +6426,7 @@ function TradingTerminalPageHydrated() {
     authStatusSyncedAtRef.current = Date.now();
     authStatusRef.current = "unauthenticated";
     setAuthStatus("unauthenticated");
+    setAuthOperatorUsername("");
     setAuthSessionRequired(true);
   };
 
@@ -5755,7 +6451,7 @@ function TradingTerminalPageHydrated() {
       return authenticated;
     }
     const request = fetchTerminalAuthStatus(wasAuthenticated)
-      .then(({ authenticated, definitive }) => {
+      .then(({ authenticated, definitive, username }) => {
         if (!definitive) {
           if (wasAuthenticated) {
             setAuthStatus("authenticated");
@@ -5767,6 +6463,7 @@ function TradingTerminalPageHydrated() {
         authStatusSyncedAtRef.current = Date.now();
         authStatusRef.current = authenticated ? "authenticated" : "unauthenticated";
         setAuthStatus(authenticated ? "authenticated" : "unauthenticated");
+        setAuthOperatorUsername(authenticated ? username : "");
         setAuthSessionRequired(!authenticated);
         if (authenticated) {
           authBackoffUntilRef.current = 0;
@@ -5802,6 +6499,12 @@ function TradingTerminalPageHydrated() {
       "x-mc-origin": "terminal",
     };
   };
+
+  const [chartSnapState, setChartSnapState] = useState<ChartSnapState>(null);
+  const [chartActiveSnapLine, setChartActiveSnapLine] = useState<ChartOrderLineKey | null>(null);
+  const [chartSnapPulseLine, setChartSnapPulseLine] = useState<ChartOrderLineKey | null>(null);
+  const [chartReleaseTicket, setChartReleaseTicket] = useState<ChartReleaseTicketState>(null);
+  const [chartReleaseValidationPulse, setChartReleaseValidationPulse] = useState(false);
 
   useEffect(() => {
     chartOrderTicketRef.current = chartOrderTicket;
@@ -5883,6 +6586,19 @@ function TradingTerminalPageHydrated() {
     : null;
   const selectedChartInstrument = normalizeInstrument(String(selectedChartQuote?.instrument || selectedChartSymbol || "BTCUSD"));
   const chartLiveFeedKey = `${selectedChartInstrument}|${selectedChartVenue}|${chartTimeframe}`;
+  useEffect(() => {
+    if (!terminalPassiveMode) {
+      setTerminalPassiveFrameCandles([]);
+      setTerminalPassiveFrameMeta(null);
+      return undefined;
+    }
+    setTerminalPassiveFrameCandles([]);
+    setTerminalPassiveFrameMeta(null);
+    return subscribeChartFrame(chartLiveFeedKey, (frame) => {
+      setTerminalPassiveFrameCandles(frame.candles);
+      setTerminalPassiveFrameMeta(frame.meta);
+    });
+  }, [chartLiveFeedKey, terminalPassiveMode]);
   const chartSurfaceFrozen = chartLoading || chartTimeframeSwitchPending;
   const marketBusGateSnapshot = useMemo(() => {
     const instrument = String(selectedChartInstrument || "").trim();
@@ -6069,6 +6785,34 @@ function TradingTerminalPageHydrated() {
     marketSnapshotInflightRef.current.set(cacheKey, request);
     return request;
   }, []);
+
+  useEffect(() => {
+    if (terminalPassiveMode) {
+      setCrossMarketTruthSummary(null);
+      return;
+    }
+    let cancelled = false;
+    const loadCrossMarketTruth = async () => {
+      const snapshots = await Promise.all(
+        CROSS_MARKET_MINIMAL_BASKET.map(async (spec) => ({
+          spec,
+          snapshot: await fetchMarketBusSnapshot(spec.instrument, spec.venue, spec.timeframe),
+        })),
+      );
+      if (cancelled) {
+        return;
+      }
+      setCrossMarketTruthSummary(buildCrossMarketTruthSummary(snapshots));
+    };
+    void loadCrossMarketTruth();
+    const timer = window.setInterval(() => {
+      void loadCrossMarketTruth();
+    }, 60_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [fetchMarketBusSnapshot, terminalPassiveMode]);
 
   useEffect(() => () => {
     if (chartLongPressTimerRef.current !== null) {
@@ -6706,6 +7450,14 @@ function TradingTerminalPageHydrated() {
 
   useEffect(() => {
     let cancelled = false;
+    if (terminalPassiveMode) {
+      setSelfLearningV5State(null);
+      setSelfLearningV5Status("");
+      setSelfLearningV5ScopeSummaries([]);
+      return () => {
+        cancelled = true;
+      };
+    }
     if (authSessionRequired) {
       setSelfLearningV5PersistenceStatus((current) => ({
         ...current,
@@ -6789,7 +7541,7 @@ function TradingTerminalPageHydrated() {
     return () => {
       cancelled = true;
     };
-  }, [accountId, authSessionRequired, chartTimeframe, selectedChartSymbol]);
+  }, [accountId, authSessionRequired, chartTimeframe, selectedChartSymbol, terminalPassiveMode]);
 
   const currentLayoutSnapshot = (): TerminalLayoutConfig => ({
     preset: layoutPreset,
@@ -6859,6 +7611,7 @@ function TradingTerminalPageHydrated() {
     setLayoutMicroOrder(normalized.microOrder);
     setLayoutLowerOrder(normalized.lowerOrder);
     setLayoutMonitoringOrder(normalized.monitoringOrder);
+    armTerminalFloatingTransition("syncing-layout", "runtime", "layout-sync", normalized.floatingPanels[0]?.id);
     setFloatingPanels(normalized.floatingPanels);
     setChartSidecarProfile(normalized.chartSidecar.profile);
     setDetachedChartSidecars(normalized.chartSidecar.detached);
@@ -6894,6 +7647,7 @@ function TradingTerminalPageHydrated() {
     setLayoutMicroOrder(next.microOrder);
     setLayoutLowerOrder(next.lowerOrder);
     setLayoutMonitoringOrder(next.monitoringOrder);
+    armTerminalFloatingTransition("syncing-layout", "runtime", "layout-sync", next.floatingPanels[0]?.id);
     setFloatingPanels(next.floatingPanels);
     setChartSidecarProfile(next.chartSidecar.profile);
     setDetachedChartSidecars(next.chartSidecar.detached);
@@ -6912,13 +7666,13 @@ function TradingTerminalPageHydrated() {
       return;
     }
     setUiMode(plan.uiMode);
-    setTerminalDensityMode(plan.densityMode);
+    requestTerminalDensityMode(plan.densityMode, "adaptive-guide", { force: true });
     applyLayoutPreset(plan.layoutPreset);
     setTerminalOnboardingExpanded(true);
     setGuidedCoachTargetId(plan.steps[0]?.targetId || "terminal-onboarding");
     setCoachOverlayVisible(true);
     focusAdaptiveGuideTarget("terminal-onboarding");
-  }, [applyLayoutPreset, focusAdaptiveGuideTarget, setUiMode, terminalAdaptiveGuide.plans]);
+  }, [applyLayoutPreset, focusAdaptiveGuideTarget, requestTerminalDensityMode, setUiMode, terminalAdaptiveGuide.plans]);
 
   useEffect(() => {
     if (terminalDensityMode !== "focus") {
@@ -6943,6 +7697,36 @@ function TradingTerminalPageHydrated() {
     focusDecksRef.current = focusDecks;
   }, [focusDecks]);
 
+  useEffect(() => {
+    terminalOpsSurfaceModeRef.current = terminalOpsSurfaceMode;
+  }, [terminalOpsSurfaceMode]);
+
+  useEffect(() => {
+    terminalOpsTransitionLockedRef.current = terminalOpsTransitionLocked;
+  }, [terminalOpsTransitionLocked]);
+
+  useEffect(() => {
+    terminalDensityTransitionLockedRef.current = terminalDensityTransitionLocked;
+  }, [terminalDensityTransitionLocked]);
+
+  useEffect(() => {
+    terminalFloatingTransitionLockedRef.current = terminalFloatingTransitionLocked;
+  }, [terminalFloatingTransitionLocked]);
+
+  useEffect(() => {
+    return () => {
+      if (terminalOpsTransitionTimerRef.current != null) {
+        window.clearTimeout(terminalOpsTransitionTimerRef.current);
+      }
+      if (terminalDensityTransitionTimerRef.current != null) {
+        window.clearTimeout(terminalDensityTransitionTimerRef.current);
+      }
+      if (terminalFloatingTransitionTimerRef.current != null) {
+        window.clearTimeout(terminalFloatingTransitionTimerRef.current);
+      }
+    };
+  }, []);
+
   const chartBootReady = terminalBootProfile === "full" || terminalBootStage !== "shell";
   const deckBootReady = terminalBootProfile === "full" || terminalBootStage === "decks";
   const renderExtendedTerminalModules = terminalDensityMode === "full" && deckBootReady;
@@ -6954,6 +7738,7 @@ function TradingTerminalPageHydrated() {
   const showMetaRiskDeck = !chartIsolationMode && (renderExtendedTerminalModules || focusDeckSet.has("metaRisk"));
   const showCorrelationDeck = !chartIsolationMode && (renderExtendedTerminalModules || focusDeckSet.has("correlation"));
   const showCalibrationDeck = !chartIsolationMode && (renderExtendedTerminalModules || focusDeckSet.has("calibration"));
+  const terminalOpsSurfaceRuntimeState = resolveTerminalOpsSurfaceRuntimeState(showMonitoringDeck, terminalOpsSurfaceMode);
   const chartSidecarMicroRealtimeEnabled = renderExtendedTerminalModules || focusDeckSet.has("micro");
   const sidecarProfileCards = CHART_SIDECAR_PROFILE_LAYOUTS[chartSidecarProfile].cards;
   const hasDomTapeSidecarConsumer = chartSidecarMicroRealtimeEnabled && sidecarProfileCards.includes("domTape");
@@ -6963,12 +7748,27 @@ function TradingTerminalPageHydrated() {
   const hasFastMarketMicroConsumer = showMicroDeck;
 
   const toggleFocusDeck = (deckId: TerminalFocusDeckId) => {
+    if (deckId === "monitoring" && terminalOpsTransitionLockedRef.current) {
+      return;
+    }
     setFocusDecks((current) => (
       current.includes(deckId)
         ? current.filter((item) => item !== deckId)
         : [...current, deckId]
     ));
   };
+
+  useEffect(() => {
+    if (previousShowMonitoringDeckRef.current == null) {
+      previousShowMonitoringDeckRef.current = showMonitoringDeck;
+      return;
+    }
+    if (previousShowMonitoringDeckRef.current === showMonitoringDeck) {
+      return;
+    }
+    armTerminalOpsTransition(showMonitoringDeck ? "showing-deck" : "hiding-deck", "runtime");
+    previousShowMonitoringDeckRef.current = showMonitoringDeck;
+  }, [armTerminalOpsTransition, showMonitoringDeck]);
 
   const shouldCommitThrottledChannel = useCallback((channelKey: string, throttleMs: number): boolean => {
     if (terminalDensityModeRef.current !== "focus") {
@@ -7013,6 +7813,10 @@ function TradingTerminalPageHydrated() {
   }, []);
 
   const resetFloatingPanels = () => {
+    if (terminalFloatingTransitionLockedRef.current) {
+      return;
+    }
+    armTerminalFloatingTransition("resetting", "toolbar", "reset");
     setFloatingPanels((current) => {
       for (const panel of current) {
         insertDockPanel(panel.fromZone, panel.id);
@@ -7488,6 +8292,10 @@ function TradingTerminalPageHydrated() {
 
   // ─── Floating panel detach / dock ────────────────────────────────────────
   const detachPanel = (id: DockPanelId, zone: DockZone) => {
+    if (terminalFloatingTransitionLockedRef.current) {
+      return;
+    }
+    armTerminalFloatingTransition("detaching", "layout-edit", "detach", id);
     removeDockPanel(zone, id);
     const cx = typeof window !== "undefined" ? Math.max(60, window.innerWidth / 2 - 185) : 200;
     const cy = typeof window !== "undefined" ? Math.max(60, window.innerHeight / 2 - 155) : 150;
@@ -7495,18 +8303,26 @@ function TradingTerminalPageHydrated() {
   };
 
   const dockPanel = (id: DockPanelId) => {
+    if (terminalFloatingTransitionLockedRef.current) {
+      return;
+    }
     const fp = floatingPanels.find((f) => f.id === id);
     if (!fp) {
       return;
     }
+    armTerminalFloatingTransition("docking", "layout-edit", "dock", id);
     setFloatingPanels((prev) => prev.filter((f) => f.id !== id));
     insertDockPanel(fp.fromZone, id);
   };
 
   const detachChartSidecar = (id: ChartSidecarId) => {
+    if (terminalFloatingTransitionLockedRef.current) {
+      return;
+    }
     const defaults = CHART_SIDECAR_FLOATING_DEFAULTS[id];
     const cx = typeof window !== "undefined" ? Math.max(60, window.innerWidth / 2 - defaults.w / 2) : 220;
     const cy = typeof window !== "undefined" ? Math.max(60, window.innerHeight / 2 - defaults.h / 2) : 180;
+    armTerminalFloatingTransition("detaching", "layout-edit", "detach", id);
     setDetachedChartSidecars((current) => [
       ...current.filter((panel) => panel.id !== id),
       clampDetachedChartSidecar({ id, x: cx, y: cy, w: defaults.w, h: defaults.h }),
@@ -7514,11 +8330,20 @@ function TradingTerminalPageHydrated() {
   };
 
   const dockChartSidecar = (id: ChartSidecarId) => {
+    if (terminalFloatingTransitionLockedRef.current) {
+      return;
+    }
+    armTerminalFloatingTransition("docking", "layout-edit", "dock", id);
     setDetachedChartSidecars((current) => current.filter((panel) => panel.id !== id));
   };
 
   const applyChartSidecarLayout = (mode: Exclude<ChartSidecarLayoutMode, "custom">) => {
-    setDetachedChartSidecars(buildDetachedChartSidecarLayout(chartSidecarProfile, mode));
+    if (terminalFloatingTransitionLockedRef.current) {
+      return;
+    }
+    const nextDetached = buildDetachedChartSidecarLayout(chartSidecarProfile, mode);
+    armTerminalFloatingTransition("syncing-layout", "layout-edit", "layout-sync", nextDetached[0]?.id);
+    setDetachedChartSidecars(nextDetached);
   };
 
   const loadAll = async (force = false) => {
@@ -7552,13 +8377,40 @@ function TradingTerminalPageHydrated() {
       }
     };
 
-    const [snapshotPayload, readinessPayload, aiPayload, overviewPayload, liveOpsResponsePayload, executionPnlAnalyzerResponsePayload, executionOptimizerLiveResponsePayload, executionAiV6ResponsePayload, marketVenueTelemetryResponsePayload, routeVenueTelemetryResponsePayload, incidentPayload, pendingPayload, outcomePayload, mt5Payload, quotesPayload, positionsPayload, balancePayload, performanceSummaryPayload, performanceAttributionPayload, accountsPayload, connectorAccountsPayload, investorReportsPayload] = await Promise.all([
-      fetchMaybeUnauthorized("/api/connectors/status"),
+    const fetchOptionalJson = async (url: string, timeoutMs: number, init: RequestInit = {}): Promise<unknown | null> => {
+      const abortController = new AbortController();
+      const timeoutId = window.setTimeout(() => abortController.abort(), timeoutMs);
+      try {
+        const response = await fetch(url, {
+          cache: "no-store",
+          ...init,
+          signal: abortController.signal,
+        });
+        if (!response.ok) {
+          return null;
+        }
+        return response.json();
+      } catch {
+        return null;
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
+    };
+
+    void fetchOptionalJson("/api/connectors/status", 2500).then((payload) => {
+      if (payload && typeof payload === "object") {
+        setSnapshot(payload as JsonMap);
+      }
+    });
+
+    const passiveObservationMode = terminalPassiveMode;
+
+    const [readinessPayload, aiPayload, overviewPayload, liveOpsResponsePayload, executionPnlAnalyzerResponsePayload, executionOptimizerLiveResponsePayload, executionAiV6ResponsePayload, marketVenueTelemetryResponsePayload, routeVenueTelemetryResponsePayload, incidentPayload, pendingPayload, outcomePayload, mt5Payload, quotesPayload, positionsPayload, balancePayload, performanceSummaryPayload, performanceAttributionPayload, accountsPayload, connectorAccountsPayload, investorReportsPayload] = await Promise.all([
       fetchMaybeUnauthorized("/api/live-readiness/overview"),
       fetchMaybeUnauthorized("/api/ai/health"),
-      fetchMaybeUnauthorized("/api/dashboard/overview"),
+      passiveObservationMode ? Promise.resolve(null) : fetchMaybeUnauthorized("/api/dashboard/overview"),
       fetchMaybeUnauthorized("/api/system/live-ops"),
-      fetchMaybeUnauthorized("/api/execution/pnl-analyzer?scope_type=strategy&scope_id=mt5-live&limit=50", {
+      passiveObservationMode ? Promise.resolve(null) : fetchMaybeUnauthorized("/api/execution/pnl-analyzer?scope_type=strategy&scope_id=mt5-live&limit=50", {
         headers: buildRoutingRequestHeaders("ui", selectedChartSymbol),
       }).catch(() => null),
       fetchMaybeUnauthorized("/api/execution/optimizer/live-state", {
@@ -7571,18 +8423,18 @@ function TradingTerminalPageHydrated() {
       fetchMaybeUnauthorized("/api/execution/routing/venues/telemetry?lookback_minutes=240", {
         headers: buildRoutingRequestHeaders("ui", selectedChartSymbol),
       }).catch(() => null),
-      fetchMaybeUnauthorized("/api/incidents"),
-      fetchArrayFallback("/api/mt5/orders/live-pending"),
-      fetchArrayFallback("/api/outcomes/recent?limit=20"),
+      passiveObservationMode ? Promise.resolve(null) : fetchMaybeUnauthorized("/api/incidents"),
+      passiveObservationMode ? Promise.resolve([]) : fetchArrayFallback("/api/mt5/orders/live-pending"),
+      passiveObservationMode ? Promise.resolve([]) : fetchArrayFallback("/api/outcomes/recent?limit=20"),
       fetchMaybeUnauthorized("/api/mt5/health"),
       fetchMaybeUnauthorized("/api/market/quotes"),
       fetchMaybeUnauthorized("/api/broker/positions"),
       fetchMaybeUnauthorized("/api/broker/balance"),
-      fetchMaybeUnauthorized("/api/performance/summary?scope_type=strategy&scope_id=mt5-live"),
-      fetchMaybeUnauthorized("/api/performance/attribution?scope_type=strategy&scope_id=mt5-live&group_by=strategy,symbol,venue"),
-      fetchMaybeUnauthorized("/api/accounts"),
-      fetchMaybeUnauthorized("/api/connectors/accounts"),
-      fetchMaybeUnauthorized("/api/investor-reports?portfolio_id=pf-internal-main&limit=1"),
+      passiveObservationMode ? Promise.resolve(null) : fetchMaybeUnauthorized("/api/performance/summary?scope_type=strategy&scope_id=mt5-live"),
+      passiveObservationMode ? Promise.resolve(null) : fetchMaybeUnauthorized("/api/performance/attribution?scope_type=strategy&scope_id=mt5-live&group_by=strategy,symbol,venue"),
+      passiveObservationMode ? Promise.resolve(null) : fetchMaybeUnauthorized("/api/accounts"),
+      passiveObservationMode ? Promise.resolve(null) : fetchMaybeUnauthorized("/api/connectors/accounts"),
+      passiveObservationMode ? Promise.resolve(null) : fetchMaybeUnauthorized("/api/investor-reports?portfolio_id=pf-internal-main&limit=1"),
     ]);
 
     if (sawUnauthorized) {
@@ -7596,7 +8448,6 @@ function TradingTerminalPageHydrated() {
 
     const nextQuotes = Array.isArray(quotesPayload) ? (quotesPayload as JsonMap[]) : [];
 
-    setSnapshot(snapshotPayload && typeof snapshotPayload === "object" ? (snapshotPayload as JsonMap) : null);
     setReadiness(readinessPayload && typeof readinessPayload === "object" ? (readinessPayload as JsonMap) : null);
     setAiHealth(aiPayload && typeof aiPayload === "object" ? (aiPayload as JsonMap) : null);
     setOverview(overviewPayload && typeof overviewPayload === "object" ? (overviewPayload as JsonMap) : null);
@@ -7629,20 +8480,7 @@ function TradingTerminalPageHydrated() {
         : [],
     );
 
-    setQuoteHistory((current) => {
-      const updated: QuoteHistoryMap = { ...current };
-      const label = new Date().toISOString();
-      for (const quote of nextQuotes) {
-        const quoteSymbol = normalizeInstrument(String(quote.instrument || instrumentLabel(quote)));
-        if (!quoteSymbol) {
-          continue;
-        }
-        const nextPoint = { label, value: toNumber(quote.last, 0) };
-        const existing = updated[quoteSymbol] || [];
-        updated[quoteSymbol] = [...existing, nextPoint].slice(-40);
-      }
-      return updated;
-    });
+    setQuoteHistory((current) => appendQuoteHistorySnapshot(current, nextQuotes, 40));
   };
 
   useEffect(() => {
@@ -7706,6 +8544,61 @@ function TradingTerminalPageHydrated() {
   }, [authSessionRequired, authStatus]);
 
   useEffect(() => {
+    let active = true;
+
+    const selectedBrokerProvider = String(selectedBrokerCapabilities.provider || "").trim().toLowerCase();
+    const selectedBrokerVenue = String(selectedBrokerCapabilities.preferredVenue || "").trim().toLowerCase();
+    const selectedAccountUsesMt5 = selectedBrokerProvider === "mt5"
+      || selectedBrokerVenue.includes("mt5")
+      || String(accountId || "").trim().toLowerCase().startsWith("mt5");
+
+    const refreshMt5Governance = async () => {
+      if (!selectedAccountUsesMt5) {
+        if (active) {
+          setMt5GovernancePayload(null);
+        }
+        return;
+      }
+      if (authSessionRequired || authStatus !== "authenticated" || Date.now() < authBackoffUntilRef.current) {
+        return;
+      }
+      if (shouldPauseNonEssentialRefresh()) {
+        return;
+      }
+      try {
+        const response = await fetch("/api/system/micro-live-stage?provider=mt5", { cache: "no-store" });
+        if (!active) {
+          return;
+        }
+        if (response.status === 401 || response.status === 403) {
+          markUnauthorizedBackoff();
+          return;
+        }
+        if (!response.ok) {
+          return;
+        }
+        const payload = await response.json().catch(() => null);
+        if (active) {
+          setMt5GovernancePayload(payload && typeof payload === "object" ? payload as JsonMap : null);
+        }
+      } catch {
+        // noop
+      }
+    };
+
+    void refreshMt5Governance();
+    const intervalMs = isGtixPublicBrowserHost() ? PUBLIC_TERMINAL_BACKGROUND_REFRESH_MS : 60_000;
+    const timer = window.setInterval(() => {
+      void refreshMt5Governance();
+    }, intervalMs);
+
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [accountId, authSessionRequired, authStatus, chartVenueOverride, snapshot]);
+
+  useEffect(() => {
     if (!AUTO_TUNING_WRITEBACK_ENABLED) return;
 
     let active = true;
@@ -7748,20 +8641,7 @@ function TradingTerminalPageHydrated() {
 
     const applyQuoteSnapshot = (nextQuotes: JsonMap[]) => {
       setQuotes(nextQuotes);
-      setQuoteHistory((current) => {
-        const updated: QuoteHistoryMap = { ...current };
-        const label = new Date().toISOString();
-        for (const quote of nextQuotes) {
-          const quoteSymbol = normalizeInstrument(String(quote.instrument || instrumentLabel(quote)));
-          if (!quoteSymbol) {
-            continue;
-          }
-          const nextPoint = { label, value: toNumber(quote.last, 0) };
-          const existing = updated[quoteSymbol] || [];
-          updated[quoteSymbol] = [...existing, nextPoint].slice(-160);
-        }
-        return updated;
-      });
+      setQuoteHistory((current) => appendQuoteHistorySnapshot(current, nextQuotes, 160));
     };
 
     const schedulePoll = (delayMs: number) => {
@@ -7906,10 +8786,11 @@ function TradingTerminalPageHydrated() {
         || allowSlowMarketMicroFeed;
       setOhlcvBars((current) => {
         const activeConfig = activeChartConfigRef.current;
-        if (snapshot.ohlcvBars.length > 0) {
-          const snapshotInstrument = normalizeInstrument(String(snapshot.ohlcvBars[0]?.instrument || activeConfig.instrument));
-          const snapshotVenue = String(snapshot.ohlcvBars[0]?.venue || activeConfig.venue);
-          const snapshotTimeframe = String(snapshot.ohlcvBars[0]?.tf || activeConfig.timeframe);
+        const sanitizedSnapshotBars = sanitizeChartDisplayBars(snapshot.ohlcvBars, activeConfig.timeframe);
+        if (sanitizedSnapshotBars.length > 0) {
+          const snapshotInstrument = normalizeInstrument(String(sanitizedSnapshotBars[0]?.instrument || activeConfig.instrument));
+          const snapshotVenue = String(sanitizedSnapshotBars[0]?.venue || activeConfig.venue);
+          const snapshotTimeframe = String(sanitizedSnapshotBars[0]?.tf || activeConfig.timeframe);
           const matchesActiveConfig = chartInstrumentsMatch(snapshotInstrument, activeConfig.instrument)
             && snapshotVenue === activeConfig.venue
             && snapshotTimeframe === activeConfig.timeframe;
@@ -7917,16 +8798,16 @@ function TradingTerminalPageHydrated() {
             return current;
           }
           const currentLast = current[current.length - 1];
-          const nextLast = snapshot.ohlcvBars[snapshot.ohlcvBars.length - 1];
+          const nextLast = sanitizedSnapshotBars[sanitizedSnapshotBars.length - 1];
           if (
-            current.length === snapshot.ohlcvBars.length
+            current.length === sanitizedSnapshotBars.length
             && currentLast?.t === nextLast?.t
             && currentLast?.c === nextLast?.c
             && currentLast?.v === nextLast?.v
           ) {
             return current;
           }
-          return snapshot.ohlcvBars;
+          return sanitizedSnapshotBars;
         }
         if (current.length === 0) {
           return current;
@@ -8177,6 +9058,10 @@ function TradingTerminalPageHydrated() {
   }, [kernelBenchmarkRate]);
 
   useEffect(() => {
+    if (terminalPassiveMode) {
+      chartRestFallbackKeyRef.current = "";
+      return;
+    }
     if (authSessionRequired || authStatus !== "authenticated") {
       chartRestFallbackKeyRef.current = "";
       return;
@@ -8227,14 +9112,18 @@ function TradingTerminalPageHydrated() {
               }
 
               const activeConfig = activeChartConfigRef.current;
-              const payloadInstrument = normalizeInstrument(String((barsPayload[0] as OhlcvBar | undefined)?.instrument || activeConfig.instrument));
-              const payloadVenue = String((barsPayload[0] as OhlcvBar | undefined)?.venue || activeConfig.venue);
-              const payloadTimeframe = String((barsPayload[0] as OhlcvBar | undefined)?.tf || activeConfig.timeframe);
+              const sanitizedBars = sanitizeChartDisplayBars(barsPayload as OhlcvBar[], activeConfig.timeframe);
+              if (sanitizedBars.length === 0) {
+                return current;
+              }
+              const payloadInstrument = normalizeInstrument(String(sanitizedBars[0]?.instrument || activeConfig.instrument));
+              const payloadVenue = String(sanitizedBars[0]?.venue || activeConfig.venue);
+              const payloadTimeframe = String(sanitizedBars[0]?.tf || activeConfig.timeframe);
 
               return chartInstrumentsMatch(payloadInstrument, activeConfig.instrument)
                 && payloadVenue === activeConfig.venue
                 && payloadTimeframe === activeConfig.timeframe
-                ? (barsPayload as OhlcvBar[])
+                ? sanitizedBars
                 : current;
             });
           setChartLoading(false);
@@ -8263,12 +9152,18 @@ function TradingTerminalPageHydrated() {
     selectedChartInstrument,
     selectedChartSymbol,
     selectedChartVenue,
+    terminalPassiveMode,
   ]);
 
   useEffect(() => {
     marketMetricsAbortRef.current?.abort();
     const controller = new AbortController();
     marketMetricsAbortRef.current = controller;
+    if (terminalPassiveMode) {
+      setMarketMetricsBySymbol({});
+      controller.abort();
+      return;
+    }
     if (authSessionRequired || authStatus !== "authenticated" || Date.now() < authBackoffUntilRef.current) {
       controller.abort();
       return;
@@ -8339,9 +9234,14 @@ function TradingTerminalPageHydrated() {
       window.clearInterval(timer);
       controller.abort();
     };
-  }, [authSessionRequired, authStatus, chartTimeframe, fetchMarketBusSnapshot, marketMetricsUniverseKey, marketFilter, selectedChartMetricCandidates, selectedChartVenue, symbolFilter]);
+  }, [authSessionRequired, authStatus, chartTimeframe, fetchMarketBusSnapshot, marketMetricsUniverseKey, marketFilter, selectedChartMetricCandidates, selectedChartVenue, symbolFilter, terminalPassiveMode]);
 
   useEffect(() => {
+    if (terminalPassiveMode) {
+      setTelemetryStreamState("offline");
+      setExecutionTelemetry([]);
+      return;
+    }
     let socket: WebSocket | null = null;
     let reconnectTimer: number | null = null;
     let pingTimer: number | null = null;
@@ -8489,7 +9389,7 @@ function TradingTerminalPageHydrated() {
       }
       socket?.close();
     };
-  }, []);
+  }, [terminalPassiveMode]);
 
   useEffect(() => {
     const candidateIds = (executionTelemetry.length > 0 ? executionTelemetry : outcomes)
@@ -8607,6 +9507,14 @@ function TradingTerminalPageHydrated() {
   }, [replayPayload]);
 
   function buildTradeTicketBody(overrides?: TradeTicketOverrides): JsonMap {
+    const orderIntent = {
+      ...(overrides?.orderIntent || {}),
+      final_decision_truth: finalDecisionTruth,
+    };
+    const metadata = {
+      ...(overrides?.metadata || {}),
+      final_decision_truth: finalDecisionTruth,
+    };
     return {
       account_id: accountId,
       symbol: overrides?.symbol || symbol,
@@ -8617,8 +9525,8 @@ function TradingTerminalPageHydrated() {
       preferred_venue: overrides?.preferredVenue,
       rationale: overrides?.rationale || rationale,
       predictor_context: predictorRequestPayload,
-      order_intent: overrides?.orderIntent,
-      metadata: overrides?.metadata,
+      order_intent: orderIntent,
+      metadata,
     };
   }
 
@@ -8831,8 +9739,8 @@ function TradingTerminalPageHydrated() {
     const requestedSide = overrides?.side === "sell" ? "sell" : overrides?.side === "buy" ? "buy" : side === "sell" ? "sell" : "buy";
     const executionMicrostructureControl = buildExecutionMicrostructureControlForSide(requestedSide);
     const profitRiskBlockedReason = getProfitRiskExecutionBlockReason(requestedSide);
-    if (confidenceExecutionControl.blocksExecution) {
-      throw new Error(confidenceExecutionControl.blockReason || "Confidence V2 blocked execution.");
+    if (finalDecisionExecutionOracle.blocks_execution) {
+      throw new Error(finalDecisionExecutionOracle.detail_label);
     }
     if (profitRiskBlockedReason) {
       throw new Error(profitRiskBlockedReason);
@@ -8862,7 +9770,7 @@ function TradingTerminalPageHydrated() {
     const totalNotionalUsd = (aiSizingAlreadyApplied ? requestedNotionalUsd : applyRiskAiLiveSizing(requestedNotionalUsd))
       * autoOptimizationMultiplier
       * confidenceExecutionControl.executionRiskMultiplier;
-    const preGateVenue = truthExecutionVenue || overrides?.preferredVenue || executionEngineSnapshot.entry.venue || executionWarfareV85Snapshot.plan.venue || String((routingScore?.best as JsonMap | undefined)?.venue || "");
+    const preGateVenue = truthExecutionVenue || overrides?.preferredVenue || crossVenueLocalRoutingDirective.preferred_venue || executionEngineSnapshot.entry.venue || executionWarfareV85Snapshot.plan.venue || String((routingScore?.best as JsonMap | undefined)?.venue || "");
     const maxSpreadBase = Number.isFinite(overrides?.maxSpread) ? Number(overrides?.maxSpread) : maxSpread;
     const smartMaxSpreadBudget = Math.max(
       1,
@@ -8923,12 +9831,12 @@ function TradingTerminalPageHydrated() {
       maxOrders: 4,
       minOrderNotionalUsd: 25,
     });
-    const effectiveVenue = truthExecutionVenue || overrides?.preferredVenue || liveSmartRoutingPlan.primaryVenue || executionEngineSnapshot.entry.venue || executionWarfareV85Snapshot.plan.venue || undefined;
+    const effectiveVenue = truthExecutionVenue || overrides?.preferredVenue || crossVenueLocalRoutingDirective.preferred_venue || liveSmartRoutingPlan.primaryVenue || executionEngineSnapshot.entry.venue || executionWarfareV85Snapshot.plan.venue || undefined;
     const maxSpreadEffective = Math.max(
       1,
       Math.min(smartMaxSpreadBudget * (executionV7VenueLearning && executionV7VenueLearning.score < 0.5 ? 0.94 : 1), executionEngineSnapshot.slippage.budgetBps),
     );
-    const smartRoutingChildren = liveSmartRoutingPlan.orders.length > 0 && liveSmartRoutingPlan.coverageRatio >= 0.55
+    const smartRoutingChildren = crossVenueLocalRoutingDirective.allow_smart_routing_split && liveSmartRoutingPlan.orders.length > 0 && liveSmartRoutingPlan.coverageRatio >= 0.55
       ? liveSmartRoutingPlan.orders.map((order, index) => ({
         id: `${selectedChartSymbol}-${order.venue}-${index + 1}`,
         venue: order.venue,
@@ -9548,19 +10456,39 @@ function TradingTerminalPageHydrated() {
       setError("Replay Mode actif — execution live desactivee.");
       return false;
     }
-    if (confidenceExecutionControl.blocksExecution) {
-      setError(confidenceExecutionControl.blockReason || "Confidence V2 blocked execution.");
+    if (selectedAccountUsesMt5 && String(terminalMt5TicketHardeningStatus || "") === "blocked") {
+      const reasons = Array.isArray(terminalMt5TicketHardening.reasons)
+        ? (terminalMt5TicketHardening.reasons as unknown[]).map((value) => String(value)).filter(Boolean)
+        : [];
+      setError(`FTMO hardening blocked: ${reasons.join(", ") || "oracle/no_trade guard"}`);
       return false;
     }
-    if (executionLockState.active) {
-      setError(executionLockState.detailLabel);
+    if (selectedAccountUsesMt5 && terminalMt5TicketPreviewRequiresHuman && !mt5ReviewAckActive) {
+      setError("FTMO review required: utilisez Ack Review avant Send Order.");
+      return false;
+    }
+    if (finalDecisionExecutionOracle.blocks_execution) {
+      setError(finalDecisionExecutionOracle.detail_label);
       return false;
     }
     setBusy(true);
     setError(null);
     setTradeResult(null);
     try {
-      const payload = await executeWarfareTradeTicket(overrides);
+      const executionOverrides = terminalMt5ReviewGovernance
+        ? {
+            ...overrides,
+            metadata: {
+              ...(overrides?.metadata || {}),
+              governance: terminalMt5ReviewGovernance,
+            },
+            orderIntent: {
+              ...(overrides?.orderIntent || {}),
+              governance: terminalMt5ReviewGovernance,
+            },
+          }
+        : overrides;
+      const payload = await executeWarfareTradeTicket(executionOverrides);
       setTradeResult(payload);
       const executionEngineTelemetry = payload.execution_engine_telemetry && typeof payload.execution_engine_telemetry === "object"
         ? payload.execution_engine_telemetry as JsonMap
@@ -9623,6 +10551,7 @@ function TradingTerminalPageHydrated() {
           decision_audit: buildExecutionDecisionAudit({
             code: normalizeExecutionDecisionOutcomeCode(journalClassification),
             summary: executionOutcomeDetail,
+            oracleFingerprint: finalDecisionTruthRef.current?.oracle_fingerprint,
           }),
           attention_context: attentionMonitoringPayload,
           execution_v7_lite: executionV7Lite,
@@ -9647,6 +10576,7 @@ function TradingTerminalPageHydrated() {
           decision_audit: buildExecutionDecisionAudit({
             code: "execution-v7-blocked",
             summary: detail,
+            oracleFingerprint: finalDecisionTruthRef.current?.oracle_fingerprint,
           }),
           attention_context: attentionMonitoringPayload,
           triple_validation: tripleValidationGate,
@@ -9674,17 +10604,12 @@ function TradingTerminalPageHydrated() {
       await submitChartOrder(confirmAck);
       return;
     }
-    if (confidenceExecutionControl.blocksExecution) {
-      setError(confidenceExecutionControl.blockReason || "Confidence V2 blocked execution.");
-      pushChartSendHistory("blocked-loss");
-      return;
-    }
     if (marketTruthLockEnabled) {
       await submitChartOrder(confirmAck);
       return;
     }
-    if (executionLockState.active) {
-      setError(executionLockState.detailLabel);
+    if (finalDecisionExecutionOracle.blocks_execution) {
+      setError(finalDecisionExecutionOracle.detail_label);
       pushChartSendHistory("blocked-loss");
       return;
     }
@@ -9987,6 +10912,17 @@ function TradingTerminalPageHydrated() {
         ])),
       };
     }
+    if (decision.routeMode === "dualVenueExecution" && crossVenueLocalRoutingDirective.route_mode_override === "bestSingleVenue") {
+      return {
+        ...decision,
+        routeMode: "bestSingleVenue",
+        opportunity: null,
+        reasons: Array.from(new Set([
+          ...decision.reasons,
+          crossVenueLocalRoutingDirective.reason_tag,
+        ])),
+      };
+    }
     if (decision.routeMode === "dualVenueExecution" && !dataReliabilitySnapshot.ready) {
       return {
         ...decision,
@@ -10008,8 +10944,22 @@ function TradingTerminalPageHydrated() {
     return buildV7LocalGateDecision(autoExecutionMode === "full-auto" ? aiAdjustedAutoNotionalUsd : applyRiskAiLiveSizing(notional));
   }
 
+  function applyFinalDecisionTruthToV7Decision(decision: V7Decision): V7Decision {
+    if (!finalDecisionExecutionOracle.blocks_execution) {
+      return decision;
+    }
+    return {
+      ...decision,
+      shouldExecute: false,
+      reasons: Array.from(new Set([
+        ...decision.reasons,
+        ...finalDecisionExecutionOracle.reason_tags,
+      ])),
+    };
+  }
+
   function getV7ExecutionDecision(): V7Decision {
-    const decision = getV7LocalGateDecision();
+    const decision = applyFinalDecisionTruthToV7Decision(getV7LocalGateDecision());
     if (executionWarfareV85Snapshot.guard.action === "BLOCK") {
       return {
         ...decision,
@@ -10152,13 +11102,8 @@ function TradingTerminalPageHydrated() {
   }
 
   async function submitChartOrder(confirmAck = false): Promise<void> {
-    if (confidenceExecutionControl.blocksExecution) {
-      setError(confidenceExecutionControl.blockReason || "Confidence V2 blocked execution.");
-      pushChartSendHistory("blocked-loss");
-      return;
-    }
-    if (executionLockState.active) {
-      setError(executionLockState.detailLabel);
+    if (finalDecisionExecutionOracle.blocks_execution) {
+      setError(finalDecisionExecutionOracle.detail_label);
       pushChartSendHistory("blocked-loss");
       return;
     }
@@ -10379,6 +11324,15 @@ function TradingTerminalPageHydrated() {
   const liveOpsGovernance = asJsonMap(liveOpsState.governance);
   const liveOpsRecovery = asJsonMap(liveOpsState.recovery);
   const liveOpsMemoryGap = asJsonMap(liveOpsState.memory_gap);
+  const liveOpsRaw = asJsonMap(liveOpsState.raw);
+  const liveOpsKillSwitch = asJsonMap(liveOpsRaw.kill_switch);
+  const liveOpsKillSwitchState = asJsonMap(liveOpsKillSwitch.state);
+  const liveOpsControlledCollection = asJsonMap(liveOpsState.controlled_collection);
+  const liveOpsOpportunityGate = asJsonMap(liveOpsGovernance.opportunity_gate);
+  const liveOpsOpportunityGateReasons = asJsonArray(liveOpsOpportunityGate.reasons)
+    .map((item) => String(item).trim())
+    .filter(Boolean);
+  const liveOpsControlledCollectionNextAction = String(liveOpsControlledCollection.next_action || "").trim();
   const liveOpsAlerts = asJsonArray(liveOpsState.alerts).map((item) => ({
     ...item,
     level: String(item.severity || item.level || "warn").toLowerCase(),
@@ -10419,7 +11373,8 @@ function TradingTerminalPageHydrated() {
   const criticalAlerts = operatorAlerts.filter((item) => String(item.level || "").toLowerCase() === "critical").length;
   const openIncidents = incidents.filter((item) => String(item.status || "") !== "closed").length;
   const riskGateway = connectors.find((item) => String(item.name || "") === "risk-gateway");
-  const killSwitchActive = String(overview?.kill_switch_active) === "true";
+  const killSwitchActive = Boolean(liveOpsKillSwitchState.active) || String(overview?.kill_switch_active) === "true";
+  const killSwitchStatusLabel = killSwitchActive ? "true" : String(overview?.kill_switch_active || "off");
   const mt5Healthy = String(mt5Health?.status || "") === "ok";
   const snapshotLinkedAccounts = (snapshot?.linked_accounts as JsonMap[] | undefined) || [];
   const providerRows = (((aiHealth?.providers as JsonMap | undefined)?.providers as JsonMap[] | undefined) || []).slice(0, 8);
@@ -10549,6 +11504,65 @@ function TradingTerminalPageHydrated() {
       accountId: accountKey,
     };
   }, [accountId, chartVenueOverride, connectors, schedulerE2eScenario, snapshotLinkedAccounts]);
+  const selectedBrokerProvider = String(selectedBrokerCapabilities.provider || "").trim().toLowerCase();
+  const selectedBrokerVenue = String(selectedBrokerCapabilities.preferredVenue || "").trim().toLowerCase();
+  const selectedAccountUsesMt5 = selectedBrokerProvider === "mt5" || selectedBrokerVenue.includes("mt5") || String(accountId || "").trim().toLowerCase().startsWith("mt5");
+  const terminalMt5GovernanceView = toJsonMap(mt5GovernancePayload);
+  const terminalMt5MicroLive = toJsonMap(terminalMt5GovernanceView.micro_live);
+  const terminalMt5CurrentStageConfig = toJsonMap(terminalMt5MicroLive.current_stage_config);
+  const terminalMt5Hardening = toJsonMap(terminalMt5GovernanceView.go_live_hardening);
+  const terminalMt5OracleStability = toJsonMap(terminalMt5Hardening.oracle_stability);
+  const terminalMt5DrawdownVelocity = toJsonMap(terminalMt5Hardening.drawdown_velocity);
+  const terminalMt5CurrentStage = String(terminalMt5MicroLive.current_stage || "").trim() || "n/a";
+  const terminalMt5OracleTone = toNumber(terminalMt5OracleStability.block_below_score, 0) >= 0.55 ? "warn" : "neutral";
+  const terminalMt5TicketPreview = toJsonMap(mt5TicketPreviewPayload);
+  const terminalMt5TicketHardening = toJsonMap(terminalMt5TicketPreview.hardening);
+  const terminalMt5TicketPreviewResolution = toJsonMap(terminalMt5TicketPreview.resolution);
+  const terminalMt5TicketGovernance = toJsonMap(terminalMt5TicketHardening.governance);
+  const terminalMt5TicketOracle = toJsonMap(terminalMt5TicketHardening.oracle_stability);
+  const terminalMt5TicketNoTrade = toJsonMap(terminalMt5TicketHardening.no_trade_context);
+  const terminalMt5TicketHardeningStatus = String(terminalMt5TicketHardening.status || "idle").trim().toLowerCase() || "idle";
+  const terminalMt5TicketPreviewBlocked = terminalMt5TicketHardeningStatus === "blocked";
+  const terminalMt5TicketPreviewRequiresHuman = terminalMt5TicketHardeningStatus === "require_human";
+  const terminalMt5ReviewTicketSignature = buildTerminalMt5ReviewSignature({ accountId, symbol, side, notional });
+  const mt5ReviewAckActive = selectedAccountUsesMt5 && mt5ReviewAckSignature === terminalMt5ReviewTicketSignature;
+  const terminalMt5TicketNoTradeReasons = Array.isArray(terminalMt5TicketNoTrade.no_trade_reasons)
+    ? (terminalMt5TicketNoTrade.no_trade_reasons as unknown[]).map((value) => String(value)).filter(Boolean)
+    : [];
+  const terminalMt5TicketHardeningReasons = Array.isArray(terminalMt5TicketHardening.reasons)
+    ? (terminalMt5TicketHardening.reasons as unknown[]).map((value) => String(value)).filter(Boolean)
+    : [];
+  const terminalMt5DominantReasonRaw = selectedAccountUsesMt5 && (terminalMt5TicketPreviewBlocked || terminalMt5TicketPreviewRequiresHuman)
+    ? (
+      (Boolean(terminalMt5TicketNoTrade.no_trade) ? (terminalMt5TicketNoTradeReasons[0] || String(terminalMt5TicketNoTrade.no_trade_state || "no_trade_active")) : "")
+      || terminalMt5TicketHardeningReasons[0]
+      || (terminalMt5TicketPreviewRequiresHuman ? "manual_review_required" : "oracle_no_trade_block")
+    )
+    : "";
+  const terminalMt5DominantReasonLabel = humanizeTerminalReasonLabel(terminalMt5DominantReasonRaw);
+  const terminalMt5ReviewGovernance = mt5ReviewAckActive
+    ? {
+        approved: true,
+        approver: authOperatorUsername || "mission-control-terminal",
+        approval_mode: "operator_ack_review",
+        override: false,
+      }
+    : null;
+  const terminalMt5TicketTone = terminalMt5TicketPreviewBlocked
+    ? "bad"
+    : terminalMt5TicketPreviewRequiresHuman
+      ? "warn"
+      : "good";
+  const terminalMt5TicketBorder = terminalMt5TicketPreviewBlocked
+    ? "rgba(224, 92, 92, 0.55)"
+    : terminalMt5TicketPreviewRequiresHuman
+      ? "rgba(224, 185, 92, 0.42)"
+      : "rgba(120,147,188,0.18)";
+  const terminalMt5TicketBackground = terminalMt5TicketPreviewBlocked
+    ? "rgba(48, 12, 16, 0.86)"
+    : terminalMt5TicketPreviewRequiresHuman
+      ? "rgba(48, 36, 12, 0.82)"
+      : "rgba(9, 18, 30, 0.72)";
 
   const signalHistoricalLearningBundle = useMemo(() => {
     const normalizedSymbol = normalizeInstrument(selectedChartSymbol);
@@ -10732,25 +11746,112 @@ function TradingTerminalPageHydrated() {
       .sort((left, right) => sortIsoAscending(left.timestamp, right.timestamp))
     : [];
 
+  const terminalPassiveCanonicalBars = useMemo<NormalizedOhlcvBar[]>(() => {
+    if (!terminalPassiveMode) {
+      return [];
+    }
+    const fallbackPassiveFrame = buildTerminalPassiveFallbackFrame(
+      ohlcvBars,
+      chartTimeframe,
+      marketBusKernelTelemetry,
+      marketBusLastSyncAt,
+      marketBusMeta,
+      syncedFrame,
+      {
+        price: Number.isFinite(selectedChartQuote?.last) ? Number(selectedChartQuote?.last) : null,
+        timestampMs: Number.isFinite(selectedChartQuote?.lastTradeTsMs) ? Number(selectedChartQuote?.lastTradeTsMs) : null,
+      },
+    );
+    const effectivePassiveFrameCandles = terminalPassiveFrameCandles.length > 0
+      ? terminalPassiveFrameCandles
+      : fallbackPassiveFrame.candles;
+    return effectivePassiveFrameCandles
+      .map((candle, index): NormalizedOhlcvBar | null => {
+        const timestamp = String(candle.label || "").trim();
+        const parsed = Date.parse(timestamp);
+        const open = toNumber(candle.open, Number.NaN);
+        const high = toNumber(candle.high, Number.NaN);
+        const low = toNumber(candle.low, Number.NaN);
+        const close = toNumber(candle.close, Number.NaN);
+        const volume = toNumber(candle.volume, 0);
+        if (!Number.isFinite(parsed) || !(open > 0) || !(high > 0) || !(low > 0) || !(close > 0)) {
+          return null;
+        }
+        return {
+          t: new Date(parsed).toISOString(),
+          o: open,
+          h: Math.max(high, open, close),
+          l: Math.min(low, open, close),
+          c: close,
+          v: Number.isFinite(volume) ? Math.max(0, volume) : 0,
+          tf: chartTimeframe,
+          seq: parsed + index,
+          venue: selectedChartVenue,
+          instrument: selectedChartInstrument,
+          source: "canonical-frame-passive",
+        } satisfies NormalizedOhlcvBar;
+      })
+      .filter((bar): bar is NormalizedOhlcvBar => Boolean(bar));
+  }, [chartTimeframe, marketBusKernelTelemetry, marketBusLastSyncAt, marketBusMeta, ohlcvBars, selectedChartInstrument, selectedChartVenue, syncedFrame, terminalPassiveFrameCandles, terminalPassiveMode]);
+
+  const terminalPassiveEffectiveFrameMeta = useMemo(() => {
+    if (!terminalPassiveMode) {
+      return null;
+    }
+    if (terminalPassiveFrameMeta) {
+      return terminalPassiveFrameMeta;
+    }
+    return buildTerminalPassiveFallbackFrame(
+      ohlcvBars,
+      chartTimeframe,
+      marketBusKernelTelemetry,
+      marketBusLastSyncAt,
+      marketBusMeta,
+      syncedFrame,
+      {
+        price: Number.isFinite(selectedChartQuote?.last) ? Number(selectedChartQuote?.last) : null,
+        timestampMs: Number.isFinite(selectedChartQuote?.lastTradeTsMs) ? Number(selectedChartQuote?.lastTradeTsMs) : null,
+      },
+    ).meta;
+  }, [chartTimeframe, marketBusKernelTelemetry, marketBusLastSyncAt, marketBusMeta, ohlcvBars, selectedChartQuote?.last, selectedChartQuote?.lastTradeTsMs, syncedFrame, terminalPassiveFrameMeta, terminalPassiveMode]);
+
   const renderableOhlcvBars = useMemo(
-    () => measureTerminalCompute("renderableOhlcvBars", terminalComputePerfEnabled, () => normalizeOhlcvRows(ohlcvBars, {
+    () => terminalPassiveMode
+      ? terminalPassiveCanonicalBars
+      : measureTerminalCompute("renderableOhlcvBars", terminalComputePerfEnabled, () => normalizeOhlcvRows(ohlcvBars, {
       instrument: selectedChartInstrument,
       venue: selectedChartVenue,
       timeframe: chartTimeframe,
     })),
-    [chartTimeframe, ohlcvBars, selectedChartInstrument, selectedChartVenue, terminalComputePerfEnabled],
+    [chartTimeframe, ohlcvBars, selectedChartInstrument, selectedChartVenue, terminalComputePerfEnabled, terminalPassiveCanonicalBars, terminalPassiveMode],
   );
 
   // V5 trades-first: les quotes live n'altèrent plus les candles canoniques.
   // Elles servent à la microstructure / latence, tandis que les candles viennent
   // du flux trades snapshot/backfill reconstruit côté moteur.
   const localOhlcvAnalysis = useMemo(
-    () => measureTerminalCompute("localOhlcvAnalysis", terminalComputePerfEnabled, () => analyzeOhlcvRows(ohlcvBars, {
+    () => terminalPassiveMode
+      ? ({
+        signal: terminalPassiveCanonicalBars.length >= DEFAULT_MIN_RENDERABLE_BARS ? "OHLCV_RENDERABLE" : terminalPassiveCanonicalBars.length > 0 ? "OHLCV_PARTIAL" : "OHLCV_UNUSABLE",
+        renderable: terminalPassiveCanonicalBars.length >= DEFAULT_MIN_RENDERABLE_BARS,
+        fetchedRows: Math.max(terminalPassiveFrameCandles.length, terminalPassiveCanonicalBars.length),
+        renderableRows: terminalPassiveCanonicalBars.length,
+        droppedRows: Math.max(0, Math.max(terminalPassiveFrameCandles.length, terminalPassiveCanonicalBars.length) - terminalPassiveCanonicalBars.length),
+        duplicateTimestamps: 0,
+        gapFillRows: 0,
+        recentGapFillRows: 0,
+        minimumRenderableBars: DEFAULT_MIN_RENDERABLE_BARS,
+        reasons: terminalPassiveCanonicalBars.length > 0 ? ["terminal_passive_canonical_frame"] : ["terminal_passive_waiting_for_canonical_frame"],
+        droppedReasonKinds: [],
+        firstTimestamp: terminalPassiveCanonicalBars[0]?.t || null,
+        lastTimestamp: terminalPassiveCanonicalBars[terminalPassiveCanonicalBars.length - 1]?.t || null,
+      } satisfies OhlcvRenderabilityAnalysis)
+      : measureTerminalCompute("localOhlcvAnalysis", terminalComputePerfEnabled, () => analyzeOhlcvRows(ohlcvBars, {
       instrument: selectedChartInstrument,
       venue: selectedChartVenue,
       timeframe: chartTimeframe,
     })),
-    [chartTimeframe, ohlcvBars, selectedChartInstrument, selectedChartVenue, terminalComputePerfEnabled],
+    [chartTimeframe, ohlcvBars, selectedChartInstrument, selectedChartVenue, terminalComputePerfEnabled, terminalPassiveCanonicalBars, terminalPassiveFrameCandles.length, terminalPassiveMode],
   );
   const localOhlcvFeedLabel = `${selectedChartInstrument} · ${selectedChartVenue} · ${chartTimeframe}`;
   const localOhlcvSignalTone = localOhlcvAnalysis.signal === "OHLCV_RENDERABLE"
@@ -10758,10 +11859,13 @@ function TradingTerminalPageHydrated() {
     : localOhlcvAnalysis.signal === "OHLCV_PARTIAL"
       ? "warn"
       : "bad";
+  const hasRenderableCandles = renderableOhlcvBars.length >= localOhlcvAnalysis.minimumRenderableBars;
   const localOhlcvAlertText = localOhlcvAnalysis.signal === "OHLCV_RENDERABLE"
     ? ""
     : localOhlcvAnalysis.signal === "OHLCV_PARTIAL"
-      ? `Feed local partiel: ${localOhlcvAnalysis.renderableRows}/${localOhlcvAnalysis.fetchedRows} bougies rendables sur ${localOhlcvFeedLabel}.`
+      ? hasRenderableCandles
+        ? `Feed local partiel: ${localOhlcvAnalysis.renderableRows}/${localOhlcvAnalysis.fetchedRows} bougies restent affichables sur ${localOhlcvFeedLabel}, mais la couche decision reste suspendue.`
+        : `Feed local partiel: ${localOhlcvAnalysis.renderableRows}/${localOhlcvAnalysis.fetchedRows} bougies rendables sur ${localOhlcvFeedLabel}.`
       : `Feed local inutilisable: 0/${localOhlcvAnalysis.fetchedRows} bougie rendable sur ${localOhlcvFeedLabel}.`;
   const localOhlcvReasonsLabel = localOhlcvAnalysis.reasons.length > 0
     ? localOhlcvAnalysis.reasons.join(" · ")
@@ -11173,13 +12277,17 @@ function TradingTerminalPageHydrated() {
       backlog: marketBusKernelTelemetry.bufferBacklog,
     };
   }, [avgExecutionLatencyForPredictor, avgExecutionSlippageForPredictor, bookmapDiscardThreshold, bookmapHeatIntensity, chartHeatmapMode, domSnapshot, executionFootprintSnapshot, liveMlAbsorptionBridge, localOhlcvAnalysis.renderableRows, marketBusKernelTelemetry.backlogPressure, marketBusKernelTelemetry.bufferBacklog, marketBusKernelTelemetry.tickLatencyMs, marketMicro, microAlphaSnapshot, microBurstTrades10ms, mlAbsorptionRuntimeMode, nativeTradeVolume30s, notional, predictorMarketSession, predictorOrderbookSignals, predictorOrderflowSnapshot, predictorRenderPressure, routingScore, terminalFeatureFlags]);
-  const hasRenderableCandles = renderableOhlcvBars.length >= localOhlcvAnalysis.minimumRenderableBars;
   const chartAuthBlocked = authSessionRequired || authStatus !== "authenticated";
-  const chartRenderBlocked = !chartAuthBlocked && localOhlcvAnalysis.signal === "OHLCV_UNUSABLE" && !hasRenderableCandles;
-  const localFeedSidecarMessage = localOhlcvAnalysis.signal === "OHLCV_RENDERABLE"
+  const chartRenderBlocked = !terminalPassiveMode && !chartAuthBlocked && localOhlcvAnalysis.signal === "OHLCV_UNUSABLE" && !hasRenderableCandles;
+  const chartDecisionLayerSuspended = terminalPassiveMode || chartAuthBlocked || localOhlcvAnalysis.signal !== "OHLCV_RENDERABLE";
+  const localFeedSidecarMessage = terminalPassiveMode
+    ? `Mode terminal passif: affichage strict de la frame canonique bus (${terminalPassiveCanonicalBars.length} bougies), sans analyse OHLCV ni gap policy UI.`
+    : localOhlcvAnalysis.signal === "OHLCV_RENDERABLE"
     ? "Ce chart et son feed local sont rendables."
     : localOhlcvAnalysis.signal === "OHLCV_PARTIAL"
-      ? "Le feed local reste partiel sur cet instrument; le chart bascule en mode preview tant que le seuil canonique n'est pas atteint."
+      ? hasRenderableCandles
+        ? "Le feed local reste partiel sur cet instrument; les bougies reelles restent affichees en contexte, mais la couche decision/execution reste bloquee tant que le flux canonique n'est pas retabli."
+        : "Le feed local reste partiel sur cet instrument; le chart bascule en mode preview tant que le seuil canonique n'est pas atteint."
       : "Ce chart est sain, mais ce feed local n’est pas rendable.";
 
   useEffect(() => {
@@ -11207,10 +12315,10 @@ function TradingTerminalPageHydrated() {
   const fallbackChartCandles: Array<{ label: string; open: number; high: number; low: number; close: number; volume: number }> = [];
   const chartCandles = ohlcvCandles;
   const chartDisplayCandles = chartCandles;
-  const chartPreviewModeActive = false;
-  const chartPreviewBannerActive = chartPreviewModeActive || (!chartAuthBlocked && chartDisplayCandles.length > 0 && localOhlcvAnalysis.signal !== "OHLCV_RENDERABLE");
-  const chartPerceptionEnabled = hasRenderableCandles && !chartPreviewModeActive;
-  const chartMaskActive = (chartRenderBlocked || (chartAuthBlocked && !hasRenderableCandles)) && !chartPreviewModeActive;
+  const chartPreviewModeActive = !terminalPassiveMode && !chartAuthBlocked && localOhlcvAnalysis.signal === "OHLCV_UNUSABLE" && !hasRenderableCandles;
+  const chartPreviewBannerActive = !terminalPassiveMode && (chartPreviewModeActive || (!chartAuthBlocked && !hasRenderableCandles && chartDisplayCandles.length > 0 && localOhlcvAnalysis.signal !== "OHLCV_RENDERABLE"));
+  const chartPerceptionEnabled = !terminalPassiveMode && hasRenderableCandles && !chartPreviewModeActive;
+  const chartMaskActive = !terminalPassiveMode && (chartRenderBlocked || (chartAuthBlocked && !hasRenderableCandles)) && !chartPreviewModeActive;
   const chartSeries = chartCandles.map((candle) => ({ label: candle.label, value: candle.close }));
 
   useEffect(() => {
@@ -11595,8 +12703,8 @@ function TradingTerminalPageHydrated() {
     if (!activeSuggestedBracket) {
       return;
     }
-    if (executionLockState.active) {
-      setError(executionLockState.detailLabel);
+    if (finalDecisionExecutionOracle.blocks_execution) {
+      setError(finalDecisionExecutionOracle.detail_label);
       pushChartSendHistory("blocked-loss");
       return;
     }
@@ -12991,6 +14099,72 @@ function TradingTerminalPageHydrated() {
     0,
     1,
   );
+  const executionRealityTemporalSizing = buildExecutionRealityTemporalSizingSummary({
+    executionRealityMemory: executionRealityMemoryContextRef.current ?? {
+      memory_state: "CLEAR",
+      size_cap_pct: 100,
+    },
+  });
+  const governanceReplayDetailedTimeline = useMemo(() => buildGovernanceReplayDetailedTimeline({
+    journalEntries: terminalGuideJournalEntries,
+    limit: 32,
+  }), [terminalGuideJournalEntries]);
+  const activeGovernanceReplayDetailedTimeline = persistedGovernanceReplayView?.timeline_detailed || governanceReplayDetailedTimeline;
+  const executionTcaSizingSummary = useMemo(() => buildExecutionTcaFoundationSummary({
+    governanceReplayTimeline: activeGovernanceReplayDetailedTimeline,
+  }), [activeGovernanceReplayDetailedTimeline]);
+  const capitalAgingGovernanceSummary = useMemo(() => buildCapitalAgingGovernanceSummary({
+    drawdownPct: dailyDrawdownPct,
+    exposureRatio,
+    openTradeCount: openTradesCount,
+    unrealizedPnlPct: activeExecutionPositionUnrealizedPnlPct,
+    accountFreeUsd,
+    governanceReplayTimeline: activeGovernanceReplayDetailedTimeline,
+  }), [accountFreeUsd, activeExecutionPositionUnrealizedPnlPct, activeGovernanceReplayDetailedTimeline, dailyDrawdownPct, exposureRatio, openTradesCount]);
+  const governanceBalanceVenueDecaySummary = useMemo(() => buildVenueDecayMemorySummary({
+    venueQualityScore: clamp(
+      executionQualityCapitalScore * 0.62
+        + clamp(1 - marketBusKernelTelemetry.tickLatencyMs / 500, 0, 1) * 0.22
+        + clamp(1 - marketBusKernelTelemetry.bufferBacklog / 10, 0, 1) * 0.16,
+      0,
+      1,
+    ),
+    replayInfraHealthScore: clamp(
+      clamp(1 - marketBusKernelTelemetry.tickLatencyMs / 500, 0, 1) * 0.4
+        + clamp(1 - marketBusKernelTelemetry.bufferBacklog / 10, 0, 1) * 0.35
+        + (localOhlcvAnalysis.signal === "OHLCV_RENDERABLE" ? 0.25 : localOhlcvAnalysis.signal === "OHLCV_PARTIAL" ? 0.15 : 0.05),
+      0,
+      1,
+    ),
+    replayLatencyMs: Math.max(avgExecutionLatencyForPredictor, marketBusKernelTelemetry.tickLatencyMs),
+    governanceReplayTimeline: activeGovernanceReplayDetailedTimeline,
+  }), [activeGovernanceReplayDetailedTimeline, avgExecutionLatencyForPredictor, executionQualityCapitalScore, localOhlcvAnalysis.signal, marketBusKernelTelemetry.bufferBacklog, marketBusKernelTelemetry.tickLatencyMs]);
+  const contagionMemorySizingSummary = useMemo(() => buildContagionMemorySummary({
+    crossMarket: crossMarketTruthSummary,
+  }), [crossMarketTruthSummary]);
+  const recoveryMomentumSizingSummary = useMemo(() => buildRecoveryMomentumSummary({
+    executionRealityMemory: executionRealityMemoryContextRef.current,
+    executionRealityTemporalSizing,
+    executionTca: executionTcaSizingSummary,
+    venueDecayMemory: governanceBalanceVenueDecaySummary,
+    contagionMemory: contagionMemorySizingSummary,
+    crossMarket: crossMarketTruthSummary,
+  }), [contagionMemorySizingSummary, crossMarketTruthSummary, executionRealityTemporalSizing, executionTcaSizingSummary, governanceBalanceVenueDecaySummary]);
+  const governanceBalanceSizingSummary = useMemo(() => buildGovernanceBalanceSummary({
+    intentScore: intentCapitalScore,
+    executionQuality: executionQualityCapitalScore,
+    attentionScore: attentionCapitalScore,
+    temporalSizing: executionRealityTemporalSizing,
+    executionTca: executionTcaSizingSummary,
+    executionRealityMemory: executionRealityMemoryContextRef.current,
+    venueDecayMemory: governanceBalanceVenueDecaySummary,
+    capitalAgingGovernance: capitalAgingGovernanceSummary,
+    contagionMemory: contagionMemorySizingSummary,
+    recoveryMomentum: recoveryMomentumSizingSummary,
+    crossMarket: crossMarketTruthSummary,
+    governanceReplayTimeline: activeGovernanceReplayDetailedTimeline,
+    hardBlock: intentRiskProxy >= 0.85 || !riskAiDecision.allow,
+  }), [activeGovernanceReplayDetailedTimeline, attentionCapitalScore, capitalAgingGovernanceSummary, contagionMemorySizingSummary, crossMarketTruthSummary, executionQualityCapitalScore, executionRealityTemporalSizing, executionTcaSizingSummary, governanceBalanceVenueDecaySummary, intentCapitalScore, intentRiskProxy, recoveryMomentumSizingSummary, riskAiDecision.allow]);
   const capitalScalingDecision = useMemo(() => computeCapitalScalingDecision({
     accountEquity: accountFreeUsd,
     intentScore: intentCapitalScore,
@@ -13004,8 +14178,9 @@ function TradingTerminalPageHydrated() {
     recentWinrate: recentExecutionPerformanceWindow,
     openTradeCount: openTradesCount,
     unrealizedPnlPct: activeExecutionPositionUnrealizedPnlPct / 100,
+    governanceBalanceOutput: riskAiMode === "live" ? governanceBalanceSizingSummary : undefined,
     hardBlock: intentRiskProxy >= 0.85 || !riskAiDecision.allow,
-  }), [accountFreeUsd, activeExecutionPositionUnrealizedPnlPct, aiVolatilityScore, attentionCapitalScore, dailyDrawdownPct, desyncAlphaCapitalScore, executionQualityCapitalScore, exposureRatio, intentCapitalScore, intentRiskProxy, openTradesCount, recentExecutionPerformanceWindow, riskAiDecision.allow, temporalCapitalScore]);
+  }), [accountFreeUsd, activeExecutionPositionUnrealizedPnlPct, aiVolatilityScore, attentionCapitalScore, dailyDrawdownPct, desyncAlphaCapitalScore, executionQualityCapitalScore, exposureRatio, governanceBalanceSizingSummary, intentCapitalScore, intentRiskProxy, openTradesCount, recentExecutionPerformanceWindow, riskAiDecision.allow, riskAiMode, temporalCapitalScore]);
   const journalWindowScalingLiveBlocked = riskAiMode === "live"
     && journalWindowScalingRecommendation.tier === "LOCKED"
     && journalWindowScalingRecommendation.confidence >= 0.45;
@@ -13261,6 +14436,31 @@ function TradingTerminalPageHydrated() {
       pass: !overCap && !localDisabled,
     };
   })();
+  const capitalScarMemorySummary = useMemo(() => buildCapitalScarMemorySummary({
+    pnlAnalyticsSnapshot,
+    currentRegime: String(volatilityRegimeSnapshot.regime || "unknown"),
+  }), [pnlAnalyticsSnapshot, volatilityRegimeSnapshot.regime]);
+  const dynamicCapitalPressure = useMemo(() => buildDynamicCapitalPressureSummary({
+    capitalScalingDecision,
+    dailyDrawdownPct,
+    exposureRatio,
+    openTradeCount: openTradesCount,
+    autoSessionGuard,
+    autoSymbolLoss,
+    autoRiskEngine,
+    journalWindowScalingLiveBlocked,
+    capitalScar: capitalScarMemorySummary,
+  }), [
+    autoRiskEngine,
+    autoSessionGuard,
+    autoSymbolLoss,
+    capitalScarMemorySummary,
+    capitalScalingDecision,
+    dailyDrawdownPct,
+    exposureRatio,
+    journalWindowScalingLiveBlocked,
+    openTradesCount,
+  ]);
   const autoEntryReady = entryTimingV3.status === "READY" || entryTimingV3.status === "TRIGGER";
   const riskAiLiveBlocked = riskAiMode === "live" && !riskAiDecision.allow;
   const capitalScalingLiveBlocked = riskAiMode === "live" && !capitalScalingDecision.allow;
@@ -13297,6 +14497,10 @@ function TradingTerminalPageHydrated() {
       multiplier: Number(signalSizingMultiplier.toFixed(3)),
       reasons: positionSizingDecision.reasons,
       composite_multiplier: Number(riskAiLiveSizeMultiplier.toFixed(3)),
+      execution_reality_temporal_multiplier: Number(executionRealityTemporalSizing.multiplier.toFixed(3)),
+      execution_reality_temporal_cap_pct: executionRealityTemporalSizing.cap_pct,
+      execution_reality_temporal_state: executionRealityTemporalSizing.state,
+      execution_reality_temporal_reasons: executionRealityTemporalSizing.reasons,
       recommended_notional_usd: Number(aiAdjustedAutoNotionalUsd.toFixed(2)),
     },
     journal_scaling: {
@@ -13317,64 +14521,42 @@ function TradingTerminalPageHydrated() {
       performance_factor: Number(capitalScalingDecision.performanceFactor.toFixed(3)),
       portfolio_heat_factor: Number(capitalScalingDecision.portfolioHeatFactor.toFixed(3)),
       scale_adjustment_factor: Number(capitalScalingDecision.scaleAdjustmentFactor.toFixed(3)),
+      governance_balance_factor: Number((capitalScalingDecision.governanceBalanceFactor ?? 1).toFixed(3)),
+      governance_balance_state: capitalScalingDecision.governanceBalanceState || "BALANCED",
       multiplier: Number(capitalScalingDecision.multiplier.toFixed(3)),
       recommended_risk_usd: Number(capitalScalingDecision.recommendedRiskUsd.toFixed(2)),
       reasons: capitalScalingDecision.reasons,
     },
   };
-  const autoExecutionGate = (() => {
-    const ready = autoMetaFilter.pass
-      && autoRiskEngine.hardPass
-      && !riskAiLiveBlocked
-      && !capitalScalingLiveBlocked
-      && !journalWindowScalingLiveBlocked
-      && !profitOptimizerLiveExitBlocked
-      && !autoRiskEngine.killSwitchActive
-      && autoSessionGuard.pass
-      && autoSymbolLoss.pass
-      && selfLearningV5ExecutionFilter.pass
-      && microAlphaSnapshot.executable
-      && autoEntryReady
-      && Boolean(marketDecisionV1?.suggestedBracket)
-      && !replayState.enabled;
-    const autoState = autoRiskEngine.killSwitchActive
-      ? "KILLED"
-      : ready
-        ? "READY"
-        : "BLOCKED";
-    const ruleLabel = autoRiskEngine.killSwitchActive
-      ? "kill switch"
-      : journalWindowScalingLiveBlocked
-        ? `journal ${journalWindowScalingRecommendation.tier.toLowerCase()}`
-      : capitalScalingLiveBlocked
-        ? `capital ${capitalScalingDecision.status.toLowerCase()}`
-      : riskAiLiveBlocked
-        ? `risk ai ${riskAiDecision.reason.toLowerCase()}`
-        : profitOptimizerLiveExitBlocked
-          ? `profit exit ${profitOptimizerDecision.reason.toLowerCase()}`
-          : !autoSessionGuard.pass
-            ? `session ${autoSessionGuard.label}`
-            : !autoSymbolLoss.pass
-              ? "symbol loss cap"
-              : !selfLearningV5ExecutionFilter.pass
-                ? selfLearningV5ExecutionFilter.reasonLabel
-                : autoRiskEngine.correlationClusterBreached
-                  ? `cluster ${autoCorrelationCluster.selectedCluster}`
-                  : autoRiskEngine.volatilitySpikeBreached
-                    ? `vol spike ${autoVolatilitySpike.volatilityBps.toFixed(1)}bps`
-                    : autoRiskEngine.alphaRejectBreached
-                      ? `alpha ${microAlphaSnapshot.setupType}`
-                      : autoMetaFilter.regimeChoppy
-                        ? "regime choppy"
-                        : autoMetaFilter.pass ? `meta pass ${microAlphaSnapshot.setupType}` : "meta blocked";
-    return {
-      ready,
-      autoState,
-      riskLabel: autoRiskEngine.hardPass && !riskAiLiveBlocked && !capitalScalingLiveBlocked && !journalWindowScalingLiveBlocked ? "OK" : "BLOCKED",
-      sizeLabel: `${aiAdjustedAutoNotionalUsd.toFixed(0)} USD`,
-      ruleLabel,
-    };
-  })();
+  const computeAutoExecutionGate = () => buildAutoExecutionOracleGate({
+      oracleBlocksExecution: finalDecisionExecutionOracle.blocks_execution,
+      oracleBlockingLayer: finalDecisionExecutionOracle.blocking_layer,
+      autoMetaPass: autoMetaFilter.pass,
+      autoRiskHardPass: autoRiskEngine.hardPass,
+      riskAiLiveBlocked,
+      capitalScalingLiveBlocked,
+      journalWindowScalingLiveBlocked,
+      profitOptimizerLiveExitBlocked,
+      autoRiskKillSwitchActive: autoRiskEngine.killSwitchActive,
+      autoSessionPass: autoSessionGuard.pass,
+      autoSessionLabel: autoSessionGuard.label,
+      autoSymbolLossPass: autoSymbolLoss.pass,
+      selfLearningPass: selfLearningV5ExecutionFilter.pass,
+      microAlphaExecutable: microAlphaSnapshot.executable,
+      autoEntryReady,
+      hasSuggestedBracket: Boolean(marketDecisionV1?.suggestedBracket),
+      replayEnabled: replayState.enabled,
+      journalTierLabel: journalWindowScalingRecommendation.tier,
+      capitalStatusLabel: capitalScalingDecision.status,
+      riskAiReasonLabel: riskAiDecision.reason,
+      profitOptimizerReasonLabel: profitOptimizerDecision.reason,
+      microAlphaSetupType: microAlphaSnapshot.setupType,
+      autoCorrelationCluster: autoCorrelationCluster.selectedCluster,
+      autoCorrelationClusterBreached: autoRiskEngine.correlationClusterBreached,
+      autoVolatilitySpikeBreached: autoRiskEngine.volatilitySpikeBreached,
+      autoVolatilityBps: autoVolatilitySpike.volatilityBps,
+      autoAlphaRejectBreached: autoRiskEngine.alphaRejectBreached,
+    });
   const selfLearningScopedOutcomesV4 = useMemo(() => {
     const normalizedSymbol = normalizeInstrument(selectedChartSymbol);
     const readOutcomeTf = (item: JsonMap): string | null => {
@@ -14392,6 +15574,9 @@ function TradingTerminalPageHydrated() {
     console.log(payload);
   }, [activeExecutionFootprint, activeTimeKey, mlAbsorptionBridge, mlAbsorptionRuntimeMode]);
   const chartCandlesWithMicrostructure = useMemo(() => chartCandles.map((candle, index) => {
+    if (terminalPassiveMode) {
+      return candle;
+    }
     const timeKey = toTimeBucketKey(candle.label, chartTimeframe);
     const executionFootprint = footprintSnapshotByTimeKey.get(timeKey) || (index === chartCandles.length - 1 ? executionFootprintSnapshot : null);
     const dom = domSnapshotByTimeKey.get(timeKey) || null;
@@ -14403,8 +15588,11 @@ function TradingTerminalPageHydrated() {
       executionFootprint,
       domSnapshot: dom,
     };
-  }), [chartCandles, chartTimeframe, domSnapshotByTimeKey, executionFootprintSnapshot, footprintSnapshotByTimeKey]);
+  }), [chartCandles, chartTimeframe, domSnapshotByTimeKey, executionFootprintSnapshot, footprintSnapshotByTimeKey, terminalPassiveMode]);
   const chartDisplayCandlesWithMicrostructure = useMemo(() => {
+    if (terminalPassiveMode) {
+      return chartDisplayCandles;
+    }
     const enriched = chartDisplayCandles.map((candle) => {
       const timeKey = toTimeBucketKey(candle.label, chartTimeframe);
       const executionFootprint = footprintSnapshotByTimeKey.get(timeKey) || null;
@@ -14427,7 +15615,7 @@ function TradingTerminalPageHydrated() {
     }
     const compressionBucketMs = replayState.enabled ? timeframeSeconds(chartTimeframe) * 1000 : resolveDisplayCompressionBucketMs(chartTimeframe, enriched.length);
     return aggregateDisplayCandles(enriched, compressionBucketMs);
-  }, [chartDisplayCandles, chartTimeframe, domSnapshotByTimeKey, effectiveChartBarConstructionMode, footprintSnapshotByTimeKey, replayState.enabled]);
+  }, [chartDisplayCandles, chartTimeframe, domSnapshotByTimeKey, effectiveChartBarConstructionMode, footprintSnapshotByTimeKey, replayState.enabled, terminalPassiveMode]);
   const chartRenderCandlesWithMicrostructure = useMemo(
     () => (chartEngineMode === "v4" ? chartCandlesWithMicrostructure : chartDisplayCandlesWithMicrostructure),
     [chartCandlesWithMicrostructure, chartDisplayCandlesWithMicrostructure, chartEngineMode],
@@ -15379,6 +16567,7 @@ function TradingTerminalPageHydrated() {
     if (autoExecutionMode === "assisted") {
       return;
     }
+    const autoExecutionGate = computeAutoExecutionGate();
     const v7Decision = getV7ExecutionDecision();
     const signature = [
       selectedChartSymbol,
@@ -15411,6 +16600,7 @@ function TradingTerminalPageHydrated() {
     if (!autoSymbolLoss.pass) reasons.push("symbol-loss-cap");
     if (!selfLearningV5ExecutionFilter.pass) reasons.push(...selfLearningV5ExecutionFilter.blockers.map((reason) => `v5:${reason}`));
     if (autoRiskEngine.killSwitchActive) reasons.push("kill-switch");
+    if (finalDecisionExecutionOracle.blocks_execution) reasons.push(...finalDecisionExecutionOracle.reason_tags.map((reason) => `oracle:${reason}`));
     if (autoRiskEngine.correlationClusterBreached) reasons.push(`cluster:${autoCorrelationCluster.selectedCluster}`);
     if (autoRiskEngine.volatilitySpikeBreached) reasons.push(`vol-spike:${autoVolatilitySpike.volatilityBps.toFixed(1)}bps`);
     if (autoRiskEngine.alphaRejectBreached) reasons.push(...microAlphaSnapshot.rejectionReasons.map((reason) => `alpha:${reason}`));
@@ -15439,34 +16629,7 @@ function TradingTerminalPageHydrated() {
       },
       ...current,
     ].slice(0, 80));
-  }, [
-    autoEntryReady,
-    autoExecutionGate.autoState,
-    autoExecutionGate.ruleLabel,
-    autoExecutionKillSwitch,
-    autoExecutionMode,
-    autoMetaFilter.pass,
-    autoMetaFilter.qualityScore,
-    autoRiskEngine.hardPass,
-    autoRiskEngine.killSwitchActive,
-    profitOptimizerDecision.reason,
-    profitOptimizerLiveExitBlocked,
-    riskAiDecision.blockers,
-    riskAiLiveBlocked,
-    autoSessionGuard.label,
-    autoSessionGuard.pass,
-    aiAdjustedAutoNotionalUsd,
-    autoSymbolLoss.pass,
-    chartTimeframe,
-    selectedChartSymbol,
-    selfLearningV5ExecutionFilter.blockers,
-    selfLearningV5ExecutionFilter.pass,
-    executionTelemetry,
-    filteredOutcomes,
-    marketMicro,
-    notional,
-    routingScore,
-  ]);
+  });
   useEffect(() => {
     if (replayState.enabled || autoExecutionMode === "assisted" || autoExecutionKillSwitch) {
       return;
@@ -15474,6 +16637,7 @@ function TradingTerminalPageHydrated() {
     if (!activeSuggestedBracket) {
       return;
     }
+    const autoExecutionGate = computeAutoExecutionGate();
     const baseSignature = [
       selectedChartSymbol,
       chartTimeframe,
@@ -15526,28 +16690,7 @@ function TradingTerminalPageHydrated() {
         autoExecutionLastAtRef.current = Date.now();
       }
     })();
-  }, [
-    approveAllAndSend,
-    autoExecutionGate.autoState,
-    autoExecutionGate.ready,
-    autoExecutionGate.ruleLabel,
-    autoExecutionKillSwitch,
-    autoExecutionMode,
-    chartEffectiveSendMode,
-    chartHudConfirmArmed,
-    chartPriceDigits,
-    chartTimeframe,
-    executeV7ArbOpportunity,
-    marketDecisionV1.executionPlan,
-    marketDecisionV1.scenario,
-    replayState.enabled,
-    selectedChartSymbol,
-    executionTelemetry,
-    filteredOutcomes,
-    marketMicro,
-    notional,
-    routingScore,
-  ]);
+  });
   const strictDepthTimeMatch = replayState.enabled
     ? Boolean(replayFrame && activeTimeKey && replayFrame.timeKey === activeTimeKey)
     : Boolean(activeTimeKey && depthTimeKey && activeTimeKey === depthTimeKey);
@@ -15856,6 +16999,23 @@ function TradingTerminalPageHydrated() {
     : routingExecutionAiV6Snapshot?.guardrails && typeof routingExecutionAiV6Snapshot.guardrails === "object"
       ? routingExecutionAiV6Snapshot.guardrails as JsonMap
       : null;
+  const routingFailurePayload = routingScore?.upstream_payload && typeof routingScore.upstream_payload === "object" && !Array.isArray(routingScore.upstream_payload)
+    ? routingScore.upstream_payload as JsonMap
+    : null;
+  const routingFailureClassification = String(
+    routingFailurePayload?.failure_classification
+    || routingScore?.failure_source
+    || "",
+  ).trim();
+  const routingCandidatesUnavailableReason = routingCandidatesV6.length <= 0 && (routingScore?.degraded || routingFailurePayload)
+    ? [
+      String(routingFailurePayload?.detail || routingScore?.detail || "").trim(),
+      routingFailureClassification,
+    ]
+      .filter((value) => value.length > 0)
+      .map((value, index) => (index === 0 ? value : value.replace(/_/g, " ")))
+      .join(" · ")
+    : "";
   const routingReasonLabel = String(routingScore?.reason || (routingCandidatesV6.length > 0 ? "best_route_candidate" : "best_quote_spread")).replace(/_/g, " ");
   const routingInfraHealth = clamp(toNumber(routingScore?.infra_health, 1), 0.05, 1);
   const routingNetworkRegime = String(routingScore?.network_regime || "stable");
@@ -16208,6 +17368,113 @@ function TradingTerminalPageHydrated() {
     outcomes: adaptiveV7Outcomes,
     gaps: adaptiveV7RealityGaps,
   }), [adaptiveV7Outcomes, adaptiveV7RealityGaps, adaptiveV7Snapshot]);
+
+  useEffect(() => {
+    let active = true;
+    const regimeHint = backendBrainRegime && backendBrainRegime !== "N/A"
+      ? backendBrainRegime
+      : String(volatilityRegimeSnapshot.regime || "UNKNOWN").trim().toUpperCase() || "UNKNOWN";
+    const confidenceHint = clamp(Math.max(backendBrainConfidence, adaptiveV7Snapshot.decision.confidence), 0, 1);
+
+    const refreshMt5TicketPreview = async () => {
+      if (!selectedAccountUsesMt5) {
+        if (active) {
+          setMt5TicketPreviewPayload(null);
+          setMt5OracleTimelineRows([]);
+        }
+        return;
+      }
+      if (authSessionRequired || authStatus !== "authenticated" || Date.now() < authBackoffUntilRef.current) {
+        return;
+      }
+      if (shouldPauseNonEssentialRefresh()) {
+        return;
+      }
+      if (toNumber(notional, 0) <= 0) {
+        if (active) {
+          setMt5TicketPreviewPayload(null);
+        }
+        return;
+      }
+      try {
+        const [previewResponse, auditResponse] = await Promise.all([
+          fetch("/api/system/micro-live/preview", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              provider: "mt5",
+              account_id: accountId,
+              requested_notional_usd: notional,
+              explicit_flag: true,
+              purpose: "execute",
+              paper_only: false,
+              symbol,
+              side,
+              regime: regimeHint,
+              confidence: Number(confidenceHint.toFixed(4)),
+              source: "mission-control-terminal",
+              governance: terminalMt5ReviewGovernance,
+            }),
+          }),
+          fetch("/api/audit?limit=120", { cache: "no-store" }),
+        ]);
+        if (!active) {
+          return;
+        }
+        if (previewResponse.status === 401 || previewResponse.status === 403 || auditResponse.status === 401 || auditResponse.status === 403) {
+          markUnauthorizedBackoff();
+          return;
+        }
+        if (previewResponse.ok) {
+          const payload = await previewResponse.json().catch(() => null);
+          if (active) {
+            setMt5TicketPreviewPayload(payload && typeof payload === "object" ? payload as JsonMap : null);
+          }
+        }
+        if (auditResponse.ok) {
+          const payload = await auditResponse.json().catch(() => []);
+          const rows = Array.isArray(payload) ? payload : [];
+          const filtered = rows
+            .filter((row) => {
+              const item = row && typeof row === "object" ? row as JsonMap : {};
+              if (String(item.category || "") !== "go_live_hardening_decision") {
+                return false;
+              }
+              const auditPayload = toJsonMap(item.payload);
+              return String(auditPayload.provider || "").trim().toLowerCase() === "mt5"
+                && String(auditPayload.account_id || "").trim() === String(accountId || "").trim();
+            })
+            .slice(0, 10)
+            .map((row) => {
+              const item = row as JsonMap;
+              const auditPayload = toJsonMap(item.payload);
+              const oracle = toJsonMap(auditPayload.oracle_stability);
+              return {
+                timestamp: String(item.timestamp || ""),
+                status: String(auditPayload.status || "unknown").trim().toLowerCase() || "unknown",
+                score: toNumber(oracle.score, 0),
+                state: String(oracle.state || "unknown").trim().toLowerCase() || "unknown",
+                reasons: Array.isArray(auditPayload.reasons) ? (auditPayload.reasons as unknown[]).map((value) => String(value)) : [],
+              };
+            });
+          if (active) {
+            setMt5OracleTimelineRows(filtered);
+          }
+        }
+      } catch {
+        // noop
+      }
+    };
+
+    const timer = window.setTimeout(() => {
+      void refreshMt5TicketPreview();
+    }, 250);
+
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [accountId, adaptiveV7Snapshot.decision.confidence, authOperatorUsername, authSessionRequired, authStatus, backendBrainConfidence, backendBrainRegime, mt5ReviewAckActive, notional, selectedAccountUsesMt5, side, symbol, volatilityRegimeSnapshot.regime]);
   const institutionalExecutionQuality = clamp(
     Math.max(
       backendBrainWorldPredictedFill,
@@ -16636,6 +17903,21 @@ function TradingTerminalPageHydrated() {
     stabilityFilledCount,
     stabilityPartialCount,
   ]);
+  const executionRealitySummary = useMemo(() => buildExecutionRealitySummary({
+    pnlAnalyticsSnapshot,
+    stabilitySnapshot: stabilityEngineSnapshot,
+  }), [pnlAnalyticsSnapshot, stabilityEngineSnapshot]);
+  const executionRealityMemorySnapshot = useMemo(() => buildExecutionRealityMemorySnapshot({
+    previous: executionRealityMemoryContextRef.current,
+    current: executionRealitySummary,
+    stabilitySnapshot: stabilityEngineSnapshot,
+    volatilityRegime: String(volatilityRegimeSnapshot.regime || "unknown"),
+  }), [executionRealitySummary, stabilityEngineSnapshot, volatilityRegimeSnapshot.regime]);
+  const executionRealityGovernanceSummary = useMemo(() => buildExecutionRealityGovernanceSummary({
+    executionReality: executionRealitySummary,
+    executionRealityMemory: executionRealityMemorySnapshot,
+    executionEngine: executionEngineSnapshot,
+  }), [executionEngineSnapshot, executionRealityMemorySnapshot, executionRealitySummary]);
   const strategyEvolutionV9Snapshot = useMemo(() => buildStrategyEvolutionSnapshot({
     selectedAgent: institutionalV8Snapshot.selectedAgent,
     institutionalHealthScore: institutionalV8Snapshot.systemHealthScore,
@@ -16688,7 +17970,7 @@ function TradingTerminalPageHydrated() {
   const arbNetSpread = toNumber(arbPayload?.net_spread ?? marketMicro?.arbitrage_net_spread, 0);
   const arbBuyVenue = String(arbPayload?.buy ?? marketMicro?.arbitrage_buy_venue ?? "").replace("-public", "").replace("paper-", "");
   const arbSellVenue = String(arbPayload?.sell ?? marketMicro?.arbitrage_sell_venue ?? "").replace("-public", "").replace("paper-", "");
-  const v7ExecutionDecision = getV7ExecutionDecision();
+  const v7ExecutionDecision = getV7LocalGateDecision();
   const backendEdgeNetBps = toNumber(backendPredictorSnapshot?.edge_net_bps, arbNetSpread);
   const backendLatencyCostBps = toNumber(backendPredictorSnapshot?.latency_cost_bps, v7ExecutionDecision.latencyCostBps);
   const backendFinalEdgeBps = toNumber(backendPredictorSnapshot?.final_edge_bps, v7ExecutionDecision.expectedNetEdgeBps);
@@ -16728,7 +18010,7 @@ function TradingTerminalPageHydrated() {
     : riskAiLiveSizeMultiplier < 0.75
       ? "warn"
       : "neutral";
-  const positionSizingLabel = `SIZE x${riskAiLiveSizeMultiplier.toFixed(2)}`;
+  const positionSizingLabel = `SIZE x${riskAiLiveSizeMultiplier.toFixed(2)} · GOV x${governanceBalanceSizingSummary.multiplier.toFixed(2)} · REC ${recoveryMomentumSizingSummary.recovery_momentum_pct}%`;
   const v7StatusTone = v7ExecutionDecision.shouldExecute
     ? "good"
     : arbOpportunity
@@ -16826,6 +18108,11 @@ function TradingTerminalPageHydrated() {
       : "neutral";
   const v8ChipTone = effectiveV8ShouldExecute ? (v8Prediction.confidence === "high" ? "good" : "warn") : effectiveV8DataReliable ? "neutral" : "warn";
   const benchmarkChipTone = kernelBenchmarkRate > 0 ? "warn" : "neutral";
+  const marketBusTradePreprocessor = asJsonMap(asJsonMap(marketBusMeta?.preprocessor).trades);
+  const marketBusTradePreprocessorAlert = asJsonMap(marketBusTradePreprocessor.alert);
+  const preprocessorAlertState = String(marketBusTradePreprocessorAlert.state || "").trim().toLowerCase();
+  const showPreprocessorWarnChip = preprocessorAlertState === "warn";
+  const preprocessorWarnChipLabel = `PREPROC ${String(marketBusTradePreprocessor.market_regime || "unknown").replace(/_/g, " ").toUpperCase()} ${toNumber(marketBusTradePreprocessor.compression_saved_pct, 0).toFixed(0)}%`;
   const kernelTelemetryLabel = `KERN ${marketBusKernelTelemetry.tickLatencyMs.toFixed(1)}ms q${marketBusKernelTelemetry.bufferBacklog} d${marketBusKernelTelemetry.drainedTicksPerFrame} sk${marketBusKernelTelemetry.skippedFrames} c${marketBusKernelTelemetry.coalescedFrames} sg${marketBusKernelTelemetry.syncGapCount}`;
   const schedulerLabel = `SCHED ${marketBusKernelTelemetry.schedulerBudgetMs.toFixed(1)}ms/${marketBusKernelTelemetry.schedulerPullLimit} jb${marketBusKernelTelemetry.dynamicBufferMs} ag${marketBusKernelTelemetry.adaptiveGraceMs} sq${marketBusKernelTelemetry.sequenceQueueDepth}`;
   const longTaskAgeMs = browserLongTaskTelemetry.lastAt ? Math.max(0, Date.now() - browserLongTaskTelemetry.lastAt) : -1;
@@ -17581,6 +18868,10 @@ function TradingTerminalPageHydrated() {
   }, [refreshBackendPredictorStats]);
 
   useEffect(() => {
+    if (terminalPassiveMode) {
+      setBackendPredictorSnapshot(null);
+      return;
+    }
     const controller = new AbortController();
     const timer = window.setTimeout(() => {
       void (async () => {
@@ -17609,9 +18900,13 @@ function TradingTerminalPageHydrated() {
       controller.abort();
       window.clearTimeout(timer);
     };
-  }, [predictorRequestPayload, selectedChartSymbol]);
+  }, [predictorRequestPayload, selectedChartSymbol, terminalPassiveMode]);
 
   useEffect(() => {
+    if (terminalPassiveMode) {
+      setBackendPredictorStats(null);
+      return;
+    }
     void refreshBackendPredictorStats();
     const timer = window.setInterval(() => {
       void refreshBackendPredictorStats();
@@ -17619,9 +18914,13 @@ function TradingTerminalPageHydrated() {
     return () => {
       window.clearInterval(timer);
     };
-  }, [refreshBackendPredictorStats]);
+  }, [refreshBackendPredictorStats, terminalPassiveMode]);
 
   useEffect(() => {
+    if (terminalPassiveMode) {
+      setRealityGapRecentRows([]);
+      return;
+    }
     void refreshRealityGapRecent();
     const timer = window.setInterval(() => {
       void refreshRealityGapRecent();
@@ -17629,7 +18928,7 @@ function TradingTerminalPageHydrated() {
     return () => {
       window.clearInterval(timer);
     };
-  }, [refreshRealityGapRecent]);
+  }, [refreshRealityGapRecent, terminalPassiveMode]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -18090,12 +19389,6 @@ function TradingTerminalPageHydrated() {
     totalWeight > 0
       ? (Math.max(weightedBuyScore, weightedSellScore) / totalWeight) * 100
       : null;
-
-  // ── CONFIDENCE DECAY ─────────────────────────────────────────────────────────
-  const decayHighLatency = replayLatency > 300;
-  const decayHighVolatility = overlayDecisionRegime === "high";
-  const confidenceDecay = (decayHighLatency ? 0.08 : 0) + (decayHighVolatility ? 0.06 : 0);
-  const effectiveScore = Math.max(0, adjustedScore - confidenceDecay);
 
   // ── CONSENSUS PENALTY ────────────────────────────────────────────────────────
   const consensusPenaltyActive =
@@ -18633,11 +19926,36 @@ function TradingTerminalPageHydrated() {
     return mid > 0 ? ((ask - bid) / mid) * 10_000 : 0;
   })();
   const microImbalance = Math.abs(toNumber(marketMicro?.depth_imbalance, 0));
-  const decayWideSpread = microSpreadBps > 8;
-  const decayExtremeImbalance = microImbalance > 0.6;
-  const microDecay = (decayWideSpread ? 0.04 : 0) + (decayExtremeImbalance ? 0.03 : 0);
-  // Full effective score = Bayesian-adjusted minus ALL decay sources
-  const effectiveScoreFull = Math.max(0, adjustedScoreBayes - confidenceDecay - microDecay);
+  const venueDecayMemorySummary = useMemo(() => buildVenueDecayMemorySummary({
+    venueQualityScore,
+    replayInfraHealthScore,
+    replayLatencyMs: replayLatency,
+    governanceReplayTimeline: activeGovernanceReplayDetailedTimeline,
+  }), [activeGovernanceReplayDetailedTimeline, replayInfraHealthScore, replayLatency, venueQualityScore]);
+  const contagionMemorySummary = useMemo(() => buildContagionMemorySummary({
+    crossMarket: crossMarketTruthSummary,
+  }), [crossMarketTruthSummary]);
+  const globalConfidenceDecaySummary = useMemo(() => buildGlobalConfidenceDecaySummary({
+    adjustedScore,
+    adjustedScoreBayes,
+    overlayDecisionConsensus,
+    weightedConsensus,
+    overlayDecisionRegime,
+    replayLatencyMs: replayLatency,
+    microSpreadBps,
+    microImbalance,
+    venueDecayMemory: venueDecayMemorySummary,
+    capitalAgingGovernance: capitalAgingGovernanceSummary,
+    contagionMemory: contagionMemorySummary,
+  }), [adjustedScore, adjustedScoreBayes, capitalAgingGovernanceSummary, contagionMemorySummary, microImbalance, microSpreadBps, overlayDecisionConsensus, overlayDecisionRegime, replayLatency, venueDecayMemorySummary, weightedConsensus]);
+  const decayHighLatency = globalConfidenceDecaySummary.components.latency_decay > 0;
+  const decayHighVolatility = globalConfidenceDecaySummary.components.volatility_decay > 0;
+  const decayWideSpread = globalConfidenceDecaySummary.components.spread_decay > 0;
+  const decayExtremeImbalance = globalConfidenceDecaySummary.components.imbalance_decay > 0;
+  const confidenceDecay = globalConfidenceDecaySummary.confidence_decay;
+  const microDecay = globalConfidenceDecaySummary.micro_decay;
+  const effectiveScore = globalConfidenceDecaySummary.effective_score;
+  const effectiveScoreFull = globalConfidenceDecaySummary.effective_score_full;
 
   // ── EXECUTION QUALITY SCORE ───────────────────────────────────────────────────
   const execQualityScore = replayTelemetry
@@ -18673,6 +19991,34 @@ function TradingTerminalPageHydrated() {
     : execQualityScore >= 0.8 ? "good"
     : execQualityScore >= 0.55 ? "fair"
     : "poor";
+  const executionAttributionSummary = useMemo(() => buildExecutionAttributionSummary({
+    replayLatencyMs: replayLatency,
+    replaySlippageBps: replaySlippage,
+    microSpreadBps,
+    microImbalance,
+    routingInfraHealthScore: routingInfraHealth,
+    venueQualityScore,
+    executionQualityScore: execQualityScore,
+    preferredRouteStability,
+    backupRouteStability,
+    predictedDeltaBps,
+    crossMarket: crossMarketTruthSummary,
+  }), [backupRouteStability, crossMarketTruthSummary, execQualityScore, microImbalance, microSpreadBps, predictedDeltaBps, preferredRouteStability, replayLatency, replaySlippage, routingInfraHealth, venueQualityScore]);
+  const crossVenueExecutionIntelligenceSummary = useMemo(() => buildCrossVenueExecutionIntelligenceSummary({
+    marketTruthLockEnabled,
+    routingInfraHealthScore: routingInfraHealth,
+    routingFailureClassification,
+    preferredRoute: preferredRoute as JsonMap | null,
+    backupRoute: backupRoute as JsonMap | null,
+    smartRoutingPlan,
+    executionAttribution: executionAttributionSummary,
+    arbitrageActive: multiVenueArbitrageSnapshot.arbitrage,
+    arbitrageNetSpreadBps: multiVenueArbitrageSnapshot.netSpreadBps,
+  }), [backupRoute, executionAttributionSummary, marketTruthLockEnabled, multiVenueArbitrageSnapshot.arbitrage, multiVenueArbitrageSnapshot.netSpreadBps, preferredRoute, routingFailureClassification, routingInfraHealth, smartRoutingPlan]);
+  const crossVenueLocalRoutingDirective = useMemo(() => resolveCrossVenueLocalRoutingDirective({
+    summary: crossVenueExecutionIntelligenceSummary,
+    smartRoutingPlan,
+  }), [crossVenueExecutionIntelligenceSummary, smartRoutingPlan]);
 
   // ── EXTENDED BLAME TAGS ───────────────────────────────────────────────────────
   // regime_mismatch / memory_bias / latency_spike added to existing blame logic
@@ -19866,7 +21212,7 @@ function TradingTerminalPageHydrated() {
     ? Math.max(0, toNumber(latestQuote.ask, 0) - toNumber(latestQuote.bid, 0))
     : 0;
   const marketMatrixRows = filteredQuotes
-    .filter((quote, index, rows) => rows.findIndex((candidate) => instrumentLabel(candidate) === instrumentLabel(quote)) === index)
+    .filter((quote, index, rows) => rows.findIndex((candidate) => buildNormalizedQuoteVenueKey(candidate) === buildNormalizedQuoteVenueKey(quote)) === index)
     .slice(0, 7)
     .map((quote) => {
       const symbol = normalizeInstrument(String(quote.instrument || instrumentLabel(quote)));
@@ -19895,11 +21241,13 @@ function TradingTerminalPageHydrated() {
       };
     });
   const gpuMatrixRows = filteredQuotes
-    .filter((quote, index, rows) => rows.findIndex((candidate) => instrumentLabel(candidate) === instrumentLabel(quote)) === index)
+    .filter((quote, index, rows) => rows.findIndex((candidate) => buildNormalizedQuoteVenueKey(candidate) === buildNormalizedQuoteVenueKey(quote)) === index)
     .slice(0, 16)
     .map((quote) => {
       const symbol = normalizeInstrument(String(quote.instrument || instrumentLabel(quote)));
-      const history = quoteHistory[symbol] || [];
+      const venue = String(quote.venue || "-");
+      const historyKey = buildQuoteHistoryKey(symbol, venue);
+      const history = quoteHistory[historyKey] || quoteHistory[symbol] || [];
       const first = history[0]?.value ?? toNumber(quote.last, 0);
       const last = history[history.length - 1]?.value ?? toNumber(quote.last, 0);
       const deltaPct = first > 0 ? ((last - first) / first) * 100 : 0;
@@ -19909,12 +21257,13 @@ function TradingTerminalPageHydrated() {
         price: toNumber(quote.last, 0),
         deltaPct,
         spread,
-        venue: String(quote.venue || "-"),
+        venue,
+        historyKey,
       };
     });
   const gpuMultiSymbolFeeds = useMemo(() => (
     gpuMatrixRows.map((row) => {
-      const history = quoteHistory[row.symbol] || [];
+      const history = quoteHistory[row.historyKey] || quoteHistory[row.symbol] || [];
       const candles = buildMiniCandlesFromQuoteHistory(history, chartTimeframe);
       return {
         id: `${row.symbol}-${row.venue}`,
@@ -20218,14 +21567,15 @@ function TradingTerminalPageHydrated() {
       }
       return Date.parse(candidateIso) > Date.parse(latest) ? candidateIso : latest;
     }, null);
+    const runtimeLastTradeIso = toIsoTimestamp(marketOrderflowRuntime?.lastTradeUpdateAt || null);
     const depthAgeMs = toNumber(marketBusDepthHealth?.freshness_ms, Number.NaN);
     return {
       bus_seq: marketBusOhlcvLatestSeq,
-      last_trade_time: latestTradeIso,
+      last_trade_time: latestTradeIso || runtimeLastTradeIso,
       depth_age_ms: Number.isFinite(depthAgeMs) ? Math.max(0, depthAgeMs) : null,
       ohlcv_time: latestOhlcvBar?.t || null,
     };
-  }, [latestOhlcvBar?.t, marketBusDepthHealth?.freshness_ms, marketBusOhlcvLatestSeq, nativeTrades]);
+  }, [latestOhlcvBar?.t, marketBusDepthHealth?.freshness_ms, marketBusOhlcvLatestSeq, marketOrderflowRuntime?.lastTradeUpdateAt, nativeTrades]);
   const systemRuntimeGuard = useMemo(() => {
     const hasReadinessPayload = Boolean(readiness) && typeof readiness === "object";
     const hasMt5Payload = Boolean(mt5Health) && typeof mt5Health === "object";
@@ -20246,7 +21596,9 @@ function TradingTerminalPageHydrated() {
         active: true,
         code: "kill-switch-active",
         summaryLabel: "KILL SWITCH · EXECUTION DISABLED",
-        detailLabel: "Kill switch central actif: aucune exécution live ne doit partir tant que le contrôle principal reste verrouillé.",
+        detailLabel: liveOpsControlledCollectionNextAction
+          ? `Kill switch central actif: aucune execution live ne doit partir tant que le controle principal reste verrouille. ${liveOpsControlledCollectionNextAction}`
+          : "Kill switch central actif: aucune execution live ne doit partir tant que le controle principal reste verrouille.",
       };
     }
     if (externalKillSwitchActive) {
@@ -20262,7 +21614,7 @@ function TradingTerminalPageHydrated() {
         active: true,
         code: "watchdog-halt",
         summaryLabel: "WATCHDOG HALT · EXECUTION DISABLED",
-        detailLabel: `Live Ops watchdog en HALT. Recovery ${recoveryMode}; health score ${toNumber(liveOpsWatchdog.health_score, 0).toFixed(0)}%.`,
+        detailLabel: `Live Ops watchdog en HALT. Recovery ${recoveryMode}; health score ${toNumber(liveOpsWatchdog.health_score, 0).toFixed(0)}%.${liveOpsOpportunityGateReasons.length > 0 ? ` Opportunity gate: ${liveOpsOpportunityGateReasons.slice(0, 2).join(" · ")}.` : ""}`,
       };
     }
     if (recoveryActive) {
@@ -20308,6 +21660,8 @@ function TradingTerminalPageHydrated() {
     externalKillSwitchLabel,
     killSwitchActive,
     liveOpsAlerts,
+    liveOpsControlledCollectionNextAction,
+    liveOpsOpportunityGateReasons,
     liveOpsRecovery,
     liveOpsWatchdog,
     mt5Health,
@@ -20399,23 +21753,111 @@ function TradingTerminalPageHydrated() {
     [executionLockState],
   );
   const chartTruthDesk = useMemo(() => {
-    const primaryViewportMeta = gpuViewportFrameMeta.primary || null;
-    const lastRenderedCandleLabel = chartRenderCandlesWithMicrostructure[chartRenderCandlesWithMicrostructure.length - 1]?.label || "";
+    const primaryViewportMeta = terminalPassiveMode ? terminalPassiveEffectiveFrameMeta : (gpuViewportFrameMeta.primary || null);
+    const rawFrameTruth = primaryViewportMeta?.truth || null;
+    const passiveTruthFallbackActive = terminalPassiveMode && !rawFrameTruth;
+    const frameTruth = rawFrameTruth || (passiveTruthFallbackActive ? {
+      integrity_status: "degraded",
+      sync_status: "unknown",
+      freshness: "unknown",
+      reconstruction_flag: "source_gap",
+      confidence: 0,
+      tradable: false,
+      decision_allowed: false,
+      reasons: ["passive_canonical_frame_pending"],
+    } : null);
+    const truthStatusLabel = frameTruth
+      ? `${frameTruth.tradable ? "TRADABLE" : frameTruth.decision_allowed ? "DECISION READY" : "OBSERVE ONLY"} · ${frameTruth.integrity_status.toUpperCase()} · ${frameTruth.sync_status.toUpperCase()} · ${frameTruth.freshness.toUpperCase()} · ${(frameTruth.confidence * 100).toFixed(0)}%`
+      : "TRUTH WAITING";
+    const truthCompactLabel = frameTruth
+      ? `TRUTH ${frameTruth.tradable ? "TRADABLE" : "OBSERVE"} ${(frameTruth.confidence * 100).toFixed(0)}%`
+      : "TRUTH WAIT";
+    const truthStatusTone: "neutral" | "good" | "warn" | "bad" = !frameTruth
+      ? "neutral"
+      : frameTruth.integrity_status === "invalid" || frameTruth.sync_status === "stale" || frameTruth.freshness === "stale"
+        ? "bad"
+        : frameTruth.tradable
+          ? "good"
+          : "warn";
+    const truthStatusReasonLabel = frameTruth?.reasons?.length
+      ? frameTruth.reasons.join(" · ")
+      : frameTruth
+        ? "canonical truth validation passed"
+        : "waiting for canonical frame truth";
+    const marketDepthMap = asJsonMap(marketDepth);
+    const marketDepthPayload = asJsonMap(marketDepthMap?.depth_payload);
+    const orderbookMap = asJsonMap(orderbook);
+    const orderbookPayload = asJsonMap(orderbookMap?.depth_payload);
+    const receiveTsMs = primaryViewportMeta?.batchPublishedAt
+      ?? (marketBusLastSyncAt ? Date.parse(marketBusLastSyncAt) : null)
+      ?? (passiveTruthFallbackActive ? Date.now() : null);
+    const renderTsMs = gpuPerceptualTelemetry?.updatedAt
+      ? Date.parse(gpuPerceptualTelemetry.updatedAt)
+      : (Number.isFinite(primaryViewportMeta?.viewportUpdatedAt) ? Number(primaryViewportMeta?.viewportUpdatedAt) : (passiveTruthFallbackActive ? receiveTsMs : null));
+    const quoteExchangeTsCandidates = chartSymbolQuoteRows
+      .map((quote) => ({
+        tsMs: parseTimestampLike(String(quote.trade_event_ts ?? quote.event_time ?? quote.timestamp ?? quote.updated_at ?? "")),
+        sourceLabel: "quotes",
+      }))
+      .filter((candidate): candidate is { tsMs: number; sourceLabel: string } => Number.isFinite(candidate.tsMs));
     const exchangeCandidates = [
-      primaryViewportMeta?.tradeEventTs,
-      primaryViewportMeta?.depthEventTs,
-      parseTimestampLike(executionSyncDiagnostics.last_trade_time),
-      parseTimestampLike(latestOhlcvBar?.t || ""),
-      parseTimestampLike(lastRenderedCandleLabel),
-    ].filter((value): value is number => Number.isFinite(value));
-    const exchangeTsMs = exchangeCandidates.length > 0 ? Math.max(...exchangeCandidates) : null;
-    const receiveTsMs = primaryViewportMeta?.batchPublishedAt ?? (marketBusLastSyncAt ? Date.parse(marketBusLastSyncAt) : null);
-    const renderTsMs = gpuPerceptualTelemetry?.updatedAt ? Date.parse(gpuPerceptualTelemetry.updatedAt) : null;
+      { tsMs: primaryViewportMeta?.tradeEventTs ?? null, sourceLabel: "gpu-trade" },
+      { tsMs: primaryViewportMeta?.depthEventTs ?? null, sourceLabel: "gpu-depth" },
+      { tsMs: parseTimestampLike(pickTimestamp(marketDepthMap, ["snapshot_at", "updated_at", "timestamp"])), sourceLabel: "depth-snapshot" },
+      { tsMs: parseTimestampLike(pickTimestamp(marketDepthPayload, ["event_time", "ts", "T", "updated_at", "timestamp"])), sourceLabel: "depth-event" },
+      { tsMs: parseTimestampLike(pickTimestamp(orderbookMap, ["snapshot_at", "updated_at", "timestamp"])), sourceLabel: "book-snapshot" },
+      { tsMs: parseTimestampLike(pickTimestamp(orderbookPayload, ["event_time", "ts", "T", "updated_at", "timestamp"])), sourceLabel: "book-event" },
+      ...quoteExchangeTsCandidates,
+      { tsMs: parseTimestampLike(marketOrderflowRuntime?.lastTradeUpdateAt || ""), sourceLabel: "orderflow-trade" },
+      { tsMs: parseTimestampLike(marketOrderflowRuntime?.lastDepthUpdateAt || ""), sourceLabel: "orderflow-depth" },
+      { tsMs: parseTimestampLike(executionSyncDiagnostics.last_trade_time), sourceLabel: "execution-sync" },
+    ].filter((candidate): candidate is { tsMs: number; sourceLabel: string } => Number.isFinite(candidate.tsMs));
+    const latestExchangeCandidate = exchangeCandidates.reduce<{ tsMs: number; sourceLabel: string } | null>((latest, candidate) => {
+      if (!latest || candidate.tsMs > latest.tsMs) {
+        return candidate;
+      }
+      return latest;
+    }, null);
+    const exchangeTsMs = latestExchangeCandidate?.tsMs ?? null;
+    const exchangeReferenceTsMs = renderTsMs ?? receiveTsMs ?? Date.now();
+    const exchangeAgeMs = exchangeTsMs != null ? Math.max(0, exchangeReferenceTsMs - exchangeTsMs) : null;
+    const exchangeStatusLabel = exchangeAgeMs == null
+      ? passiveTruthFallbackActive
+        ? "EXCHANGE FRESHNESS WARMING"
+        : "EXCHANGE FRESHNESS n/a"
+      : exchangeAgeMs > TERMINAL_TRUTH_XCH_STALE_THRESHOLD_MS
+        ? `EXCHANGE FRESHNESS STALE ${formatFreshness(exchangeAgeMs)} · ${(latestExchangeCandidate?.sourceLabel || "n/a").toUpperCase()}`
+        : `EXCHANGE FRESHNESS LIVE ${formatFreshness(exchangeAgeMs)} · ${(latestExchangeCandidate?.sourceLabel || "n/a").toUpperCase()}`;
+    const exchangeStatusTone: "neutral" | "good" | "warn" | "bad" = exchangeAgeMs == null
+      ? "neutral"
+      : exchangeAgeMs > TERMINAL_TRUTH_XCH_STALE_THRESHOLD_MS
+        ? "warn"
+        : "good";
+    const exchangeStatusState: "live" | "stale" | "unknown" = exchangeAgeMs == null
+      ? "unknown"
+      : exchangeAgeMs > TERMINAL_TRUTH_XCH_STALE_THRESHOLD_MS
+        ? "stale"
+        : "live";
+    const exchangeStatusEmphasis: "default" | "secondary" = exchangeStatusState === "stale"
+      ? "secondary"
+      : "default";
+    const feedStatusTone: "neutral" | "good" | "warn" | "bad" = localOhlcvAnalysis.signal === "OHLCV_RENDERABLE"
+      ? "good"
+      : localOhlcvAnalysis.signal === "OHLCV_PARTIAL"
+        ? "warn"
+        : "bad";
+    const feedStatusLabel = localOhlcvAnalysis.signal === "OHLCV_RENDERABLE"
+      ? `CHART FEED RENDERABLE ${localOhlcvAnalysis.renderableRows}/${localOhlcvAnalysis.fetchedRows}`
+      : localOhlcvAnalysis.signal === "OHLCV_PARTIAL"
+        ? `CHART FEED PARTIAL ${localOhlcvAnalysis.renderableRows}/${localOhlcvAnalysis.fetchedRows}`
+        : passiveTruthFallbackActive
+          ? `CHART FEED WARMING ${localOhlcvAnalysis.renderableRows}/${localOhlcvAnalysis.fetchedRows}`
+          : `CHART FEED UNUSABLE ${localOhlcvAnalysis.renderableRows}/${localOhlcvAnalysis.fetchedRows}`;
     const busLagMs = exchangeTsMs != null && receiveTsMs != null ? Math.max(0, receiveTsMs - exchangeTsMs) : null;
     const renderLagMs = receiveTsMs != null && renderTsMs != null ? Math.max(0, renderTsMs - receiveTsMs) : null;
     const endToEndLagMs = exchangeTsMs != null && renderTsMs != null
       ? Math.max(0, renderTsMs - exchangeTsMs)
-      : routingInputDiagnostics.bus_lag_ms;
+      : (busLagMs ?? routingInputDiagnostics.bus_lag_ms);
     const lagTone: "neutral" | "good" | "warn" | "bad" = endToEndLagMs == null
       ? "neutral"
       : endToEndLagMs <= 750
@@ -20437,12 +21879,30 @@ function TradingTerminalPageHydrated() {
       : "DIVERGENCE normal";
     return {
       sourceLabel: `SOURCE ${selectedChartInstrument} · ${selectedChartVenueDisplayLabel} · ${marketTruthLockEnabled ? "TRUTH LOCK" : "MANUAL VENUE"}`,
-      modeLabel: chartIsolationMode
+      modeLabel: terminalPassiveMode
+        ? "PASSIVE TERMINAL · CANONICAL FRAME"
+        : chartIsolationMode
         ? (marketTruthLockEnabled ? "TRUTH LOCK · ISOLATED CHART" : "ISOLATED CHART")
         : (marketTruthLockEnabled ? `TRUTH LOCK · ${selectedTruthVenueLabel}` : "SINGLE VENUE CHART"),
-      clockLabel: `XCH ${formatDeskClockLabel(exchangeTsMs)} · BUS ${formatDeskClockLabel(receiveTsMs)} · UI ${formatDeskClockLabel(renderTsMs)}`,
-      lagLabel: `LAG e2e ${endToEndLagMs != null ? `${endToEndLagMs}ms` : "n/a"} · bus ${busLagMs != null ? `${busLagMs}ms` : "n/a"} · ui ${renderLagMs != null ? `${renderLagMs}ms` : "n/a"}`,
-      lagCompactLabel: `LAG ${endToEndLagMs != null ? `${endToEndLagMs}ms` : "n/a"}`,
+      clockLabel: `XCH ${exchangeTsMs != null ? formatDeskClockLabel(exchangeTsMs) : passiveTruthFallbackActive ? "pending" : formatDeskClockLabel(exchangeTsMs)} · BUS ${receiveTsMs != null ? formatDeskClockLabel(receiveTsMs) : passiveTruthFallbackActive ? "warming" : formatDeskClockLabel(receiveTsMs)} · UI ${renderTsMs != null ? formatDeskClockLabel(renderTsMs) : passiveTruthFallbackActive ? "warming" : formatDeskClockLabel(renderTsMs)}`,
+      feedStatusLabel,
+      feedStatusTone,
+      exchangeStatusLabel,
+      exchangeStatusTone,
+      exchangeStatusEmphasis,
+      exchangeStatusState,
+      truthStatusLabel,
+      truthCompactLabel,
+      truthStatusTone,
+      truthStatusReasonLabel,
+      exchangeAgeMs,
+      exchangeSourceLabel: latestExchangeCandidate?.sourceLabel || null,
+      exchangeAgeLabel: exchangeAgeMs != null ? formatFreshness(exchangeAgeMs) : "n/a",
+      busLagMs,
+      renderLagMs,
+      endToEndLagMs,
+      lagLabel: `LAG e2e ${endToEndLagMs != null ? `${endToEndLagMs}ms` : passiveTruthFallbackActive ? "pending" : "n/a"} · bus ${busLagMs != null ? `${busLagMs}ms` : passiveTruthFallbackActive ? "pending" : "n/a"} · ui ${renderLagMs != null ? `${renderLagMs}ms` : passiveTruthFallbackActive ? "pending" : "n/a"}`,
+      lagCompactLabel: `LAG ${endToEndLagMs != null ? `${endToEndLagMs}ms` : passiveTruthFallbackActive ? "pending" : "n/a"}`,
       freshnessLabel: `BARS ${formatFreshness(marketBusOhlcvHealth?.freshness_ms)} · DEPTH ${formatFreshness(marketBusDepthHealth?.freshness_ms)} · TRADES ${formatFreshness(marketBusTradesHealth?.freshness_ms)} · REL ${truthReliabilityLabel} · DRIFT ${truthDriftLabel}`,
       routeLabel: marketTruthLockEnabled
         ? `TRUTH ${selectedTruthVenueLabel} · OBS ${marketTruthSelection.validationVenues.length} venue(s) · DIV ${divergenceLabel} · ROUTE ${routeVenueLabel}`
@@ -20451,27 +21911,37 @@ function TradingTerminalPageHydrated() {
     };
   }, [
     chartIsolationMode,
+    terminalPassiveMode,
     chartRenderCandlesWithMicrostructure,
+    chartSymbolQuoteRows,
     executionSyncDiagnostics.last_trade_time,
     gpuPerceptualTelemetry?.updatedAt,
     gpuViewportFrameMeta,
+    terminalPassiveEffectiveFrameMeta,
+    terminalPassiveMode,
     latestOhlcvBar?.t,
     marketDivergenceSnapshot.signal,
     marketDivergenceTopRow,
+    marketDepth,
+    marketOrderflowRuntime?.lastDepthUpdateAt,
+    marketOrderflowRuntime?.lastTradeUpdateAt,
     marketTruthLockEnabled,
     marketTruthSelection.validationVenues.length,
     marketBusDepthHealth?.freshness_ms,
     marketBusLastSyncAt,
     marketBusOhlcvHealth?.freshness_ms,
     marketBusTradesHealth?.freshness_ms,
+    orderbook,
     preferredRoute,
     routingInputDiagnostics.bus_lag_ms,
+    localOhlcvAnalysis.fetchedRows,
+    localOhlcvAnalysis.renderableRows,
+    localOhlcvAnalysis.signal,
     selectedChartInstrument,
     selectedChartTruthState,
     selectedChartVenueDisplayLabel,
     selectedTruthVenueLabel,
   ]);
-  const executionInputsDisabled = replayState.enabled || executionLockState.active;
   const desyncSignal = useMemo(() => {
     const recentPrices = chartSeries.slice(-8).map((point) => toNumber(point.value, NaN)).filter((value) => Number.isFinite(value));
     const firstPrice = recentPrices[0] ?? activePrice ?? chartLastValue;
@@ -20480,6 +21950,16 @@ function TradingTerminalPageHydrated() {
     const recentTradeVolume = activeFootprintRows.slice(-4).reduce((sum, row) => {
       return sum + Math.max(0, toNumber(row.buyVolume, 0)) + Math.max(0, toNumber(row.sellVolume, 0));
     }, 0);
+    const timeframeMs = Math.max(1_000, timeframeToMs(chartTimeframe));
+    const reportedBarsAgeMs = toNumber(marketBusOhlcvHealth?.freshness_ms, Number.NaN);
+    const localFeedPenaltyMs = localOhlcvAnalysis.signal === "OHLCV_RENDERABLE"
+      ? 0
+      : localOhlcvAnalysis.signal === "OHLCV_PARTIAL"
+        ? Math.max(15_000, timeframeMs)
+        : Math.max(60_000, timeframeMs * 2);
+    const sourceAgeMs = Number.isFinite(reportedBarsAgeMs)
+      ? Math.max(0, Math.max(reportedBarsAgeMs, localFeedPenaltyMs))
+      : localFeedPenaltyMs;
 
     return computeDesyncAlpha({
       priceDeltaBps,
@@ -20491,9 +21971,10 @@ function TradingTerminalPageHydrated() {
       temporalDriftMs: temporalSyncDriftMs,
       spoofRisk: activeDomSnapshot?.spoofingRisk ?? predictorOrderflowSnapshot.spoofingScore,
       eventKind: terminalFlowInsight?.eventKind || null,
-      sourceAgeMs: 0,
+      sourceAgeMs,
+      decayMs: Math.max(4_000, timeframeMs * 2),
     });
-  }, [activeDomSnapshot?.spoofingRisk, activeExecutionFootprint?.imbalance, activeFootprintRows, activePrice, chartLastValue, chartSeries, marketMicro?.depth_imbalance, predictorOrderflowSnapshot.imbalance, predictorOrderflowSnapshot.spoofingScore, reconstructedOrderflowSnapshot.depthImbalance, temporalSyncAligned, temporalSyncDriftMs, terminalFlowInsight?.eventKind]);
+  }, [activeDomSnapshot?.spoofingRisk, activeExecutionFootprint?.imbalance, activeFootprintRows, activePrice, chartLastValue, chartSeries, chartTimeframe, localOhlcvAnalysis.signal, marketBusOhlcvHealth?.freshness_ms, marketMicro?.depth_imbalance, predictorOrderflowSnapshot.imbalance, predictorOrderflowSnapshot.spoofingScore, reconstructedOrderflowSnapshot.depthImbalance, temporalSyncAligned, temporalSyncDriftMs, terminalFlowInsight?.eventKind]);
   const executionQualityScore = contextualAttentionInput.executionQualityScore;
   const executionQualityTone = executionQualityScore >= 0.65 ? "good" : executionQualityScore >= 0.5 ? "warn" : "bad";
   const executionQualitySummaryLabel = `EXEC Q ${Math.round(executionQualityScore * 100)}%`;
@@ -20503,6 +21984,16 @@ function TradingTerminalPageHydrated() {
   const desyncWindowSignal = useMemo(() => {
     const recentPoints = chartSeries.slice(-6).map((point) => toNumber(point.value, NaN)).filter((value) => Number.isFinite(value));
     const recentRows = activeFootprintRows.slice(-6);
+    const timeframeMs = Math.max(1_000, timeframeToMs(chartTimeframe));
+    const reportedBarsAgeMs = toNumber(marketBusOhlcvHealth?.freshness_ms, Number.NaN);
+    const localFeedPenaltyMs = localOhlcvAnalysis.signal === "OHLCV_RENDERABLE"
+      ? 0
+      : localOhlcvAnalysis.signal === "OHLCV_PARTIAL"
+        ? Math.max(15_000, timeframeMs)
+        : Math.max(60_000, timeframeMs * 2);
+    const sourceAgeMs = Number.isFinite(reportedBarsAgeMs)
+      ? Math.max(0, Math.max(reportedBarsAgeMs, localFeedPenaltyMs))
+      : localFeedPenaltyMs;
     const frames = recentPoints.slice(1).map((currentPrice, index) => {
       const previousPrice = recentPoints[index] ?? currentPrice;
       const row = recentRows[Math.min(index, Math.max(0, recentRows.length - 1))];
@@ -20524,12 +22015,13 @@ function TradingTerminalPageHydrated() {
           temporalDriftMs: temporalSyncDriftMs,
           spoofRisk: activeDomSnapshot?.spoofingRisk ?? predictorOrderflowSnapshot.spoofingScore,
           eventKind: terminalFlowInsight?.eventKind || null,
-          sourceAgeMs: 0,
+          sourceAgeMs,
+          decayMs: Math.max(4_000, timeframeMs * 2),
         }),
       };
     });
     return buildDesyncWindowSignal({ frames, halfLifeCandles: 3 });
-  }, [activeDomSnapshot?.spoofingRisk, activeFootprintRows, chartSeries, chartTimeframe, marketMicro?.depth_imbalance, predictorOrderflowSnapshot.imbalance, predictorOrderflowSnapshot.spoofingScore, reconstructedOrderflowSnapshot.depthImbalance, temporalSyncAligned, temporalSyncDriftMs, terminalFlowInsight?.eventKind]);
+  }, [activeDomSnapshot?.spoofingRisk, activeFootprintRows, chartSeries, chartTimeframe, localOhlcvAnalysis.signal, marketBusOhlcvHealth?.freshness_ms, marketMicro?.depth_imbalance, predictorOrderflowSnapshot.imbalance, predictorOrderflowSnapshot.spoofingScore, reconstructedOrderflowSnapshot.depthImbalance, temporalSyncAligned, temporalSyncDriftMs, terminalFlowInsight?.eventKind]);
   const microstructureTrapContext = useMemo(() => {
     const recentPoints = chartSeries.slice(-6).map((point) => toNumber(point.value, NaN)).filter((value) => Number.isFinite(value));
     const latestPrice = recentPoints[recentPoints.length - 1] ?? activePrice ?? chartLastValue;
@@ -21051,7 +22543,672 @@ function TradingTerminalPageHydrated() {
     pnlAnalyticsSnapshot.stats.maxDrawdownPct,
     pnlAnalyticsSnapshot.stats.tradeCount,
   ]);
-  const executionFormDisabled = executionInputsDisabled || confidenceExecutionControl.blocksExecution;
+  const terminalTradabilityAnalytics = useMemo(
+    () => buildTradabilityAnalyticsSummary(terminalCalibrationEntries, { currentRegime: String(volatilityRegimeSnapshot.regime || "unknown") }),
+    [terminalCalibrationEntries, volatilityRegimeSnapshot.regime],
+  );
+  const selfPreservationSummary = useMemo(() => buildSelfPreservationSummary({
+    stabilitySnapshot: stabilityEngineSnapshot,
+    systemRuntimeGuard: systemRuntimeGuard.active
+      ? {
+          active: systemRuntimeGuard.active,
+          code: systemRuntimeGuard.code,
+          summaryLabel: systemRuntimeGuard.summaryLabel,
+          detailLabel: systemRuntimeGuard.detailLabel,
+        }
+      : null,
+    watchdogStatus: String(liveOpsWatchdog.status || "ok").trim().toUpperCase() || "OK",
+    governanceMode: String(liveOpsGovernance.mode || "adaptive").trim().toUpperCase() || "ADAPTIVE",
+    opportunityGateReasons: liveOpsOpportunityGateReasons,
+    mt5ReviewRequired: terminalMt5TicketPreviewRequiresHuman,
+    mt5ReviewAcknowledged: mt5ReviewAckActive,
+    backendHaltNewExposure: backendBrainMetaHaltNewExposure,
+    backendCloseOnly: backendBrainMetaCloseOnly,
+    backendReasons: backendBrainMetaReasons,
+    learningFrozen: Boolean(executionAiV6AlertGuardrails.learning_frozen) || executionAiV6FreezeReasons.length > 0,
+    persistenceAvailable: typeof executionAiV6AlertGuardrails.persistence_available === "boolean"
+      ? Boolean(executionAiV6AlertGuardrails.persistence_available)
+      : true,
+    freezeReasons: executionAiV6FreezeReasons,
+  }), [
+    backendBrainMetaCloseOnly,
+    backendBrainMetaHaltNewExposure,
+    backendBrainMetaReasons,
+    executionAiV6AlertGuardrails.learning_frozen,
+    executionAiV6AlertGuardrails.persistence_available,
+    executionAiV6FreezeReasons,
+    liveOpsGovernance.mode,
+    liveOpsOpportunityGateReasons,
+    liveOpsWatchdog.status,
+    mt5ReviewAckActive,
+    stabilityEngineSnapshot,
+    systemRuntimeGuard,
+    terminalMt5TicketPreviewRequiresHuman,
+  ]);
+  const finalDecisionTruth = useMemo<FinalDecisionTruth>(() => {
+    const primaryViewportMeta = terminalPassiveMode ? terminalPassiveEffectiveFrameMeta : (gpuViewportFrameMeta.primary || null);
+    const rawFrameTruth = primaryViewportMeta?.truth || null;
+    const frameTruth = rawFrameTruth || (terminalPassiveMode ? {
+      integrity_status: "degraded",
+      sync_status: "unknown",
+      freshness: "unknown",
+      reconstruction_flag: "source_gap",
+      confidence: 0,
+      tradable: false,
+      decision_allowed: false,
+      reasons: ["passive_canonical_frame_pending"],
+    } : null);
+    return buildFinalDecisionTruth({
+      frameTruth,
+      smartDecision: smartDecisionHud ? {
+        state: smartDecisionHud.state,
+        confidenceBand: smartDecisionHud.confidenceBand,
+        headline: smartDecisionHud.headline,
+        reason: smartDecisionHud.reason,
+      } : null,
+      confidence: {
+        actionState: confidenceV2Snapshot.actionState,
+        finalScorePct: confidenceV2Snapshot.finalScorePct,
+        qualityLabel: confidenceV2Snapshot.qualityLabel,
+        hardVeto: confidenceV2Snapshot.hardVeto,
+        hardVetoReasons: confidenceV2Snapshot.hardVetoReasons,
+      },
+      attention: {
+        state: crossLayerAttentionState,
+        shouldBlockTrading: crossLayerAttentionShouldBlockTrading,
+        summaryLabel: crossLayerAttentionSummaryLabel,
+        detailLabel: crossLayerAttentionDetailLabel,
+      },
+      executionLock: {
+        active: executionLockState.active,
+        code: executionLockState.code,
+        detailLabel: executionLockState.detailLabel,
+      },
+      informationDensity: {
+        orderflowQuality: predictorOrderflowSnapshot.orderflowQuality,
+        domDensity: toNumber(domSnapshot?.domDensity, toNumber(executionFootprintSnapshot?.domDensity, reconstructedOrderflowSnapshot.domDensity)),
+        touchDensity: predictorOrderflowSnapshot.liquidityEngine.touchDensity,
+        liquidityVacuum: predictorOrderflowSnapshot.liquidityEngine.liquidityVacuum,
+        sweepRisk: predictorOrderflowSnapshot.liquidityEngine.sweepRisk,
+        syntheticReliability: reconstructedOrderflowSnapshot.reliability,
+        microNoise: reconstructedOrderflowSnapshot.microNoiseScore,
+      },
+      informationDensityCalibration: terminalTradabilityAnalytics.calibration.sensitivity.thresholds,
+      informationDensityImpactWeight: terminalTradabilityAnalytics.calibration.impact.edgeEligibilityWeight,
+      crossMarket: crossMarketTruthSummary,
+      executionReality: executionRealitySummary,
+      executionRealityGovernance: executionRealityGovernanceSummary,
+      executionRealityMemory: executionRealityMemorySnapshot,
+      capitalScar: capitalScarMemorySummary,
+      capitalPressure: dynamicCapitalPressure,
+      selfPreservation: selfPreservationSummary,
+      riskMultiplier: confidenceExecutionControl.executionRiskMultiplier,
+      preferredVenue: preferredRoute?.venue ? String(preferredRoute.venue) : selectedChartVenue,
+      truthExecutionVenue,
+      marketTruthLockEnabled,
+    });
+  }, [
+    confidenceExecutionControl.executionRiskMultiplier,
+    confidenceV2Snapshot.actionState,
+    confidenceV2Snapshot.finalScorePct,
+    confidenceV2Snapshot.hardVeto,
+    confidenceV2Snapshot.hardVetoReasons,
+    confidenceV2Snapshot.qualityLabel,
+    executionRealitySummary,
+    executionRealityGovernanceSummary,
+    executionRealityMemorySnapshot,
+    capitalScarMemorySummary,
+    dynamicCapitalPressure,
+    crossMarketTruthSummary,
+    crossLayerAttentionDetailLabel,
+    crossLayerAttentionShouldBlockTrading,
+    crossLayerAttentionState,
+    crossLayerAttentionSummaryLabel,
+    executionLockState.active,
+    executionLockState.code,
+    executionLockState.detailLabel,
+    executionFootprintSnapshot,
+    domSnapshot,
+    gpuViewportFrameMeta,
+    marketTruthLockEnabled,
+    predictorOrderflowSnapshot,
+    preferredRoute,
+    reconstructedOrderflowSnapshot,
+    selectedChartVenue,
+    selfPreservationSummary,
+    smartDecisionHud,
+    terminalTradabilityAnalytics,
+    terminalPassiveEffectiveFrameMeta,
+    terminalPassiveMode,
+    truthExecutionVenue,
+  ]);
+  const finalDecisionExecutionOracle = useMemo(
+    () => buildFinalDecisionOracleExecutionView(finalDecisionTruth),
+    [finalDecisionTruth],
+  );
+  const finalDecisionObservabilityOracle = useMemo(
+    () => buildFinalDecisionOracleObservabilityView(finalDecisionTruth),
+    [finalDecisionTruth],
+  );
+  const selfHealingRecoveryMemorySnapshot = useMemo(() => buildSelfHealingRecoverySnapshot({
+    finalDecisionTruth,
+    selfHealingSnapshot: selfHealingV75Snapshot,
+    selfPreservation: selfPreservationSummary,
+    stabilitySnapshot: stabilityEngineSnapshot,
+    volatilityRegime: String(volatilityRegimeSnapshot.regime || "unknown"),
+  }), [finalDecisionTruth, selfHealingV75Snapshot, selfPreservationSummary, stabilityEngineSnapshot, volatilityRegimeSnapshot.regime]);
+  const finalDecisionCrossMarket = finalDecisionTruth.cross_market;
+  const finalDecisionExecutionReality = finalDecisionTruth.execution_reality;
+  const finalDecisionExecutionRealityGovernance = finalDecisionTruth.execution_reality_governance;
+  const finalDecisionExecutionRealityMemory = finalDecisionTruth.execution_reality_memory;
+  const finalDecisionCapitalScar = finalDecisionTruth.capital_scar;
+  const finalDecisionCapitalPressure = finalDecisionTruth.capital_pressure;
+  const finalDecisionSelfPreservation = finalDecisionTruth.self_preservation;
+  const marketRegimeArchiveSummary = useMemo(() => buildMarketRegimeArchiveSummary(
+    terminalGuideJournalEntries,
+    { currentRegime: String(volatilityRegimeSnapshot.regime || "unknown") },
+  ), [terminalGuideJournalEntries, volatilityRegimeSnapshot.regime]);
+  const governanceReplaySummary = useMemo(() => buildGovernanceReplaySummary({
+    journalEntries: terminalGuideJournalEntries,
+    currentTruth: finalDecisionTruth,
+    archive: marketRegimeArchiveSummary,
+  }), [finalDecisionTruth, marketRegimeArchiveSummary, terminalGuideJournalEntries]);
+  const freezeV1ContractsSummary = useMemo(() => buildFreezeV1ContractsSummary({
+    finalDecisionTruth,
+    marketRegimeArchive: marketRegimeArchiveSummary,
+    governanceReplay: governanceReplaySummary,
+    executionReality: finalDecisionTruth.execution_reality,
+    executionRealityGovernance: finalDecisionTruth.execution_reality_governance,
+    executionRealityMemory: finalDecisionTruth.execution_reality_memory,
+    capitalScar: finalDecisionTruth.capital_scar,
+    capitalPressure: finalDecisionTruth.capital_pressure,
+    selfPreservation: finalDecisionTruth.self_preservation,
+    capitalScaling: capitalScalingDecision,
+    executionRealityTemporalSizing,
+  }), [finalDecisionTruth, governanceReplaySummary, marketRegimeArchiveSummary]);
+  useEffect(() => {
+    const symbolKey = terminalGuideJournalContext.symbol.trim().toUpperCase();
+    const timeframeKey = terminalGuideJournalContext.timeframe.trim();
+    const strategyKey = terminalGuideJournalContext.strategy.trim();
+    if (terminalPassiveMode) {
+      setPersistedGovernanceReplayView(null);
+      setPersistedGovernanceReplayError(null);
+      return;
+    }
+    if (!symbolKey || !timeframeKey || !strategyKey) {
+      setPersistedGovernanceReplayView(null);
+      setPersistedGovernanceReplayError(null);
+      return;
+    }
+
+    let cancelled = false;
+    const loadPersistedReplay = async () => {
+      const query = new URLSearchParams();
+      query.set("symbol", symbolKey);
+      query.set("timeframe", timeframeKey);
+      query.set("strategy", strategyKey);
+      query.set("limit", "1200");
+      query.set("sinceDays", "30");
+      query.set("currentRegime", String(volatilityRegimeSnapshot.regime || "unknown"));
+      const response = await fetch(`/api/terminal/governance-replay?${query.toString()}`, { cache: "no-store" }).catch(() => null);
+      const payload = response ? await response.json().catch(() => null) : null;
+      if (cancelled) {
+        return;
+      }
+      if (!response || !response.ok || !isGovernanceReplayViewPayload(payload)) {
+        setPersistedGovernanceReplayError("governance replay historique indisponible");
+        return;
+      }
+      setPersistedGovernanceReplayView(payload);
+      setPersistedGovernanceReplayError(null);
+    };
+
+    void loadPersistedReplay();
+    const timer = window.setInterval(() => {
+      void loadPersistedReplay();
+    }, 45_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [terminalGuideJournalContext, terminalPassiveMode, volatilityRegimeSnapshot.regime]);
+  const activeMarketRegimeArchiveSummary = persistedGovernanceReplayView?.archive || marketRegimeArchiveSummary;
+  const activeMarketRegimePersistentCompression = useMemo(() => {
+    const compression = activeMarketRegimeArchiveSummary.persistent_compression;
+    if (!compression || typeof compression !== "object") {
+      return {
+        state: "THIN",
+        compression_ratio_pct: 0,
+        relapse_probability_pct: 0,
+        retention_half_life_hours: 0,
+        persistent_transition_count: 0,
+        hot_capsule_count: 0,
+        dominant_transition: null,
+      };
+    }
+    return {
+      state: typeof compression.state === "string" ? compression.state : "THIN",
+      compression_ratio_pct: toNumber(compression.compression_ratio_pct, 0),
+      relapse_probability_pct: toNumber(compression.relapse_probability_pct, 0),
+      retention_half_life_hours: toNumber(compression.retention_half_life_hours, 0),
+      persistent_transition_count: toNumber(compression.persistent_transition_count, 0),
+      hot_capsule_count: toNumber(compression.hot_capsule_count, 0),
+      dominant_transition: compression.dominant_transition && typeof compression.dominant_transition === "object"
+        ? compression.dominant_transition
+        : null,
+    };
+  }, [activeMarketRegimeArchiveSummary]);
+  const activeGovernanceReplaySummary = persistedGovernanceReplayView?.replay || governanceReplaySummary;
+  const activeFreezeV1ContractsSummary = persistedGovernanceReplayView?.freeze || freezeV1ContractsSummary;
+  const activeGovernanceReplayArchiveContractsSummary = useMemo<GovernanceReplayArchiveContractsSummary>(() => {
+    const freezeMarketContract = activeFreezeV1ContractsSummary.contracts.find((contract) => contract.key === "market_regime_archive") || null;
+    const freezeReplayContract = activeFreezeV1ContractsSummary.contracts.find((contract) => contract.key === "governance_replay") || null;
+    const persistedArchiveContracts = toJsonMap(persistedGovernanceReplayView?.archive_contracts);
+    const persistedMarketContract = toJsonMap(persistedArchiveContracts.market_regime_archive);
+    const persistedReplayContract = toJsonMap(persistedArchiveContracts.governance_replay);
+
+    return {
+      schema_version: persistedArchiveContracts.schema_version === "governance-replay-archive-contracts/v1"
+        ? "governance-replay-archive-contracts/v1"
+        : "governance-replay-archive-contracts/v1",
+      generated_at_iso: typeof persistedArchiveContracts.generated_at_iso === "string"
+        ? persistedArchiveContracts.generated_at_iso
+        : new Date().toISOString(),
+      market_regime_archive: {
+        schema_version: persistedMarketContract.schema_version === "governance-replay-archive-contract/v1"
+          ? "governance-replay-archive-contract/v1"
+          : "governance-replay-archive-contract/v1",
+        contract_key: "market_regime_archive",
+        expected_summary_version: typeof persistedMarketContract.expected_summary_version === "string"
+          ? persistedMarketContract.expected_summary_version
+          : freezeMarketContract?.expected_version || activeMarketRegimeArchiveSummary.schema_version,
+        current_summary_version: typeof persistedMarketContract.current_summary_version === "string"
+          ? persistedMarketContract.current_summary_version
+          : freezeMarketContract?.current_version || activeMarketRegimeArchiveSummary.schema_version,
+        status: persistedMarketContract.status === "LOCKED" || persistedMarketContract.status === "MISSING" || persistedMarketContract.status === "DRIFT"
+          ? persistedMarketContract.status
+          : freezeMarketContract?.status || "LOCKED",
+        summary: activeMarketRegimeArchiveSummary,
+      },
+      governance_replay: {
+        schema_version: persistedReplayContract.schema_version === "governance-replay-archive-contract/v1"
+          ? "governance-replay-archive-contract/v1"
+          : "governance-replay-archive-contract/v1",
+        contract_key: "governance_replay",
+        expected_summary_version: typeof persistedReplayContract.expected_summary_version === "string"
+          ? persistedReplayContract.expected_summary_version
+          : freezeReplayContract?.expected_version || activeGovernanceReplaySummary.schema_version,
+        current_summary_version: typeof persistedReplayContract.current_summary_version === "string"
+          ? persistedReplayContract.current_summary_version
+          : freezeReplayContract?.current_version || activeGovernanceReplaySummary.schema_version,
+        status: persistedReplayContract.status === "LOCKED" || persistedReplayContract.status === "MISSING" || persistedReplayContract.status === "DRIFT"
+          ? persistedReplayContract.status
+          : freezeReplayContract?.status || "LOCKED",
+        summary: activeGovernanceReplaySummary,
+      },
+      reasons: Array.isArray(persistedArchiveContracts.reasons)
+        ? persistedArchiveContracts.reasons.filter((reason): reason is string => typeof reason === "string" && reason.length > 0)
+        : [
+          `market_regime_archive:${freezeMarketContract?.current_version || activeMarketRegimeArchiveSummary.schema_version || "missing"}:${(freezeMarketContract?.status || "LOCKED").toLowerCase()}`,
+          `governance_replay:${freezeReplayContract?.current_version || activeGovernanceReplaySummary.schema_version || "missing"}:${(freezeReplayContract?.status || "LOCKED").toLowerCase()}`,
+        ],
+    };
+  }, [activeFreezeV1ContractsSummary, activeGovernanceReplaySummary, activeMarketRegimeArchiveSummary, persistedGovernanceReplayView]);
+  const finalDecisionCrossMarketSummary = useMemo(() => {
+    if (!finalDecisionCrossMarket) {
+      return null;
+    }
+    const metrics = finalDecisionCrossMarket.metrics;
+    const reasons = finalDecisionCrossMarket.reasons.slice(0, 3).join(" · ");
+    const basketPreview = finalDecisionCrossMarket.basket
+      .filter((member) => member.available)
+      .slice(0, 4)
+      .map((member) => {
+        const changeLabel = typeof member.change_pct === "number"
+          ? `${member.change_pct >= 0 ? "+" : ""}${member.change_pct.toFixed(2)}%`
+          : "n/a";
+        return `${member.code} ${member.direction} ${changeLabel}`;
+      })
+      .join(" · ");
+    const compactLabel = finalDecisionCrossMarket.state === "UNAVAILABLE"
+      ? "XM:N/A"
+      : `XM:${finalDecisionCrossMarket.state} ${finalDecisionCrossMarket.score_pct}%`;
+    const summaryLabel = `${finalDecisionCrossMarket.summary_label} · cov ${metrics.coverage_pct}% · coh ${metrics.coherence_pct}% · fresh ${metrics.freshness_pct}%`;
+    const detailLabel = [summaryLabel, basketPreview, reasons].filter(Boolean).join(" · ");
+    return {
+      compactLabel,
+      summaryLabel,
+      detailLabel,
+      toneClass: finalDecisionCrossMarket.state === "INCOHERENT"
+        ? "chart-chip-warn"
+        : finalDecisionCrossMarket.state === "CONFIRMED"
+          ? "active"
+          : "",
+      pillTone: finalDecisionCrossMarket.state === "INCOHERENT"
+        ? "warn"
+        : finalDecisionCrossMarket.state === "CONFIRMED"
+          ? "good"
+          : "subtle",
+    };
+  }, [finalDecisionCrossMarket]);
+  const finalDecisionCapitalPressureSummary = useMemo(() => {
+    if (!finalDecisionCapitalPressure) {
+      return null;
+    }
+    const metrics = finalDecisionCapitalPressure.metrics;
+    return {
+      compactLabel: `CP:${finalDecisionCapitalPressure.state} ${finalDecisionCapitalPressure.score_pct}%`,
+      detailLabel: [
+        `${finalDecisionCapitalPressure.summary_label} · dom ${finalDecisionCapitalPressure.dominant_constraint}`,
+        `risk ${metrics.recommended_risk_usd.toFixed(0)} USD · dd ${metrics.drawdown_pct.toFixed(2)}% · exp ${metrics.exposure_pct.toFixed(2)}% · trades ${metrics.open_trade_count}`,
+        finalDecisionCapitalPressure.reasons.slice(0, 4).join(" · "),
+      ].filter(Boolean).join(" · "),
+      toneClass: finalDecisionCapitalPressure.state === "LOCKDOWN"
+        ? "chart-chip-bad"
+        : finalDecisionCapitalPressure.state === "CONSTRAINED" || finalDecisionCapitalPressure.state === "ELEVATED"
+          ? "chart-chip-warn"
+          : finalDecisionCapitalPressure.state === "RELIEF"
+            ? "active"
+            : "",
+      pillTone: finalDecisionCapitalPressure.state === "LOCKDOWN"
+        ? "bad"
+        : finalDecisionCapitalPressure.state === "CONSTRAINED" || finalDecisionCapitalPressure.state === "ELEVATED"
+          ? "warn"
+          : finalDecisionCapitalPressure.state === "RELIEF"
+            ? "good"
+            : "subtle",
+    };
+  }, [finalDecisionCapitalPressure]);
+  const finalDecisionExecutionRealitySummary = useMemo(() => {
+    if (!finalDecisionExecutionReality) {
+      return null;
+    }
+    const metrics = finalDecisionExecutionReality.metrics;
+    return {
+      compactLabel: `ER:${finalDecisionExecutionReality.state} ${finalDecisionExecutionReality.score_pct}%`,
+      detailLabel: [
+        `${finalDecisionExecutionReality.summary_label} · dom ${finalDecisionExecutionReality.dominant_drag}`,
+        `slip ${metrics.slippage_bps.toFixed(2)}bps · fill ${metrics.fill_rate_pct}% · lat ${metrics.latency_ms}ms · stab ${metrics.stability_mode}`,
+        finalDecisionExecutionReality.reasons.slice(0, 4).join(" · "),
+      ].filter(Boolean).join(" · "),
+      toneClass: finalDecisionExecutionReality.state === "HALT"
+        ? "chart-chip-bad"
+        : finalDecisionExecutionReality.state === "DEGRADED" || finalDecisionExecutionReality.state === "CAUTION"
+          ? "chart-chip-warn"
+          : "active",
+      pillTone: finalDecisionExecutionReality.state === "HALT"
+        ? "bad"
+        : finalDecisionExecutionReality.state === "DEGRADED" || finalDecisionExecutionReality.state === "CAUTION"
+          ? "warn"
+          : "good",
+    };
+  }, [finalDecisionExecutionReality]);
+  const finalDecisionExecutionRealityGovernanceSummary = useMemo(() => {
+    if (!finalDecisionExecutionRealityGovernance) {
+      return null;
+    }
+    const metrics = finalDecisionExecutionRealityGovernance.metrics;
+    return {
+      compactLabel: `ERG:${finalDecisionExecutionRealityGovernance.state} ${finalDecisionExecutionRealityGovernance.score_pct}%`,
+      detailLabel: [
+        `${finalDecisionExecutionRealityGovernance.summary_label} · dom ${finalDecisionExecutionRealityGovernance.dominant_driver}`,
+        `drift ${finalDecisionExecutionRealityGovernance.reality_drift} ${metrics.reality_drift_pct}% · route ${finalDecisionExecutionRealityGovernance.routing_fragility} ${metrics.routing_fragility_pct}% · lat ${finalDecisionExecutionRealityGovernance.latency_pressure} ${metrics.latency_pressure_pct}%`,
+        `spread ${finalDecisionExecutionRealityGovernance.spread_degradation} ${metrics.spread_degradation_pct}% · fill ${finalDecisionExecutionRealityGovernance.fill_reliability} ${metrics.fill_reliability_pct}% · venue ${finalDecisionExecutionRealityGovernance.venue_stability} ${metrics.venue_stability_pct}%`,
+        finalDecisionExecutionRealityGovernance.reasons.slice(0, 4).join(" · "),
+      ].filter(Boolean).join(" · "),
+      toneClass: finalDecisionExecutionRealityGovernance.state === "LOCKDOWN"
+        ? "chart-chip-bad"
+        : finalDecisionExecutionRealityGovernance.state === "DEFENSIVE" || finalDecisionExecutionRealityGovernance.state === "CAUTION"
+          ? "chart-chip-warn"
+          : "active",
+      pillTone: finalDecisionExecutionRealityGovernance.state === "LOCKDOWN"
+        ? "bad"
+        : finalDecisionExecutionRealityGovernance.state === "DEFENSIVE" || finalDecisionExecutionRealityGovernance.state === "CAUTION"
+          ? "warn"
+          : "good",
+    };
+  }, [finalDecisionExecutionRealityGovernance]);
+  const executionTcaFoundationSummary = useMemo(() => buildExecutionTcaFoundationSummary({
+    executionReality: finalDecisionExecutionReality,
+    governanceReplayTimeline: activeGovernanceReplayDetailedTimeline,
+  }), [activeGovernanceReplayDetailedTimeline, finalDecisionExecutionReality]);
+  const recoveryMomentumSummary = useMemo(() => buildRecoveryMomentumSummary({
+    selfHealingRecovery: selfHealingRecoveryMemorySnapshot,
+    executionRealityMemory: executionRealityMemorySnapshot,
+    executionRealityTemporalSizing,
+    executionTca: executionTcaFoundationSummary,
+    venueDecayMemory: venueDecayMemorySummary,
+    contagionMemory: contagionMemorySummary,
+    globalConfidenceDecay: globalConfidenceDecaySummary,
+    crossMarket: finalDecisionCrossMarket,
+  }), [contagionMemorySummary, executionRealityMemorySnapshot, executionRealityTemporalSizing, executionTcaFoundationSummary, finalDecisionCrossMarket, globalConfidenceDecaySummary, selfHealingRecoveryMemorySnapshot, venueDecayMemorySummary]);
+  const governanceBalanceSummary = useMemo(() => buildGovernanceBalanceSummary({
+    intentScore: intentCapitalScore,
+    executionQuality: executionQualityCapitalScore,
+    attentionScore: attentionCapitalScore,
+    temporalSizing: executionRealityTemporalSizing,
+    executionTca: executionTcaFoundationSummary,
+    executionRealityMemory: executionRealityMemorySnapshot,
+    capitalScar: finalDecisionCapitalScar || capitalScarMemorySummary,
+    venueDecayMemory: venueDecayMemorySummary,
+    capitalAgingGovernance: capitalAgingGovernanceSummary,
+    contagionMemory: contagionMemorySummary,
+    globalConfidenceDecay: globalConfidenceDecaySummary,
+    recoveryMomentum: recoveryMomentumSummary,
+    crossMarket: finalDecisionCrossMarket,
+    governanceReplayTimeline: activeGovernanceReplayDetailedTimeline,
+  }), [activeGovernanceReplayDetailedTimeline, attentionCapitalScore, capitalAgingGovernanceSummary, capitalScarMemorySummary, contagionMemorySummary, executionQualityCapitalScore, executionRealityMemorySnapshot, executionRealityTemporalSizing, executionTcaFoundationSummary, finalDecisionCapitalScar, finalDecisionCrossMarket, globalConfidenceDecaySummary, intentCapitalScore, recoveryMomentumSummary, venueDecayMemorySummary]);
+  const executionRealityMemorySummary = useMemo(() => {
+    const metrics = executionRealityMemorySnapshot.metrics;
+    return {
+      compactLabel: `ERM:${executionRealityMemorySnapshot.memory_state} ${executionRealityMemorySnapshot.persistence_score_pct}%`,
+      detailLabel: [
+        `${executionRealityMemorySnapshot.summary_label} · dom ${executionRealityMemorySnapshot.dominant_drag}`,
+        `recur ${executionRealityMemorySnapshot.recurrence_count} · cycles ${executionRealityMemorySnapshot.persistent_cycles} · cap ${executionRealityMemorySnapshot.size_cap_pct}%`,
+        executionRealityMemorySnapshot.reasons.slice(0, 4).join(" · "),
+      ].filter(Boolean).join(" · "),
+      toneClass: executionRealityMemorySnapshot.memory_state === "LOCKDOWN"
+        ? "chart-chip-bad"
+        : executionRealityMemorySnapshot.memory_state === "PERSISTENT" || executionRealityMemorySnapshot.memory_state === "RECOVERING"
+          ? "chart-chip-warn"
+          : executionRealityMemorySnapshot.memory_state === "CLEAR"
+            ? "active"
+            : "",
+      pillTone: executionRealityMemorySnapshot.memory_state === "LOCKDOWN"
+        ? "bad"
+        : executionRealityMemorySnapshot.memory_state === "PERSISTENT" || executionRealityMemorySnapshot.memory_state === "RECOVERING"
+          ? "warn"
+          : executionRealityMemorySnapshot.memory_state === "CLEAR"
+            ? "good"
+            : "subtle",
+      metrics,
+    };
+  }, [executionRealityMemorySnapshot]);
+  const finalDecisionCapitalScarSummary = useMemo(() => {
+    if (!finalDecisionCapitalScar) {
+      return null;
+    }
+    const metrics = finalDecisionCapitalScar.metrics;
+    return {
+      compactLabel: `CS:${finalDecisionCapitalScar.state} ${finalDecisionCapitalScar.score_pct}%`,
+      detailLabel: [
+        `${finalDecisionCapitalScar.summary_label} · dom ${finalDecisionCapitalScar.dominant_scar}`,
+        `regime ${metrics.regime} · pnl ${metrics.regime_pnl_usd.toFixed(0)} USD · exp ${metrics.regime_expectancy_usd.toFixed(2)} · dd ${metrics.regime_drawdown_pct.toFixed(2)}%`,
+        finalDecisionCapitalScar.reasons.slice(0, 4).join(" · "),
+      ].filter(Boolean).join(" · "),
+      toneClass: finalDecisionCapitalScar.state === "TRAUMA"
+        ? "chart-chip-bad"
+        : finalDecisionCapitalScar.state === "SCARRED" || finalDecisionCapitalScar.state === "WATCH"
+          ? "chart-chip-warn"
+          : "active",
+      pillTone: finalDecisionCapitalScar.state === "TRAUMA"
+        ? "bad"
+        : finalDecisionCapitalScar.state === "SCARRED" || finalDecisionCapitalScar.state === "WATCH"
+          ? "warn"
+          : "good",
+    };
+  }, [finalDecisionCapitalScar]);
+  const finalDecisionSelfPreservationSummary = useMemo(() => {
+    if (!finalDecisionSelfPreservation) {
+      return null;
+    }
+    const metrics = finalDecisionSelfPreservation.metrics;
+    return {
+      compactLabel: `SP:${finalDecisionSelfPreservation.state} ${finalDecisionSelfPreservation.score_pct}%`,
+      detailLabel: [
+        `${finalDecisionSelfPreservation.summary_label} · dom ${finalDecisionSelfPreservation.dominant_trigger}`,
+        `stability ${metrics.stability_mode.toUpperCase()} ${metrics.stability_monitor_pct}% · drift ${metrics.drift_watchdog} · watchdog ${metrics.watchdog_status} · gov ${metrics.governance_mode}`,
+        finalDecisionSelfPreservation.reasons.slice(0, 4).join(" · "),
+      ].filter(Boolean).join(" · "),
+      toneClass: finalDecisionSelfPreservation.state === "LOCKDOWN"
+        ? "chart-chip-bad"
+        : finalDecisionSelfPreservation.state === "PROTECT" || finalDecisionSelfPreservation.state === "DEFENSIVE"
+          ? "chart-chip-warn"
+          : finalDecisionSelfPreservation.state === "OPEN"
+            ? "active"
+            : "",
+      pillTone: finalDecisionSelfPreservation.state === "LOCKDOWN"
+        ? "bad"
+        : finalDecisionSelfPreservation.state === "PROTECT" || finalDecisionSelfPreservation.state === "DEFENSIVE"
+          ? "warn"
+          : finalDecisionSelfPreservation.state === "OPEN"
+            ? "good"
+            : "subtle",
+    };
+  }, [finalDecisionSelfPreservation]);
+  const selfHealingRecoveryMemorySummary = useMemo(() => ({
+    compactLabel: `REC:${selfHealingRecoveryMemorySnapshot.recovery_tier} ${selfHealingRecoveryMemorySnapshot.recovery_confidence_pct}%`,
+    detailLabel: [
+      `${selfHealingRecoveryMemorySnapshot.self_healing_action} ${selfHealingRecoveryMemorySnapshot.self_healing_drift} · cooldown ${(selfHealingRecoveryMemorySnapshot.adaptive_cooldown_ms / 1000).toFixed(0)}s`,
+      `frag ${selfHealingRecoveryMemorySnapshot.recovery_fragility_pct}% · relapse ${selfHealingRecoveryMemorySnapshot.relapse_probability_pct}% · quality ${selfHealingRecoveryMemorySnapshot.recovery_quality_pct}%`,
+      `${selfHealingRecoveryMemorySnapshot.blocking_layer} · ${selfHealingRecoveryMemorySnapshot.dominant_reason}`,
+    ].filter(Boolean).join(" · "),
+    toneClass: selfHealingRecoveryMemorySnapshot.recovery_tier === "LOCKDOWN" || selfHealingRecoveryMemorySnapshot.recovery_tier === "RECOVERING"
+      ? "chart-chip-bad"
+      : selfHealingRecoveryMemorySnapshot.recovery_tier === "PROTECT" || selfHealingRecoveryMemorySnapshot.recovery_tier === "DEGRADED" || selfHealingRecoveryMemorySnapshot.recovery_tier === "REVALIDATING"
+        ? "chart-chip-warn"
+        : selfHealingRecoveryMemorySnapshot.recovery_tier === "STABLE"
+          ? "active"
+          : "",
+    pillTone: selfHealingRecoveryMemorySnapshot.recovery_tier === "LOCKDOWN" || selfHealingRecoveryMemorySnapshot.recovery_tier === "RECOVERING"
+      ? "bad"
+      : selfHealingRecoveryMemorySnapshot.recovery_tier === "PROTECT" || selfHealingRecoveryMemorySnapshot.recovery_tier === "DEGRADED" || selfHealingRecoveryMemorySnapshot.recovery_tier === "REVALIDATING"
+        ? "warn"
+        : selfHealingRecoveryMemorySnapshot.recovery_tier === "STABLE"
+          ? "good"
+          : "subtle",
+  }), [selfHealingRecoveryMemorySnapshot]);
+    const marketRegimeArchivePanelSummary = useMemo(() => {
+      const hottestRow = activeMarketRegimeArchiveSummary.rows[0] || null;
+      return {
+        compactLabel: `MRA:${activeMarketRegimeArchiveSummary.archive_state} ${activeMarketRegimeArchiveSummary.market_temperature_pct}%`,
+        detailLabel: [
+          `active ${activeMarketRegimeArchiveSummary.active_regime || "UNKNOWN"} · hot ${activeMarketRegimeArchiveSummary.hottest_regime || "NONE"} · block ${activeMarketRegimeArchiveSummary.dominant_blocking_layer || "none"}`,
+          `compression ${activeMarketRegimePersistentCompression.state.toLowerCase()} ${activeMarketRegimePersistentCompression.compression_ratio_pct}% · relapse ${activeMarketRegimePersistentCompression.relapse_probability_pct}% · half ${activeMarketRegimePersistentCompression.retention_half_life_hours}h`,
+          hottestRow
+            ? `stress ${hottestRow.stress_score_pct}% · inad ${hottestRow.inadmissible_share_pct}% · degr ${hottestRow.degradation_share_pct}% · samples ${hottestRow.sample_count}`
+            : "archive journal pending",
+          activeMarketRegimeArchiveSummary.reasons.slice(0, 3).join(" · "),
+        ].filter(Boolean).join(" · "),
+        pillTone: activeMarketRegimeArchiveSummary.archive_state === "BROKEN"
+          ? "bad"
+          : activeMarketRegimeArchiveSummary.archive_state === "FRAGILE" || activeMarketRegimeArchiveSummary.archive_state === "WATCH"
+            ? "warn"
+            : "good",
+        hottestRow,
+      };
+    }, [activeMarketRegimeArchiveSummary, activeMarketRegimePersistentCompression]);
+    const governanceReplayPanelSummary = useMemo(() => ({
+      compactLabel: `GR:${activeGovernanceReplaySummary.state}${activeGovernanceReplaySummary.active_layer ? ` · ${humanizeTerminalReasonLabel(activeGovernanceReplaySummary.active_layer)}` : ""}`,
+      detailLabel: [
+        `allow ${activeGovernanceReplaySummary.allow_answer.action} · ${activeGovernanceReplaySummary.allow_answer.headline}`,
+        `block ${activeGovernanceReplaySummary.block_answer.action} · ${activeGovernanceReplaySummary.block_answer.headline}`,
+        `failure ${activeGovernanceReplaySummary.failure_answer.layer ? humanizeTerminalReasonLabel(activeGovernanceReplaySummary.failure_answer.layer) : "Unresolved"}`,
+      ].join(" · "),
+      pillTone: activeGovernanceReplaySummary.state === "BLOCKED"
+        ? "bad"
+        : activeGovernanceReplaySummary.state === "DEFENSIVE"
+          ? "warn"
+          : "good",
+    }), [activeGovernanceReplaySummary]);
+    const freezeV1ContractsPanelSummary = useMemo(() => {
+      const missingCount = activeFreezeV1ContractsSummary.contracts.filter((contract) => contract.status === "MISSING").length;
+      const driftCount = activeFreezeV1ContractsSummary.contracts.filter((contract) => contract.status === "DRIFT").length;
+      return {
+        compactLabel: `FRZ:${activeFreezeV1ContractsSummary.freeze_state} ${activeFreezeV1ContractsSummary.locked_contract_count}/${activeFreezeV1ContractsSummary.contracts.length}`,
+        detailLabel: [
+          `locked ${activeFreezeV1ContractsSummary.locked_contract_count}/${activeFreezeV1ContractsSummary.contracts.length}`,
+          `missing ${missingCount} · drift ${driftCount}`,
+          activeFreezeV1ContractsSummary.reasons.slice(0, 3).join(" · "),
+        ].filter(Boolean).join(" · "),
+        pillTone: activeFreezeV1ContractsSummary.freeze_state === "DRIFT"
+          ? "bad"
+          : activeFreezeV1ContractsSummary.freeze_state === "PARTIAL"
+            ? "warn"
+            : "good",
+      };
+    }, [activeFreezeV1ContractsSummary]);
+    const governanceReplayArchiveContractsPanelSummary = useMemo(() => {
+      const contracts = [
+        activeGovernanceReplayArchiveContractsSummary.market_regime_archive,
+        activeGovernanceReplayArchiveContractsSummary.governance_replay,
+      ];
+      const lockedCount = contracts.filter((contract) => contract.status === "LOCKED").length;
+      const driftCount = contracts.filter((contract) => contract.status === "DRIFT").length;
+      const missingCount = contracts.filter((contract) => contract.status === "MISSING").length;
+      const archiveContract = activeGovernanceReplayArchiveContractsSummary.market_regime_archive;
+      const replayContract = activeGovernanceReplayArchiveContractsSummary.governance_replay;
+      const operatorCards = [
+        {
+          key: archiveContract.contract_key,
+          label: formatArchiveContractOperatorLabel(archiveContract.contract_key),
+          shortLabel: `${formatArchiveContractOperatorLabel(archiveContract.contract_key)} ${archiveContract.status.toLowerCase()}`,
+          dominantReason: archiveContract.status === "DRIFT"
+            ? "schema drift"
+            : archiveContract.status === "MISSING"
+              ? "payload missing"
+              : archiveContract.summary.dominant_blocking_layer && archiveContract.summary.dominant_blocking_layer !== "none"
+                ? humanizeTerminalReasonLabel(archiveContract.summary.dominant_blocking_layer)
+                : archiveContract.summary.latest_transition?.transition_type
+                  ? humanizeTerminalReasonLabel(archiveContract.summary.latest_transition.transition_type)
+                  : `compression ${archiveContract.summary.persistent_compression.state.toLowerCase()}`,
+          versionLabel: archiveContract.current_summary_version || "missing",
+          pillTone: archiveContract.status === "LOCKED" ? "good" : archiveContract.status === "MISSING" ? "warn" : "bad",
+        },
+        {
+          key: replayContract.contract_key,
+          label: formatArchiveContractOperatorLabel(replayContract.contract_key),
+          shortLabel: `${formatArchiveContractOperatorLabel(replayContract.contract_key)} ${replayContract.status.toLowerCase()}`,
+          dominantReason: replayContract.status === "DRIFT"
+            ? "schema drift"
+            : replayContract.status === "MISSING"
+              ? "payload missing"
+              : replayContract.summary.failure_answer.layer
+                ? humanizeTerminalReasonLabel(replayContract.summary.failure_answer.layer)
+                : replayContract.summary.active_layer
+                  ? humanizeTerminalReasonLabel(replayContract.summary.active_layer)
+                  : humanizeTerminalReasonLabel(replayContract.summary.state),
+          versionLabel: replayContract.current_summary_version || "missing",
+          pillTone: replayContract.status === "LOCKED" ? "good" : replayContract.status === "MISSING" ? "warn" : "bad",
+        },
+      ];
+      return {
+        compactLabel: `ARC:${driftCount > 0 ? "DRIFT" : missingCount > 0 ? "PARTIAL" : "LOCKED"} ${lockedCount}/${contracts.length}`,
+        detailLabel: [
+          ...operatorCards.map((card) => `${card.label} ${card.versionLabel} · reason ${card.dominantReason}`),
+          activeGovernanceReplayArchiveContractsSummary.reasons.slice(0, 2).join(" · "),
+        ].filter(Boolean).join(" · "),
+        pillTone: driftCount > 0 ? "bad" : missingCount > 0 ? "warn" : "good",
+        operatorCards,
+      };
+    }, [activeGovernanceReplayArchiveContractsSummary]);
+  finalDecisionTruthRef.current = finalDecisionTruth;
+  const autoExecutionGate = {
+    ...computeAutoExecutionGate(),
+    sizeLabel: `${aiAdjustedAutoNotionalUsd.toFixed(0)} USD`,
+  };
+  const executionInputsDisabled = replayState.enabled || finalDecisionExecutionOracle.blocks_execution;
+  const executionFormDisabled = executionInputsDisabled;
   const buildExecutionMicrostructureControlForSide = useCallback((requestedSide: "buy" | "sell") => buildExecutionMicrostructureControl({
     requestedSide,
     tripleValidationGate,
@@ -21193,6 +23350,102 @@ function TradingTerminalPageHydrated() {
     });
   }, [activeIntentCalibrationWindow?.label, activeIntentThresholds, appendTerminalGuideJournalEntry, attentionMonitoringPayload, desyncWindowSignal, intentSignal, intentTargetSignal, journalIntentScalingRecommendation, liquidityTrapSignal, predictiveTrapSignal, tripleValidationGate]);
   useEffect(() => {
+    const anomalies: Array<{
+      anomalyType: string;
+      anomalyFamily: string;
+      operatorFamily: string;
+      severity: "info" | "warn" | "critical";
+      detail: string;
+      persistencePct: number;
+      confidencePct: number;
+    }> = [];
+    if (liquidityTrapSignal.detected) {
+      anomalies.push({
+        anomalyType: "LIQUIDITY_TRAP",
+        anomalyFamily: "LIQUIDITY_TRAP",
+        operatorFamily: "liquidity",
+        severity: "critical",
+        detail: liquidityTrapSignal.detailLabel,
+        persistencePct: Math.round(Math.max(0, Math.min(1, desyncWindowSignal.persistenceScore || 0)) * 100),
+        confidencePct: Math.round(Math.max(0, Math.min(1, crossLayerAttentionReliabilityScore || 0)) * 100),
+      });
+    }
+    if (predictiveTrapSignal.imminent) {
+      anomalies.push({
+        anomalyType: "PREDICTIVE_TRAP",
+        anomalyFamily: "FALSE_INTENT",
+        operatorFamily: "intent",
+        severity: "warn",
+        detail: predictiveTrapSignal.detailLabel,
+        persistencePct: Math.round(Math.max(0, Math.min(1, intentSignal.persistence || 0)) * 100),
+        confidencePct: Math.round(Math.max(0, Math.min(1, crossLayerAttentionReliabilityScore || 0)) * 100),
+      });
+    }
+    if (intentSignal.intent !== "NONE" && intentSignal.persistence >= 0.55) {
+      anomalies.push({
+        anomalyType: "FALSE_INTENT_SIGNAL",
+        anomalyFamily: "FALSE_INTENT",
+        operatorFamily: "intent",
+        severity: "warn",
+        detail: intentSignal.detailLabel,
+        persistencePct: Math.round(Math.max(0, Math.min(1, intentSignal.persistence || 0)) * 100),
+        confidencePct: Math.round(Math.max(0, Math.min(1, crossLayerAttentionReliabilityScore || 0)) * 100),
+      });
+    }
+    if (desyncWindowSignal.classification !== "neutral" && desyncWindowSignal.persistenceScore >= 0.55) {
+      anomalies.push({
+        anomalyType: desyncWindowSignal.classification === "alpha" ? "VENUE_ALPHA_DESYNCHRONIZATION" : "VENUE_RISK_DESYNCHRONIZATION",
+        anomalyFamily: "VENUE_DESYNC",
+        operatorFamily: "venue",
+        severity: "warn",
+        detail: desyncWindowSignal.detailLabel,
+        persistencePct: Math.round(Math.max(0, Math.min(1, desyncWindowSignal.persistenceScore || 0)) * 100),
+        confidencePct: Math.round(Math.max(0, Math.min(1, crossLayerAttentionReliabilityScore || 0)) * 100),
+      });
+    }
+    if (anomalies.length === 0 || terminalPassiveMode || !finalDecisionTruth) {
+      if (anomalies.length === 0) {
+        marketMicrostructureAnomalySignatureRef.current = "";
+      }
+      return;
+    }
+    const volatilityRegime = String(volatilityRegimeSnapshot.regime || "unknown").trim().toUpperCase() || "UNKNOWN";
+    const signature = JSON.stringify([
+      volatilityRegime,
+      finalDecisionTruth.market_truth.state,
+      finalDecisionTruth.blocking_layer || "none",
+      ...anomalies.map((anomaly) => `${anomaly.anomalyFamily}:${anomaly.anomalyType}:${anomaly.persistencePct}:${anomaly.confidencePct}`),
+    ]);
+    if (signature === marketMicrostructureAnomalySignatureRef.current) {
+      return;
+    }
+    marketMicrostructureAnomalySignatureRef.current = signature;
+    anomalies.forEach((anomaly) => {
+      void appendTerminalGuideJournalEntry(
+        "market-microstructure-anomaly",
+        anomaly.detail,
+        {
+          microstructure_anomaly: {
+            anomaly_type: anomaly.anomalyType,
+            anomaly_family: anomaly.anomalyFamily,
+            operator_family: anomaly.operatorFamily,
+            venue: finalDecisionTruth.preferred_venue || "MULTI",
+            route_mode: finalDecisionTruth.route_mode,
+            regime: volatilityRegime,
+            severity: anomaly.severity,
+            market_truth_state: finalDecisionTruth.market_truth.state,
+            blocking_layer: finalDecisionTruth.blocking_layer || "none",
+            evidence_metrics: {
+              persistence_pct: anomaly.persistencePct,
+              confidence_pct: anomaly.confidencePct,
+            },
+            detail: anomaly.detail,
+          },
+        },
+      );
+    });
+  }, [appendTerminalGuideJournalEntry, crossLayerAttentionReliabilityScore, desyncWindowSignal, finalDecisionTruth, intentSignal, liquidityTrapSignal, predictiveTrapSignal, terminalPassiveMode, volatilityRegimeSnapshot.regime]);
+  useEffect(() => {
     const shouldLog = journalWindowScalingRecommendation.sampleCount >= 3 || capitalScalingDecision.status !== "BALANCED" || !capitalScalingDecision.allow;
     if (!shouldLog) {
       return;
@@ -21210,10 +23463,11 @@ function TradingTerminalPageHydrated() {
     capitalScalingJournalSignatureRef.current = signature;
     void appendTerminalGuideJournalEntry(
       "capital-scaling-updated",
-      `Capital ${capitalScalingDecision.status} x${capitalScalingDecision.multiplier.toFixed(2)} · journal ${journalWindowScalingRecommendation.tier} x${journalWindowScalingRecommendation.multiplier.toFixed(2)}.`,
+      `Capital ${capitalScalingDecision.status} x${capitalScalingDecision.multiplier.toFixed(2)} · erm x${executionRealityTemporalSizing.multiplier.toFixed(2)} · journal ${journalWindowScalingRecommendation.tier} x${journalWindowScalingRecommendation.multiplier.toFixed(2)}.`,
       {
         capital_scaling: {
           ...capitalScalingDecision,
+          execution_reality_temporal_sizing: executionRealityTemporalSizing,
           journal_window_scaling: journalWindowScalingRecommendation,
           intent_scaling: journalIntentScalingRecommendation,
           blocked_by_journal: journalWindowScalingLiveBlocked,
@@ -21227,7 +23481,7 @@ function TradingTerminalPageHydrated() {
         },
       },
     );
-  }, [activeIntentCalibrationWindow?.label, activeIntentThresholds, appendTerminalGuideJournalEntry, attentionMonitoringPayload, capitalScalingDecision, intentSignal, intentTargetSignal, journalIntentScalingRecommendation, journalWindowScalingLiveBlocked, journalWindowScalingRecommendation]);
+  }, [activeIntentCalibrationWindow?.label, activeIntentThresholds, appendTerminalGuideJournalEntry, attentionMonitoringPayload, capitalScalingDecision, executionRealityTemporalSizing, intentSignal, intentTargetSignal, journalIntentScalingRecommendation, journalWindowScalingLiveBlocked, journalWindowScalingRecommendation]);
   useEffect(() => {
     if (!executionLockState.active) {
       executionLockJournalSignatureRef.current = "";
@@ -21253,7 +23507,13 @@ function TradingTerminalPageHydrated() {
           : "execution-disabled-routing",
       executionLockState.detailLabel,
       {
-        ...(executionLockDecisionAudit ? { decision_audit: executionLockDecisionAudit } : {}),
+        ...(executionLockDecisionAudit ? {
+          decision_audit: buildExecutionDecisionAudit({
+            code: executionLockDecisionAudit.code,
+            summary: executionLockDecisionAudit.summary,
+            oracleFingerprint: finalDecisionTruth.oracle_fingerprint,
+          }),
+        } : {}),
         execution_lock: executionLockState,
         sync_diagnostics: executionSyncDiagnostics,
         attention_context: attentionMonitoringPayload,
@@ -21261,6 +23521,317 @@ function TradingTerminalPageHydrated() {
       },
     );
   }, [appendTerminalGuideJournalEntry, attentionMonitoringPayload, executionLockDecisionAudit, executionLockState, executionSyncDiagnostics, tripleValidationGate]);
+  useEffect(() => {
+    if (terminalPassiveMode || !finalDecisionTruth) {
+      tradabilityJournalSignatureRef.current = "";
+      return;
+    }
+    const informationDensity = finalDecisionTruth.information_density;
+    if (!informationDensity) {
+      return;
+    }
+    const volatilityRegime = String(volatilityRegimeSnapshot.regime || "unknown").trim().toUpperCase() || "UNKNOWN";
+    const marketSession = String(predictorMarketSession || "unknown").trim().toUpperCase() || "UNKNOWN";
+    const preprocessorRegime = String(marketBusTradePreprocessor.market_regime || "unknown").trim().toLowerCase() || "unknown";
+    const preprocessorAlertState = String(asJsonMap(marketBusTradePreprocessor.alert).state || "unknown").trim().toLowerCase() || "unknown";
+    const signature = JSON.stringify([
+      volatilityRegime,
+      marketSession,
+      preprocessorRegime,
+      preprocessorAlertState,
+      finalDecisionTruth.action,
+      finalDecisionTruth.blocking_layer || "none",
+      finalDecisionTruth.edge_eligibility.state,
+      informationDensity.state,
+      informationDensity.score_pct,
+      informationDensity.entropy_pct,
+    ]);
+    if (signature === tradabilityJournalSignatureRef.current) {
+      return;
+    }
+    tradabilityJournalSignatureRef.current = signature;
+    void appendTerminalGuideJournalEntry(
+      "tradability-snapshot",
+      `${informationDensity.state} ${volatilityRegime} · ${finalDecisionTruth.action} ${finalDecisionTruth.edge_eligibility.state} ${informationDensity.score_pct}%`,
+      {
+        tradability_snapshot: {
+          volatility_regime: volatilityRegime,
+          market_session: marketSession,
+          preprocessor_regime: preprocessorRegime,
+          preprocessor_alert_state: preprocessorAlertState,
+          state: finalDecisionTruth.state,
+          action: finalDecisionTruth.action,
+          route_mode: finalDecisionTruth.route_mode,
+          execution_allowed: finalDecisionTruth.execution_allowed,
+          should_trade: finalDecisionTruth.should_trade,
+          edge_state: finalDecisionTruth.edge_eligibility.state,
+          blocking_layer: finalDecisionTruth.blocking_layer || "none",
+          information_density_state: informationDensity.state,
+          score_pct: informationDensity.score_pct,
+          entropy_pct: informationDensity.entropy_pct,
+          reasons: informationDensity.reasons,
+        },
+      },
+    );
+  }, [appendTerminalGuideJournalEntry, finalDecisionTruth, marketBusTradePreprocessor, predictorMarketSession, terminalPassiveMode, volatilityRegimeSnapshot.regime]);
+  useEffect(() => {
+    if (terminalPassiveMode || !finalDecisionTruth) {
+      marketMemorySnapshotSignatureRef.current = "";
+      return;
+    }
+    const informationDensity = finalDecisionTruth.information_density;
+    const marketTruth = finalDecisionTruth.market_truth;
+    const volatilityRegime = String(volatilityRegimeSnapshot.regime || "unknown").trim().toUpperCase() || "UNKNOWN";
+    const marketSession = String(predictorMarketSession || "unknown").trim().toUpperCase() || "UNKNOWN";
+    const admissibilityState = finalDecisionTruth.execution_allowed
+      ? finalDecisionTruth.should_trade
+        ? "ADMISSIBLE"
+        : "WATCH"
+      : marketTruth.state === "UNTRUSTWORTHY" || informationDensity.state === "DEGRADED"
+        ? "INADMISSIBLE"
+        : "DEGRADED";
+    const signature = JSON.stringify([
+      volatilityRegime,
+      marketSession,
+      marketTruth.state,
+      marketTruth.score_pct,
+      marketTruth.metrics.coherence_pct,
+      marketTruth.metrics.freshness_pct,
+      marketTruth.metrics.execution_quality_pct,
+      marketTruth.metrics.anomaly_burden_pct,
+      informationDensity.state,
+      finalDecisionTruth.edge_eligibility.state,
+      finalDecisionTruth.blocking_layer || "none",
+      admissibilityState,
+    ]);
+    if (signature === marketMemorySnapshotSignatureRef.current) {
+      return;
+    }
+    marketMemorySnapshotSignatureRef.current = signature;
+    void appendTerminalGuideJournalEntry(
+      "market-memory-snapshot",
+      `${marketTruth.state} ${volatilityRegime} · truth ${marketTruth.score_pct}% · exec ${marketTruth.metrics.execution_quality_pct}%`,
+      {
+        market_memory_snapshot: {
+          oracle_fingerprint: finalDecisionTruth.oracle_fingerprint,
+          volatility_regime: volatilityRegime,
+          market_session: marketSession,
+          venue: finalDecisionTruth.preferred_venue || "MULTI",
+          route_mode: finalDecisionTruth.route_mode,
+          market_truth_state: marketTruth.state,
+          truth_quality_pct: marketTruth.score_pct,
+          admissibility_state: admissibilityState,
+          information_density_state: informationDensity.state,
+          edge_state: finalDecisionTruth.edge_eligibility.state,
+          blocking_layer: finalDecisionTruth.blocking_layer || "none",
+          false_context_family: finalDecisionTruth.false_context.family,
+          false_context_no_trade: finalDecisionTruth.false_context.no_trade,
+          false_context_trigger_layer: finalDecisionTruth.false_context.trigger_layer,
+          false_context_reasons: finalDecisionTruth.false_context.reasons,
+          coherence_pct: marketTruth.metrics.coherence_pct,
+          freshness_pct: marketTruth.metrics.freshness_pct,
+          information_density_pct: marketTruth.metrics.information_density_pct,
+          execution_quality_pct: marketTruth.metrics.execution_quality_pct,
+          anomaly_burden_pct: marketTruth.metrics.anomaly_burden_pct,
+        },
+      },
+    );
+  }, [appendTerminalGuideJournalEntry, finalDecisionTruth, predictorMarketSession, terminalPassiveMode, volatilityRegimeSnapshot.regime]);
+  useEffect(() => {
+    if (terminalPassiveMode || !finalDecisionTruth) {
+      marketTransitionContextRef.current = null;
+      return;
+    }
+    const informationDensity = finalDecisionTruth.information_density;
+    const marketTruth = finalDecisionTruth.market_truth;
+    const admissibilityState = finalDecisionTruth.execution_allowed
+      ? finalDecisionTruth.should_trade
+        ? "ADMISSIBLE"
+        : "WATCH"
+      : marketTruth.state === "UNTRUSTWORTHY" || informationDensity.state === "DEGRADED"
+        ? "INADMISSIBLE"
+        : "DEGRADED";
+    const currentContext = {
+      regime: String(volatilityRegimeSnapshot.regime || "unknown").trim().toUpperCase() || "UNKNOWN",
+      marketTruthState: marketTruth.state,
+      truthQualityPct: marketTruth.score_pct,
+      admissibilityState,
+      densityState: informationDensity.state,
+      edgeState: finalDecisionTruth.edge_eligibility.state,
+      blockingLayer: finalDecisionTruth.blocking_layer || "none",
+    };
+    const previousContext = marketTransitionContextRef.current;
+    marketTransitionContextRef.current = currentContext;
+    if (!previousContext) {
+      return;
+    }
+    const truthDeltaPct = currentContext.truthQualityPct - previousContext.truthQualityPct;
+    const hasTransition = previousContext.regime !== currentContext.regime
+      || previousContext.marketTruthState !== currentContext.marketTruthState
+      || previousContext.admissibilityState !== currentContext.admissibilityState
+      || previousContext.densityState !== currentContext.densityState
+      || previousContext.edgeState !== currentContext.edgeState
+      || previousContext.blockingLayer !== currentContext.blockingLayer
+      || Math.abs(truthDeltaPct) >= 8;
+    if (!hasTransition) {
+      return;
+    }
+    const transitionType = previousContext.regime !== currentContext.regime
+      ? "REGIME_SHIFT"
+      : previousContext.marketTruthState !== currentContext.marketTruthState
+        ? "MARKET_TRUTH_SHIFT"
+        : previousContext.admissibilityState !== currentContext.admissibilityState
+          ? "ADMISSIBILITY_SHIFT"
+        : previousContext.densityState !== currentContext.densityState
+          ? "INFORMATION_DENSITY_SHIFT"
+          : previousContext.blockingLayer !== currentContext.blockingLayer
+            ? "GATING_SHIFT"
+            : previousContext.edgeState !== currentContext.edgeState
+              ? "EDGE_ELIGIBILITY_SHIFT"
+              : "TRUTH_QUALITY_SHIFT";
+    void appendTerminalGuideJournalEntry(
+      "market-transition",
+      `${transitionType} ${previousContext.regime}/${previousContext.marketTruthState}/${previousContext.admissibilityState} -> ${currentContext.regime}/${currentContext.marketTruthState}/${currentContext.admissibilityState}`,
+      {
+        market_transition: {
+          transition_type: transitionType,
+          from_regime: previousContext.regime,
+          to_regime: currentContext.regime,
+          from_market_truth_state: previousContext.marketTruthState,
+          to_market_truth_state: currentContext.marketTruthState,
+          from_admissibility_state: previousContext.admissibilityState,
+          to_admissibility_state: currentContext.admissibilityState,
+          from_blocking_layer: previousContext.blockingLayer,
+          to_blocking_layer: currentContext.blockingLayer,
+          from_density_state: previousContext.densityState,
+          to_density_state: currentContext.densityState,
+          from_edge_state: previousContext.edgeState,
+          to_edge_state: currentContext.edgeState,
+          truth_quality_delta_pct: truthDeltaPct,
+        },
+      },
+    );
+  }, [appendTerminalGuideJournalEntry, finalDecisionTruth, terminalPassiveMode, volatilityRegimeSnapshot.regime]);
+  useEffect(() => {
+    if (terminalPassiveMode || !finalDecisionTruth) {
+      marketExecutionDegradationSignatureRef.current = "";
+      return;
+    }
+    const executionQualityPct = finalDecisionTruth.market_truth.metrics.execution_quality_pct;
+    const volatilityRegime = String(volatilityRegimeSnapshot.regime || "unknown").trim().toUpperCase() || "UNKNOWN";
+    const degraded = executionLockState.active || executionQualityPct < 60;
+    if (!degraded) {
+      marketExecutionDegradationSignatureRef.current = "";
+      return;
+    }
+    const degradationType = executionLockState.active
+      ? String(executionLockState.code || "execution_lock").trim().toUpperCase() || "EXECUTION_LOCK"
+      : executionQualityPct < 40
+        ? "EXECUTION_QUALITY_COLLAPSE"
+        : "EXECUTION_QUALITY_DEGRADED";
+    const detail = executionLockState.active
+      ? executionLockState.detailLabel
+      : `execution quality ${executionQualityPct}% under ${volatilityRegime}`;
+    const signature = JSON.stringify([
+      degradationType,
+      volatilityRegime,
+      detail,
+      executionQualityPct,
+      finalDecisionTruth.market_truth.state,
+      finalDecisionTruth.edge_eligibility.state,
+      finalDecisionTruth.blocking_layer || "none",
+    ]);
+    if (signature === marketExecutionDegradationSignatureRef.current) {
+      return;
+    }
+    marketExecutionDegradationSignatureRef.current = signature;
+    void appendTerminalGuideJournalEntry(
+      "market-execution-degradation",
+      detail,
+      {
+        execution_degradation: {
+          degradation_type: degradationType,
+          venue: finalDecisionTruth.preferred_venue || "MULTI",
+          route_mode: finalDecisionTruth.route_mode,
+          regime: volatilityRegime,
+          market_truth_state: finalDecisionTruth.market_truth.state,
+          edge_state: finalDecisionTruth.edge_eligibility.state,
+          blocking_layer: finalDecisionTruth.blocking_layer || "none",
+          execution_quality_pct: executionQualityPct,
+          detail,
+        },
+      },
+    );
+  }, [appendTerminalGuideJournalEntry, executionLockState, finalDecisionTruth, terminalPassiveMode, volatilityRegimeSnapshot.regime]);
+  useEffect(() => {
+    if (terminalPassiveMode || !finalDecisionTruth) {
+      oracleStabilityMemoryContextRef.current = null;
+      return;
+    }
+    const currentContext = buildOracleStabilitySnapshot({
+      finalDecisionTruth,
+      volatilityRegime: String(volatilityRegimeSnapshot.regime || "unknown"),
+      executionLockActive: executionLockState.active,
+    });
+    const previousContext = oracleStabilityMemoryContextRef.current;
+    oracleStabilityMemoryContextRef.current = currentContext;
+    const event = buildOracleStabilityMemoryEvent({
+      previous: previousContext,
+      current: currentContext,
+      finalDecisionTruth,
+      executionLockActive: executionLockState.active,
+    });
+    if (!event) {
+      return;
+    }
+    void appendTerminalGuideJournalEntry(event.journal_action, event.detail_label, event.payload);
+  }, [appendTerminalGuideJournalEntry, executionLockState.active, finalDecisionTruth, terminalPassiveMode, volatilityRegimeSnapshot.regime]);
+  useEffect(() => {
+    if (terminalPassiveMode || !finalDecisionTruth) {
+      selfHealingRecoveryMemoryContextRef.current = null;
+      return;
+    }
+    const previousContext = selfHealingRecoveryMemoryContextRef.current;
+    selfHealingRecoveryMemoryContextRef.current = selfHealingRecoveryMemorySnapshot;
+    const event = buildSelfHealingRecoveryMemoryEvent({
+      previous: previousContext,
+      current: selfHealingRecoveryMemorySnapshot,
+      finalDecisionTruth,
+      selfHealingSnapshot: selfHealingV75Snapshot,
+      selfPreservation: selfPreservationSummary,
+      stabilitySnapshot: stabilityEngineSnapshot,
+    });
+    if (!event) {
+      return;
+    }
+    void appendTerminalGuideJournalEntry(event.journal_action, event.detail_label, event.payload);
+  }, [appendTerminalGuideJournalEntry, finalDecisionTruth, selfHealingRecoveryMemorySnapshot, selfHealingV75Snapshot, selfPreservationSummary, stabilityEngineSnapshot, terminalPassiveMode]);
+  useEffect(() => {
+    if (terminalPassiveMode || !finalDecisionTruth) {
+      executionRealityMemoryContextRef.current = null;
+      return;
+    }
+    const previousContext = executionRealityMemoryContextRef.current;
+    executionRealityMemoryContextRef.current = executionRealityMemorySnapshot;
+    const event = buildExecutionRealityMemoryEvent({
+      previous: previousContext,
+      current: executionRealityMemorySnapshot,
+      executionReality: executionRealitySummary,
+      stabilitySnapshot: stabilityEngineSnapshot,
+      truthContext: {
+        oracle_fingerprint: finalDecisionTruth.oracle_fingerprint,
+        preferred_venue: finalDecisionTruth.preferred_venue,
+        route_mode: finalDecisionTruth.route_mode,
+        reasons: finalDecisionTruth.reasons,
+        should_trade: finalDecisionTruth.should_trade,
+        execution_allowed: finalDecisionTruth.execution_allowed,
+      },
+    });
+    if (!event) {
+      return;
+    }
+    void appendTerminalGuideJournalEntry(event.journal_action, event.detail_label, event.payload);
+  }, [appendTerminalGuideJournalEntry, executionRealityMemorySnapshot, executionRealitySummary, finalDecisionTruth, stabilityEngineSnapshot, terminalPassiveMode]);
   const expectedGpuGlobalBatchKey = useMemo(
     () => `${chartTimeframe}|${activeGpuMultiSymbolFeeds.map((feed) => feed.id).join(",")}`,
     [activeGpuMultiSymbolFeeds, chartTimeframe],
@@ -21565,6 +24136,130 @@ function TradingTerminalPageHydrated() {
       capturedFrom,
     };
   }, [executionTelemetry, mergedChartSendHistory, tradeResult]);
+  const multiChartCaptureIntegrity = useMemo<LocalMultiChartIntegrity>(() => {
+    const expectedTiles = Math.max(1, gridSyncBadge.chartCount);
+    const viewportMetaCount = Object.keys(gpuViewportFrameMeta).length;
+    const activeTiles = expectedTiles <= 1
+      ? 1
+      : activeGpuGlobalGridBatch
+        ? Math.min(expectedTiles, activeGpuGlobalGridBatch.frameCount + 1)
+        : Math.min(expectedTiles, Math.max(1, viewportMetaCount));
+    const syncAgeMs = activeGpuGlobalGridBatch ? Math.max(0, Date.now() - activeGpuGlobalGridBatch.publishedAt) : null;
+    const sourceDivergenceCount = activeGpuGlobalGridBatch?.partialCount ?? Math.max(0, expectedTiles - activeTiles);
+    const masterClockDriftMs = activeGpuGlobalGridBatch?.maxSkewMs ?? null;
+    const confidencePct = activeGpuGlobalGridBatch?.minConfidence != null
+      ? Math.round(activeGpuGlobalGridBatch.minConfidence * 100)
+      : gpuPerceptualTelemetry?.sync?.confidence != null
+        ? Math.round(gpuPerceptualTelemetry.sync.confidence * 100)
+        : null;
+    const reasons: string[] = [];
+
+    if (expectedTiles <= 1) {
+      return {
+        state: "inactive",
+        activeTiles,
+        expectedTiles,
+        syncAgeMs,
+        sourceDivergenceCount: 0,
+        masterClockDriftMs,
+        confidencePct,
+        reasons,
+        summary: "multi-chart inactive",
+      };
+    }
+
+    if (activeTiles < expectedTiles) {
+      reasons.push("multi_chart_missing_tiles");
+    }
+    if (sourceDivergenceCount > 0) {
+      reasons.push("multi_chart_source_divergence");
+    }
+    if ((masterClockDriftMs ?? 0) > Math.max(750, timeframeToMs(chartTimeframe))) {
+      reasons.push("multi_chart_clock_drift");
+    }
+    if ((syncAgeMs ?? 0) > Math.max(2_500, Math.min(10_000, timeframeToMs(chartTimeframe) * 2))) {
+      reasons.push("multi_chart_sync_age_high");
+    }
+
+    const state: LocalIntegrityState = gridSyncBadge.chipTone === "danger" || activeTiles <= Math.max(1, Math.floor(expectedTiles / 2))
+      ? "broken"
+      : reasons.length > 0 || gridSyncBadge.chipTone === "warn"
+        ? "degraded"
+        : "high";
+
+    return {
+      state,
+      activeTiles,
+      expectedTiles,
+      syncAgeMs,
+      sourceDivergenceCount,
+      masterClockDriftMs,
+      confidencePct,
+      reasons,
+      summary: state === "high"
+        ? `multi-chart stable ${activeTiles}/${expectedTiles} · skew ${masterClockDriftMs ?? 0}ms`
+        : `${state} ${activeTiles}/${expectedTiles} · skew ${masterClockDriftMs ?? 0}ms · ${reasons.slice(0, 3).join(" · ") || "sync_watch"}`,
+    };
+  }, [activeGpuGlobalGridBatch, chartTimeframe, gpuPerceptualTelemetry, gpuViewportFrameMeta, gridSyncBadge]);
+  const v5CaptureObservation = useMemo<LocalV5Observation>(() => {
+    const requiredShadowCycles = Math.max(0, Math.round(Number(selfLearningV5Observation?.requiredShadowCycles || 0)));
+    const observedShadowCycles = Math.max(0, Math.round(Number(selfLearningV5Observation?.observedShadowCycles || 0)));
+    const requiredObservationHours = Math.max(0, Number(selfLearningV5Observation?.requiredObservationHours || 0));
+    const observedObservationHours = Math.max(0, Number(selfLearningV5Observation?.observedObservationHours || 0));
+    const missingExecutionMetrics = latestExecutionCapture.status == null
+      && latestExecutionCapture.fillLatencyMs == null
+      && latestExecutionCapture.slippageBps == null
+      && latestExecutionCapture.fillRatio == null
+      && latestExecutionCapture.pnlUsd == null;
+    const blockedReasons = Array.from(new Set([
+      ...localAutoTraderV5Observation.blockedReasons,
+      ...(selfLearningV5ExecutionFilter.active && !selfLearningV5ExecutionFilter.pass ? selfLearningV5ExecutionFilter.blockers : []),
+      ...((selfLearningV5Observation?.reasons || []).map((reason) => String(reason || "").trim()).filter(Boolean)),
+      ...(localAutoTraderV5Observation.drawdownPaused ? ["v5_drawdown_pause"] : []),
+      ...(!Boolean(selfLearningV5Observation?.eligibleForPromotion) && (requiredShadowCycles > 0 || requiredObservationHours > 0) ? ["v5_promotion_not_ready"] : []),
+      ...(missingExecutionMetrics ? ["v5_execution_metrics_missing"] : []),
+    ])).slice(0, 8);
+    const enabled = localAutoTraderV5Observation.enabled || Boolean(selfLearningV5State?.enabled);
+    const sourceLabel = selfLearningV5ExecutionFilter.active
+      ? selfLearningV5ExecutionFilter.sourceLabel
+      : enabled
+        ? "unknown"
+        : "inactive";
+    const promotionReady = Boolean(selfLearningV5Observation?.eligibleForPromotion);
+    const state: LocalIntegrityState = !enabled
+      ? "inactive"
+      : localAutoTraderV5Observation.drawdownPaused || (blockedReasons.length > 0 && missingExecutionMetrics)
+        ? "broken"
+        : blockedReasons.length > 0 || !promotionReady || missingExecutionMetrics
+          ? "degraded"
+          : "high";
+
+    return {
+      state,
+      enabled,
+      mode: localAutoTraderV5Observation.mode,
+      drawdownPaused: localAutoTraderV5Observation.drawdownPaused,
+      blockedReasons,
+      sourceLabel,
+      promotionReady,
+      requiredShadowCycles,
+      observedShadowCycles,
+      requiredObservationHours,
+      observedObservationHours,
+      missingExecutionMetrics,
+      summary: !enabled
+        ? "v5 inactive"
+        : state === "high"
+          ? `v5 ${sourceLabel} ready · promotion ready`
+          : `v5 ${sourceLabel} ${localAutoTraderV5Observation.mode} · ${blockedReasons.slice(0, 3).join(" · ") || "integrity_watch"}`,
+    };
+  }, [latestExecutionCapture, localAutoTraderV5Observation, selfLearningV5ExecutionFilter, selfLearningV5Observation, selfLearningV5State?.enabled]);
+    const publishedMultiChartState: LocalIntegrityState = multiChartCaptureIntegrity.state === "high"
+      || multiChartCaptureIntegrity.state === "degraded"
+      || multiChartCaptureIntegrity.state === "broken"
+      || multiChartCaptureIntegrity.state === "inactive"
+      ? multiChartCaptureIntegrity.state
+      : "inactive";
   const localTerminalCapturePayload = useMemo(
     () => (localTerminalCaptureClientId ? buildLocalTerminalRuntimeCapture({
       clientId: localTerminalCaptureClientId,
@@ -21619,18 +24314,12 @@ function TradingTerminalPageHydrated() {
       temporalSyncBufferWindowMs,
       temporalSyncSummaryLabel,
       temporalSyncDetailLabel,
-      smartMarketState: executionLockState.active ? "NO_TRADE" : confidenceV2SmartState,
-      smartMarketReason: executionLockState.active ? executionLockState.detailLabel : confidenceV2DetailLabel,
-      smartMarketConfidence: executionLockState.active ? 0 : confidenceV2Snapshot.finalScorePct / 100,
-      smartMarketTone: executionLockState.active
-        ? "bad"
-        : confidenceV2Snapshot.actionState === "go"
-          ? "good"
-          : confidenceV2Snapshot.actionState === "caution"
-            ? "warn"
-            : "warn",
-      smartMarketSummaryLabel: executionLockState.active ? executionLockState.summaryLabel : confidenceV2SummaryLabel,
-      smartMarketDetailLabel: executionLockState.active ? executionLockState.detailLabel : confidenceV2DetailLabel,
+      smartMarketState: finalDecisionObservabilityOracle.market_state,
+      smartMarketReason: finalDecisionObservabilityOracle.reason_code,
+      smartMarketConfidence: finalDecisionObservabilityOracle.confidence,
+      smartMarketTone: finalDecisionObservabilityOracle.tone,
+      smartMarketSummaryLabel: finalDecisionObservabilityOracle.summary_label,
+      smartMarketDetailLabel: finalDecisionObservabilityOracle.detail_label,
       desyncType: desyncSignal.type,
       desyncState: desyncSignal.state,
       desyncTradeBias: desyncSignal.tradeBias,
@@ -21656,6 +24345,15 @@ function TradingTerminalPageHydrated() {
       candleUpdates: marketBusKernelTelemetry.candleUpdates,
       syntheticHeartbeatOpens: marketBusKernelTelemetry.syntheticHeartbeatOpens,
       candleLastUpdateAge: candleLastUpdateAgeLabel,
+      exchangeStatusState: chartTruthDesk.exchangeStatusState,
+      exchangeAgeMs: chartTruthDesk.exchangeAgeMs,
+      exchangeAgeLabel: chartTruthDesk.exchangeAgeLabel,
+      exchangeSourceLabel: chartTruthDesk.exchangeSourceLabel,
+      truthStatusLabel: chartTruthDesk.truthStatusLabel,
+      truthStatusReasonLabel: chartTruthDesk.truthStatusReasonLabel,
+      busLagMs: chartTruthDesk.busLagMs,
+      endToEndLagMs: chartTruthDesk.endToEndLagMs,
+      renderLagMs: chartTruthDesk.renderLagMs,
       syncBusSeq: executionSyncDiagnostics.bus_seq,
       syncLastTradeTime: executionSyncDiagnostics.last_trade_time,
       syncDepthAgeMs: executionSyncDiagnostics.depth_age_ms,
@@ -21677,6 +24375,28 @@ function TradingTerminalPageHydrated() {
       latestExecutionMaxDrawdownUsd: latestExecutionCapture.maxDrawdownUsd,
       latestExecutionHoldingTimeSec: latestExecutionCapture.holdingTimeSec,
       latestExecutionCapturedFrom: latestExecutionCapture.capturedFrom,
+      multiChartState: publishedMultiChartState,
+      multiChartActiveTiles: multiChartCaptureIntegrity.activeTiles,
+      multiChartExpectedTiles: multiChartCaptureIntegrity.expectedTiles,
+      multiChartSyncAgeMs: multiChartCaptureIntegrity.syncAgeMs,
+      multiChartSourceDivergenceCount: multiChartCaptureIntegrity.sourceDivergenceCount,
+      multiChartMasterClockDriftMs: multiChartCaptureIntegrity.masterClockDriftMs,
+      multiChartConfidencePct: multiChartCaptureIntegrity.confidencePct,
+      multiChartReasons: multiChartCaptureIntegrity.reasons,
+      multiChartSummaryLabel: multiChartCaptureIntegrity.summary,
+      v5Enabled: v5CaptureObservation.enabled,
+      v5Mode: v5CaptureObservation.mode,
+      v5DrawdownPaused: v5CaptureObservation.drawdownPaused,
+      v5BlockedReasons: v5CaptureObservation.blockedReasons,
+      v5SourceLabel: v5CaptureObservation.sourceLabel,
+      v5PromotionReady: v5CaptureObservation.promotionReady,
+      v5RequiredShadowCycles: v5CaptureObservation.requiredShadowCycles,
+      v5ObservedShadowCycles: v5CaptureObservation.observedShadowCycles,
+      v5RequiredObservationHours: v5CaptureObservation.requiredObservationHours,
+      v5ObservedObservationHours: v5CaptureObservation.observedObservationHours,
+      v5MissingExecutionMetrics: v5CaptureObservation.missingExecutionMetrics,
+      v5Reasons: v5CaptureObservation.blockedReasons,
+      v5SummaryLabel: v5CaptureObservation.summary,
       chartCompactAlertLabel,
       chartFlowAlertText,
       perceptual: chartEngineMode === "v4"
@@ -21735,6 +24455,7 @@ function TradingTerminalPageHydrated() {
       authSessionRequired,
       authStatus,
       chartCompactAlertLabel,
+      chartTruthDesk,
       chartEngineMode,
       chartFlowAlertText,
       chartPerceptualTelemetry,
@@ -21767,6 +24488,8 @@ function TradingTerminalPageHydrated() {
       executionSyncDiagnostics.last_trade_time,
       executionSyncDiagnostics.ohlcv_time,
       latestExecutionCapture,
+      localAutoTraderV5Observation,
+      multiChartCaptureIntegrity,
       overlayDecisionRegime,
       routingInputDiagnostics,
       ohlcvFreshnessState,
@@ -21784,6 +24507,7 @@ function TradingTerminalPageHydrated() {
       tripleValidationGate.tone,
       tradesFreshnessState,
       volatilityRegimeSnapshot.regime,
+      v5CaptureObservation,
     ],
   );
   const localTerminalCapturePayloadSignature = useMemo(
@@ -22010,8 +24734,8 @@ function TradingTerminalPageHydrated() {
   };
 
   const handleChartHudSubmit = () => {
-    if (confidenceExecutionControl.blocksExecution) {
-      setError(confidenceExecutionControl.blockReason || "Confidence V2 blocked execution.");
+    if (finalDecisionExecutionOracle.blocks_execution) {
+      setError(finalDecisionExecutionOracle.detail_label);
       pushChartSendHistory("blocked-loss");
       return;
     }
@@ -22032,7 +24756,7 @@ function TradingTerminalPageHydrated() {
   const agentsHealthy = providerRows.filter((item) => Boolean(item.available)).length;
 
   const governanceRows = [
-    { label: "Kill switch", value: String(overview?.kill_switch_active || "off"), severity: String(overview?.kill_switch_active) === "true" ? 3 : 1 },
+    { label: "Kill switch", value: killSwitchStatusLabel, severity: killSwitchActive ? 3 : 1 },
     { label: "System mode", value: String(liveOpsGovernance.mode || "SAFE"), severity: String(liveOpsGovernance.mode || "SAFE") === "LOCKED" ? 3 : String(liveOpsGovernance.mode || "SAFE") === "LIVE" ? 1 : 2 },
     { label: "Watchdog", value: String(liveOpsWatchdog.status || "OK"), severity: String(liveOpsWatchdog.status || "OK") === "HALT" ? 3 : String(liveOpsWatchdog.status || "OK") === "WARNING" ? 2 : 1 },
     { label: "Health score", value: `${toNumber(liveOpsWatchdog.health_score, 0).toFixed(0)}%`, severity: toNumber(liveOpsWatchdog.health_score, 0) < 60 ? 3 : toNumber(liveOpsWatchdog.health_score, 0) < 80 ? 2 : 1 },
@@ -22274,6 +24998,7 @@ function TradingTerminalPageHydrated() {
       ? (["policy"] satisfies ChartSidecarId[])
       : dockedChartSidecarIds;
   const effectiveDetachedChartSidecars = detachedChartSidecars.filter((panel) => !effectiveDockedChartSidecarIds.includes(panel.id));
+  const detachedChartSidecarFloatingIds = effectiveDetachedChartSidecars.map((panel) => panel.id);
 
   useEffect(() => {
     const allowed = new Set(CHART_SIDECAR_PROFILE_LAYOUTS[chartSidecarProfile].cards);
@@ -22283,12 +25008,23 @@ function TradingTerminalPageHydrated() {
   const renderChartSidecarCard = (id: ChartSidecarId, floating = false): ReactNode => {
     const headActions = floating ? null : (
       <div className="chart-sidecar-actions">
-        <button type="button" className="chart-sidecar-head-btn" title="Detacher ce sidecar" onClick={() => detachChartSidecar(id)}>Float</button>
+        <button
+          type="button"
+          data-testid={`terminal-chart-sidecar-float-${id}`}
+          className="chart-sidecar-head-btn"
+          title="Detacher ce sidecar"
+          onClick={() => detachChartSidecar(id)}
+          disabled={terminalFloatingTransitionLocked}
+        >
+          Float
+        </button>
       </div>
     );
 
     const approveAllAndSendLabel = chartEffectiveSendMode === "confirm-required" && !chartHudConfirmArmed
       ? "Approve + Arm Send"
+      : finalDecisionExecutionOracle.blocks_execution
+        ? "EXECUTION DISABLED"
       : chartLowFlowEdgeBlocked
         ? "LOW FLOW EDGE"
         : "Approve All + Send";
@@ -22498,7 +25234,7 @@ function TradingTerminalPageHydrated() {
           void approveAllAndSend();
         }}
         approveAllAndSendLabel={approveAllAndSendLabel}
-        approveAllAndSendDisabled={executionLockState.active || chartLowFlowEdgeBlocked || confidenceExecutionControl.blocksExecution}
+        approveAllAndSendDisabled={finalDecisionExecutionOracle.blocks_execution || chartLowFlowEdgeBlocked}
         showCriticalActions={marketDecisionV1.criticalConfirmed}
         previewOpen={chartOrderPreviewOpen}
         onTogglePreview={() => setChartOrderPreviewOpen((value) => !value)}
@@ -22818,15 +25554,17 @@ function TradingTerminalPageHydrated() {
       case "controlroom":
         return <ControlRoomMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} liveOpsPayload={liveOpsPayload} executionAiV6Payload={executionAiV6Payload} emergencyStopBusy={emergencyStopBusy} emergencyStopFeedback={emergencyStopFeedback} onEmergencyStop={() => { void triggerEmergencyStop(); }} formatClock={formatClock} />;
       case "pnltruth":
-        return <ExecutionPnlTruthMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} payload={executionPnlAnalyzerPayload} liveOpsPayload={liveOpsPayload} executionAiV6Payload={executionAiV6Payload} journalContext={terminalGuideJournalContext} formatClock={formatClock} />;
+        return <ExecutionPnlTruthMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} payload={executionPnlAnalyzerPayload} liveOpsPayload={liveOpsPayload} executionAiV6Payload={executionAiV6Payload} finalDecisionTruth={finalDecisionTruth} passiveMode={terminalPassiveMode} journalContext={terminalGuideJournalContext} formatClock={formatClock} />;
       case "optimizer":
         return <ExecutionOptimizerMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} payload={executionOptimizerLivePayload} routingPayload={routingScore} formatClock={formatClock} />;
       case "execsmart":
         return <ExecutionSmartTrackerPanel badge={null} layoutEditMode={false} onDetach={() => {}} telemetry={executionTelemetry} outcomes={filteredOutcomes} preview={executionSmartTrackerPreview} symbol={selectedChartSymbol} formatClock={formatClock} />;
       case "marketcontext":
-        return <ExecutionContextMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} routingPayload={routingScore} optimizerPayload={executionOptimizerLivePayload} smartDecision={smartDecisionHud} formatClock={formatClock} />;
+        return <ExecutionContextMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} routingPayload={routingScore} optimizerPayload={executionOptimizerLivePayload} smartDecision={smartDecisionHud} finalDecisionTruth={finalDecisionTruth} formatClock={formatClock} />;
+      case "tradability":
+        return <TradabilitySurfaceMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} finalDecisionTruth={finalDecisionTruth} preprocessorPayload={marketBusTradePreprocessor} journalEntries={terminalCalibrationEntries} analyticsSummary={terminalTradabilityAnalytics} volatilityRegime={String(volatilityRegimeSnapshot.regime || "unknown")} marketSession={predictorMarketSession} formatClock={formatClock} />;
       case "attentioncontext":
-        return <AttentionContextMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} liveAttention={attentionMonitoringPayload} journalContext={terminalGuideJournalContext} formatClock={formatClock} />;
+        return <AttentionContextMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} liveAttention={attentionMonitoringPayload} passiveMode={terminalPassiveMode} journalContext={terminalGuideJournalContext} formatClock={formatClock} />;
       case "v6observability":
         return <ExecutionAiV6ObservabilityPanel badge={null} layoutEditMode={false} onDetach={() => {}} payload={executionAiV6Payload} formatClock={formatClock} />;
       case "venues":
@@ -22838,7 +25576,7 @@ function TradingTerminalPageHydrated() {
       case "governance":
         return <GovernanceMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} governanceSort={governanceSort} onGovernanceSortChange={setGovernanceSort} incidentSort={incidentSort} onIncidentSortChange={setIncidentSort} governanceOnlyAlerts={governanceOnlyAlerts} onGovernanceOnlyAlertsChange={setGovernanceOnlyAlerts} governanceFilterText={governanceFilterText} onGovernanceFilterTextChange={setGovernanceFilterText} governanceFiltered={governanceFiltered} />;
       case "readiness":
-        return <ReadinessMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} driftItems={driftItems} suspendedCount={suspended.length} memorySummary={memorySummary} incidents={incidents} />;
+        return <ReadinessMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} driftItems={driftItems} suspendedCount={suspended.length} memorySummary={memorySummary} incidents={incidents} preprocessorPayload={asJsonMap(asJsonMap(marketBusMeta?.preprocessor).trades)} finalDecisionTruth={finalDecisionTruth} />;
       case "risktimeline":
         return <RiskTimelineMonitoringPanel badge={null} layoutEditMode={false} onDetach={() => {}} body={<RiskTimelineBody {...buildRiskTimelineBodyProps(10, "rt")} />} />;
       default:
@@ -22902,10 +25640,156 @@ function TradingTerminalPageHydrated() {
     : displayDepthStreamState === "live" && mt5Healthy
       ? "go"
       : "watch";
+  const driftSimilarityLabel = typeof memorySummary?.avg_final_similarity === "number"
+    ? memorySummary.avg_final_similarity.toFixed(2)
+    : "n/a";
+  const driftImpactLabel = typeof memorySummary?.avg_memory_impact === "number"
+    ? memorySummary.avg_memory_impact.toFixed(2)
+    : null;
+  const diagnosticsSurfaceOpen = terminalOpsSurfaceMode === "diagnostic";
+  const floatingPanelIds = floatingPanels.map((panel) => panel.id);
+  const floatingSurfaceIds: TerminalFloatingSurfaceId[] = [...floatingPanelIds, ...detachedChartSidecarFloatingIds];
+  const floatingSurfaceCount = floatingSurfaceIds.length;
+  const floatingPanelIdsLabel = floatingSurfaceIds.length > 0 ? floatingSurfaceIds.join("|") : "none";
+  const detachedChartSidecarIdsLabel = detachedChartSidecarFloatingIds.length > 0 ? detachedChartSidecarFloatingIds.join("|") : "none";
+  const focusDecksLabel = focusDecks.length > 0 ? focusDecks.join("|") : "none";
+  const terminalUiDebugCards = [
+    {
+      label: "Ops surface",
+      value: terminalOpsSurfaceRuntimeState,
+      detail: `${terminalOpsTransitionPhase} · ${terminalOpsTransitionLocked ? "lock" : "stable"}`,
+    },
+    {
+      label: "Density",
+      value: terminalDensityMode,
+      detail: `${terminalDensityTransitionPhase} · ${terminalDensityTransitionLocked ? "lock" : "stable"}`,
+    },
+    {
+      label: "Floating",
+      value: `${floatingSurfaceCount} surface${floatingSurfaceCount > 1 ? "s" : ""}`,
+      detail: `dock ${floatingPanels.length} · sidecar ${detachedChartSidecarFloatingIds.length} · ${terminalFloatingLastAction}`,
+    },
+    {
+      label: "Render cycle",
+      value: String(terminalOpsRenderCycleRef.current),
+      detail: `${terminalOpsTransitionCount + terminalDensityTransitionCount + terminalFloatingTransitionCount} transitions`,
+    },
+  ] as const;
+  const terminalUiDebugRows = [
+    { label: "Focus decks", value: focusDecksLabel },
+    { label: "Floating IDs", value: floatingPanelIdsLabel },
+    { label: "Sidecar IDs", value: detachedChartSidecarIdsLabel },
+    { label: "Last floating panel", value: terminalFloatingLastPanelId || "none" },
+  ] as const;
+  useLayoutEffect(() => {
+    terminalOpsRenderCycleRef.current += 1;
+    if (typeof window === "undefined") {
+      return;
+    }
+    const runtimeWindow = window as Window & {
+      __TERMINAL_UI_STABILITY__?: {
+        renderCycle: number;
+        transitionCount: number;
+        transitionPhase: TerminalOpsTransitionPhase;
+        transitionSource: TerminalOpsTransitionSource;
+        transitionLocked: boolean;
+        surfaceState: TerminalOpsSurfaceRuntimeState;
+        requestedSurfaceMode: TerminalOpsSurfaceMode;
+        monitoringDeckVisible: boolean;
+        densityMode: TerminalDensityMode;
+        densityTransitionCount: number;
+        densityTransitionPhase: TerminalDensityTransitionPhase;
+        densityTransitionSource: TerminalDensityTransitionSource;
+        densityTransitionLocked: boolean;
+        floatingPanelCount: number;
+        floatingPanelIds: DockPanelId[];
+        detachedChartSidecarCount: number;
+        detachedChartSidecarIds: ChartSidecarId[];
+        floatingSurfaceCount: number;
+        floatingSurfaceIds: TerminalFloatingSurfaceId[];
+        floatingTransitionCount: number;
+        floatingTransitionPhase: TerminalFloatingTransitionPhase;
+        floatingTransitionSource: TerminalFloatingTransitionSource;
+        floatingTransitionLocked: boolean;
+        floatingLastAction: TerminalFloatingTransitionAction;
+        floatingLastPanelId: TerminalFloatingSurfaceId | null;
+        uiDebugVisible: boolean;
+        layoutEditMode: boolean;
+        updatedAt: string;
+      };
+    };
+    runtimeWindow.__TERMINAL_UI_STABILITY__ = {
+      renderCycle: terminalOpsRenderCycleRef.current,
+      transitionCount: terminalOpsTransitionCount,
+      transitionPhase: terminalOpsTransitionPhase,
+      transitionSource: terminalOpsTransitionSource,
+      transitionLocked: terminalOpsTransitionLocked,
+      surfaceState: terminalOpsSurfaceRuntimeState,
+      requestedSurfaceMode: terminalOpsSurfaceMode,
+      monitoringDeckVisible: showMonitoringDeck,
+      densityMode: terminalDensityMode,
+      densityTransitionCount: terminalDensityTransitionCount,
+      densityTransitionPhase: terminalDensityTransitionPhase,
+      densityTransitionSource: terminalDensityTransitionSource,
+      densityTransitionLocked: terminalDensityTransitionLocked,
+      floatingPanelCount: floatingPanels.length,
+      floatingPanelIds,
+      detachedChartSidecarCount: detachedChartSidecarFloatingIds.length,
+      detachedChartSidecarIds: detachedChartSidecarFloatingIds,
+      floatingSurfaceCount,
+      floatingSurfaceIds,
+      floatingTransitionCount: terminalFloatingTransitionCount,
+      floatingTransitionPhase: terminalFloatingTransitionPhase,
+      floatingTransitionSource: terminalFloatingTransitionSource,
+      floatingTransitionLocked: terminalFloatingTransitionLocked,
+      floatingLastAction: terminalFloatingLastAction,
+      floatingLastPanelId: terminalFloatingLastPanelId,
+      uiDebugVisible: terminalUiDebugVisible,
+      layoutEditMode,
+      updatedAt: new Date().toISOString(),
+    };
+  });
+  const compactContextCards = [
+    {
+      key: "drift",
+      label: "Drift summary",
+      metric: `${driftItems.length} drift · ${suspended.length} suspendus`,
+      detail: `${openIncidents} incidents · similarity ${driftSimilarityLabel}${driftImpactLabel ? ` · impact ${driftImpactLabel}` : ""}`,
+      tone: openIncidents > 0 || suspended.length > 0 ? "caution" : driftItems.length > 0 ? "watch" : "go",
+    },
+    {
+      key: "opportunity",
+      label: "Opportunity summary",
+      metric: `${marketDecisionV1.scenarioLabel} · ${marketDecisionV1.scenarioProbabilityPct.toFixed(0)}%`,
+      detail: `${decisionGateLabel} · confidence ${confidenceV2Snapshot.finalScorePct.toFixed(0)}% · ${marketDecisionV1.biasDirection === "neutral" ? "biais neutre" : marketDecisionV1.biasDirection === "buy" ? "biais long" : "biais short"}`,
+      tone: decisionGateTone === "go" ? "go" : decisionGateTone === "caution" ? "caution" : decisionGateTone === "blocked" ? "blocked" : "watch",
+    },
+    {
+      key: "market",
+      label: "Market state",
+      metric: `${selectedTruthVenueLabel} · DOM ${displayDepthStreamState.toUpperCase()}`,
+      detail: `${preferredRouteLabel || "route indisponible"} · ${criticalAlerts} alertes critiques · ${openIncidents} incidents`,
+      tone: displayDepthStreamState === "live" ? "go" : displayDepthStreamState === "connecting" ? "watch" : "blocked",
+    },
+  ] as const;
 
   if (!isHydrated) {
     return (
-      <main className={`term-root ui-${uiMode}`} data-testid="mission-control-terminal-page">
+      <main
+        className={`term-root ui-${uiMode}`}
+        data-testid="mission-control-terminal-page"
+        data-ops-surface-state="hidden"
+        data-ops-transition-phase="stable"
+        data-ops-transition-lock="0"
+        data-density-mode="focus"
+        data-density-transition-phase="stable"
+        data-density-transition-lock="0"
+        data-floating-count="0"
+        data-floating-panel-count="0"
+        data-chart-sidecar-floating-count="0"
+        data-floating-transition-phase="stable"
+        data-floating-transition-lock="0"
+      >
         <header className="term-topbar gtix-panel-shell">
           <span className="eyebrow term-topbar-brand">TXT Trading Terminal</span>
         </header>
@@ -22917,7 +25801,56 @@ function TradingTerminalPageHydrated() {
   }
 
   return (
-    <main className={`term-root ui-${uiMode}`} data-testid="mission-control-terminal-page">
+    <main
+      className={`term-root ui-${uiMode}`}
+      data-testid="mission-control-terminal-page"
+      data-ops-surface-state={terminalOpsSurfaceRuntimeState}
+      data-ops-transition-phase={terminalOpsTransitionPhase}
+      data-ops-transition-source={terminalOpsTransitionSource}
+      data-ops-transition-lock={terminalOpsTransitionLocked ? "1" : "0"}
+      data-ops-transition-count={String(terminalOpsTransitionCount)}
+      data-ops-render-cycle={String(terminalOpsRenderCycleRef.current)}
+      data-density-mode={terminalDensityMode}
+      data-density-transition-phase={terminalDensityTransitionPhase}
+      data-density-transition-source={terminalDensityTransitionSource}
+      data-density-transition-lock={terminalDensityTransitionLocked ? "1" : "0"}
+      data-density-transition-count={String(terminalDensityTransitionCount)}
+      data-floating-count={String(floatingSurfaceCount)}
+      data-floating-panel-count={String(floatingPanels.length)}
+      data-chart-sidecar-floating-count={String(detachedChartSidecarFloatingIds.length)}
+      data-floating-transition-phase={terminalFloatingTransitionPhase}
+      data-floating-transition-source={terminalFloatingTransitionSource}
+      data-floating-transition-lock={terminalFloatingTransitionLocked ? "1" : "0"}
+      data-floating-transition-count={String(terminalFloatingTransitionCount)}
+    >
+      <div
+        data-testid="terminal-ui-stability-telemetry"
+        hidden
+        aria-hidden="true"
+        data-ops-surface-state={terminalOpsSurfaceRuntimeState}
+        data-ops-transition-phase={terminalOpsTransitionPhase}
+        data-ops-transition-source={terminalOpsTransitionSource}
+        data-ops-transition-lock={terminalOpsTransitionLocked ? "1" : "0"}
+        data-ops-transition-count={String(terminalOpsTransitionCount)}
+        data-ops-render-cycle={String(terminalOpsRenderCycleRef.current)}
+        data-density-mode={terminalDensityMode}
+        data-density-transition-phase={terminalDensityTransitionPhase}
+        data-density-transition-source={terminalDensityTransitionSource}
+        data-density-transition-lock={terminalDensityTransitionLocked ? "1" : "0"}
+        data-density-transition-count={String(terminalDensityTransitionCount)}
+        data-floating-count={String(floatingSurfaceCount)}
+        data-floating-panel-count={String(floatingPanels.length)}
+        data-chart-sidecar-floating-count={String(detachedChartSidecarFloatingIds.length)}
+        data-floating-transition-phase={terminalFloatingTransitionPhase}
+        data-floating-transition-source={terminalFloatingTransitionSource}
+        data-floating-transition-lock={terminalFloatingTransitionLocked ? "1" : "0"}
+        data-floating-transition-count={String(terminalFloatingTransitionCount)}
+        data-floating-last-action={terminalFloatingLastAction}
+        data-floating-last-panel-id={terminalFloatingLastPanelId || "none"}
+        data-floating-active-ids={floatingPanelIdsLabel}
+        data-chart-sidecar-floating-ids={detachedChartSidecarIdsLabel}
+        data-focus-decks={focusDecksLabel}
+      />
       {hardAlertActive ? (
         <div className="hard-alert-banner">
           HARD ALERT: ratio miss {(toNumber(riskSummary?.ratio_miss_window, 0) * 100).toFixed(0)}% ≥ {hardAlertThreshold}%
@@ -22934,6 +25867,11 @@ function TradingTerminalPageHydrated() {
           </span>
           <span className={`th-kpi ${criticalAlerts > 0 ? "th-warn" : ""}`}>{criticalAlerts} crit.</span>
           <span className={`th-kpi ${openIncidents > 0 ? "th-warn" : ""}`}>{openIncidents} incidents</span>
+          {showPreprocessorWarnChip ? (
+            <span data-testid="terminal-topbar-preprocessor-alert-chip" className="th-kpi th-warn" title={String(marketBusTradePreprocessorAlert.summary || "Preprocessor compression alert")}>
+              {preprocessorWarnChipLabel}
+            </span>
+          ) : null}
           {riskSummary ? (
             <span className={`th-kpi ${riskSummary.alert ? "th-warn" : ""}`}>
               miss {riskSummary.miss_in_window}/{riskSummary.window_size} ({(toNumber(riskSummary.ratio_miss_window, 0) * 100).toFixed(0)}%)
@@ -22944,6 +25882,11 @@ function TradingTerminalPageHydrated() {
           <span className={`th-kpi expert-only ${String(riskGateway?.healthy) === "false" ? "th-warn" : ""}`}>RG {String(riskGateway?.healthy ?? "–")}</span>
           <span className={`th-kpi expert-only ${pendingLive.length > 0 ? "th-warn" : ""}`}>{pendingLive.length} approvals</span>
           <span className={`th-kpi ${String(mt5Health?.status || "") === "ok" ? "" : "th-warn"}`}>MT5 {String(mt5Health?.status || "–")}</span>
+          {selectedAccountUsesMt5 && terminalMt5DominantReasonLabel ? (
+            <span className={`th-kpi ${terminalMt5TicketPreviewBlocked || terminalMt5TicketPreviewRequiresHuman ? "th-warn" : ""}`} title={terminalMt5TicketHardeningReasons.join(", ") || terminalMt5DominantReasonRaw}>
+              {`MT5 ${terminalMt5DominantReasonLabel}`}
+            </span>
+          ) : null}
         </div>
         <div className="connector-health-inline connector-health-inline-compact">
           {executionConnectorRows.map((item) => {
@@ -22964,12 +25907,12 @@ function TradingTerminalPageHydrated() {
           })}
         </div>
         <div className="th-nav">
-          <Link href="/">Dashboard</Link>
-          <Link href="/learn">Learn</Link>
-          <Link href="/ai">IA</Link>
-          <Link href="/connectors">Connecteurs</Link>
-          <Link href="/live-readiness">Readiness</Link>
-          <Link href="/incidents">Incidents</Link>
+          <a href="/dashboard" data-testid="terminal-topbar-link-dashboard">Dashboard</a>
+          <a href="/learn" data-testid="terminal-topbar-link-learn">Learn</a>
+          <a href="/ai" data-testid="terminal-topbar-link-ai">IA</a>
+          <a href="/connectors" data-testid="terminal-topbar-link-connectors">Connecteurs</a>
+          <a href="/live-readiness" data-testid="terminal-topbar-link-readiness">Readiness</a>
+          <a href="/incidents" data-testid="terminal-topbar-link-incidents">Incidents</a>
           <div className="th-mode-toggle" role="tablist" aria-label="Display mode">
             <button type="button" className={`th-mode-btn${uiMode === "novice" ? " active" : ""}`} onClick={() => setUiMode("novice")}>
               Novice
@@ -22984,17 +25927,21 @@ function TradingTerminalPageHydrated() {
             </button>
             <button
               type="button"
+              data-testid="terminal-density-focus-button"
               className={`th-mode-btn${terminalDensityMode === "focus" ? " active" : ""}`}
-              onClick={() => setTerminalDensityMode("focus")}
+              onClick={() => requestTerminalDensityMode("focus", "toolbar")}
               title="Principal chart only"
+              disabled={terminalDensityTransitionLocked}
             >
               Live Focus
             </button>
             <button
               type="button"
+              data-testid="terminal-density-full-button"
               className={`th-mode-btn${terminalDensityMode === "full" ? " active" : ""}`}
-              onClick={() => setTerminalDensityMode("full")}
+              onClick={() => requestTerminalDensityMode("full", "toolbar")}
               title="All modules"
+              disabled={terminalDensityTransitionLocked}
             >
               Full Surface
             </button>
@@ -23019,7 +25966,7 @@ function TradingTerminalPageHydrated() {
             <button type="button" className={`th-mode-btn${layoutPreset === "monitoring" ? " active" : ""}`} onClick={() => applyLayoutPreset("monitoring")} title="Alt+3">Monitoring <span className="th-hotkey">3</span></button>
             <button type="button" className="th-mode-btn" onClick={saveCurrentLayout} title="Alt+S">Save <span className="th-hotkey">S</span></button>
             <button type="button" className="th-mode-btn" onClick={restoreSavedLayout} title="Alt+R">Restore <span className="th-hotkey">R</span></button>
-            <button type="button" className="th-mode-btn" onClick={resetFloatingPanels} title="Alt+0">Reset Floating <span className="th-hotkey">0</span></button>
+            <button type="button" data-testid="terminal-reset-floating-button" className="th-mode-btn" onClick={resetFloatingPanels} title="Alt+0" disabled={terminalFloatingTransitionLocked}>Reset Floating <span className="th-hotkey">0</span></button>
           </div>
           {terminalDensityMode === "focus" ? (
             <div className="th-mode-toggle" role="group" aria-label="Focus panel controls">
@@ -23157,9 +26104,12 @@ function TradingTerminalPageHydrated() {
               <div className="terminal-onboarding-status">
                 <span className="terminal-onboarding-pill">Mode {uiMode === "novice" ? "Novice" : "Expert"}</span>
                 <span className="terminal-onboarding-pill">Vue {terminalDensityMode === "focus" ? "Focus" : "Full Surface"}</span>
-                <span className="terminal-onboarding-pill">Boot {terminalBootProfile === "light" ? `Light/${terminalBootStage}` : "Full"}</span>
-                <span className="terminal-onboarding-pill">Preset {layoutPreset}</span>
                 <span className={`terminal-onboarding-pill ${terminalAdaptiveGuide.tone}`}>Assist {terminalAdaptiveGuide.assistanceLevel}</span>
+              </div>
+              <div className="terminal-onboarding-meta">
+                <span>Preset {layoutPreset}</span>
+                <span>Boot {terminalBootProfile === "light" ? `Light/${terminalBootStage}` : "Full"}</span>
+                <span>{terminalGuideDisciplineLabel}</span>
               </div>
               <div className="terminal-onboarding-toolbar">
                 <button
@@ -23202,49 +26152,105 @@ function TradingTerminalPageHydrated() {
           </div>
           {terminalOnboardingExpanded ? (
             <div className="terminal-onboarding-body">
-              <div className="terminal-onboarding-status" style={{ marginBottom: 14 }}>
-                <span className={`terminal-onboarding-pill ${terminalAdaptiveGuide.tone}`}>Reco {terminalAdaptiveGuide.recommendedMode.replace(/_/g, " ")}</span>
-                <span className={`terminal-onboarding-pill ${terminalFeedbackSummary.modelHealth === "BROKEN" || terminalFeedbackSummary.modelHealth === "DEGRADING" ? "warn" : terminalFeedbackSummary.modelHealth === "ADAPTING" ? "subtle" : "good"}`}>Health {terminalFeedbackSummary.modelHealth}</span>
-                <span className={`terminal-onboarding-pill ${terminalFeedbackSummary.driftState === "LOCK" || terminalFeedbackSummary.driftState === "DRIFT" ? "warn" : terminalFeedbackSummary.driftState === "WATCH" ? "subtle" : "good"}`}>Drift {terminalFeedbackSummary.driftState}</span>
-                <span className={`terminal-onboarding-pill ${terminalAdaptiveGuide.disciplineLock ? "warn" : "good"}`}>{terminalAdaptiveGuide.disciplineLock ? `Discipline lock ${terminalAdaptiveGuide.disciplineReason || "active"}` : "Discipline open"}</span>
+              <div className="terminal-onboarding-brief">
+                <div className="terminal-onboarding-brief-main">
+                  <strong>{terminalAdaptiveGuide.headline}</strong>
+                  <p>{terminalAdaptiveGuide.summary}</p>
+                  <p className="terminal-onboarding-summary">Assistance {terminalAdaptiveGuide.assistanceLevel}: {terminalAdaptiveGuide.assistanceReason}</p>
+                  {terminalGuideJournalError ? <div className="warn">{terminalGuideJournalError}</div> : null}
+                </div>
+                <div className="terminal-onboarding-status terminal-onboarding-status-start">
+                  <span className={`terminal-onboarding-pill ${terminalAdaptiveGuide.tone}`}>Reco {terminalAdaptiveGuide.recommendedMode.replace(/_/g, " ")}</span>
+                  <span className={`terminal-onboarding-pill ${terminalGuideHealthTone}`}>Health {terminalFeedbackSummary.modelHealth}</span>
+                  <span className={`terminal-onboarding-pill ${terminalGuideDriftTone}`}>Drift {terminalFeedbackSummary.driftState}</span>
+                  <span className={`terminal-onboarding-pill ${terminalGuideDisciplineTone}`}>{terminalAdaptiveGuide.disciplineLock ? "Discipline lock" : "Discipline open"}</span>
+                </div>
               </div>
-              <div className="txt-page-guide-note" style={{ marginBottom: 14 }}>
-                <strong>{terminalAdaptiveGuide.headline}</strong>
-                <div>{terminalAdaptiveGuide.summary}</div>
-                <div style={{ marginTop: 6 }}>Assistance: {terminalAdaptiveGuide.assistanceReason}</div>
-                {terminalGuideJournalError ? <div className="warn" style={{ marginTop: 6 }}>{terminalGuideJournalError}</div> : null}
-              </div>
-              <div className="terminal-onboarding-grid">
+              <div className="terminal-onboarding-mode-rail" role="list" aria-label="Modes de guide terminal">
                 {terminalAdaptiveGuide.plans.map((plan, index) => {
                   const completedSteps = plan.steps.filter((step) => step.completed).length;
                   const isActive = plan.mode === activeAdaptiveGuideMode;
                   const isRecommended = plan.mode === terminalAdaptiveGuide.recommendedMode;
                   return (
-                    <article key={plan.mode} className="terminal-onboarding-card" style={isActive ? { borderColor: "rgba(56,189,248,0.45)", boxShadow: "0 0 0 1px rgba(56,189,248,0.28) inset" } : undefined}>
-                      <div className="terminal-onboarding-card-label">{index + 1}. {plan.title}</div>
-                      <h3>{plan.headline}</h3>
-                      <p>{plan.summary}</p>
-                      <div className="terminal-onboarding-status" style={{ marginBottom: 10 }}>
+                    <button
+                      key={plan.mode}
+                      type="button"
+                      className={[
+                        "terminal-onboarding-mode-card",
+                        isActive ? "is-active" : "",
+                        isRecommended ? "is-recommended" : "",
+                      ].filter(Boolean).join(" ")}
+                      onClick={() => activateAdaptiveGuide(plan.mode)}
+                      aria-pressed={isActive}
+                    >
+                      <div className="terminal-onboarding-mode-head">
+                        <div className="terminal-onboarding-card-label">{index + 1}. {plan.title}</div>
                         <span className={`terminal-onboarding-pill ${plan.tone}`}>{completedSteps}/{plan.steps.length} etapes</span>
+                      </div>
+                      <div className="terminal-onboarding-mode-title">{plan.headline}</div>
+                      <div className="terminal-onboarding-mode-copy">{plan.summary}</div>
+                      <div className="terminal-onboarding-status terminal-onboarding-status-start">
                         <span className="terminal-onboarding-pill">{plan.uiMode} / {plan.densityMode}</span>
-                        {isRecommended ? <span className="terminal-onboarding-pill">recommande</span> : null}
-                        {isActive ? <span className="terminal-onboarding-pill">actif</span> : null}
+                        {isRecommended ? <span className="terminal-onboarding-pill subtle">recommande</span> : null}
+                        {isActive ? <span className="terminal-onboarding-pill good">actif</span> : null}
                       </div>
-                      <div className="terminal-onboarding-links" style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                        <button type="button" className={plan.mode === "EXECUTE_SAFE" ? "btn btn-primary" : "btn"} onClick={() => activateAdaptiveGuide(plan.mode)}>
-                          Activer ce guide
-                        </button>
-                        <button type="button" className="btn" onClick={() => openAdaptiveGuideCommand(plan.mode)}>
-                          Mode commandant
-                        </button>
-                      </div>
-                    </article>
+                    </button>
                   );
                 })}
-                <article className="terminal-onboarding-card">
-                  <div className="terminal-onboarding-card-label">4. Aide contextuelle</div>
-                  <h3>Aller au bon écran</h3>
-                  <p>Utilise les guides dédiés si tu bascules en apprentissage, audit live ou traitement d'incident.</p>
+              </div>
+              <div className="terminal-onboarding-detail-grid">
+                <article className="terminal-onboarding-card terminal-onboarding-detail-card">
+                  <div className="terminal-onboarding-card-label">Guide actif</div>
+                  <h3>{activeAdaptiveGuidePlan.headline}</h3>
+                  <p>{activeAdaptiveGuidePlan.summary}</p>
+                  <div className="terminal-onboarding-status terminal-onboarding-status-start">
+                    <span className={`terminal-onboarding-pill ${activeAdaptiveGuidePlan.tone}`}>{activeAdaptiveGuideCompletedSteps}/{activeAdaptiveGuidePlan.steps.length} etapes</span>
+                    <span className="terminal-onboarding-pill">{activeAdaptiveGuidePlan.uiMode} / {activeAdaptiveGuidePlan.densityMode}</span>
+                    <span className="terminal-onboarding-pill">preset {activeAdaptiveGuidePlan.layoutPreset}</span>
+                    {activeAdaptiveGuidePlan.mode === terminalAdaptiveGuide.recommendedMode ? <span className="terminal-onboarding-pill subtle">mode recommande</span> : null}
+                  </div>
+                  <div className="terminal-onboarding-step-list">
+                    {activeAdaptiveGuidePlan.steps.map((step, index) => (
+                      <div
+                        key={step.id}
+                        className={[
+                          "terminal-onboarding-step-item",
+                          index === terminalAdaptiveGuideStepIndex ? "is-active" : "",
+                          step.completed ? "is-complete" : "",
+                        ].filter(Boolean).join(" ")}
+                      >
+                        <span className={`operator-action-dot ${step.completed ? "good" : index === terminalAdaptiveGuideStepIndex ? "subtle" : "warn"}`} />
+                        <span className="terminal-onboarding-step-progress">
+                          <strong>{index + 1}. {step.title}</strong>
+                          <span>{step.validationLabel}</span>
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="terminal-onboarding-links" style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      onClick={() => {
+                        setTerminalOnboardingWalkthroughDonePreference(false);
+                        setTerminalOnboardingExpanded(true);
+                        setCoachOverlayVisible(true);
+                        if (activeAdaptiveGuideStep) {
+                          focusAdaptiveGuideTarget(activeAdaptiveGuideStep.targetId);
+                        }
+                      }}
+                    >
+                      Ouvrir le walkthrough
+                    </button>
+                    <button type="button" className="btn" onClick={() => openAdaptiveGuideCommand(activeAdaptiveGuidePlan.mode)}>
+                      Mode commandant
+                    </button>
+                  </div>
+                </article>
+                <article className="terminal-onboarding-card terminal-onboarding-context-card">
+                  <div className="terminal-onboarding-card-label">Aide contextuelle</div>
+                  <h3>Basculer vers le bon desk</h3>
+                  <p>Quand le terminal ne suffit plus, bascule vers l'espace dedie au lieu de garder tout ouvert ici.</p>
                   <div className="terminal-onboarding-links">
                     <Link href="/learn" onClick={completeTerminalOnboardingAction}>Ouvrir Learn</Link>
                     <Link href="/live-ops" onClick={completeTerminalOnboardingAction}>Ouvrir Live Ops</Link>
@@ -23344,7 +26350,7 @@ function TradingTerminalPageHydrated() {
           <div className="synth-item"><span className="synth-icon">▤</span><span className="synth-label">DOM</span><span className={`synth-val ${displayDepthStreamState === "live" ? "good" : "warn"}`}>{displayDepthStreamState}</span></div>
           <div className="synth-item"><span className="synth-icon">Δ</span><span className="synth-label">Footprint</span><span className={`synth-val ${toNumber(dominantFootprint?.delta, 0) >= 0 ? "good" : "warn"}`}>{toNumber(dominantFootprint?.delta, 0).toFixed(0)}</span></div>
           <div className="synth-item"><span className="synth-icon">!</span><span className="synth-label">Incidents</span><span className={`synth-val ${openIncidents > 0 ? "warn" : "good"}`}>{openIncidents}</span></div>
-          <div className="synth-item"><span className="synth-icon">×</span><span className="synth-label">Kill</span><span className={`synth-val ${String(overview?.kill_switch_active) === "true" ? "warn" : "good"}`}>{String(overview?.kill_switch_active || "off")}</span></div>
+          <div className="synth-item"><span className="synth-icon">×</span><span className="synth-label">Kill</span><span className={`synth-val ${killSwitchActive ? "warn" : "good"}`}>{killSwitchStatusLabel}</span></div>
         </div>
       </section>
 
@@ -23796,6 +26802,74 @@ function TradingTerminalPageHydrated() {
                   TRUTH DEGRADED
                 </span>
               ) : null}
+              {finalDecisionCrossMarketSummary ? (
+                <span
+                  className={`chart-chip ${finalDecisionCrossMarketSummary.toneClass}`.trim()}
+                  title={finalDecisionCrossMarketSummary.detailLabel}
+                  data-testid="terminal-cross-market-summary-chip"
+                >
+                  {finalDecisionCrossMarketSummary.compactLabel}
+                </span>
+              ) : null}
+              {finalDecisionCapitalPressureSummary ? (
+                <span
+                  className={`chart-chip ${finalDecisionCapitalPressureSummary.toneClass}`.trim()}
+                  title={finalDecisionCapitalPressureSummary.detailLabel}
+                  data-testid="terminal-capital-pressure-summary-chip"
+                >
+                  {finalDecisionCapitalPressureSummary.compactLabel}
+                </span>
+              ) : null}
+              {finalDecisionExecutionRealitySummary ? (
+                <span
+                  className={`chart-chip ${finalDecisionExecutionRealitySummary.toneClass}`.trim()}
+                  title={finalDecisionExecutionRealitySummary.detailLabel}
+                  data-testid="terminal-execution-reality-summary-chip"
+                >
+                  {finalDecisionExecutionRealitySummary.compactLabel}
+                </span>
+              ) : null}
+              {finalDecisionExecutionRealityGovernanceSummary ? (
+                <span
+                  className={`chart-chip ${finalDecisionExecutionRealityGovernanceSummary.toneClass}`.trim()}
+                  title={finalDecisionExecutionRealityGovernanceSummary.detailLabel}
+                  data-testid="terminal-execution-reality-governance-summary-chip"
+                >
+                  {finalDecisionExecutionRealityGovernanceSummary.compactLabel}
+                </span>
+              ) : null}
+              <span
+                className={`chart-chip ${executionRealityMemorySummary.toneClass}`.trim()}
+                title={executionRealityMemorySummary.detailLabel}
+                data-testid="terminal-execution-reality-memory-summary-chip"
+              >
+                {executionRealityMemorySummary.compactLabel}
+              </span>
+              {finalDecisionCapitalScarSummary ? (
+                <span
+                  className={`chart-chip ${finalDecisionCapitalScarSummary.toneClass}`.trim()}
+                  title={finalDecisionCapitalScarSummary.detailLabel}
+                  data-testid="terminal-capital-scar-summary-chip"
+                >
+                  {finalDecisionCapitalScarSummary.compactLabel}
+                </span>
+              ) : null}
+              {finalDecisionSelfPreservationSummary ? (
+                <span
+                  className={`chart-chip ${finalDecisionSelfPreservationSummary.toneClass}`.trim()}
+                  title={finalDecisionSelfPreservationSummary.detailLabel}
+                  data-testid="terminal-self-preservation-summary-chip"
+                >
+                  {finalDecisionSelfPreservationSummary.compactLabel}
+                </span>
+              ) : null}
+              <span
+                className={`chart-chip ${selfHealingRecoveryMemorySummary.toneClass}`.trim()}
+                title={selfHealingRecoveryMemorySummary.detailLabel}
+                data-testid="terminal-self-healing-recovery-summary-chip"
+              >
+                {selfHealingRecoveryMemorySummary.compactLabel}
+              </span>
               {(["auto", "clean", "full"] as const).map((mode) => (
                 <button
                   key={`visual-${mode}`}
@@ -24157,7 +27231,7 @@ function TradingTerminalPageHydrated() {
               sidecarStack={renderDockedChartSidecarStack("chart-sidecar-stack terminal-v2-sidecar-stack")}
               symbol={selectedChartSymbol}
               timeframe={chartTimeframe}
-              liveFeedKey={`${selectedChartInstrument}|${selectedChartVenue}|${chartTimeframe}`}
+              liveFeedKey={terminalPassiveMode ? undefined : `${selectedChartInstrument}|${selectedChartVenue}|${chartTimeframe}`}
               onTimeframeChange={setActiveChartTimeframe}
               chartWindow={chartWindow}
               onZoomIn={() => setChartWindow((value) => Math.max(30, value - 20))}
@@ -24165,6 +27239,7 @@ function TradingTerminalPageHydrated() {
               candles={chartRenderCandlesWithMicrostructure}
               analyticsCandles={chartCandlesWithMicrostructure}
               isPreviewMode={chartPreviewModeActive}
+              suspendDecisionLayer={chartDecisionLayerSuspended}
               fallbackPrice={chartAnchorPrice > 0 ? chartAnchorPrice : (chartLastValue > 0 ? chartLastValue : 1)}
               loading={chartLoading}
               uiMode={uiMode}
@@ -24228,6 +27303,7 @@ function TradingTerminalPageHydrated() {
                 deltaPct: row.deltaPct,
                 spread: row.spread,
                 venue: row.venue,
+                historyKey: row.historyKey,
               }))}
               quoteHistory={quoteHistory}
               gpuViewportGrid={gpuViewportGrid}
@@ -24239,24 +27315,31 @@ function TradingTerminalPageHydrated() {
               aiConfidencePct={confidenceV2Snapshot.finalScorePct}
               aiExplanation={`${intentTargetSignal.detailLabel} · ${overlayDecisionRationale || marketSignalV1.signals[0]?.detail || "No contextual explanation available."}`}
               marketSyncGate={{
-                state: executionLockState.active ? "NO_TRADE" : tripleValidationGate.state,
-                reason: executionLockState.active ? executionLockState.detailLabel : tripleValidationGate.reason,
+                state: finalDecisionObservabilityOracle.market_state !== "VALID" ? finalDecisionObservabilityOracle.market_state : tripleValidationGate.state,
+                reason: finalDecisionObservabilityOracle.market_state !== "VALID" ? finalDecisionObservabilityOracle.reason_code : tripleValidationGate.reason,
                 confidence: confidenceV2Snapshot.finalScorePct / 100,
-                summaryLabel: executionLockState.active ? executionLockState.summaryLabel : tripleValidationGate.summaryLabel,
-                detailLabel: executionLockState.active ? executionLockState.detailLabel : tripleValidationGate.detailLabel,
+                summaryLabel: finalDecisionObservabilityOracle.market_state !== "VALID"
+                  ? finalDecisionObservabilityOracle.summary_label
+                  : tripleValidationGate.summaryLabel,
+                detailLabel: finalDecisionObservabilityOracle.market_state !== "VALID"
+                  ? `${finalDecisionObservabilityOracle.detail_label}${localOhlcvAnalysis.signal === "OHLCV_RENDERABLE" ? " Chart feed remains renderable; this gate blocks execution only." : ""}`
+                  : tripleValidationGate.detailLabel,
                 temporalSummaryLabel: temporalSyncSummaryLabel,
                 attentionSummaryLabel: crossLayerAttentionSummaryLabel,
                 desyncSummaryLabel: desyncSignal.summaryLabel,
                 intentSummaryLabel: intentSignal.summaryLabel,
-                executionSummaryLabel: executionLockState.active ? executionLockState.summaryLabel : `${executionQualitySummaryLabel} · ${intentTargetLabel}`,
+                executionSummaryLabel: finalDecisionObservabilityOracle.market_state !== "VALID"
+                  ? finalDecisionObservabilityOracle.execution_summary_label
+                  : `${executionQualitySummaryLabel} · ${intentTargetLabel}`,
               }}
               indicatorSeries={indicatorSeriesForChart}
               chartEngineMode={chartEngineMode}
               chartSmoothingMs={effectiveChartSmoothingMs}
               onChartPerceptualTelemetry={chartPerceptionEnabled ? setChartPerceptualTelemetry : undefined}
               onGpuPerceptualTelemetry={chartPerceptionEnabled ? setGpuPerceptualTelemetry : undefined}
-              onGpuViewportFrameMetaChange={chartPerceptionEnabled ? setGpuViewportFrameMeta : undefined}
+              onGpuViewportFrameMetaChange={chartPerceptionEnabled ? handleGpuViewportFrameMetaChange : undefined}
               onSmartDecisionHudChange={setSmartDecisionHud}
+              onAutoTraderV5ObservationChange={setLocalAutoTraderV5Observation}
             />
           ) : (
             <div className={`chart-shell chart-shell-premium chart-shell-${chartMotionClass} chart-shell-signal-mode-${signalDisplayMode}`}>
@@ -24313,9 +27396,11 @@ function TradingTerminalPageHydrated() {
               {chartOverlayCompactMode ? (
                 <div className="chart-flow-banner chart-flow-banner-compact" aria-live="polite">
                   <span className="chart-flow-pill tone-neutral">{chartTruthDesk.sourceLabel}</span>
+                  <span className={`chart-flow-pill tone-${chartTruthDesk.truthStatusTone}`} title={chartTruthDesk.truthStatusReasonLabel}>{chartTruthDesk.truthCompactLabel}</span>
                   <span className={`chart-flow-pill tone-${chartTruthDesk.lagTone}`}>{chartTruthDesk.lagCompactLabel}</span>
                   <span className={`chart-flow-pill tone-${marketBusHealthTone}`}>BUS {marketBusHealthStatus.toUpperCase()}</span>
                   <span className={`chart-flow-pill tone-${marketBusOhlcvContiguous ? "good" : "warn"}`}>{marketBusOhlcvContiguous ? "SEQ OK" : "SEQ GAP"} {marketBusOhlcvLatestSeq > 0 ? `#${marketBusOhlcvLatestSeq}` : "#-"}</span>
+                  {showPreprocessorWarnChip ? <span data-testid="terminal-preprocessor-alert-chip" className="chart-flow-pill tone-bad" title={String(marketBusTradePreprocessorAlert.summary || "Preprocessor compression alert")}>{preprocessorWarnChipLabel}</span> : null}
                   <span className={`chart-flow-pill tone-${marketFlowAlerts.length > 0 ? "warn" : "good"}`}>{chartCompactAlertLabel}</span>
                   <span className={`chart-flow-pill tone-${crossLayerAttentionTone}`} title={crossLayerAttentionDetailLabel}>{crossLayerAttentionSummaryLabel}</span>
                   <span className={`chart-flow-pill tone-${temporalSyncDegraded ? "bad" : temporalSyncAligned ? "good" : "warn"}`} title={temporalSyncDetailLabel}>{temporalSyncSummaryLabel}</span>
@@ -24367,10 +27452,12 @@ function TradingTerminalPageHydrated() {
               ) : (
                 <div className="chart-flow-banner" aria-live="polite">
                   <span className="chart-flow-pill tone-neutral">{chartTruthDesk.sourceLabel}</span>
+                  <span className={`chart-flow-pill tone-${chartTruthDesk.truthStatusTone}`} title={chartTruthDesk.truthStatusReasonLabel}>{chartTruthDesk.truthStatusLabel}</span>
                   <span className={`chart-flow-pill tone-${chartTruthDesk.lagTone}`}>{chartTruthDesk.lagCompactLabel}</span>
                   <span className={`chart-flow-pill tone-${marketBusHealthTone}`}>BUS {marketBusHealthStatus.toUpperCase()}</span>
                   <span className={`chart-flow-pill tone-${streamStateTone(ohlcvStreamState)}`}>OHLCV {ohlcvStreamState.toUpperCase()}</span>
                   <span className={`chart-flow-pill tone-${localOhlcvSignalTone}`}>LOCAL {localOhlcvAnalysis.signal === "OHLCV_RENDERABLE" ? "RENDERABLE" : localOhlcvAnalysis.signal === "OHLCV_PARTIAL" ? "PARTIAL" : "UNUSABLE"} {localOhlcvAnalysis.renderableRows}/{localOhlcvAnalysis.fetchedRows}</span>
+                  {showPreprocessorWarnChip ? <span data-testid="terminal-preprocessor-alert-chip" className="chart-flow-pill tone-bad" title={String(marketBusTradePreprocessorAlert.summary || "Preprocessor compression alert")}>{preprocessorWarnChipLabel}</span> : null}
                   <span className={`chart-flow-pill tone-${crossLayerAttentionTone}`} title={crossLayerAttentionDetailLabel}>{crossLayerAttentionSummaryLabel}</span>
                   <span className={`chart-flow-pill tone-${temporalSyncDegraded ? "bad" : temporalSyncAligned ? "good" : "warn"}`} title={temporalSyncDetailLabel}>{temporalSyncSummaryLabel}</span>
                   <span className={`chart-flow-pill tone-${desyncSignal.state === "risk" ? "bad" : desyncSignal.state === "opportunity" ? "good" : "good"}`} title={desyncSignal.detailLabel}>{desyncSignal.summaryLabel}</span>
@@ -24489,13 +27576,13 @@ function TradingTerminalPageHydrated() {
                   className={`chart-stage-premium ${chartActiveSnapLine ? "execution-focus" : ""} ${marketSignalV1.focusMode ? "signal-focus" : ""}`}
                   symbol={selectedChartSymbol}
                   timeframe={chartTimeframe}
-                  liveFeedKey={chartLiveFeedKey}
+                  liveFeedKey={terminalPassiveMode ? undefined : chartLiveFeedKey}
                   mode={effectiveChartMode}
                   frozen={chartSurfaceFrozen}
                   chartMotionPreset={chartMotionPreset}
                   visualMode={chartVisualMode}
                   candles={chartRenderCandlesWithMicrostructure}
-                  isPreviewMode={chartPreviewBannerActive}
+                  isPreviewMode={chartPreviewModeActive}
                   overlayZones={activeOverlayZones}
                   liquidityZones={activeLiquidityZones}
                   domLevels={chartRuntimeOrderflowEnabled ? activeDomLevels : undefined}
@@ -24518,7 +27605,7 @@ function TradingTerminalPageHydrated() {
                   heatmapDiscardThreshold={bookmapDiscardThreshold}
                   multiSymbolFeeds={activeGpuMultiSymbolFeeds}
                   onPerceptualTelemetry={chartPerceptionEnabled ? setGpuPerceptualTelemetry : undefined}
-                  onViewportFrameMetaChange={chartPerceptionEnabled ? setGpuViewportFrameMeta : undefined}
+                  onViewportFrameMetaChange={chartPerceptionEnabled ? handleGpuViewportFrameMetaChange : undefined}
                 />
               ) : (
                 <InstitutionalChart
@@ -24526,7 +27613,7 @@ function TradingTerminalPageHydrated() {
                   className={`chart-stage-premium ${chartActiveSnapLine ? "execution-focus" : ""} ${marketSignalV1.focusMode ? "signal-focus" : ""}`}
                   symbol={selectedChartSymbol}
                   timeframe={chartTimeframe}
-                  liveFeedKey={chartLiveFeedKey}
+                  liveFeedKey={terminalPassiveMode ? undefined : chartLiveFeedKey}
                   mode={effectiveChartMode}
                   frozen={chartSurfaceFrozen}
                   chartMotionPreset={chartMotionPreset}
@@ -24690,11 +27777,8 @@ function TradingTerminalPageHydrated() {
                         {chartLowFlowEdgeBlocked && (
                           <div className="chart-order-release-note chart-order-release-note-warn">{chartLowFlowEdgeMessage}</div>
                         )}
-                        {executionLockState.active && (
-                          <div className="chart-order-release-note chart-order-release-note-warn">{executionLockState.detailLabel}</div>
-                        )}
-                        {confidenceExecutionControl.blocksExecution && (
-                          <div className="chart-order-release-note chart-order-release-note-warn">{confidenceExecutionControl.blockReason}</div>
+                        {finalDecisionExecutionOracle.blocks_execution && (
+                          <div className="chart-order-release-note chart-order-release-note-warn">{finalDecisionExecutionOracle.detail_label}</div>
                         )}
                         <div className="chart-order-release-actions">
                           {chartEffectiveSendMode === "confirm-required" ? (
@@ -24711,7 +27795,7 @@ function TradingTerminalPageHydrated() {
                           <button
                             type="button"
                             className="chart-chip chart-buy-btn"
-                            disabled={executionLockState.active || chartLowFlowEdgeBlocked || confidenceExecutionControl.blocksExecution || (chartEffectiveSendMode === "confirm-required" && !chartReleaseTicket.armed)}
+                            disabled={finalDecisionExecutionOracle.blocks_execution || chartLowFlowEdgeBlocked || (chartEffectiveSendMode === "confirm-required" && !chartReleaseTicket.armed)}
                             onClick={() => {
                               setChartReleaseValidationPulse(true);
                               setChartReleaseTicket(null);
@@ -25012,6 +28096,21 @@ function TradingTerminalPageHydrated() {
               Backup: {backupRoute ? `${String(backupRoute.venue || "–")} · score ${backupScore.toFixed(1)} · ${backupRouteStability > 0 ? `${backupRouteState} ${(backupRouteStability * 100).toFixed(0)}%` : backupRouteState}` : "n/a"}
             </div>
           </div>
+          <div className="exec-route-block" style={{ gap: 6 }} data-testid="terminal-cross-venue-execution-intelligence-panel">
+            <div className="chart-stat-label" style={{ marginBottom: 2 }}>Cross-venue intelligence</div>
+            <div className="exec-explainability-pills">
+              <span className={`chart-action-pill chart-action-pill-status ${crossVenueExecutionIntelligenceSummary.state === "OBSERVE" ? "warn" : crossVenueExecutionIntelligenceSummary.state === "ROTATE" ? "warn" : "good"}`}>{crossVenueExecutionIntelligenceSummary.summary_label}</span>
+              <span className="chart-action-pill">{`action ${crossVenueExecutionIntelligenceSummary.action.toLowerCase()}`}</span>
+              <span className="chart-action-pill">{`route ${crossVenueExecutionIntelligenceSummary.route_health_pct}%`}</span>
+              <span className="chart-action-pill">{`opp ${crossVenueExecutionIntelligenceSummary.opportunity_score_pct}%`}</span>
+            </div>
+            <div className="subtle mini">
+              {`primary ${formatVenueDisplayLabel(crossVenueExecutionIntelligenceSummary.recommended_primary_venue || "-")}`}
+              {crossVenueExecutionIntelligenceSummary.backup_venue ? ` · backup ${formatVenueDisplayLabel(crossVenueExecutionIntelligenceSummary.backup_venue)}` : ""}
+              {crossVenueExecutionIntelligenceSummary.recommended_split_pct > 0 ? ` · split ${crossVenueExecutionIntelligenceSummary.recommended_split_pct}%` : ""}
+              {` · conf ${crossVenueExecutionIntelligenceSummary.confidence_pct}%`}
+            </div>
+          </div>
           <div className="exec-lane-summary">
             <div className="chart-stat-label" style={{ marginBottom: 4 }}>Desk Summary</div>
             <div className="exec-lane-summary-grid">
@@ -25040,6 +28139,11 @@ function TradingTerminalPageHydrated() {
             <>
           <div className="exec-route-block" style={{ gap: 6 }}>
             <div className="chart-stat-label" style={{ marginBottom: 2 }}>Candidats V6</div>
+            {routingCandidatesUnavailableReason ? (
+              <div className="subtle mini" style={{ color: "#f2cb88" }}>
+                Routing proxy degraded: {routingCandidatesUnavailableReason}. Les lignes ci-dessous sont un fallback quote-only, pas les vrais scores backend.
+              </div>
+            ) : null}
             <div style={{ display: "grid", gridTemplateColumns: "1.2fr 0.7fr 0.9fr 0.9fr 0.8fr 0.8fr", gap: 6, fontSize: 10, opacity: 0.7 }}>
               <span>Venue</span>
               <span>Score</span>
@@ -25089,6 +28193,21 @@ function TradingTerminalPageHydrated() {
           </div>
           <div className="exec-route-block" style={{ gap: 6 }}>
             <div className="chart-stat-label" style={{ marginBottom: 2 }}>Smart Routing MX</div>
+            <div style={{ marginBottom: 4, padding: "6px 8px", borderRadius: 8, border: "1px solid rgba(120, 147, 188, 0.16)", background: "rgba(12, 18, 30, 0.56)" }}>
+              <div className="subtle mini" style={{ marginBottom: 4 }}>Cross-venue execution intelligence</div>
+              <div className="exec-explainability-pills">
+                <span className={`chart-action-pill chart-action-pill-status ${crossVenueExecutionIntelligenceSummary.state === "OBSERVE" ? "warn" : crossVenueExecutionIntelligenceSummary.state === "ROTATE" ? "warn" : "good"}`}>{crossVenueExecutionIntelligenceSummary.summary_label}</span>
+                <span className="chart-action-pill">{`action ${crossVenueExecutionIntelligenceSummary.action.toLowerCase()}`}</span>
+                <span className="chart-action-pill">{`route ${crossVenueExecutionIntelligenceSummary.route_health_pct}%`}</span>
+                <span className="chart-action-pill">{`opp ${crossVenueExecutionIntelligenceSummary.opportunity_score_pct}%`}</span>
+                <span className="chart-action-pill">{`conf ${crossVenueExecutionIntelligenceSummary.confidence_pct}%`}</span>
+              </div>
+              <div className="subtle mini" style={{ marginTop: 4 }}>
+                {`primary ${formatVenueDisplayLabel(crossVenueExecutionIntelligenceSummary.recommended_primary_venue || "-")}`}
+                {crossVenueExecutionIntelligenceSummary.backup_venue ? ` · backup ${formatVenueDisplayLabel(crossVenueExecutionIntelligenceSummary.backup_venue)}` : ""}
+                {crossVenueExecutionIntelligenceSummary.recommended_split_pct > 0 ? ` · split ${crossVenueExecutionIntelligenceSummary.recommended_split_pct}%` : ""}
+              </div>
+            </div>
             {marketTruthLockEnabled ? (
               <div className="subtle mini">Truth lock actif: le routage decisionnel reste mono-venue sur {selectedTruthVenueLabel}; le cross-venue reste observation/divergence.</div>
             ) : null}
@@ -25519,15 +28638,296 @@ function TradingTerminalPageHydrated() {
               ) : null}
             </div>
             {replayState.enabled ? <div className="replay-exec-guard">Replay Mode — execution disabled</div> : null}
-            {executionLockState.active ? <div className="replay-exec-guard">{executionLockState.summaryLabel}</div> : null}
-            {executionLockState.active ? (
+            {finalDecisionExecutionOracle.blocks_execution ? <div className="replay-exec-guard">{finalDecisionObservabilityOracle.execution_summary_label}</div> : null}
+            {finalDecisionExecutionOracle.blocks_execution ? (
               <div className="subtle mini" style={{ marginBottom: 8 }}>
-                {executionLockState.detailLabel}
+                {finalDecisionObservabilityOracle.execution_detail_label}
               </div>
             ) : null}
             <div className="chart-tools-visual-note" style={{ marginBottom: 8 }}>
               {profitOptimizerLabel} · {riskAiLabel} · {capitalScalingLabel} · {journalScalingLabel} · {positionSizingLabel} · {intentTargetLabel} · AUTO {autoExecutionGate.autoState}
             </div>
+            {finalDecisionCrossMarketSummary ? (
+              <div style={{ marginBottom: 8, padding: "8px 10px", borderRadius: 8, border: "1px solid rgba(120, 147, 188, 0.2)", background: "rgba(9, 14, 24, 0.72)" }} data-testid="terminal-cross-market-summary-panel">
+                <div className="chart-stat-label" style={{ marginBottom: 6 }}>Cross-market truth</div>
+                <div className="exec-explainability-pills">
+                  <span className={`chart-action-pill chart-action-pill-status ${finalDecisionCrossMarketSummary.pillTone}`}>{finalDecisionCrossMarketSummary.compactLabel}</span>
+                  <span className="chart-action-pill">{`regime ${finalDecisionCrossMarket?.dominant_regime || "UNKNOWN"}`}</span>
+                  <span className="chart-action-pill">{`cov ${finalDecisionCrossMarket?.metrics.coverage_pct || 0}%`}</span>
+                  <span className="chart-action-pill">{`coh ${finalDecisionCrossMarket?.metrics.coherence_pct || 0}%`}</span>
+                  <span className="chart-action-pill">{`fresh ${finalDecisionCrossMarket?.metrics.freshness_pct || 0}%`}</span>
+                </div>
+                <div className="subtle mini" style={{ marginTop: 6 }}>
+                  {finalDecisionCrossMarketSummary.detailLabel}
+                </div>
+              </div>
+            ) : null}
+            <CrossMarketPressureGraphPanel summary={finalDecisionCrossMarket} />
+            {finalDecisionCapitalPressureSummary ? (
+              <div style={{ marginBottom: 8, padding: "8px 10px", borderRadius: 8, border: "1px solid rgba(120, 147, 188, 0.2)", background: "rgba(9, 14, 24, 0.72)" }} data-testid="terminal-capital-pressure-summary-panel">
+                <div className="chart-stat-label" style={{ marginBottom: 6 }}>Dynamic capital pressure</div>
+                <div className="exec-explainability-pills">
+                  <span className={`chart-action-pill chart-action-pill-status ${finalDecisionCapitalPressureSummary.pillTone}`}>{finalDecisionCapitalPressureSummary.compactLabel}</span>
+                  <span className="chart-action-pill">{`dom ${finalDecisionCapitalPressure?.dominant_constraint || "NONE"}`}</span>
+                  <span className="chart-action-pill">{`risk ${finalDecisionCapitalPressure?.metrics.recommended_risk_usd || 0} USD`}</span>
+                  <span className="chart-action-pill">{`dd ${finalDecisionCapitalPressure?.metrics.drawdown_pct || 0}%`}</span>
+                  <span className="chart-action-pill">{`exp ${finalDecisionCapitalPressure?.metrics.exposure_pct || 0}%`}</span>
+                </div>
+                <div className="subtle mini" style={{ marginTop: 6 }}>
+                  {finalDecisionCapitalPressureSummary.detailLabel}
+                </div>
+              </div>
+            ) : null}
+            {finalDecisionExecutionRealitySummary ? (
+              <div style={{ marginBottom: 8, padding: "8px 10px", borderRadius: 8, border: "1px solid rgba(120, 147, 188, 0.2)", background: "rgba(9, 14, 24, 0.72)" }} data-testid="terminal-execution-reality-summary-panel">
+                <div className="chart-stat-label" style={{ marginBottom: 6 }}>Execution reality score</div>
+                <div className="exec-explainability-pills">
+                  <span className={`chart-action-pill chart-action-pill-status ${finalDecisionExecutionRealitySummary.pillTone}`}>{finalDecisionExecutionRealitySummary.compactLabel}</span>
+                  <span className="chart-action-pill">{`dom ${finalDecisionExecutionReality?.dominant_drag || "NONE"}`}</span>
+                  <span className="chart-action-pill">{`fill ${finalDecisionExecutionReality?.metrics.fill_rate_pct || 0}%`}</span>
+                  <span className="chart-action-pill">{`slip ${finalDecisionExecutionReality?.metrics.slippage_bps || 0}bps`}</span>
+                  <span className="chart-action-pill">{`cap ${finalDecisionExecutionReality?.size_cap_pct || 0}%`}</span>
+                </div>
+                <div className="subtle mini" style={{ marginTop: 6 }}>
+                  {finalDecisionExecutionRealitySummary.detailLabel}
+                </div>
+              </div>
+            ) : null}
+            {finalDecisionExecutionRealityGovernanceSummary ? (
+              <div style={{ marginBottom: 8, padding: "8px 10px", borderRadius: 8, border: "1px solid rgba(120, 147, 188, 0.2)", background: "rgba(9, 14, 24, 0.72)" }} data-testid="terminal-execution-reality-governance-summary-panel">
+                <div className="chart-stat-label" style={{ marginBottom: 6 }}>Execution reality governance</div>
+                <div className="exec-explainability-pills">
+                  <span className={`chart-action-pill chart-action-pill-status ${finalDecisionExecutionRealityGovernanceSummary.pillTone}`}>{finalDecisionExecutionRealityGovernanceSummary.compactLabel}</span>
+                  <span className="chart-action-pill">{`drift ${finalDecisionExecutionRealityGovernance?.reality_drift || "CALM"}`}</span>
+                  <span className="chart-action-pill">{`route ${finalDecisionExecutionRealityGovernance?.routing_fragility || "STABLE"}`}</span>
+                  <span className="chart-action-pill">{`spread ${finalDecisionExecutionRealityGovernance?.spread_degradation || "TIGHT"}`}</span>
+                  <span className="chart-action-pill">{`cap ${finalDecisionExecutionRealityGovernance?.size_cap_pct || 0}%`}</span>
+                </div>
+                <div className="subtle mini" style={{ marginTop: 6 }}>
+                  {finalDecisionExecutionRealityGovernanceSummary.detailLabel}
+                </div>
+              </div>
+            ) : null}
+            <div style={{ marginBottom: 8, padding: "8px 10px", borderRadius: 8, border: "1px solid rgba(120, 147, 188, 0.2)", background: "rgba(9, 14, 24, 0.72)" }} data-testid="terminal-execution-reality-memory-summary-panel">
+              <div className="chart-stat-label" style={{ marginBottom: 6 }}>Execution reality memory</div>
+              <div className="exec-explainability-pills">
+                <span className={`chart-action-pill chart-action-pill-status ${executionRealityMemorySummary.pillTone}`}>{executionRealityMemorySummary.compactLabel}</span>
+                <span className="chart-action-pill">{`dom ${executionRealityMemorySnapshot.dominant_drag}`}</span>
+                <span className="chart-action-pill">{`recur ${executionRealityMemorySnapshot.recurrence_count}`}</span>
+                <span className="chart-action-pill">{`cycles ${executionRealityMemorySnapshot.persistent_cycles}`}</span>
+                <span className="chart-action-pill">{`cap ${executionRealityMemorySnapshot.size_cap_pct}%`}</span>
+              </div>
+              <div className="subtle mini" style={{ marginTop: 6 }}>
+                {executionRealityMemorySummary.detailLabel}
+              </div>
+            </div>
+            {finalDecisionCapitalScarSummary ? (
+              <div style={{ marginBottom: 8, padding: "8px 10px", borderRadius: 8, border: "1px solid rgba(120, 147, 188, 0.2)", background: "rgba(9, 14, 24, 0.72)" }} data-testid="terminal-capital-scar-summary-panel">
+                <div className="chart-stat-label" style={{ marginBottom: 6 }}>Capital scar memory</div>
+                <div className="exec-explainability-pills">
+                  <span className={`chart-action-pill chart-action-pill-status ${finalDecisionCapitalScarSummary.pillTone}`}>{finalDecisionCapitalScarSummary.compactLabel}</span>
+                  <span className="chart-action-pill">{`dom ${finalDecisionCapitalScar?.dominant_scar || "NONE"}`}</span>
+                  <span className="chart-action-pill">{`regime ${finalDecisionCapitalScar?.metrics.regime || "UNKNOWN"}`}</span>
+                  <span className="chart-action-pill">{`bias ${finalDecisionCapitalScar?.pressure_bias_pct || 0}%`}</span>
+                  <span className="chart-action-pill">{`dd ${finalDecisionCapitalScar?.metrics.regime_drawdown_pct || 0}%`}</span>
+                </div>
+                <div className="subtle mini" style={{ marginTop: 6 }}>
+                  {finalDecisionCapitalScarSummary.detailLabel}
+                </div>
+              </div>
+            ) : null}
+            {finalDecisionSelfPreservationSummary ? (
+              <div style={{ marginBottom: 8, padding: "8px 10px", borderRadius: 8, border: "1px solid rgba(120, 147, 188, 0.2)", background: "rgba(9, 14, 24, 0.72)" }} data-testid="terminal-self-preservation-summary-panel">
+                <div className="chart-stat-label" style={{ marginBottom: 6 }}>Self preservation</div>
+                <div className="exec-explainability-pills">
+                  <span className={`chart-action-pill chart-action-pill-status ${finalDecisionSelfPreservationSummary.pillTone}`}>{finalDecisionSelfPreservationSummary.compactLabel}</span>
+                  <span className="chart-action-pill">{`dom ${finalDecisionSelfPreservation?.dominant_trigger || "NONE"}`}</span>
+                  <span className="chart-action-pill">{`stability ${finalDecisionSelfPreservation?.metrics.stability_mode || "live"}`}</span>
+                  <span className="chart-action-pill">{`watchdog ${finalDecisionSelfPreservation?.metrics.drift_watchdog || "CALM"}`}</span>
+                  <span className="chart-action-pill">{`guard ${finalDecisionSelfPreservation?.metrics.runtime_guard_code || "none"}`}</span>
+                </div>
+                <div className="subtle mini" style={{ marginTop: 6 }}>
+                  {finalDecisionSelfPreservationSummary.detailLabel}
+                </div>
+              </div>
+            ) : null}
+            <div style={{ marginBottom: 8, padding: "8px 10px", borderRadius: 8, border: "1px solid rgba(120, 147, 188, 0.2)", background: "rgba(9, 14, 24, 0.72)" }} data-testid="terminal-self-healing-recovery-summary-panel">
+              <div className="chart-stat-label" style={{ marginBottom: 6 }}>Self healing recovery memory</div>
+              <div className="exec-explainability-pills">
+                <span className={`chart-action-pill chart-action-pill-status ${selfHealingRecoveryMemorySummary.pillTone}`}>{selfHealingRecoveryMemorySummary.compactLabel}</span>
+                <span className="chart-action-pill">{`action ${selfHealingRecoveryMemorySnapshot.self_healing_action}`}</span>
+                <span className="chart-action-pill">{`drift ${selfHealingRecoveryMemorySnapshot.self_healing_drift}`}</span>
+                <span className="chart-action-pill">{`cooldown ${(selfHealingRecoveryMemorySnapshot.adaptive_cooldown_ms / 1000).toFixed(0)}s`}</span>
+                <span className="chart-action-pill">{`relapse ${selfHealingRecoveryMemorySnapshot.relapse_probability_pct}%`}</span>
+              </div>
+              <div className="subtle mini" style={{ marginTop: 6 }}>
+                {selfHealingRecoveryMemorySummary.detailLabel}
+              </div>
+            </div>
+            <div style={{ marginBottom: 8, padding: "8px 10px", borderRadius: 8, border: "1px solid rgba(120, 147, 188, 0.2)", background: "rgba(9, 14, 24, 0.72)" }} data-testid="terminal-market-regime-archive-panel">
+              <div className="chart-stat-label" style={{ marginBottom: 6 }}>Market regime archive</div>
+              <div className="exec-explainability-pills">
+                <span className={`chart-action-pill chart-action-pill-status ${marketRegimeArchivePanelSummary.pillTone}`}>{marketRegimeArchivePanelSummary.compactLabel}</span>
+                <span className="chart-action-pill">{`active ${activeMarketRegimeArchiveSummary.active_regime || "UNKNOWN"}`}</span>
+                <span className="chart-action-pill">{`hot ${activeMarketRegimeArchiveSummary.hottest_regime || "NONE"}`}</span>
+                <span className="chart-action-pill">{`block ${activeMarketRegimeArchiveSummary.dominant_blocking_layer || "none"}`}</span>
+                <span className="chart-action-pill">{`stress ${marketRegimeArchivePanelSummary.hottestRow?.stress_score_pct || 0}%`}</span>
+                <span className="chart-action-pill">{`cmp ${activeMarketRegimePersistentCompression.compression_ratio_pct}%`}</span>
+                <span className="chart-action-pill">{`relapse ${activeMarketRegimePersistentCompression.relapse_probability_pct}%`}</span>
+                <span className="chart-action-pill">{`half ${activeMarketRegimePersistentCompression.retention_half_life_hours}h`}</span>
+              </div>
+              <div className="subtle mini" style={{ marginTop: 6 }}>
+                {marketRegimeArchivePanelSummary.detailLabel}
+              </div>
+            </div>
+            <div style={{ marginBottom: 8, padding: "8px 10px", borderRadius: 8, border: "1px solid rgba(120, 147, 188, 0.2)", background: "rgba(9, 14, 24, 0.72)" }} data-testid="terminal-governance-replay-panel">
+              <div className="chart-stat-label" style={{ marginBottom: 6 }}>Governance replay</div>
+              <div className="exec-explainability-pills">
+                <span className={`chart-action-pill chart-action-pill-status ${governanceReplayPanelSummary.pillTone}`}>{governanceReplayPanelSummary.compactLabel}</span>
+                <span className="chart-action-pill">{persistedGovernanceReplayView ? "history persisted" : persistedGovernanceReplayError ? "history fallback" : "history loading"}</span>
+                <span className="chart-action-pill">{`allow ${activeGovernanceReplaySummary.allow_answer.action}`}</span>
+                <span className="chart-action-pill">{`block ${activeGovernanceReplaySummary.block_answer.action}`}</span>
+                <span className="chart-action-pill">{`layer ${activeGovernanceReplaySummary.failure_answer.layer ? humanizeTerminalReasonLabel(activeGovernanceReplaySummary.failure_answer.layer) : "Unresolved"}`}</span>
+                <span className="chart-action-pill">{`steps ${persistedGovernanceReplayView?.timeline_detailed.length || activeGovernanceReplaySummary.timeline.length}`}</span>
+              </div>
+              <div className="subtle mini" style={{ marginTop: 6 }}>
+                {governanceReplayPanelSummary.detailLabel}
+              </div>
+              <div className="subtle mini" style={{ marginTop: 6 }}>
+                {`Why allowed: ${activeGovernanceReplaySummary.allow_answer.detail || activeGovernanceReplaySummary.allow_answer.headline}`}
+              </div>
+              <div className="subtle mini" style={{ marginTop: 4 }}>
+                {`Why block: ${activeGovernanceReplaySummary.block_answer.detail || activeGovernanceReplaySummary.block_answer.headline}`}
+              </div>
+              {persistedGovernanceReplayView?.timeline_detailed[0] ? (
+                <div className="subtle mini" style={{ marginTop: 4 }}>
+                  {`Latest timeline: ${persistedGovernanceReplayView.timeline_detailed[0].label} · ${persistedGovernanceReplayView.timeline_detailed[0].detail}`}
+                </div>
+              ) : null}
+            </div>
+            <div style={{ marginBottom: 8, padding: "8px 10px", borderRadius: 8, border: "1px solid rgba(120, 147, 188, 0.2)", background: "rgba(9, 14, 24, 0.72)" }} data-testid="terminal-governance-archive-contracts-panel">
+              <div className="chart-stat-label" style={{ marginBottom: 6 }}>Archive contracts</div>
+              <div className="exec-explainability-pills">
+                <span className={`chart-action-pill chart-action-pill-status ${governanceReplayArchiveContractsPanelSummary.pillTone}`}>{governanceReplayArchiveContractsPanelSummary.compactLabel}</span>
+                {governanceReplayArchiveContractsPanelSummary.operatorCards.map((card) => (
+                  <span
+                    key={card.key}
+                    className={`chart-action-pill chart-action-pill-status ${card.pillTone}`}
+                  >
+                    {card.shortLabel}
+                  </span>
+                ))}
+                {governanceReplayArchiveContractsPanelSummary.operatorCards.map((card) => (
+                  <span key={`${card.key}-reason`} className="chart-action-pill">{`${card.label} reason ${card.dominantReason}`}</span>
+                ))}
+              </div>
+              <div className="subtle mini" style={{ marginTop: 6 }}>
+                {governanceReplayArchiveContractsPanelSummary.detailLabel}
+              </div>
+            </div>
+            <GovernanceReplayTimelinePanel
+              timeline={activeGovernanceReplayDetailedTimeline}
+              persisted={Boolean(persistedGovernanceReplayView?.timeline_detailed.length)}
+              fallbackActive={!persistedGovernanceReplayView && Boolean(governanceReplayDetailedTimeline.length)}
+            />
+            <ExecutionTcaFoundationPanel summary={executionTcaFoundationSummary} />
+            <GovernanceBalanceEnginePanel
+              summary={governanceBalanceSummary}
+              recoveryMomentum={recoveryMomentumSummary}
+            />
+            <ExecutionAttributionLayerPanel summary={executionAttributionSummary} />
+            <StructuralMemoryLayersPanel
+              venueDecayMemory={venueDecayMemorySummary}
+              capitalAgingGovernance={capitalAgingGovernanceSummary}
+              contagionMemory={contagionMemorySummary}
+              globalConfidenceDecay={globalConfidenceDecaySummary}
+            />
+            <div style={{ marginBottom: 8, padding: "8px 10px", borderRadius: 8, border: "1px solid rgba(120, 147, 188, 0.2)", background: "rgba(9, 14, 24, 0.72)" }} data-testid="terminal-freeze-v1-contracts-panel">
+              <div className="chart-stat-label" style={{ marginBottom: 6 }}>Freeze v1 contracts</div>
+              <div className="exec-explainability-pills">
+                <span className={`chart-action-pill chart-action-pill-status ${freezeV1ContractsPanelSummary.pillTone}`}>{freezeV1ContractsPanelSummary.compactLabel}</span>
+                {activeFreezeV1ContractsSummary.contracts.map((contract) => (
+                  <span
+                    key={contract.key}
+                    className={`chart-action-pill chart-action-pill-status ${contract.status === "LOCKED" ? "good" : contract.status === "MISSING" ? "warn" : "bad"}`}
+                  >
+                    {`${contract.key} ${contract.current_version || "missing"}`}
+                  </span>
+                ))}
+              </div>
+              <div className="subtle mini" style={{ marginTop: 6 }}>
+                {freezeV1ContractsPanelSummary.detailLabel}
+              </div>
+            </div>
+            {selectedAccountUsesMt5 ? (
+              <div style={{ marginBottom: 8, padding: "8px 10px", borderRadius: 8, border: `1px solid ${terminalMt5TicketBorder}`, background: terminalMt5TicketBackground }}>
+                <div className="chart-stat-label" style={{ marginBottom: 6 }}>FTMO phase active</div>
+                <div className="exec-explainability-pills">
+                  <span className={`chart-action-pill chart-action-pill-status ${terminalMt5TicketTone}`}>{`mt5 ${accountId || "n/a"} · ${terminalMt5CurrentStage}`}</span>
+                  <span className="chart-action-pill">{`cap ${toNumber(terminalMt5CurrentStageConfig.max_order_notional_usd, 0).toFixed(0)} USD`}</span>
+                  <span className={`chart-action-pill chart-action-pill-status ${terminalMt5TicketTone}`}>{`hardening ${terminalMt5TicketHardeningStatus}`}</span>
+                  <span className={`chart-action-pill chart-action-pill-status ${terminalMt5OracleTone}`}>{`oracle ${toNumber(terminalMt5TicketOracle.score, 0).toFixed(2)} / ${toNumber(terminalMt5OracleStability.block_below_score, 0).toFixed(2)}`}</span>
+                </div>
+                <div className="subtle mini" style={{ marginTop: 6 }}>
+                  {`drawdown ${toNumber(terminalMt5DrawdownVelocity.warn_loss_usd, 0).toFixed(0)} / ${toNumber(terminalMt5DrawdownVelocity.block_loss_usd, 0).toFixed(0)} USD · no_trade ${Boolean(terminalMt5TicketNoTrade.no_trade) ? String(terminalMt5TicketNoTrade.no_trade_state || "active") : "eligible"}`}
+                </div>
+                {terminalMt5DominantReasonLabel ? (
+                  <div className="subtle mini" style={{ marginTop: 6 }}>
+                    {`dominant reason ${terminalMt5DominantReasonLabel.toLowerCase()}`}
+                  </div>
+                ) : null}
+                {mt5OracleTimelineRows.length > 0 ? (
+                  <div style={{ marginTop: 8 }}>
+                    <div className="chart-stat-label" style={{ marginBottom: 4 }}>Oracle Stability timeline</div>
+                    <div style={{ display: "flex", alignItems: "flex-end", gap: 6, minHeight: 42 }}>
+                      {mt5OracleTimelineRows.slice().reverse().map((row, index) => {
+                        const score = clamp(toNumber(row.score, 0), 0, 1);
+                        const status = String(row.status || "unknown");
+                        const tone = status === "blocked" ? "rgba(224, 92, 92, 0.95)" : status === "require_human" ? "rgba(224, 185, 92, 0.9)" : "rgba(72, 190, 132, 0.9)";
+                        return (
+                          <div key={`oracle-timeline-${index}`} title={`${String(row.timestamp || "n/a")} · ${status} · score ${score.toFixed(2)}`} style={{ display: "grid", gap: 4, justifyItems: "center" }}>
+                            <div style={{ width: 14, height: `${Math.max(10, Math.round(score * 36))}px`, borderRadius: 4, background: tone }} />
+                            <span className="subtle mini">{score.toFixed(2)}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ) : null}
+                {terminalMt5TicketPreviewRequiresHuman || terminalMt5TicketPreviewBlocked ? (
+                  <div className="subtle mini" style={{ marginTop: 8 }}>
+                    {terminalMt5TicketPreviewBlocked
+                      ? `Pre-warning: execution lockee avant envoi (${terminalMt5TicketHardeningReasons.join(", ") || "oracle/no_trade"}).`
+                      : `Pre-warning: revue humaine requise avant soumission (${terminalMt5TicketHardeningReasons.join(", ") || "manual governance"}).`}
+                  </div>
+                ) : null}
+                {terminalMt5TicketPreviewRequiresHuman || mt5ReviewAckActive || Boolean(terminalMt5TicketGovernance.approved) ? (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+                    <button
+                      type="button"
+                      onClick={() => setMt5ReviewAckSignature(terminalMt5ReviewTicketSignature)}
+                      disabled={terminalMt5TicketPreviewBlocked || mt5ReviewAckActive}
+                      style={{
+                        borderRadius: 8,
+                        border: `1px solid ${mt5ReviewAckActive ? "rgba(72, 190, 132, 0.4)" : "rgba(224, 185, 92, 0.42)"}`,
+                        background: mt5ReviewAckActive ? "rgba(18, 54, 36, 0.9)" : "rgba(54, 40, 14, 0.88)",
+                        color: "rgba(244, 247, 255, 0.95)",
+                        padding: "6px 10px",
+                        fontSize: 12,
+                        cursor: terminalMt5TicketPreviewBlocked || mt5ReviewAckActive ? "default" : "pointer",
+                      }}
+                    >
+                      {mt5ReviewAckActive || Boolean(terminalMt5TicketGovernance.approved) ? "Review Acked" : "Ack Review"}
+                    </button>
+                    {mt5ReviewAckActive || Boolean(terminalMt5TicketGovernance.approved) ? (
+                      <span className="subtle mini">
+                        {`governance approved by ${String(terminalMt5TicketGovernance.approver || terminalMt5ReviewGovernance?.approver || authOperatorUsername || "mission-control-terminal")}`}
+                      </span>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
             {showExecutionLaneAdvanced ? (
               <div style={{ marginBottom: 8, padding: "8px 10px", borderRadius: 8, border: "1px solid rgba(120,147,188,0.18)", background: "rgba(9, 18, 30, 0.72)" }}>
               <div className="chart-stat-label" style={{ marginBottom: 6 }}>Routing Engine</div>
@@ -25561,16 +28961,16 @@ function TradingTerminalPageHydrated() {
               </div>
               </div>
             ) : null}
-            {showExecutionLaneAdvanced && executionLockState.active ? (
+            {showExecutionLaneAdvanced && finalDecisionExecutionOracle.blocks_execution ? (
               <div className="subtle mini" style={{ marginBottom: 8 }}>
                 {`sync bus_seq #${Math.max(0, executionSyncDiagnostics.bus_seq)} · last_trade_time ${executionSyncDiagnostics.last_trade_time || "n/a"} · depth_age ${executionSyncDiagnostics.depth_age_ms != null ? formatFreshness(executionSyncDiagnostics.depth_age_ms) : "n/a"} · ohlcv_time ${executionSyncDiagnostics.ohlcv_time || "n/a"}`}
               </div>
             ) : null}
-            {!executionLockState.active && confidenceExecutionControl.blocksExecution ? (
+            {!finalDecisionExecutionOracle.blocks_execution && finalDecisionTruth.action === "REDUCE" ? (
               <div className="subtle mini" style={{ marginBottom: 8 }}>
-                {confidenceExecutionControl.blockReason}
+                {finalDecisionObservabilityOracle.execution_detail_label}
               </div>
-            ) : !executionLockState.active && confidenceExecutionControl.executionRiskMultiplier < 0.999 ? (
+            ) : !finalDecisionExecutionOracle.blocks_execution && confidenceExecutionControl.executionRiskMultiplier < 0.999 ? (
               <div className="subtle mini" style={{ marginBottom: 8 }}>
                 {confidenceExecutionControl.sizingSummary}
               </div>
@@ -25586,7 +28986,7 @@ function TradingTerminalPageHydrated() {
               <input type="number" step="1" value={notional} onChange={(e) => setNotional(Number(e.target.value || 0))} placeholder="notional USD" disabled={executionFormDisabled} />
               <input type="number" step="1" value={maxSpread} onChange={(e) => setMaxSpread(Number(e.target.value || 0))} placeholder="max spread bps" disabled={executionFormDisabled} />
               <input value={rationale} onChange={(e) => setRationale(e.target.value)} placeholder="rationale" style={{ gridColumn: "1 / -1" }} disabled={executionFormDisabled} />
-              <button type="button" onClick={() => void submitTradeTicket()} disabled={busy || executionFormDisabled} className="exec-send-order" style={{ gridColumn: "1 / -1" }}>{executionLockState.active || confidenceExecutionControl.blocksExecution ? "Execution Disabled" : busy ? "Envoi…" : "Send Order"}</button>
+              <button type="button" onClick={() => void submitTradeTicket()} disabled={busy || executionFormDisabled || terminalMt5TicketPreviewBlocked} className="exec-send-order" style={{ gridColumn: "1 / -1" }}>{finalDecisionExecutionOracle.blocks_execution ? "Execution Disabled" : terminalMt5TicketPreviewBlocked ? "FTMO Hardening Blocked" : busy ? "Envoi…" : terminalMt5TicketPreviewRequiresHuman ? "Send Order · Review" : "Send Order"}</button>
             </div>
             {tradeResult ? (
               <details style={{ marginTop: 8 }}>
@@ -25892,9 +29292,51 @@ function TradingTerminalPageHydrated() {
       </section>
       ) : null}
 
-      {showMonitoringDeck ? (
+      {!chartIsolationMode ? (
+      <section className="panel term-context-layer" data-testid="terminal-context-layer">
+        <div className="term-context-bar">
+          <div className="term-context-copy">
+            <span className="term-context-kicker">Layer 2 · Context</span>
+            <strong>Contexte compact pour décider sans rouvrir toute la télémétrie.</strong>
+            <p>Le détail dense est déplacé dans les diagnostics secondaires ou dans le guide de reprise.</p>
+          </div>
+          <div className="term-context-actions">
+            <button
+              type="button"
+              className="th-mode-btn"
+              onClick={() => {
+                setTerminalOnboardingPinned(true);
+                setTerminalOnboardingExpanded(true);
+                document.getElementById("terminal-onboarding")?.scrollIntoView({ behavior: "smooth", block: "start" });
+              }}
+            >
+              Revoir guide
+            </button>
+          </div>
+        </div>
+        <div className="term-context-cards">
+          {compactContextCards.map((card) => (
+            <article key={card.key} className={`term-context-card tone-${card.tone}`} data-testid={`terminal-context-card-${card.key}`}>
+              <span className="term-context-card-label">{card.label}</span>
+              <strong className="term-context-card-metric">{card.metric}</strong>
+              <p className="term-context-card-detail">{card.detail}</p>
+            </article>
+          ))}
+        </div>
+      </section>
+      ) : null}
+
       <>
-      <section id="terminal-operator-action" className={`panel term-operator-action-shell terminal-guide-anchor${guidedCoachTargetId === "terminal-operator-action" ? " is-guided-target" : ""}`}>
+      <section
+        id="terminal-operator-action"
+        className={`panel term-operator-action-shell terminal-guide-anchor${guidedCoachTargetId === "terminal-operator-action" ? " is-guided-target" : ""}`}
+        hidden={!showMonitoringDeck}
+        aria-hidden={!showMonitoringDeck}
+        data-deck-visible={showMonitoringDeck ? "1" : "0"}
+        data-ops-surface-state={terminalOpsSurfaceRuntimeState}
+        data-ops-transition-phase={terminalOpsTransitionPhase}
+        data-ops-transition-lock={terminalOpsTransitionLocked ? "1" : "0"}
+      >
         <OperatorActionSummary
           badge={publicOpsPanelBadge}
           executionPnlPayload={executionPnlAnalyzerPayload}
@@ -25902,32 +29344,93 @@ function TradingTerminalPageHydrated() {
           executionAiV6Payload={executionAiV6Payload}
           routingPayload={routingScore}
           smartDecision={smartDecisionHud}
+          finalDecisionTruth={finalDecisionTruth}
+          passiveMode={terminalPassiveMode}
           journalContext={terminalGuideJournalContext}
           formatClock={formatClock}
           footer={(
             <>
-              <button
-                type="button"
-                onClick={() => openOpsCopilotPrompt({
-                  message: "Mode commandant: que faire maintenant sur le terminal ? Donne DECISION, RISQUE, RAISON et rappelle que l'override doit rester visible.",
-                  autoSend: true,
-                })}
-              >
-                Mode commandant
-              </button>
-              <Link href="/live-ops" className="subtle mini">Ouvrir Live Ops</Link>
+              <div className="operator-action-footer-main">
+                <button
+                  type="button"
+                  onClick={() => openOpsCopilotPrompt({
+                    message: "Mode commandant: que faire maintenant sur le terminal ? Donne DECISION, RISQUE, RAISON et rappelle que l'override doit rester visible.",
+                    autoSend: true,
+                  })}
+                >
+                  Mode commandant
+                </button>
+                <Link href="/live-ops" className="subtle mini">Ouvrir Live Ops</Link>
+                <button
+                  type="button"
+                  data-testid="terminal-ui-stability-debug-toggle"
+                  className={`th-mode-btn${terminalUiDebugVisible ? " active" : ""}`}
+                  onClick={() => setTerminalUiDebugVisible((current) => !current)}
+                  aria-pressed={terminalUiDebugVisible}
+                >
+                  UI debug
+                </button>
+              </div>
+              {terminalUiDebugVisible ? (
+                <RuntimeStabilityDebugView
+                  panelTestId="terminal-ui-stability-debug-panel"
+                  cards={[...terminalUiDebugCards]}
+                  rows={[...terminalUiDebugRows]}
+                />
+              ) : null}
             </>
           )}
         />
       </section>
       {/* ═══════════════ MONITORING ════════════════════════════ */}
-      <section className="panel term-monitoring">
+      <section
+        className={`panel term-monitoring${diagnosticsSurfaceOpen ? " is-open" : " is-collapsed"}`}
+        data-testid="terminal-diagnostics-section"
+        hidden={!showMonitoringDeck}
+        aria-hidden={!showMonitoringDeck}
+        data-deck-visible={showMonitoringDeck ? "1" : "0"}
+        data-surface-mode={terminalOpsSurfaceMode}
+        data-ops-surface-state={terminalOpsSurfaceRuntimeState}
+        data-ops-transition-phase={terminalOpsTransitionPhase}
+        data-ops-transition-lock={terminalOpsTransitionLocked ? "1" : "0"}
+        aria-busy={terminalOpsTransitionLocked}
+      >
         <div className="term-monitoring-bar">
-          <span className="term-monitoring-title">Ops Widgets</span>
-          {publicOpsRefreshPaused ? <span className="monitoring-state-badge paused">background paused</span> : <span className="monitoring-state-badge live">live refresh</span>}
+          <span className="term-monitoring-title">Layer 3 · Diagnostics</span>
+          <div className="term-monitoring-actions">
+            <div className="th-mode-toggle" role="tablist" aria-label="Cockpit surface mode">
+              <button
+                type="button"
+                data-testid="terminal-surface-context-button"
+                className={`th-mode-btn${!diagnosticsSurfaceOpen ? " active" : ""}`}
+                onClick={() => requestTerminalOpsSurfaceMode("context", "surface-button")}
+                aria-pressed={!diagnosticsSurfaceOpen}
+                disabled={terminalOpsTransitionLocked}
+              >
+                Contexte
+              </button>
+              <button
+                type="button"
+                data-testid="terminal-surface-diagnostics-button"
+                className={`th-mode-btn${diagnosticsSurfaceOpen ? " active" : ""}`}
+                onClick={() => requestTerminalOpsSurfaceMode("diagnostic", "surface-button")}
+                aria-pressed={diagnosticsSurfaceOpen}
+                disabled={terminalOpsTransitionLocked}
+              >
+                Diagnostics
+              </button>
+            </div>
+            {layoutEditMode ? <span className="term-monitoring-layout-note">Layout Edit garde le détail ouvert.</span> : null}
+            {publicOpsRefreshPaused ? <span className="monitoring-state-badge paused">background paused</span> : <span className="monitoring-state-badge live">live refresh</span>}
+          </div>
         </div>
         <div
+          data-testid="terminal-diagnostics-grid"
           className={`monitoring-cols${layoutDropPreview?.zone === "monitoring" ? " is-drop-zone-active" : ""}`}
+          hidden={!diagnosticsSurfaceOpen}
+          aria-hidden={!diagnosticsSurfaceOpen}
+          data-surface-state={diagnosticsSurfaceOpen ? "diagnostic" : "context"}
+          data-transition-phase={terminalOpsTransitionPhase}
           onDragOver={(event) => {
             if (layoutEditMode) {
               event.preventDefault();
@@ -25979,6 +29482,8 @@ function TradingTerminalPageHydrated() {
               payload={executionPnlAnalyzerPayload}
               liveOpsPayload={liveOpsPayload}
               executionAiV6Payload={executionAiV6Payload}
+              finalDecisionTruth={finalDecisionTruth}
+              passiveMode={terminalPassiveMode}
               journalContext={terminalGuideJournalContext}
               formatClock={formatClock}
             />
@@ -26037,6 +29542,29 @@ function TradingTerminalPageHydrated() {
               routingPayload={routingScore}
               optimizerPayload={executionOptimizerLivePayload}
               smartDecision={smartDecisionHud}
+              finalDecisionTruth={finalDecisionTruth}
+              formatClock={formatClock}
+            />
+            </div>
+            <div
+              className={`layout-draggable-card${layoutEditMode ? " is-edit" : ""}${layoutDropPreview?.zone === "monitoring" && layoutDropPreview.targetId === "tradability" ? " is-drop-target" : ""}`}
+              draggable={layoutEditMode}
+              onDragStart={() => { layoutDragRef.current = { zone: "monitoring", id: "tradability" }; setLayoutDropPreview({ zone: "monitoring", targetId: "tradability", mode: "panel" }); }}
+              onDragEnd={() => { layoutDragRef.current = null; setLayoutDropPreview(null); }}
+              onDragOver={(event) => { if (layoutEditMode) { event.preventDefault(); setLayoutDropPreview({ zone: "monitoring", targetId: "tradability", mode: "panel" }); } }}
+              onDrop={() => handleLayoutDrop("monitoring", "tradability")}
+              style={{ order: monitoringOrderById.tradability ?? 5, display: floatingPanels.some((fp) => fp.id === "tradability") ? "none" : undefined }}
+            >
+            <TradabilitySurfaceMonitoringPanel
+              badge={publicOpsPanelBadge}
+              layoutEditMode={layoutEditMode}
+              onDetach={() => detachPanel("tradability", "monitoring")}
+              finalDecisionTruth={finalDecisionTruth}
+              preprocessorPayload={marketBusTradePreprocessor}
+              journalEntries={terminalCalibrationEntries}
+              analyticsSummary={terminalTradabilityAnalytics}
+              volatilityRegime={String(volatilityRegimeSnapshot.regime || "unknown")}
+              marketSession={predictorMarketSession}
               formatClock={formatClock}
             />
             </div>
@@ -26054,6 +29582,7 @@ function TradingTerminalPageHydrated() {
               layoutEditMode={layoutEditMode}
               onDetach={() => detachPanel("attentioncontext", "monitoring")}
               liveAttention={attentionMonitoringPayload}
+              passiveMode={terminalPassiveMode}
               journalContext={terminalGuideJournalContext}
               formatClock={formatClock}
             />
@@ -26148,7 +29677,7 @@ function TradingTerminalPageHydrated() {
             onDrop={() => handleLayoutDrop("monitoring", "readiness")}
             style={{ order: monitoringOrderById.readiness ?? 3, display: floatingPanels.some((fp) => fp.id === "readiness") ? "none" : undefined }}
           >
-          <ReadinessMonitoringPanel badge={publicOpsPanelBadge} layoutEditMode={layoutEditMode} onDetach={() => detachPanel("readiness", "monitoring")} driftItems={driftItems} suspendedCount={suspended.length} memorySummary={memorySummary} incidents={incidents} />
+          <ReadinessMonitoringPanel badge={publicOpsPanelBadge} layoutEditMode={layoutEditMode} onDetach={() => detachPanel("readiness", "monitoring")} driftItems={driftItems} suspendedCount={suspended.length} memorySummary={memorySummary} incidents={incidents} preprocessorPayload={asJsonMap(asJsonMap(marketBusMeta?.preprocessor).trades)} finalDecisionTruth={finalDecisionTruth} />
           </div>
           <div
             className={`layout-draggable-card${layoutEditMode ? " is-edit" : ""}${layoutDropPreview?.zone === "monitoring" && layoutDropPreview.targetId === "risktimeline" ? " is-drop-target" : ""}`}
@@ -26162,9 +29691,12 @@ function TradingTerminalPageHydrated() {
           <RiskTimelineMonitoringPanel badge={publicOpsPanelBadge} layoutEditMode={layoutEditMode} onDetach={() => detachPanel("risktimeline", "monitoring")} body={renderRiskTimelineBody(6, "rt-mon")} />
           </div>
         </div>
+        <div className="term-monitoring-empty" hidden={diagnosticsSurfaceOpen} aria-hidden={diagnosticsSurfaceOpen}>
+          <strong>Diagnostics cachés par défaut.</strong>
+          <span>{TERMINAL_DIAGNOSTIC_PANEL_IDS.length} panneaux secondaires restent disponibles à la demande pour l’analyse détaillée.</span>
+        </div>
       </section>
       </>
-      ) : null}
 
       {/* ═══════════════ CAPITAL ALLOCATION ENGINE ═══════════════════════════ */}
       {showCapitalDeck && (strategyPerformance.length > 0 || showDecisionOverlay) && (
@@ -27566,6 +31098,7 @@ function TradingTerminalPageHydrated() {
         <div
           key={`float-${fp.id}`}
           className="floating-panel-window"
+          data-testid={`terminal-floating-panel-${fp.id}`}
           style={{ left: fp.x, top: fp.y, width: fp.w, height: fp.h }}
         >
           <div
@@ -27591,14 +31124,17 @@ function TradingTerminalPageHydrated() {
               <button
                 type="button"
                 className="floating-panel-dock-btn"
+                data-testid={`terminal-floating-dock-${fp.id}`}
                 title={`Redocker dans ${fp.fromZone}`}
                 onClick={() => dockPanel(fp.id)}
+                disabled={terminalFloatingTransitionLocked}
               >⤢ Dock</button>
               <button
                 type="button"
                 className="floating-panel-close-btn"
                 title="Fermer la fenêtre et redocker"
                 onClick={() => dockPanel(fp.id)}
+                disabled={terminalFloatingTransitionLocked}
               >✕</button>
             </div>
           </div>
@@ -27635,6 +31171,7 @@ function TradingTerminalPageHydrated() {
       {effectiveDetachedChartSidecars.map((panel) => (
         <div
           key={`chart-sidecar-float-${panel.id}`}
+          data-testid={`terminal-chart-sidecar-floating-${panel.id}`}
           className="floating-panel-window chart-sidecar-floating-window"
           style={{ left: panel.x, top: panel.y, width: panel.w, height: panel.h }}
         >
@@ -27658,8 +31195,25 @@ function TradingTerminalPageHydrated() {
                     : entry
                 )))}
               >□+</button>
-              <button type="button" className="floating-panel-dock-btn" title="Replacer dans le layout" onClick={() => dockChartSidecar(panel.id)}>⤢ Dock</button>
-              <button type="button" className="floating-panel-close-btn" title="Fermer la fenêtre et redocker" onClick={() => dockChartSidecar(panel.id)}>✕</button>
+              <button
+                type="button"
+                data-testid={`terminal-chart-sidecar-dock-${panel.id}`}
+                className="floating-panel-dock-btn"
+                title="Replacer dans le layout"
+                onClick={() => dockChartSidecar(panel.id)}
+                disabled={terminalFloatingTransitionLocked}
+              >
+                ⤢ Dock
+              </button>
+              <button
+                type="button"
+                className="floating-panel-close-btn"
+                title="Fermer la fenêtre et redocker"
+                onClick={() => dockChartSidecar(panel.id)}
+                disabled={terminalFloatingTransitionLocked}
+              >
+                ✕
+              </button>
             </div>
           </div>
           <div className="floating-panel-body">

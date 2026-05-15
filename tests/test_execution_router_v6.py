@@ -8,6 +8,9 @@ from apps.execution_router.main import (
     _execution_ai_v6_decide,
     _execution_ai_v6_guardrails,
     _execution_ai_v6_learn,
+    _live_execution_context,
+    _normalize_live_order_protection,
+    _resolve_live_execution_notional,
     _rebuild_execution_ai_v6_state_from_episodes,
 )
 
@@ -196,6 +199,122 @@ class ExecutionRouterV6Tests(unittest.TestCase):
         self.assertTrue(result["policy_freeze_learning"])
         self.assertFalse(result["learning_applied"])
         self.assertEqual(EXECUTION_AI_V6_STATE["actions"], {})
+
+    def test_normalize_live_order_protection_marks_partial_when_one_leg_acknowledged(self) -> None:
+        requested = {
+            "take_profit": {
+                "trigger_price": 70500.0,
+                "order_type": "market",
+                "working_type": "MARK_PRICE",
+            },
+            "stop_loss": {
+                "trigger_price": 69500.0,
+                "order_type": "market",
+                "working_type": "MARK_PRICE",
+            },
+            "require_full_acceptance": True,
+        }
+        order_payload = {
+            "status": "dry_run",
+            "protection_status": "armed",
+            "protection": {
+                "mode": "native_attached",
+                "requested": requested,
+                "accepted": {
+                    "stop_loss": {
+                        "trigger_price": 69500.0,
+                        "order_type": "market",
+                        "working_type": "MARK_PRICE",
+                    }
+                },
+                "reasons": [],
+            },
+        }
+
+        normalized = _normalize_live_order_protection(order_payload, requested)
+
+        self.assertEqual(normalized["protection_status"], "protection_partial")
+        protection = normalized["protection"]
+        self.assertEqual(protection["status"], "protection_partial")
+        self.assertEqual(protection["requested"], requested)
+        self.assertIn("stop_loss", protection["accepted"])
+        self.assertNotIn("take_profit", protection["accepted"])
+        self.assertEqual(
+            protection["reasons"],
+            ["take_profit was not acknowledged by BingX"],
+        )
+
+    def test_live_execution_context_enables_auto_adjust_notional_by_default(self) -> None:
+        context = _live_execution_context(
+            {
+                "estimated_notional_usd": 2.5,
+                "live_execution": {
+                    "enabled": True,
+                    "provider": "bingx",
+                    "account_id": "acct-1",
+                    "secret_payload": {"api_key": "k"},
+                },
+            }
+        )
+
+        self.assertTrue(context["enabled"])
+        self.assertTrue(context["auto_adjust_notional"])
+
+    def test_live_execution_context_respects_explicit_auto_adjust_disable(self) -> None:
+        context = _live_execution_context(
+            {
+                "estimated_notional_usd": 2.5,
+                "live_execution": {
+                    "enabled": True,
+                    "provider": "bingx",
+                    "account_id": "acct-1",
+                    "secret_payload": {"api_key": "k"},
+                    "auto_adjust_notional": False,
+                },
+            }
+        )
+
+        self.assertFalse(context["auto_adjust_notional"])
+
+    def test_resolve_live_execution_notional_preserves_approved_live_intent(self) -> None:
+        execution_notional, context_adjusted, preserved = _resolve_live_execution_notional(
+            {
+                "estimated_notional_usd": 7.50397,
+                "execution_mode": "live-intent",
+                "metadata": {"origin": "approved-intent"},
+            },
+            {
+                "enabled": True,
+                "notional_usd": 7.50397,
+            },
+            {
+                "target_notional_usd": 6.3,
+            },
+        )
+
+        self.assertTrue(preserved)
+        self.assertEqual(execution_notional, 7.50397)
+        self.assertEqual(context_adjusted, 6.3)
+
+    def test_resolve_live_execution_notional_keeps_router_adjustment_for_non_live_flow(self) -> None:
+        execution_notional, context_adjusted, preserved = _resolve_live_execution_notional(
+            {
+                "estimated_notional_usd": 7.50397,
+                "execution_mode": "routed",
+                "metadata": {"origin": "webhook"},
+            },
+            {
+                "enabled": False,
+                "notional_usd": 7.50397,
+            },
+            {
+                "target_notional_usd": 6.3,
+            },
+        )
+
+        self.assertFalse(preserved)
+        self.assertEqual(execution_notional, 6.3)
+        self.assertEqual(context_adjusted, 6.3)
 
 
 if __name__ == "__main__":

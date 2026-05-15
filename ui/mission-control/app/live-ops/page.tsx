@@ -265,6 +265,26 @@ export default function LiveOpsPage() {
   const governance = asRecord(snapshot.governance);
   const recovery = asRecord(snapshot.recovery);
   const memoryGap = asRecord(snapshot.memory_gap);
+  const controlledCollection = asRecord(snapshot.controlled_collection);
+  const collectionLabelProgress = asRecord(controlledCollection.label_progress);
+  const collectionEdgeConfidence = asRecord(controlledCollection.edge_confidence);
+  const collectionStatus = String(controlledCollection.status || "UNCONFIGURED").toUpperCase();
+  const collectionNextAction = String(controlledCollection.next_action || "Attend la prochaine mise a jour Live Ops.");
+  const collectionThesis = String(controlledCollection.thesis || "Collecter des labels avant de chercher a optimiser.");
+  const collectionConstraints = Array.isArray(controlledCollection.constraints) ? controlledCollection.constraints.map((item) => String(item)) : [];
+  const collectionForbidden = Array.isArray(controlledCollection.forbidden) ? controlledCollection.forbidden.map((item) => String(item)) : [];
+  const collectionStopConditions = Array.isArray(controlledCollection.stop_conditions) ? controlledCollection.stop_conditions.map((item) => String(item)) : [];
+  const collectionStage = String(collectionLabelProgress.stage || "BOOTSTRAP");
+  const collectionTargetMin = toNumber(collectionLabelProgress.targetMin, 50);
+  const collectionTargetMax = toNumber(collectionLabelProgress.targetMax, 100);
+  const collectionClassifiedCount = toNumber(collectionLabelProgress.classifiedCount, 0);
+  const collectionRecentClassifiedCount = toNumber(collectionLabelProgress.recentClassifiedCount, 0);
+  const collectionToTargetMin = toNumber(collectionLabelProgress.toTargetMin, Math.max(0, collectionTargetMin - collectionClassifiedCount));
+  const collectionProgressToMinPct = Math.max(0, Math.min(100, toNumber(collectionLabelProgress.progressToMinPct, 0)));
+  const collectionProgressToMaxPct = Math.max(0, Math.min(100, toNumber(collectionLabelProgress.progressToMaxPct, 0)));
+  const collectionLabelSummary = String(collectionLabelProgress.summary || "Pas encore assez de labels classes pour faire vivre l'edge map.");
+  const collectionConfidenceSummary = String(collectionEdgeConfidence.summary || "Confiance edge en attente de labels frais.");
+  const collectionTone = collectionStatus === "READY" ? "good" : collectionStatus === "LOCKED" || collectionStatus === "BLOCKED" ? "warn" : "subtle";
   const alerts = Array.isArray(snapshot.alerts) ? snapshot.alerts : [];
   const backendMode = String(governance.backend_mode || "guarded_auto");
   const pnlEnvelope = asRecord(executionPnlAnalyzerPayload);
@@ -348,27 +368,27 @@ export default function LiveOpsPage() {
     {
       dayOffset: 0,
       title: "Jour 1 · Bootstrap micro-live",
-      focus: "Survivre et capter une verite propre",
-      objective: "+0.5% max, zero forcing",
-      context: `Bias ${truthLine.label === "OK" ? "constructif" : "defensif"} · volatilite ${avgSlippageBps > 3 ? "bruyante" : "moyenne"} · risque ${drawdownPct >= 2 ? "sous tension" : "controle"}`,
+      focus: "Ouvrir une collecte controlee, pas chercher un PnL heroique",
+      objective: `${collectionClassifiedCount}/${collectionTargetMin} labels vers le seuil minimum`,
+      context: `Mode ${collectionStatus} · stage ${collectionStage} · gate ${String(asRecord(governance.opportunity_gate).status || "unknown")}`,
       tasks: [
-        { id: "preopen-check", title: "Valider pre-open", detail: `Watchdog ${watchdogStatus}, memory gate ${String(memoryGap.memory_decision || "OK")}, mode ${backendMode}.` },
-        { id: "size-fixed", title: "Conserver size fixe", detail: "Reste a 5$ et interdit tout scaling sur le premier jour." },
-        { id: "max-10-trades", title: "Limiter le flux", detail: "Max 10 trades, no-trade prioritaire si le contexte se degrade." },
-        { id: "avoid-revenge", title: "Interdire revenge trade", detail: "Aucun trade force si deux executions d'affilee sont sales." },
+        { id: "preopen-check", title: "Valider pre-open", detail: `Kill switch ${watchdogStatus === "HALT" ? "a reset manuellement" : "neutralise"}, opportunity gate ${String(asRecord(governance.opportunity_gate).status || "unknown")}, mode ${backendMode}.` },
+        { id: "size-fixed", title: "Verrouiller le scope", detail: "BingX uniquement, BTCUSDT uniquement, 7-7.5$ max, aucun scaling." },
+        { id: "max-10-trades", title: "Limiter le flux", detail: "Chaque trade = data point. Max 10 trades, no-trade prioritaire si le contexte se degrade." },
+        { id: "avoid-revenge", title: "Interdire les tweaks", detail: "Aucun tweak de strategie, aucun changement de seuil, aucun scalping de poursuite." },
       ],
     },
     {
       dayOffset: 1,
       title: "Jour 2 · Collecte disciplinee",
-      focus: "Mesurer execution et latence avant toute idee de perf",
-      objective: "Execution propre > resultat brut",
-      context: `Latency ${avgLatencyMs.toFixed(0)}ms · slippage ${avgSlippageBps.toFixed(2)}bps · fill strict`,
+      focus: "Mesurer execution, slippage et qualite des labels avant toute idee de perf",
+      objective: "Labels propres > resultat brut",
+      context: `Latency ${avgLatencyMs.toFixed(0)}ms · slippage ${avgSlippageBps.toFixed(2)}bps · recent labels ${collectionRecentClassifiedCount}`,
       tasks: [
         { id: "latency-watch", title: "Surveiller latency", detail: `Reduire si latency > 120ms, stop infra si > 200ms.` },
         { id: "fills-review", title: "Verifier fills", detail: "Comparer fill rate et slippage reel avant d'autoriser un flux plus dense." },
-        { id: "context-lock", title: "Respecter le contexte", detail: "Si volatilite spike + liquidite faible, repasse en NO TRADE." },
-        { id: "close-check", title: "Cloture sobre", detail: "Pas de trade de rattrapage en fin de session pour compenser la journee." },
+        { id: "context-lock", title: "Respecter le contexte", detail: "Si volatilite spike + liquidite faible, repasse en NO TRADE sans changer de strategie." },
+        { id: "close-check", title: "Cloture sobre", detail: "Pas de trade de rattrapage et pas de changement de venue/instrument en fin de session." },
       ],
     },
     {
@@ -538,7 +558,7 @@ export default function LiveOpsPage() {
             )}
           />
           <p>
-            <Link href="/">Dashboard</Link>
+            <Link href="/dashboard">Dashboard</Link>
             {" | "}
             <Link href="/terminal">Terminal</Link>
             {" | "}
@@ -603,6 +623,62 @@ export default function LiveOpsPage() {
             </button>
           </div>
           {systemModeFeedback ? <p className="subtle" style={{ marginTop: 10 }}>{systemModeFeedback}</p> : null}
+        </div>
+      </section>
+
+      <section className="grid" style={{ gridTemplateColumns: "1.1fr 0.9fr", marginBottom: 16 }}>
+        <div className="panel">
+          <OperatorPanelGuide
+            title="Collecte Controlee"
+            what="Cadre operateur pour produire des labels reaction x regime x outcome sans retomber dans une logique HFT ou scalping."
+            why="Transformer le live en pipeline de collecte mesurable, pas en chasse au profit prematuree."
+            example="Si le kill switch est reset et que l'opportunity gate est GO, ouvre seulement une session BingX / BTCUSDT / 7-7.5$."
+            compact
+          />
+          <div className="row" style={{ marginTop: 10 }}><span>Status</span><span className={collectionTone}>{collectionStatus}</span></div>
+          <div className="row"><span>Stage labels</span><span>{collectionStage}</span></div>
+          <div className="row"><span>Labels classes</span><span>{collectionClassifiedCount} / {collectionTargetMin} min · {collectionTargetMax} plein</span></div>
+          <div className="row"><span>Recent classes</span><span>{collectionRecentClassifiedCount}</span></div>
+          <div className="row"><span>Progress min</span><span>{collectionProgressToMinPct.toFixed(0)}%</span></div>
+          <div className="row"><span>Progress max</span><span>{collectionProgressToMaxPct.toFixed(0)}%</span></div>
+          <div className="row"><span>Confiance edge</span><span>{String(collectionEdgeConfidence.level || "LOW")} · {toNumber(collectionEdgeConfidence.scorePct, 0).toFixed(0)}%</span></div>
+          <p className="subtle" style={{ marginTop: 10 }}>{collectionThesis}</p>
+          <p className="subtle mini" style={{ marginTop: 6 }}>{collectionNextAction}</p>
+          <div style={{ marginTop: 10, height: 8, borderRadius: 999, background: "rgba(148, 163, 184, 0.14)", overflow: "hidden" }}>
+            <div style={{ width: `${collectionProgressToMinPct}%`, height: "100%", background: collectionProgressToMinPct >= 100 ? "linear-gradient(90deg, rgba(34,197,94,0.9), rgba(16,185,129,0.9))" : "linear-gradient(90deg, rgba(56,189,248,0.9), rgba(14,165,233,0.9))" }} />
+          </div>
+          <div className="subtle mini" style={{ marginTop: 8 }}>{collectionLabelSummary}</div>
+          <div className="subtle mini" style={{ marginTop: 4 }}>{collectionConfidenceSummary}</div>
+        </div>
+        <div className="panel">
+          <div className="eyebrow">Cadre Non-Negociable</div>
+          <div style={{ display: "grid", gap: 10, marginTop: 10 }}>
+            <div>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Conditions fixes</div>
+              <div style={{ display: "grid", gap: 6 }}>
+                {collectionConstraints.map((item) => (
+                  <div key={item} className="row"><span>{item}</span><span className="good">LOCK</span></div>
+                ))}
+              </div>
+            </div>
+            <div>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>A ne pas faire</div>
+              <div style={{ display: "grid", gap: 6 }}>
+                {collectionForbidden.map((item) => (
+                  <div key={item} className="row"><span>{item}</span><span className="warn">NO</span></div>
+                ))}
+              </div>
+            </div>
+            <div>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Stop immediat si</div>
+              <div style={{ display: "grid", gap: 6 }}>
+                {collectionStopConditions.map((item) => (
+                  <div key={item} className="row"><span>{item}</span><span className="warn">STOP</span></div>
+                ))}
+              </div>
+            </div>
+            <div className="subtle mini">Encore {collectionToTargetMin} labels pour atteindre le seuil minimum exploitable.</div>
+          </div>
         </div>
       </section>
 

@@ -48,6 +48,7 @@ function createFeedbackSummary(overrides: Partial<FeedbackSummary> = {}): Feedba
     forceNoTrade: false,
     learningDisabled: false,
     maxAdjustmentPerDayPct: 5,
+    canonicalDecision: null,
     ...overrides,
   };
 }

@@ -22,7 +22,7 @@ export default function NotFound() {
             Si ce lien devait exister, traite-le comme un incident UX ou routing, pas comme une invitation a contourner le cockpit.
           </div>
           <p>
-            <Link href="/">Retour au dashboard</Link>
+            <Link href="/dashboard">Retour au dashboard</Link>
           </p>
         </div>
       </section>

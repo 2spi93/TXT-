@@ -4,8 +4,8 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 
 import HelpHint from "../../components/HelpHint";
 import PanelShell from "../../components/ui/PanelShell";
-import RuntimeDecisionOverviewCard from "../../components/ui/RuntimeDecisionOverviewCard";
 import type { SmartDecisionHudShape } from "./chartHudTypes";
+import type { FinalDecisionTruth } from "./finalDecisionTruth";
 import { buildFeedbackSummary } from "./feedbackEngine";
 import {
   EXECUTION_DECISION_POLICY_VERSION,
@@ -14,6 +14,7 @@ import {
   type ExecutionDecisionAudit,
 } from "../../lib/executionDecisionSchema";
 import type { RuntimeDecisionAnalyticsSummary } from "../../lib/runtimeDecisionAnalytics";
+import { buildTradabilityAnalyticsSummary as buildSharedTradabilityAnalyticsSummary, parseTradabilityJournalSamples as parseSharedTradabilityJournalSamples, type TradabilityAnalyticsSummary } from "../../lib/tradabilityAnalytics";
 import SmartDecisionSummary from "./SmartDecisionSummary";
 
 type RiskTimelineFilter = "all" | "compliant" | "miss";
@@ -161,9 +162,323 @@ function formatCompactMetricMs(value: unknown): string {
   return `${Math.round(numeric / 60_000)}m`;
 }
 
+function formatCompactPercent(value: unknown, digits = 1): string {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? `${numeric.toFixed(digits)}%` : "n/a";
+}
+
+function formatCompactFixed(value: unknown, digits = 2): string {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric.toFixed(digits) : "n/a";
+}
+
 function formatCompactClock(value: unknown, formatClock: (value: string) => string): string {
   const iso = String(value || "").trim();
   return iso ? formatClock(iso) : "--:--:--";
+}
+
+function runtimeDecisionDriftTypeLabel(value: string): string {
+  switch (value) {
+    case "MARKET_MICROSTRUCTURE":
+      return "market microstructure";
+    case "MARKET_REGIME":
+      return "market regime";
+    case "EXECUTION_LATENCY":
+      return "execution latency";
+    case "EXECUTION_ROUTING":
+      return "execution routing";
+    case "SYSTEM_HEALTH":
+      return "system health";
+    case "MIXED":
+      return "mixed";
+    default:
+      return "unknown";
+  }
+}
+
+function runtimeTelemetryStateTone(value: string | null | undefined): "good" | "subtle" | "warn" {
+  const normalized = String(value || "").trim().toUpperCase();
+  if (normalized === "LIVE" || normalized === "OPEN") {
+    return "good";
+  }
+  if (normalized === "NO_EDGE" || normalized === "NO_DATA_EMPTY" || normalized === "UNKNOWN") {
+    return "subtle";
+  }
+  return "warn";
+}
+
+function isRuntimeTelemetryIssueState(value: string | null | undefined): boolean {
+  const normalized = String(value || "").trim().toUpperCase();
+  return normalized === "NO_DATA_AUTH"
+    || normalized === "NO_DATA_PARTIAL"
+    || normalized === "NO_DATA_EMPTY"
+    || normalized === "STALE";
+}
+
+function deriveRuntimeTelemetryGuard(summary: RuntimeDecisionApiSummary | null): {
+  state: string;
+  label: string;
+  tone: "good" | "subtle" | "warn";
+  summary: string;
+  action: "allow" | "reduce" | "block";
+} | null {
+  if (!summary) {
+    return null;
+  }
+
+  const explicitGuardState = String(summary.opportunity.guard?.state || "").trim().toUpperCase();
+  if (explicitGuardState === "BLOCKED_BY_DATA") {
+    return {
+      state: explicitGuardState,
+      label: explicitGuardState,
+      tone: "warn",
+      summary: String(summary.opportunity.guard?.summary || summary.reliability?.summary || "Interpretation blocked by data"),
+      action: "block",
+    };
+  }
+  if (explicitGuardState === "UNTRUSTED") {
+    return {
+      state: explicitGuardState,
+      label: explicitGuardState,
+      tone: "warn",
+      summary: String(summary.opportunity.guard?.summary || summary.reliability?.summary || summary.opportunity.liveSummary || "Observation integrity degraded"),
+      action: "reduce",
+    };
+  }
+  if (explicitGuardState === "PARTIAL_DATA") {
+    return {
+      state: explicitGuardState,
+      label: explicitGuardState,
+      tone: "warn",
+      summary: String(summary.opportunity.guard?.summary || summary.opportunity.liveSummary || "Telemetry partial"),
+      action: "block",
+    };
+  }
+
+  const state = String(summary.opportunity.liveState || "UNKNOWN").trim().toUpperCase() || "UNKNOWN";
+  if (state === "NO_DATA_AUTH") {
+    return { state, label: state, tone: "warn", summary: summary.opportunity.liveSummary, action: "block" };
+  }
+  if (state === "STALE") {
+    return { state, label: state, tone: "warn", summary: summary.opportunity.liveSummary, action: "block" };
+  }
+  if (state === "NO_DATA_PARTIAL") {
+    return { state, label: state, tone: "warn", summary: summary.opportunity.liveSummary, action: "reduce" };
+  }
+  if (state === "NO_DATA_EMPTY") {
+    return { state, label: state, tone: "subtle", summary: summary.opportunity.liveSummary, action: "reduce" };
+  }
+  return {
+    state,
+    label: state,
+    tone: runtimeTelemetryStateTone(state),
+    summary: summary.opportunity.liveSummary,
+    action: "allow",
+  };
+}
+
+function runtimeTelemetryIntegrityTone(severity: string | null | undefined): "good" | "subtle" | "warn" {
+  const normalized = String(severity || "").trim().toLowerCase();
+  if (normalized === "critical") {
+    return "warn";
+  }
+  if (normalized === "warning") {
+    return "subtle";
+  }
+  return "good";
+}
+
+function deriveRuntimeTelemetryIntegrity(summary: RuntimeDecisionApiSummary | null): Array<{
+  code: string;
+  detail: string;
+  tone: "good" | "subtle" | "warn";
+}> {
+  const telemetry = summary?.opportunity?.telemetry;
+  const integrity = telemetry?.integrity;
+  if (Array.isArray(integrity?.items) && integrity.items.length > 0) {
+    return integrity.items.map((item) => ({
+      code: String(item.label || item.code || "UNKNOWN").trim() || "UNKNOWN",
+      detail: String(item.detail || "").trim() || "telemetry gap",
+      tone: runtimeTelemetryIntegrityTone(item.severity),
+    }));
+  }
+
+  const missingFields = Array.isArray(telemetry?.missingFields) ? telemetry.missingFields : [];
+  const fallback = missingFields.map((field) => {
+    switch (String(field)) {
+      case "execution":
+        return { code: "NO_EXECUTION_STATS", detail: "stats execution route absentes", tone: "warn" as const };
+      case "latency":
+        return { code: "NO_EXECUTION_LATENCY", detail: "latence execution/route non observee", tone: "warn" as const };
+      case "slippage":
+        return { code: "NO_EXECUTION_SLIPPAGE", detail: "slippage execution absent", tone: "warn" as const };
+      case "budget_profile":
+        return { code: "NO_EXECUTION_BUDGET", detail: "budgets route max_* absents", tone: "subtle" as const };
+      case "profile":
+        return { code: "NO_EXECUTION_PROFILE", detail: "profile route absent", tone: "subtle" as const };
+      case "spread":
+        return { code: "NO_MARKET_SPREAD", detail: "spread market absent", tone: "subtle" as const };
+      case "depth":
+        return { code: "NO_MARKET_DEPTH", detail: "depth/fill probability market absente", tone: "subtle" as const };
+      case "venues":
+        return { code: "NO_ROUTE_VENUES", detail: "aucune venue exploitable", tone: "warn" as const };
+      default:
+        return { code: String(field || "UNKNOWN").trim().toUpperCase() || "UNKNOWN", detail: String(field || "telemetry gap"), tone: "subtle" as const };
+    }
+  });
+  return fallback.filter((item, index, collection) => collection.findIndex((candidate) => candidate.code === item.code) === index);
+}
+
+function deriveRuntimeTelemetryIntegritySummary(summary: RuntimeDecisionApiSummary | null): string | null {
+  const telemetry = summary?.opportunity?.telemetry;
+  const integrity = telemetry?.integrity;
+  if (integrity?.summary) {
+    return integrity.summary;
+  }
+  const items = deriveRuntimeTelemetryIntegrity(summary);
+  if (items.length === 0) {
+    return null;
+  }
+  return items.map((item) => `${item.code} ${item.detail}`).join(" · ");
+}
+
+function deriveExecutionLockDescriptor(summary: RuntimeDecisionApiSummary | null): {
+  label: string;
+  tone: "good" | "subtle" | "warn";
+  detail: string;
+} {
+  if (!summary) {
+    return {
+      label: "n/a",
+      tone: "subtle",
+      detail: "execution lock unavailable",
+    };
+  }
+
+  const runtimeTelemetryGuard = deriveRuntimeTelemetryGuard(summary);
+  if (!runtimeTelemetryGuard || runtimeTelemetryGuard.action === "allow") {
+    return {
+      label: "OPEN",
+      tone: "good",
+      detail: String(summary.opportunity.guard?.summary || summary.opportunity.liveSummary || "execution path available").trim(),
+    };
+  }
+
+  return {
+    label: runtimeTelemetryGuard.action === "block" ? "LOCKED" : "GUARDED",
+    tone: runtimeTelemetryGuard.action === "block" ? "warn" : "subtle",
+    detail: String(runtimeTelemetryGuard.summary || summary.opportunity.guard?.summary || summary.opportunity.liveSummary || "execution constrained").trim(),
+  };
+}
+
+function buildRuntimeDecisionCompactRead(
+  summary: RuntimeDecisionApiSummary | null,
+  options?: {
+    busy?: boolean;
+    error?: string | null;
+  },
+) {
+  if (!summary) {
+    const error = String(options?.error || "").trim();
+    const busy = Boolean(options?.busy);
+    const meta = busy
+      ? "loading runtime decision summary..."
+      : error || "runtime decision summary unavailable";
+    return {
+      driftTone: busy ? "subtle" : "warn",
+      driftLabel: "DRIFT n/a",
+      driftMeta: meta,
+      opportunityTone: busy ? "subtle" : "warn",
+      opportunityLabel: "OPPORTUNITY n/a",
+      opportunityMeta: meta,
+      observationTone: busy ? "subtle" : "warn",
+      observationLabel: "OBS unavailable",
+      observationMeta: busy ? "awaiting observation window" : meta,
+      liveTone: busy ? "subtle" : "warn",
+      liveLabel: "LIVE n/a",
+      liveMeta: busy ? "stabilizing operator context" : meta,
+      state: busy ? "loading" : error ? "error" : "idle",
+    };
+  }
+
+  const limitingFactor = summary.opportunity.breakdown
+    .slice()
+    .sort((left, right) => left.score - right.score || left.label.localeCompare(right.label))[0] || null;
+  const runtimeTelemetryGuard = deriveRuntimeTelemetryGuard(summary);
+  const executionLock = deriveExecutionLockDescriptor(summary);
+  const explicitOpportunityState = runtimeTelemetryGuard?.action !== "allow" || summary.opportunity.liveState === "NO_EDGE";
+  const live = summary.monitoring?.live || null;
+  const liveAnomalies = summary.monitoring?.anomalies.rows || [];
+  const falseContextCompact = (summary.monitoring?.falseContextMotifs || [])
+    .slice(0, 2)
+    .map((motif) => `${String(motif.family || "").trim().toUpperCase()} ${motif.sharePct}%`)
+    .filter(Boolean)
+    .join(" · ");
+  const chartFeedLabel = live?.latestFeedLabel
+    ? `CHART FEED ${live.latestFeedLabel}`
+    : "CHART FEED capture n/a";
+  const exchangeFreshnessLabel = live
+    ? `EXCHANGE FRESHNESS ${live.latestXchStatus} ${live.latestXchAgeLabel}`
+    : "EXCHANGE FRESHNESS n/a";
+  const exchangeRateLabel = live?.staleRateXchPct != null
+    ? `stale ${live.staleRateXchPct}%`
+    : null;
+  const busLabel = live ? `bus ${formatCompactMetricMs(live.latestBusLagMs)}` : null;
+  const runtimeGridLabel = live?.multiChart?.state && live.multiChart.state !== "INACTIVE"
+    ? `grid ${live.multiChart.state.toLowerCase()}`
+    : null;
+  const runtimeV5Label = live?.v5?.state && live.v5.state !== "INACTIVE"
+    ? `v5 ${live.v5.state.toLowerCase()}`
+    : null;
+  const liveParts = [
+    exchangeFreshnessLabel,
+    exchangeRateLabel,
+    `EXECUTION ${executionLock.label}`,
+    executionLock.detail,
+    busLabel,
+    runtimeGridLabel,
+    runtimeV5Label,
+  ].filter(Boolean);
+
+  return {
+    driftTone: summary.drift.tone,
+    driftLabel: `DRIFT ${runtimeDecisionDriftTypeLabel(summary.drift.type)}`,
+    driftMeta: `P ${summary.drift.stats.probabilityPct}% | R ${summary.drift.stats.reliabilityPct}% | C ${summary.drift.stats.confidencePct}%`,
+    opportunityTone: explicitOpportunityState
+      ? (runtimeTelemetryGuard?.tone || runtimeTelemetryStateTone(summary.opportunity.liveState))
+      : (limitingFactor?.tone || (["OPEN", "LIVE"].includes(summary.opportunity.liveState) ? "good" : ["NO_EDGE", "NO_DATA_EMPTY", "UNKNOWN"].includes(summary.opportunity.liveState) ? "subtle" : "warn")),
+    opportunityLabel: explicitOpportunityState
+      ? `OPPORTUNITY ${runtimeTelemetryGuard?.label || summary.opportunity.liveState}`
+      : `OPPORTUNITY ${summary.opportunity.avgScore}%`,
+    opportunityMeta: explicitOpportunityState
+      ? String(runtimeTelemetryGuard?.summary || summary.opportunity.guard?.summary || summary.opportunity.liveSummary)
+      : limitingFactor
+        ? `facteur limitant ${limitingFactor.label.toLowerCase()} ${limitingFactor.scorePct.toFixed(0)}%`
+        : summary.opportunity.liveSummary,
+    observationTone: summary.integrity.state === "BROKEN"
+      ? "warn"
+      : summary.integrity.state === "DEGRADED"
+        ? "subtle"
+        : summary.observation.manualCalibrationEligible
+      ? "good"
+      : summary.observation.status === "OBSERVE"
+        ? "subtle"
+        : "warn",
+    observationLabel: `OBS ${summary.observation.status.toLowerCase().replace(/_/g, " ")}`,
+    observationMeta: `FP ${summary.observation.driftFalsePositiveRate}% | Det ${summary.observation.driftDetectionRate}% | Stability ${summary.observation.driftStability}% | Consistency ${summary.observation.decisionConsistency}%${summary.integrity ? ` | Runtime Integrity ${summary.integrity.state} ${summary.integrity.scorePct}%` : ""}${summary.monitoring?.observationWindow.validation?.integrityTrend?.direction && summary.monitoring.observationWindow.validation.integrityTrend.direction !== "UNKNOWN" ? ` | Trend ${summary.monitoring.observationWindow.validation.integrityTrend.direction}` : ""}${summary.observation.integrity ? ` | Observation Integrity ${summary.observation.integrity.status}` : ""}${summary.reliability?.state ? ` | Reliability ${summary.reliability.state}` : ""}${falseContextCompact ? ` | FalseCtx ${falseContextCompact}` : ""}`,
+    liveTone: executionLock.tone === "warn"
+      ? "warn"
+      : liveAnomalies[0]?.severity === "critical"
+      ? "warn"
+      : liveAnomalies[0]?.severity === "warning"
+        ? "subtle"
+        : live?.latestXchStatus === "LIVE"
+          ? "good"
+          : "subtle",
+    liveLabel: chartFeedLabel,
+    liveMeta: liveParts.join(" | ") || "capture locale indisponible",
+    state: "ready",
+  };
 }
 
 function resolveVenueTelemetryTone(input: {
@@ -370,6 +685,7 @@ function deriveDeskTruthState(input: {
   summary: Record<string, unknown>;
   liveOpsPayload?: Record<string, unknown> | null;
   executionAiV6Payload?: ExecutionAiV6PanelPayload | null;
+  runtimeDecisionSummary?: RuntimeDecisionApiSummary | null;
 }): { label: "OK" | "REDUCE" | "BLOCK"; tone: "good" | "subtle" | "warn"; reason: string } {
   const summary = safeRecord(input.summary);
   const liveOps = safeRecord(input.liveOpsPayload);
@@ -378,6 +694,7 @@ function deriveDeskTruthState(input: {
   const v6Envelope = safeRecord(input.executionAiV6Payload);
   const v6Snapshot = safeRecord(v6Envelope.snapshot);
   const v6Guardrails = safeRecord(v6Snapshot.guardrails);
+  const runtimeTelemetryGuard = deriveRuntimeTelemetryGuard(input.runtimeDecisionSummary || null);
 
   const tradeCount = safeNumber(summary.trade_count, 0);
   const noTradeCount = safeNumber(summary.no_trade_dominance_count, 0);
@@ -390,6 +707,19 @@ function deriveDeskTruthState(input: {
   const watchdogStatus = String(watchdog.status || "OK").trim().toUpperCase();
   const governanceMode = String(governance.mode || "SAFE").trim().toUpperCase();
   const learningFrozen = Boolean(v6Guardrails.learning_frozen);
+
+  if (runtimeTelemetryGuard?.state === "NO_DATA_AUTH") {
+    return { label: "BLOCK", tone: "warn", reason: runtimeTelemetryGuard.summary };
+  }
+  if (runtimeTelemetryGuard?.state === "STALE") {
+    return { label: "BLOCK", tone: "warn", reason: runtimeTelemetryGuard.summary };
+  }
+  if (runtimeTelemetryGuard?.state === "NO_DATA_PARTIAL") {
+    return { label: "REDUCE", tone: "warn", reason: runtimeTelemetryGuard.summary };
+  }
+  if (runtimeTelemetryGuard?.state === "NO_DATA_EMPTY") {
+    return { label: "REDUCE", tone: "subtle", reason: runtimeTelemetryGuard.summary };
+  }
 
   if (watchdogStatus === "HALT" || governanceMode === "LOCKED") {
     return { label: "BLOCK", tone: "warn", reason: "system guardrails locked the desk" };
@@ -462,6 +792,8 @@ type OperatorActionSummaryProps = {
   executionAiV6Payload?: ExecutionAiV6PanelPayload | null;
   routingPayload?: Record<string, unknown> | null;
   smartDecision?: SmartDecisionHudShape | null;
+  finalDecisionTruth?: FinalDecisionTruth | null;
+  passiveMode?: boolean;
   journalContext?: {
     symbol: string;
     timeframe: string;
@@ -552,6 +884,83 @@ type ExecutionDecisionJournalAuditSummary = {
 type RuntimeDecisionApiSummary = RuntimeDecisionAnalyticsSummary;
 
 const OPERATOR_OVERRIDE_STORAGE_KEY = "txt.operator.override.v1";
+
+function useRuntimeDecisionSummary(journalContext?: {
+  symbol: string;
+  timeframe: string;
+  strategy: string;
+}, disabled = false) {
+  const journalSymbol = String(journalContext?.symbol || "").trim().toUpperCase();
+  const journalTimeframe = String(journalContext?.timeframe || "").trim();
+  const journalStrategy = String(journalContext?.strategy || "").trim();
+  const enabled = !disabled && Boolean(journalSymbol && journalTimeframe && journalStrategy);
+  const [summary, setSummary] = useState<RuntimeDecisionApiSummary | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const exportHref = useMemo(() => {
+    if (!enabled) {
+      return null;
+    }
+    const query = new URLSearchParams();
+    query.set("symbol", journalSymbol);
+    query.set("timeframe", journalTimeframe);
+    query.set("strategy", journalStrategy);
+    query.set("limit", "600");
+    query.set("sinceDays", "7");
+    query.set("historyLimit", "20");
+    query.set("download", "1");
+    return `/api/system/runtime-decision/export?${query.toString()}`;
+  }, [enabled, journalStrategy, journalSymbol, journalTimeframe]);
+
+  useEffect(() => {
+    if (!enabled) {
+      setSummary(null);
+      setBusy(false);
+      setError(null);
+      return;
+    }
+    let cancelled = false;
+    const loadRuntimeDecision = async () => {
+      setBusy(true);
+      const query = new URLSearchParams();
+      query.set("symbol", journalSymbol);
+      query.set("timeframe", journalTimeframe);
+      query.set("strategy", journalStrategy);
+      query.set("limit", "600");
+      query.set("sinceDays", "7");
+      query.set("samples", "1");
+      const response = await fetch(`/api/system/runtime-decision?${query.toString()}`, { cache: "no-store" }).catch(() => null);
+      const payload = response ? await response.json().catch(() => null) : null;
+      if (cancelled) {
+        return;
+      }
+      if (!response || !response.ok || !payload || !payload.totals || !Array.isArray(payload.topCodes)) {
+        setError("Runtime decision summary indisponible");
+        setBusy(false);
+        return;
+      }
+      setSummary(payload as RuntimeDecisionApiSummary);
+      setError(null);
+      setBusy(false);
+    };
+    void loadRuntimeDecision();
+    return () => {
+      cancelled = true;
+    };
+  }, [enabled, journalStrategy, journalSymbol, journalTimeframe]);
+
+  return {
+    enabled,
+    summary,
+    busy,
+    error,
+    exportHref,
+    journalSymbol,
+    journalTimeframe,
+    journalStrategy,
+  };
+}
 
 function isOperatorJournalEntry(value: unknown): value is OperatorJournalEntry {
   const row = safeRecord(value);
@@ -1100,6 +1509,8 @@ function buildOperatorActionDecision(input: {
   executionAiV6Payload?: ExecutionAiV6PanelPayload | null;
   routingPayload?: Record<string, unknown> | null;
   smartDecision?: SmartDecisionHudShape | null;
+  runtimeDecisionSummary?: RuntimeDecisionApiSummary | null;
+  finalDecisionTruth?: FinalDecisionTruth | null;
 }): OperatorActionDecision {
   const envelope = safeRecord(input.executionPnlPayload);
   const summary = safeRecord(envelope.summary);
@@ -1107,6 +1518,12 @@ function buildOperatorActionDecision(input: {
   const liveOps = safeRecord(input.liveOpsPayload);
   const watchdog = safeRecord(liveOps.watchdog_state);
   const governance = safeRecord(liveOps.governance);
+  const controlledCollection = safeRecord(liveOps.controlled_collection);
+  const recovery = safeRecord(liveOps.recovery);
+  const rawLiveOps = safeRecord(liveOps.raw);
+  const liveOpsKillSwitch = safeRecord(rawLiveOps.kill_switch);
+  const liveOpsKillSwitchState = safeRecord(liveOpsKillSwitch.state);
+  const opportunityGate = safeRecord(governance.opportunity_gate);
   const routingEnvelope = safeRecord(input.routingPayload);
   const executionContext = safeRecord(routingEnvelope.execution_context);
   const policy = safeRecord(executionContext.policy);
@@ -1119,7 +1536,18 @@ function buildOperatorActionDecision(input: {
     ? Boolean(v6Guardrails.persistence_available)
     : true;
   const smartDecision = input.smartDecision ?? null;
-  const truthState = deriveDeskTruthState({ summary, liveOpsPayload: input.liveOpsPayload, executionAiV6Payload: input.executionAiV6Payload });
+  const runtimeTelemetryGuard = deriveRuntimeTelemetryGuard(input.runtimeDecisionSummary || null);
+  const runtimeTelemetryIntegrity = deriveRuntimeTelemetryIntegrity(input.runtimeDecisionSummary || null);
+  const runtimeTelemetryLead = runtimeTelemetryIntegrity[0] || null;
+  const executionLockDescriptor = deriveExecutionLockDescriptor(input.runtimeDecisionSummary || null);
+  const runtimeLive = input.runtimeDecisionSummary?.monitoring?.live || null;
+  const finalDecisionTruth = input.finalDecisionTruth || null;
+  const truthState = deriveDeskTruthState({
+    summary,
+    liveOpsPayload: input.liveOpsPayload,
+    executionAiV6Payload: input.executionAiV6Payload,
+    runtimeDecisionSummary: input.runtimeDecisionSummary,
+  });
   const dominanceReasons = aggregateDominanceReasons(trades).slice(0, 3).map((item) => `${item.label} x${item.count}`);
   const noTradeReasons = safeTextArray(executionContext.no_trade_reasons).slice(0, 3);
   const freezeReasons = safeTextArray(executionContext.freeze_learning_reasons).slice(0, 2);
@@ -1134,6 +1562,19 @@ function buildOperatorActionDecision(input: {
   const noTrade = Boolean(executionContext.no_trade || policy.no_trade);
   const watchdogStatus = String(watchdog.status || "OK").trim().toUpperCase();
   const governanceMode = String(governance.mode || "SAFE").trim().toUpperCase();
+  const killSwitchActive = Boolean(liveOpsKillSwitchState.active) || Boolean(controlledCollection.manual_reset_required);
+  const controlledCollectionStatus = String(controlledCollection.status || "UNKNOWN").trim().toUpperCase();
+  const controlledCollectionNextAction = String(controlledCollection.next_action || "").trim();
+  const controlledCollectionThesis = String(controlledCollection.thesis || "").trim();
+  const gateStatus = String(opportunityGate.status || "unknown").trim().toLowerCase();
+  const gateReasons = safeTextArray(opportunityGate.reasons).slice(0, 2);
+  const labelProgress = safeRecord(controlledCollection.label_progress);
+  const labelProgressSummary = String(labelProgress.summary || "").trim() || (
+    safeNumber(labelProgress.targetMin, 0) > 0
+      ? `${safeNumber(labelProgress.classifiedCount, 0)}/${safeNumber(labelProgress.targetMin, 0)} labels min`
+      : ""
+  );
+  const recoveryMode = String(recovery.mode || "NOMINAL").trim().toUpperCase();
   const leadingVenue = String(dominance.leader_venue || bestRoute.venue || "--");
   const updatedAt = String(envelope.updated_at || liveOps.updated_at || "").trim() || null;
   const negativeStreak = (() => {
@@ -1148,11 +1589,17 @@ function buildOperatorActionDecision(input: {
     return streak;
   })();
   const hardGuardReasons: string[] = [];
+  if (killSwitchActive) {
+    hardGuardReasons.push("kill switch central actif");
+  }
   if (watchdogStatus === "HALT") {
     hardGuardReasons.push("watchdog en HALT");
   }
   if (governanceMode === "LOCKED") {
     hardGuardReasons.push("gouvernance lockee");
+  }
+  if (gateStatus && gateStatus !== "go") {
+    hardGuardReasons.push(`opportunity gate ${gateStatus}${gateReasons.length > 0 ? ` · ${gateReasons.join(" · ")}` : ""}`);
   }
   if (noTrade) {
     hardGuardReasons.push("desk policy en NO TRADE");
@@ -1168,6 +1615,15 @@ function buildOperatorActionDecision(input: {
   }
   if (!v6PersistenceAvailable) {
     hardGuardReasons.push("DB V6 indisponible");
+  }
+  if (runtimeTelemetryGuard?.state === "NO_DATA_AUTH") {
+    hardGuardReasons.push("telemetry live NO_DATA_AUTH");
+  }
+  if (runtimeTelemetryGuard?.state === "STALE") {
+    hardGuardReasons.push("telemetry live STALE");
+  }
+  if (finalDecisionTruth?.execution_allowed === false) {
+    hardGuardReasons.push(`final decision ${finalDecisionTruth.action.toLowerCase()}${finalDecisionTruth.blocking_layer ? ` · ${finalDecisionTruth.blocking_layer}` : ""}`);
   }
   const hardGuardActive = hardGuardReasons.length > 0;
   const postTradeFeedback = buildPostTradeFeedback(trades);
@@ -1188,6 +1644,11 @@ function buildOperatorActionDecision(input: {
 
   const metrics: OperatorActionDecision["metrics"] = [
     { label: "Truth", value: truthState.label, tone: truthState.tone as OperatorActionDecision["metrics"][number]["tone"] },
+    { label: "Contract", value: finalDecisionTruth ? `${finalDecisionTruth.action} / ${finalDecisionTruth.edge_eligibility.state}` : "n/a", tone: finalDecisionTruth ? (finalDecisionTruth.execution_allowed ? finalDecisionTruth.should_trade ? "good" : "subtle" : "warn") : "subtle" },
+    { label: "Chart feed", value: runtimeLive?.latestFeedLabel || "capture n/a", tone: runtimeLive?.latestFeedLabel ? "good" : "subtle" },
+    { label: "Exchange", value: runtimeLive ? `${runtimeLive.latestXchStatus} ${runtimeLive.latestXchAgeLabel}` : "n/a", tone: runtimeLive?.latestXchStatus === "LIVE" ? "good" : runtimeLive?.latestXchStatus === "STALE" ? "subtle" : "subtle" },
+    { label: "Execution", value: executionLockDescriptor.label, tone: executionLockDescriptor.tone },
+    { label: "Telemetry", value: runtimeTelemetryGuard?.label ? `${runtimeTelemetryGuard.label}${runtimeTelemetryLead ? ` / ${runtimeTelemetryLead.code}` : ""}` : (runtimeTelemetryLead?.code || "n/a"), tone: runtimeTelemetryGuard?.tone || runtimeTelemetryLead?.tone || "subtle" },
     { label: "No-trade", value: `${noTradeRatioPct.toFixed(0)}%`, tone: noTradeRatioPct >= 70 ? "warn" : noTradeRatioPct >= 35 ? "subtle" : "good" },
     { label: "Confidence", value: smartDecision?.confidenceBand || (confidencePct > 0 ? `${confidencePct.toFixed(0)}%` : "n/a"), tone: smartDecision ? (smartDecision.confidenceBand === "HIGH" ? "good" : smartDecision.confidenceBand === "MEDIUM" ? "subtle" : "warn") : confidencePct >= 60 ? "good" : confidencePct >= 40 ? "subtle" : "warn" },
     { label: "Latency", value: formatCompactMetricMs(avgLatencyMs), tone: avgLatencyMs > 120 ? "warn" : avgLatencyMs > 80 ? "subtle" : "good" },
@@ -1195,20 +1656,41 @@ function buildOperatorActionDecision(input: {
     { label: "Dominance", value: leadingVenue === "--" ? "n/a" : `${leadingVenue} ${dominanceGapPct.toFixed(0)}%`, tone: dominanceGapPct >= 8 ? "good" : dominanceGapPct >= 4 ? "subtle" : "warn" },
   ];
 
-  if (watchdogStatus === "HALT" || governanceMode === "LOCKED" || truthState.label === "BLOCK") {
+  if (watchdogStatus === "HALT" || governanceMode === "LOCKED" || truthState.label === "BLOCK" || finalDecisionTruth?.action === "BLOCK") {
+    const rootBlocker = killSwitchActive
+      ? "Kill switch central actif: le desk reste verrouille tant que le reset manuel n'est pas confirme."
+      : watchdogStatus === "HALT"
+        ? `Watchdog en HALT: recovery ${recoveryMode.toLowerCase()} actif tant que la gouvernance runtime n'est pas redevenue saine.`
+        : truthState.label === "BLOCK"
+          ? "Le moteur de verite bloque le desk: le contexte n'est pas defendable en live."
+          : `Gouvernance ${governanceMode.toLowerCase()}: le desk reste verrouille.`;
+    const stopReasons = [
+      finalDecisionTruth?.detail_label || truthState.reason,
+      killSwitchActive
+        ? "kill switch central actif -> controlled collection verrouillee"
+        : watchdogStatus === "HALT"
+          ? `watchdog en HALT -> recovery ${recoveryMode.toLowerCase()}`
+          : `governance ${governanceMode.toLowerCase()}`,
+      gateStatus && gateStatus !== "go"
+        ? `opportunity gate ${gateStatus}${gateReasons.length > 0 ? ` · ${gateReasons.join(" · ")}` : ""}`
+        : avgLatencyMs > 0
+          ? `latence moyenne ${Math.round(avgLatencyMs)}ms`
+          : "verite PnL deja en blocage",
+    ];
+    if (controlledCollectionStatus !== "UNKNOWN") {
+      stopReasons.push(`controlled collection ${controlledCollectionStatus.toLowerCase()}${labelProgressSummary ? ` · ${labelProgressSummary}` : ""}`);
+    }
     return {
       action: "STOP",
       tone: "warn",
       riskLabel,
-      headline: "Arrete le live et repasse par la verification.",
-      summary: "Le desk n'est pas dans un etat ou une nouvelle prise de risque est defendable.",
-      reasons: [
-        truthState.reason,
-        watchdogStatus === "HALT" ? "watchdog en HALT" : `governance ${governanceMode.toLowerCase()}`,
-        avgLatencyMs > 0 ? `latence moyenne ${Math.round(avgLatencyMs)}ms` : "verite PnL deja en blocage",
-      ],
+      headline: rootBlocker,
+      summary: killSwitchActive
+        ? "Le NO TRADE encore actif vient du verrou de gouvernance, pas du chart seul."
+        : "Le desk n'est pas dans un etat ou une nouvelle prise de risque est defendable.",
+      reasons: stopReasons,
       metrics,
-      nextStep: "Traite l'alerte ou la cause de blocage avant toute nouvelle execution.",
+      nextStep: controlledCollectionNextAction || controlledCollectionThesis || "Traite l'alerte ou la cause de blocage avant toute nouvelle execution.",
       updatedAt,
       hardGuardActive,
       hardGuardLabel: "TRADE BLOQUE",
@@ -1313,7 +1795,7 @@ function buildOperatorActionDecision(input: {
     };
   }
 
-  if (learningFrozen || truthState.label === "REDUCE" || avgLatencyMs > 120 || avgSlippageBps > 3) {
+  if (learningFrozen || truthState.label === "REDUCE" || finalDecisionTruth?.action === "REDUCE" || avgLatencyMs > 120 || avgSlippageBps > 3) {
     return {
       action: "REDUCE SIZE",
       tone: "subtle",
@@ -1399,30 +1881,36 @@ export function OperatorActionSummary({
   executionAiV6Payload,
   routingPayload,
   smartDecision,
+  finalDecisionTruth,
+  passiveMode = false,
   journalContext,
   formatClock,
   footer,
 }: OperatorActionSummaryProps) {
+  const runtimeDecision = useRuntimeDecisionSummary(journalContext, passiveMode);
+  const runtimeDecisionSummary = runtimeDecision.summary;
+  const runtimeDecisionBusy = runtimeDecision.busy;
+  const runtimeDecisionError = runtimeDecision.error;
+  const runtimeDecisionExportHref = runtimeDecision.exportHref;
   const decision = useMemo(() => buildOperatorActionDecision({
     executionPnlPayload,
     liveOpsPayload,
     executionAiV6Payload,
     routingPayload,
     smartDecision,
-  }), [executionAiV6Payload, executionPnlPayload, liveOpsPayload, routingPayload, smartDecision]);
+    runtimeDecisionSummary,
+    finalDecisionTruth,
+  }), [executionAiV6Payload, executionPnlPayload, finalDecisionTruth, liveOpsPayload, routingPayload, runtimeDecisionSummary, smartDecision]);
   const journalSymbol = String(journalContext?.symbol || "").trim().toUpperCase();
   const journalTimeframe = String(journalContext?.timeframe || "").trim();
   const journalStrategy = String(journalContext?.strategy || "").trim();
-  const journalEnabled = Boolean(journalSymbol && journalTimeframe && journalStrategy);
+  const journalEnabled = !passiveMode && Boolean(journalSymbol && journalTimeframe && journalStrategy);
   const [overrideArmed, setOverrideArmed] = useState(false);
   const [overrideDraft, setOverrideDraft] = useState("");
   const [overrideRecord, setOverrideRecord] = useState<{ reason: string; createdAt: string; action: string } | null>(null);
   const [journalEntries, setJournalEntries] = useState<OperatorJournalEntry[]>([]);
   const [journalBusy, setJournalBusy] = useState(false);
   const [journalError, setJournalError] = useState<string | null>(null);
-  const [runtimeDecisionSummary, setRuntimeDecisionSummary] = useState<RuntimeDecisionApiSummary | null>(null);
-  const [runtimeDecisionBusy, setRuntimeDecisionBusy] = useState(false);
-  const [runtimeDecisionError, setRuntimeDecisionError] = useState<string | null>(null);
   const [driftItems, setDriftItems] = useState<DriftItem[]>([]);
   const [driftBusy, setDriftBusy] = useState(false);
   const [driftError, setDriftError] = useState<string | null>(null);
@@ -1432,7 +1920,8 @@ export function OperatorActionSummary({
     liveOpsPayload,
     executionAiV6Payload,
     journalEntries,
-  }), [executionAiV6Payload, executionPnlPayload, journalEntries, liveOpsPayload]);
+    finalDecisionTruth,
+  }), [executionAiV6Payload, executionPnlPayload, finalDecisionTruth, journalEntries, liveOpsPayload]);
   const overrideLockActive = feedbackSummary.driftState === "LOCK" || feedbackSummary.learningDisabled;
   const overrideLockReason = feedbackSummary.protections[0] || "drift LOCK";
   const disciplineAnalytics = useMemo(() => buildDisciplineAnalytics({
@@ -1447,6 +1936,50 @@ export function OperatorActionSummary({
     () => buildExecutionDecisionJournalAudit(journalEntries),
     [journalEntries],
   );
+  const runtimeDecisionCompactRead = useMemo(
+    () => buildRuntimeDecisionCompactRead(runtimeDecisionSummary, {
+      busy: runtimeDecisionBusy,
+      error: runtimeDecisionError,
+    }),
+    [runtimeDecisionBusy, runtimeDecisionError, runtimeDecisionSummary],
+  );
+  const runtimeTelemetryIntegrity = useMemo(
+    () => deriveRuntimeTelemetryIntegrity(runtimeDecisionSummary),
+    [runtimeDecisionSummary],
+  );
+  const runtimeTelemetryIntegritySummary = useMemo(
+    () => deriveRuntimeTelemetryIntegritySummary(runtimeDecisionSummary),
+    [runtimeDecisionSummary],
+  );
+  const controlledCollectionSummary = useMemo(() => {
+    const liveOps = safeRecord(liveOpsPayload);
+    const controlledCollection = safeRecord(liveOps.controlled_collection);
+    if (Object.keys(controlledCollection).length === 0) {
+      return null;
+    }
+    const governance = safeRecord(liveOps.governance);
+    const opportunityGate = safeRecord(governance.opportunity_gate);
+    const labelProgress = safeRecord(controlledCollection.label_progress);
+    const constraints = safeTextArray(controlledCollection.constraints).slice(0, 2);
+    const stopConditions = safeTextArray(controlledCollection.stop_conditions).slice(0, 2);
+    const gateReasons = safeTextArray(opportunityGate.reasons).slice(0, 2);
+    const labelSummary = String(labelProgress.summary || "").trim() || (
+      safeNumber(labelProgress.targetMin, 0) > 0
+        ? `${safeNumber(labelProgress.classifiedCount, 0)}/${safeNumber(labelProgress.targetMin, 0)} labels min`
+        : ""
+    );
+    return {
+      status: String(controlledCollection.status || "UNKNOWN").trim().toUpperCase(),
+      thesis: String(controlledCollection.thesis || "").trim(),
+      nextAction: String(controlledCollection.next_action || "").trim(),
+      manualResetRequired: Boolean(controlledCollection.manual_reset_required),
+      labelSummary,
+      constraints,
+      stopConditions,
+      gateStatus: String(opportunityGate.status || "unknown").trim().toLowerCase(),
+      gateReasons,
+    };
+  }, [liveOpsPayload]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -1509,43 +2042,12 @@ export function OperatorActionSummary({
   }, [journalEnabled, journalStrategy, journalSymbol, journalTimeframe]);
 
   useEffect(() => {
-    if (!journalEnabled) {
-      setRuntimeDecisionSummary(null);
-      setRuntimeDecisionBusy(false);
-      setRuntimeDecisionError(null);
+    if (passiveMode) {
+      setDriftItems([]);
+      setDriftBusy(false);
+      setDriftError(null);
       return;
     }
-    let cancelled = false;
-    const loadRuntimeDecision = async () => {
-      setRuntimeDecisionBusy(true);
-      const query = new URLSearchParams();
-      query.set("symbol", journalSymbol);
-      query.set("timeframe", journalTimeframe);
-      query.set("strategy", journalStrategy);
-      query.set("limit", "600");
-      query.set("sinceDays", "7");
-      query.set("samples", "1");
-      const response = await fetch(`/api/system/runtime-decision?${query.toString()}`, { cache: "no-store" }).catch(() => null);
-      const payload = response ? await response.json().catch(() => null) : null;
-      if (cancelled) {
-        return;
-      }
-      if (!response || !response.ok || !payload || !payload.totals || !Array.isArray(payload.topCodes)) {
-        setRuntimeDecisionError("Runtime decision summary indisponible");
-        setRuntimeDecisionBusy(false);
-        return;
-      }
-      setRuntimeDecisionSummary(payload as RuntimeDecisionApiSummary);
-      setRuntimeDecisionError(null);
-      setRuntimeDecisionBusy(false);
-    };
-    void loadRuntimeDecision();
-    return () => {
-      cancelled = true;
-    };
-  }, [journalEnabled, journalStrategy, journalSymbol, journalTimeframe]);
-
-  useEffect(() => {
     let cancelled = false;
     const loadDrift = async () => {
       setDriftBusy(true);
@@ -1573,7 +2075,7 @@ export function OperatorActionSummary({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [passiveMode]);
 
   async function appendOperatorJournalEntry(action: string, detail: string, meta?: Record<string, unknown>): Promise<void> {
     if (!journalEnabled) {
@@ -1652,6 +2154,21 @@ export function OperatorActionSummary({
     }
   }
 
+  const runtimeDecisionHeaderLabel = runtimeDecisionBusy
+    ? "sync..."
+    : runtimeDecisionSummary
+      ? (isRuntimeTelemetryIssueState(runtimeDecisionSummary.opportunity.liveState)
+        ? runtimeDecisionSummary.opportunity.liveState
+        : runtimeDecisionSummary.dominant.bucket.label)
+      : "indispo";
+  const runtimeDecisionHeaderTone = runtimeDecisionBusy
+    ? "subtle"
+    : runtimeDecisionSummary
+      ? (isRuntimeTelemetryIssueState(runtimeDecisionSummary.opportunity.liveState)
+        ? runtimeTelemetryStateTone(runtimeDecisionSummary.opportunity.liveState)
+        : runtimeDecisionSummary.deskRead.tone)
+      : "warn";
+
   return (
     <div className={`operator-action-panel ${decision.tone}`}>
       <div className="operator-action-head">
@@ -1689,8 +2206,53 @@ export function OperatorActionSummary({
             </div>
           ))}
           <div className="operator-action-next-step">{decision.nextStep}</div>
+          {controlledCollectionSummary ? (
+            <div style={{ marginTop: 10, display: "grid", gap: 6 }} data-testid="operator-controlled-collection-summary">
+              <div className="subtle mini">Controlled collection</div>
+              <div className="operator-action-reason-row">
+                <span className={`operator-action-dot ${controlledCollectionSummary.manualResetRequired ? "warn" : "subtle"}`} />
+                <span><strong>{controlledCollectionSummary.status}</strong> · {controlledCollectionSummary.nextAction || controlledCollectionSummary.thesis || "Collection mode disponible depuis Live Ops."}</span>
+              </div>
+              {controlledCollectionSummary.gateStatus !== "go" ? (
+                <div className="operator-action-reason-row">
+                  <span className="operator-action-dot warn" />
+                  <span>Opportunity gate {controlledCollectionSummary.gateStatus}{controlledCollectionSummary.gateReasons.length > 0 ? ` · ${controlledCollectionSummary.gateReasons.join(" · ")}` : ""}</span>
+                </div>
+              ) : null}
+              {controlledCollectionSummary.labelSummary ? (
+                <div className="operator-action-reason-row">
+                  <span className="operator-action-dot subtle" />
+                  <span>{controlledCollectionSummary.labelSummary}</span>
+                </div>
+              ) : null}
+              {controlledCollectionSummary.constraints.map((constraint) => (
+                <div key={constraint} className="operator-action-reason-row">
+                  <span className="operator-action-dot subtle" />
+                  <span>{constraint}</span>
+                </div>
+              ))}
+              {controlledCollectionSummary.stopConditions.map((condition) => (
+                <div key={condition} className="operator-action-reason-row">
+                  <span className="operator-action-dot warn" />
+                  <span>{condition}</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
           {decision.updatedAt ? <div className="subtle mini">Derniere mise a jour utile: {formatClock(decision.updatedAt)}</div> : null}
         </div>
+        {runtimeTelemetryIntegrity.length > 0 ? (
+          <div className="operator-action-reasons-card" data-testid="operator-runtime-telemetry-integrity">
+            <div className="subtle mini" style={{ marginBottom: 6 }}>Runtime telemetry integrity</div>
+            {runtimeTelemetryIntegritySummary ? <div className="subtle mini" style={{ marginBottom: 8 }}>{runtimeTelemetryIntegritySummary}</div> : null}
+            {runtimeTelemetryIntegrity.slice(0, 5).map((item) => (
+              <div key={`${item.code}-${item.detail}`} className="operator-action-reason-row">
+                <span className={`operator-action-dot ${item.tone}`} />
+                <span><strong>{item.code}</strong> · {item.detail}</span>
+              </div>
+            ))}
+          </div>
+        ) : null}
       </div>
       <div className={`operator-dominance-card ${decision.dominanceTone}`}>
         <div>
@@ -1887,11 +2449,41 @@ export function OperatorActionSummary({
           <div className="operator-discipline-drift-box" data-testid="execution-runtime-decision-compact">
             <div className="operator-feedback-head">
               <div className="subtle mini">Runtime decision compact</div>
-              <div className={`operator-dominance-chip ${runtimeDecisionBusy ? "subtle" : runtimeDecisionSummary ? runtimeDecisionSummary.deskRead.tone : "warn"}`}>
-                {runtimeDecisionBusy ? "sync..." : runtimeDecisionSummary ? runtimeDecisionSummary.dominant.bucket.label : "indispo"}
+              <div className={`operator-dominance-chip ${runtimeDecisionHeaderTone}`}>
+                {runtimeDecisionHeaderLabel}
               </div>
             </div>
-            {runtimeDecisionSummary ? <RuntimeDecisionOverviewCard summary={runtimeDecisionSummary} compact title="Decision desk" /> : null}
+            <div
+              className="operator-runtime-compact-read"
+              data-testid="execution-runtime-decision-quick-read"
+              data-runtime-summary-state={runtimeDecisionCompactRead.state}
+            >
+              <div className={`operator-runtime-compact-row ${runtimeDecisionCompactRead.driftTone}`} data-testid="execution-runtime-decision-quick-read-drift">
+                <strong>{runtimeDecisionCompactRead.driftLabel}</strong>
+                <span>{runtimeDecisionCompactRead.driftMeta}</span>
+              </div>
+              <div className={`operator-runtime-compact-row ${runtimeDecisionCompactRead.opportunityTone}`} data-testid="execution-runtime-decision-quick-read-opportunity">
+                <strong>{runtimeDecisionCompactRead.opportunityLabel}</strong>
+                <span>{runtimeDecisionCompactRead.opportunityMeta}</span>
+              </div>
+              <div className={`operator-runtime-compact-row ${runtimeDecisionCompactRead.observationTone}`} data-testid="execution-runtime-decision-quick-read-observation">
+                <strong>{runtimeDecisionCompactRead.observationLabel}</strong>
+                <span>{runtimeDecisionCompactRead.observationMeta}</span>
+              </div>
+              <div className={`operator-runtime-compact-row ${runtimeDecisionCompactRead.liveTone}`} data-testid="execution-runtime-decision-quick-read-live">
+                <strong>{runtimeDecisionCompactRead.liveLabel}</strong>
+                <span>{runtimeDecisionCompactRead.liveMeta}</span>
+              </div>
+            </div>
+            {runtimeDecisionSummary ? (
+              <>
+                <div className="operator-journal-summary">
+                  <a className="runtime-decision-link" href="/dashboard#runtime-observation-dashboard">Observation dashboard detaille</a>
+                  {" · "}
+                  <a className="runtime-decision-link" href={runtimeDecisionExportHref}>export review json</a>
+                </div>
+              </>
+            ) : null}
             {runtimeDecisionError ? <div className="operator-journal-summary warn">{runtimeDecisionError}</div> : null}
           </div>
         </div>
@@ -2558,6 +3150,8 @@ export function ExecutionPnlTruthMonitoringPanel({
   payload,
   liveOpsPayload,
   executionAiV6Payload,
+  finalDecisionTruth,
+  passiveMode = false,
   journalContext,
   formatClock,
 }: {
@@ -2567,6 +3161,8 @@ export function ExecutionPnlTruthMonitoringPanel({
   payload: ExecutionPnlAnalyzerPayload | null;
   liveOpsPayload?: Record<string, unknown> | null;
   executionAiV6Payload?: ExecutionAiV6PanelPayload | null;
+  finalDecisionTruth?: FinalDecisionTruth | null;
+  passiveMode?: boolean;
   journalContext?: {
     symbol: string;
     timeframe: string;
@@ -2574,10 +3170,18 @@ export function ExecutionPnlTruthMonitoringPanel({
   };
   formatClock: (value: string) => string;
 }) {
+  const runtimeDecision = useRuntimeDecisionSummary(journalContext, passiveMode);
+  const runtimeDecisionSummary = runtimeDecision.summary;
+  const runtimeDecisionBusy = runtimeDecision.busy;
+  const runtimeDecisionError = runtimeDecision.error;
+  const runtimeTelemetryGuard = deriveRuntimeTelemetryGuard(runtimeDecisionSummary);
+  const runtimeTelemetryIssue = isRuntimeTelemetryIssueState(runtimeTelemetryGuard?.state);
+  const runtimeTelemetryIntegrity = deriveRuntimeTelemetryIntegrity(runtimeDecisionSummary);
+  const runtimeTelemetryIntegritySummary = deriveRuntimeTelemetryIntegritySummary(runtimeDecisionSummary);
   const journalSymbol = String(journalContext?.symbol || "").trim().toUpperCase();
   const journalTimeframe = String(journalContext?.timeframe || "").trim();
   const journalStrategy = String(journalContext?.strategy || "").trim();
-  const journalEnabled = Boolean(journalSymbol && journalTimeframe && journalStrategy);
+  const journalEnabled = !passiveMode && Boolean(journalSymbol && journalTimeframe && journalStrategy);
   const [journalEntries, setJournalEntries] = useState<OperatorJournalEntry[]>([]);
   const [journalBusy, setJournalBusy] = useState(false);
   const [journalError, setJournalError] = useState<string | null>(null);
@@ -2629,7 +3233,7 @@ export function ExecutionPnlTruthMonitoringPanel({
   const byExecutionMode = safeRows(envelope.by_execution_mode).slice(0, 3);
   const badModelFlags = safeRows(envelope.bad_model_flags).slice(0, 4);
   const dominanceReasons = aggregateDominanceReasons(trades);
-  const truthState = deriveDeskTruthState({ summary, liveOpsPayload, executionAiV6Payload });
+  const truthState = deriveDeskTruthState({ summary, liveOpsPayload, executionAiV6Payload, runtimeDecisionSummary });
   const tradeCount = safeNumber(summary.trade_count, 0);
   const noTradeCount = safeNumber(summary.no_trade_dominance_count, 0);
   const noTradeRatioPct = tradeCount > 0 ? (noTradeCount / tradeCount) * 100 : 0;
@@ -2638,7 +3242,8 @@ export function ExecutionPnlTruthMonitoringPanel({
     liveOpsPayload,
     executionAiV6Payload,
     journalEntries,
-  }), [executionAiV6Payload, journalEntries, liveOpsPayload, payload]);
+    finalDecisionTruth,
+  }), [executionAiV6Payload, finalDecisionTruth, journalEntries, liveOpsPayload, payload]);
 
   return (
     <MonitoringPanelCard title="Execution PnL Truth" badge={badge} layoutEditMode={layoutEditMode} onDetach={onDetach}>
@@ -2647,11 +3252,26 @@ export function ExecutionPnlTruthMonitoringPanel({
         <>
           <div className="venue-telemetry-summary">
             <span className={`venue-telemetry-pill ${truthState.tone === "warn" ? "warn" : ""}`}>{truthState.label}</span>
+            {finalDecisionTruth ? <span className={`venue-telemetry-pill ${finalDecisionTruth.execution_allowed ? finalDecisionTruth.should_trade ? "good" : "" : "warn"}`}>contract {finalDecisionTruth.action}</span> : null}
+            {runtimeTelemetryIssue && runtimeTelemetryGuard ? <span className={`venue-telemetry-pill ${runtimeTelemetryGuard.tone === "warn" ? "warn" : ""}`}>{runtimeTelemetryGuard.label}</span> : null}
             <span className="venue-telemetry-pill">trades {tradeCount.toFixed(0)}</span>
             <span className="venue-telemetry-pill">net {formatSignedCompactUsd(summary.net_pnl_usd)}</span>
             <span className="venue-telemetry-pill">flags {safeNumber(summary.high_confidence_loss_count, 0).toFixed(0)}</span>
           </div>
           <div className="subtle mini" style={{ marginBottom: 8 }}>{truthState.reason}</div>
+          {runtimeDecisionBusy ? <div className="subtle mini">runtime telemetry sync...</div> : null}
+          {runtimeTelemetryIssue && runtimeTelemetryGuard ? <div className={`subtle mini ${runtimeTelemetryGuard.tone === "warn" ? "warn" : ""}`} data-testid="execution-pnl-telemetry-guard">{runtimeTelemetryGuard.summary}</div> : null}
+          {runtimeTelemetryIntegrity.length > 0 ? (
+            <>
+              <div className="venue-telemetry-summary" data-testid="execution-pnl-telemetry-integrity">
+                {runtimeTelemetryIntegrity.slice(0, 5).map((item) => (
+                  <span key={`${item.code}-${item.detail}`} className={`venue-telemetry-pill ${item.tone === "warn" ? "warn" : item.tone === "subtle" ? "subtle" : ""}`.trim()}>{item.code}</span>
+                ))}
+              </div>
+              {runtimeTelemetryIntegritySummary ? <div className="subtle mini">Runtime telemetry integrity · {runtimeTelemetryIntegritySummary}</div> : null}
+            </>
+          ) : null}
+          {runtimeDecisionError ? <div className="warn mini">{runtimeDecisionError}</div> : null}
           <div className="optimizer-live-section">
             <div className="venue-telemetry-summary">
               <span className={`venue-telemetry-pill ${feedbackSummary.modelHealth === "BROKEN" || feedbackSummary.modelHealth === "DEGRADING" ? "warn" : feedbackSummary.modelHealth === "ADAPTING" ? "subtle" : ""}`}>health {feedbackSummary.modelHealth}</span>
@@ -2708,6 +3328,7 @@ export function ExecutionPnlTruthMonitoringPanel({
                 <span className="venue-telemetry-venue">Truth line</span>
                 <span className={`venue-telemetry-state ${truthState.tone}`}>{truthState.label}</span>
               </div>
+              <div className="mon-row"><span>Runtime telemetry</span><span className={runtimeTelemetryGuard?.tone || "subtle"}>{runtimeTelemetryGuard?.label || "n/a"}</span></div>
               <div className="mon-row"><span>Expectancy</span><span className={safeNumber(summary.avg_pnl_usd, 0) >= 0 ? "good" : "warn"}>{formatSignedCompactUsd(summary.avg_pnl_usd)}</span></div>
               <div className="mon-row"><span>Win rate</span><span>{safeNumber(summary.win_rate_pct, 0).toFixed(1)}%</span></div>
               <div className="mon-row"><span>Fees</span><span>{formatCompactUsd(summary.fees_usd)}</span></div>
@@ -2767,8 +3388,8 @@ export function ExecutionPnlTruthMonitoringPanel({
             {byRegime.map((row) => (
               <div key={`pnl-regime-${String(row.regime || "unknown")}`} className="mon-row">
                 <span>{String(row.regime || "UNKNOWN")}</span>
-                <span className="subtle mini">{safeNumber(row.trade_count, 0).toFixed(0)} trades · {safeNumber(row.win_rate_pct, 0).toFixed(1)}%</span>
-                <span className={safeNumber(row.net_pnl_usd, 0) >= 0 ? "good" : "warn"}>{formatSignedCompactUsd(row.net_pnl_usd)}</span>
+                <span className="subtle mini">{safeNumber(row.trade_count, 0).toFixed(0)} trades · {safeNumber(row.win_rate_pct, 0).toFixed(1)}% · fees {formatSignedCompactUsd(row.fees_usd)}</span>
+                <span className={safeNumber(row.net_after_costs_usd ?? row.net_pnl_usd, 0) >= 0 ? "good" : "warn"}>{formatSignedCompactUsd(row.net_after_costs_usd ?? row.net_pnl_usd)}</span>
               </div>
             ))}
             {byVenue.map((row) => (
@@ -2907,6 +3528,7 @@ export function ExecutionContextMonitoringPanel({
   routingPayload,
   optimizerPayload,
   smartDecision,
+  finalDecisionTruth,
   formatClock,
 }: {
   badge: ReactNode;
@@ -2915,6 +3537,7 @@ export function ExecutionContextMonitoringPanel({
   routingPayload: Record<string, unknown> | null;
   optimizerPayload: ExecutionOptimizerLivePayload | null;
   smartDecision?: SmartDecisionHudShape | null;
+  finalDecisionTruth?: FinalDecisionTruth | null;
   formatClock: (value: string) => string;
 }) {
   const routingEnvelope = safeRecord(routingPayload);
@@ -2940,6 +3563,14 @@ export function ExecutionContextMonitoringPanel({
   const freezeLearning = Boolean(executionContext.freeze_learning || policy.freeze_learning);
   const noTrade = Boolean(executionContext.no_trade || policy.no_trade);
   const confidence = safeNumber(executionContext.confidence, 0);
+  const informationDensity = finalDecisionTruth?.information_density || null;
+  const informationDensityTone = informationDensity
+    ? informationDensity.state === "DEGRADED"
+      ? "warn"
+      : informationDensity.state === "THIN"
+        ? "subtle"
+        : "good"
+    : "subtle";
   const targetNotionalUsd = safeNumber(executionContext.target_notional_usd, 0);
   const sizeMultiplier = safeNumber(executionContext.size_multiplier, 0);
   const entryBoost = safeNumber(executionContext.entry_boost_adjustment, 0);
@@ -2951,7 +3582,6 @@ export function ExecutionContextMonitoringPanel({
       </span>
     </>
   );
-
   return (
     <MonitoringPanelCard title="Execution Context" badge={titleBadge} layoutEditMode={layoutEditMode} onDetach={onDetach}>
       {!routingPayload ? <p className="subtle mini">Contexte d'execution indisponible.</p> : null}
@@ -2971,6 +3601,8 @@ export function ExecutionContextMonitoringPanel({
                 <span className={`venue-telemetry-state ${noTrade ? "warn" : confidence >= 0.6 ? "good" : "subtle"}`}>{fallbackMode.replace(/_/g, " ")}</span>
               </div>
               <div className="mon-row"><span>Trade gate</span><span className={noTrade ? "warn" : "good"}>{noTrade ? "NO_TRADE" : "eligible"}</span></div>
+              {finalDecisionTruth ? <div className="mon-row"><span>Final contract</span><span className={finalDecisionTruth.execution_allowed ? finalDecisionTruth.should_trade ? "good" : "subtle" : "warn"}>{finalDecisionTruth.action} · {finalDecisionTruth.edge_eligibility.state} {finalDecisionTruth.edge_eligibility.score_pct}%</span></div> : null}
+              {informationDensity ? <div className="mon-row" data-testid="terminal-execution-context-info-density"><span>Info density</span><span className={informationDensityTone}>{informationDensity.state} · score {informationDensity.score_pct}% · H {informationDensity.entropy_pct}%</span></div> : null}
               {smartDecision ? <div className="mon-row"><span>Smart state</span><span className={smartDecision.tone}>{smartDecision.displayStateLabel} · {smartDecision.confidenceBand}</span></div> : null}
               {smartDecision ? <div className="mon-row"><span>Stability</span><span className={smartDecision.stability.isStable ? "good" : "warn"}>{smartDecision.stability.statusLabel}</span></div> : null}
               <div className="mon-row"><span>Learning</span><span className={freezeLearning ? "warn" : "good"}>{freezeLearning ? "frozen" : String(policy.learning_mode || executionContext.learning_mode || "online")}</span></div>
@@ -2978,6 +3610,7 @@ export function ExecutionContextMonitoringPanel({
               <div className="optimizer-live-reasons">
                 {noTradeReasons.length === 0 ? <span className="optimizer-live-chip good">trade allowed</span> : null}
                 {noTradeReasons.map((reason) => <span key={reason} className="optimizer-live-chip warn">{reason}</span>)}
+                {informationDensity?.reasons.slice(0, 3).map((reason) => <span key={`density-${reason}`} className={`optimizer-live-chip ${informationDensity.state === "DEGRADED" ? "warn" : "subtle"}`}>{reason}</span>)}
               </div>
               {smartDecision ? <div className="subtle mini gtix-ellipsis" style={{ marginTop: 6 }}>{smartDecision.headline} · {smartDecision.reason}</div> : null}
             </div>
@@ -3047,6 +3680,494 @@ export function ExecutionContextMonitoringPanel({
             })}
           </div>
         </>
+      ) : null}
+    </MonitoringPanelCard>
+  );
+}
+
+type TradabilityDensityState = "SUFFICIENT" | "THIN" | "DEGRADED";
+
+type TradabilityJournalSample = {
+  id: string;
+  createdAtIso: string;
+  regime: string;
+  marketSession: string;
+  densityState: TradabilityDensityState;
+  scorePct: number;
+  entropyPct: number;
+  edgeState: string;
+  action: string;
+  blockingLayer: string;
+  source: "live" | "journal";
+};
+
+type TradabilityRegimeSummaryRow = {
+  regime: string;
+  sampleCount: number;
+  thinSharePct: number;
+  degradedSharePct: number;
+  sufficientSharePct: number;
+  avgScorePct: number;
+  avgEntropyPct: number;
+  lastState: TradabilityDensityState;
+  lastAction: string;
+  lastSeenIso: string;
+  reviewLabel: string;
+  reviewTone: "good" | "subtle" | "warn";
+};
+
+type TradabilityRegimeWindowComparisonRow = {
+  regime: string;
+  window24h: TradabilityRegimeSummaryRow | null;
+  window7d: TradabilityRegimeSummaryRow | null;
+  driftLabel: string;
+  driftTone: "good" | "subtle" | "warn";
+};
+
+function normalizeTradabilityDensityState(value: unknown): TradabilityDensityState | null {
+  const normalized = String(value || "").trim().toUpperCase();
+  if (normalized === "SUFFICIENT" || normalized === "THIN" || normalized === "DEGRADED") {
+    return normalized;
+  }
+  return null;
+}
+
+function tradabilityDensityTone(state: TradabilityDensityState | null): "good" | "subtle" | "warn" {
+  if (state === "DEGRADED") {
+    return "warn";
+  }
+  if (state === "THIN") {
+    return "subtle";
+  }
+  return "good";
+}
+
+function buildCurrentTradabilityJournalSample(input: {
+  finalDecisionTruth?: FinalDecisionTruth | null;
+  volatilityRegime?: string;
+  marketSession?: string;
+}): TradabilityJournalSample | null {
+  const finalDecisionTruth = input.finalDecisionTruth || null;
+  const informationDensity = finalDecisionTruth?.information_density || null;
+  const densityState = normalizeTradabilityDensityState(informationDensity?.state);
+  if (!finalDecisionTruth || !informationDensity || !densityState) {
+    return null;
+  }
+  return {
+    id: "tradability-live-snapshot",
+    createdAtIso: new Date().toISOString(),
+    regime: String(input.volatilityRegime || "UNKNOWN").trim().toUpperCase() || "UNKNOWN",
+    marketSession: String(input.marketSession || "UNKNOWN").trim().toUpperCase() || "UNKNOWN",
+    densityState,
+    scorePct: safeNumber(informationDensity.score_pct, 0),
+    entropyPct: safeNumber(informationDensity.entropy_pct, 0),
+    edgeState: String(finalDecisionTruth.edge_eligibility.state || "UNKNOWN").trim().toUpperCase() || "UNKNOWN",
+    action: String(finalDecisionTruth.action || "HOLD").trim().toUpperCase() || "HOLD",
+    blockingLayer: String(finalDecisionTruth.blocking_layer || "none").trim().toLowerCase() || "none",
+    source: "live",
+  };
+}
+
+function parseTradabilityJournalSamples(entries: Array<Record<string, unknown>>): TradabilityJournalSample[] {
+  return entries
+    .map((entry) => {
+      const action = String(entry.action || "").trim().toLowerCase();
+      if (action !== "tradability-snapshot") {
+        return null;
+      }
+      const meta = safeRecord(entry.meta);
+      const snapshot = safeRecord(meta.tradability_snapshot);
+      const finalDecisionTruth = safeRecord(meta.final_decision_truth);
+      const informationDensity = safeRecord(finalDecisionTruth.information_density);
+      const densityState = normalizeTradabilityDensityState(snapshot.information_density_state || informationDensity.state);
+      if (!densityState) {
+        return null;
+      }
+      return {
+        id: String(entry.id || `${entry.createdAtIso || ""}-${action}`),
+        createdAtIso: String(entry.createdAtIso || ""),
+        regime: String(snapshot.volatility_regime || snapshot.regime || "UNKNOWN").trim().toUpperCase() || "UNKNOWN",
+        marketSession: String(snapshot.market_session || "UNKNOWN").trim().toUpperCase() || "UNKNOWN",
+        densityState,
+        scorePct: safeNumber(snapshot.score_pct, safeNumber(informationDensity.score_pct, 0)),
+        entropyPct: safeNumber(snapshot.entropy_pct, safeNumber(informationDensity.entropy_pct, 0)),
+        edgeState: String(snapshot.edge_state || safeRecord(finalDecisionTruth.edge_eligibility).state || "UNKNOWN").trim().toUpperCase() || "UNKNOWN",
+        action: String(snapshot.action || finalDecisionTruth.action || "HOLD").trim().toUpperCase() || "HOLD",
+        blockingLayer: String(snapshot.blocking_layer || finalDecisionTruth.blocking_layer || "none").trim().toLowerCase() || "none",
+        source: "journal",
+      };
+    })
+    .filter((value): value is TradabilityJournalSample => Boolean(value))
+    .sort((left, right) => Date.parse(right.createdAtIso) - Date.parse(left.createdAtIso));
+}
+
+function buildTradabilityRegimeSummaryRows(samples: TradabilityJournalSample[]): TradabilityRegimeSummaryRow[] {
+  const grouped = new Map<string, {
+    sampleCount: number;
+    thinCount: number;
+    degradedCount: number;
+    sufficientCount: number;
+    scoreSum: number;
+    entropySum: number;
+    lastState: TradabilityDensityState;
+    lastAction: string;
+    lastSeenIso: string;
+  }>();
+
+  for (const sample of samples) {
+    const regime = sample.regime || "UNKNOWN";
+    const bucket = grouped.get(regime) || {
+      sampleCount: 0,
+      thinCount: 0,
+      degradedCount: 0,
+      sufficientCount: 0,
+      scoreSum: 0,
+      entropySum: 0,
+      lastState: sample.densityState,
+      lastAction: sample.action,
+      lastSeenIso: sample.createdAtIso,
+    };
+    bucket.sampleCount += 1;
+    bucket.scoreSum += sample.scorePct;
+    bucket.entropySum += sample.entropyPct;
+    if (sample.densityState === "DEGRADED") {
+      bucket.degradedCount += 1;
+    } else if (sample.densityState === "THIN") {
+      bucket.thinCount += 1;
+    } else {
+      bucket.sufficientCount += 1;
+    }
+    if (Date.parse(sample.createdAtIso) >= Date.parse(bucket.lastSeenIso)) {
+      bucket.lastSeenIso = sample.createdAtIso;
+      bucket.lastState = sample.densityState;
+      bucket.lastAction = sample.action;
+    }
+    grouped.set(regime, bucket);
+  }
+
+  return [...grouped.entries()]
+    .map(([regime, bucket]) => {
+      const thinSharePct = bucket.sampleCount > 0 ? (bucket.thinCount / bucket.sampleCount) * 100 : 0;
+      const degradedSharePct = bucket.sampleCount > 0 ? (bucket.degradedCount / bucket.sampleCount) * 100 : 0;
+      const sufficientSharePct = bucket.sampleCount > 0 ? (bucket.sufficientCount / bucket.sampleCount) * 100 : 0;
+      const avgScorePct = bucket.sampleCount > 0 ? bucket.scoreSum / bucket.sampleCount : 0;
+      const avgEntropyPct = bucket.sampleCount > 0 ? bucket.entropySum / bucket.sampleCount : 0;
+      const reviewTone: TradabilityRegimeSummaryRow["reviewTone"] = bucket.sampleCount < 4
+        ? "subtle"
+        : degradedSharePct >= 35 || thinSharePct >= 60
+          ? "warn"
+          : degradedSharePct <= 10 && thinSharePct <= 25
+            ? "good"
+            : "subtle";
+      const reviewLabel = bucket.sampleCount < 4
+        ? "sample faible"
+        : degradedSharePct >= 35
+          ? avgScorePct >= 50
+            ? "seuil possiblement strict"
+            : "regime adverse"
+          : thinSharePct >= 60
+            ? "poids a plafonner"
+            : degradedSharePct <= 10 && thinSharePct <= 25
+              ? "candidate pour poids ++"
+              : "observer";
+      return {
+        regime,
+        sampleCount: bucket.sampleCount,
+        thinSharePct,
+        degradedSharePct,
+        sufficientSharePct,
+        avgScorePct,
+        avgEntropyPct,
+        lastState: bucket.lastState,
+        lastAction: bucket.lastAction,
+        lastSeenIso: bucket.lastSeenIso,
+        reviewLabel,
+        reviewTone,
+      };
+    })
+    .sort((left, right) => right.sampleCount - left.sampleCount || right.degradedSharePct - left.degradedSharePct || left.regime.localeCompare(right.regime));
+}
+
+function filterTradabilitySamplesWithinHours(samples: TradabilityJournalSample[], hours: number): TradabilityJournalSample[] {
+  const cutoffMs = Date.now() - hours * 60 * 60 * 1000;
+  return samples.filter((sample) => {
+    const createdAtMs = Date.parse(sample.createdAtIso);
+    return Number.isFinite(createdAtMs) && createdAtMs >= cutoffMs;
+  });
+}
+
+function buildTradabilityWindowComparisonRows(input: {
+  rows24h: TradabilityRegimeSummaryRow[];
+  rows7d: TradabilityRegimeSummaryRow[];
+}): TradabilityRegimeWindowComparisonRow[] {
+  const rows24hByRegime = new Map(input.rows24h.map((row) => [row.regime, row]));
+  const rows7dByRegime = new Map(input.rows7d.map((row) => [row.regime, row]));
+  const regimes = [...new Set([...rows24hByRegime.keys(), ...rows7dByRegime.keys()])];
+
+  return regimes
+    .map<TradabilityRegimeWindowComparisonRow>((regime) => {
+      const window24h = rows24hByRegime.get(regime) || null;
+      const window7d = rows7dByRegime.get(regime) || null;
+      if (!window24h || !window7d) {
+        return {
+          regime,
+          window24h,
+          window7d,
+          driftLabel: !window24h ? "24h insuffisant" : "7j insuffisant",
+          driftTone: "subtle",
+        };
+      }
+      const thinDelta = window24h.thinSharePct - window7d.thinSharePct;
+      const degradedDelta = window24h.degradedSharePct - window7d.degradedSharePct;
+      const driftTone: TradabilityRegimeWindowComparisonRow["driftTone"] = degradedDelta >= 15 || thinDelta >= 20
+        ? "warn"
+        : degradedDelta <= -15 || thinDelta <= -20
+          ? "good"
+          : "subtle";
+      const driftLabel = driftTone === "warn"
+        ? `derive +${Math.max(thinDelta, degradedDelta).toFixed(0)} pts`
+        : driftTone === "good"
+          ? `derive ${Math.min(thinDelta, degradedDelta).toFixed(0)} pts`
+          : "derive stable";
+      return {
+        regime,
+        window24h,
+        window7d,
+        driftLabel,
+        driftTone,
+      };
+    })
+    .sort((left, right) => {
+      const leftCount = (left.window24h?.sampleCount || 0) + (left.window7d?.sampleCount || 0);
+      const rightCount = (right.window24h?.sampleCount || 0) + (right.window7d?.sampleCount || 0);
+      return rightCount - leftCount || left.regime.localeCompare(right.regime);
+    });
+}
+
+function buildTradabilityCalibrationHint(rows: TradabilityRegimeSummaryRow[], currentRegime: string): { tone: "good" | "subtle" | "warn"; summary: string } {
+  if (rows.length === 0) {
+    return {
+      tone: "subtle",
+      summary: "Aucun historique regime encore disponible. On journalise d'abord avant de retoucher les seuils.",
+    };
+  }
+  const activeRow = rows.find((row) => row.regime === currentRegime) || rows[0];
+  if (!activeRow) {
+    return {
+      tone: "subtle",
+      summary: "Pas de regime comparable pour l'instant.",
+    };
+  }
+  if (activeRow.sampleCount < 4) {
+    return {
+      tone: "subtle",
+      summary: `${activeRow.regime}: seulement ${activeRow.sampleCount} echantillons. Garder le poids information_density stable et accumuler plus de cas reels.`,
+    };
+  }
+  if (activeRow.degradedSharePct >= 35 || activeRow.thinSharePct >= 60) {
+    return {
+      tone: "warn",
+      summary: `${activeRow.regime}: THIN ${activeRow.thinSharePct.toFixed(0)}% / DEGRADED ${activeRow.degradedSharePct.toFixed(0)}%. Revoir les seuils avant d'augmenter le poids de l'oracle.`,
+    };
+  }
+  if (activeRow.degradedSharePct <= 10 && activeRow.thinSharePct <= 25) {
+    return {
+      tone: "good",
+      summary: `${activeRow.regime}: surface stable (${activeRow.sufficientSharePct.toFixed(0)}% SUFFICIENT). La calibration peut supporter un poids un peu plus fort si le comportement reste stable.`,
+    };
+  }
+  return {
+    tone: "subtle",
+    summary: `${activeRow.regime}: surface encore mixte. Continuer la mesure par regime avant toute hausse de poids.`,
+  };
+}
+
+export function TradabilitySurfaceMonitoringPanel({
+  badge,
+  layoutEditMode,
+  onDetach,
+  finalDecisionTruth,
+  preprocessorPayload,
+  journalEntries = [],
+  analyticsSummary,
+  volatilityRegime,
+  marketSession,
+  formatClock,
+}: {
+  badge: ReactNode;
+  layoutEditMode: boolean;
+  onDetach: () => void;
+  finalDecisionTruth?: FinalDecisionTruth | null;
+  preprocessorPayload?: Record<string, unknown> | null;
+  journalEntries?: Array<Record<string, unknown>>;
+  analyticsSummary?: TradabilityAnalyticsSummary | null;
+  volatilityRegime?: string;
+  marketSession?: string;
+  formatClock: (value: string) => string;
+}) {
+  const preprocessor = safeRecord(preprocessorPayload);
+  const alert = safeRecord(preprocessor.alert);
+  const informationDensity = finalDecisionTruth?.information_density || null;
+  const marketTruth = finalDecisionTruth?.market_truth || null;
+  const falseContext = finalDecisionTruth?.false_context || null;
+  const truth = finalDecisionTruth?.truth || null;
+  const attention = finalDecisionTruth?.attention || null;
+  const confidence = finalDecisionTruth?.confidence || null;
+  const infoTone = informationDensity
+    ? informationDensity.state === "DEGRADED"
+      ? "warn"
+      : informationDensity.state === "THIN"
+        ? "subtle"
+        : "good"
+    : "subtle";
+  const contractTone = finalDecisionTruth
+    ? finalDecisionTruth.execution_allowed
+      ? finalDecisionTruth.should_trade
+        ? "good"
+        : "subtle"
+      : "warn"
+    : "subtle";
+  const blockingLayerTone = finalDecisionTruth?.blocking_layer === "information_density"
+    ? "warn"
+    : finalDecisionTruth?.blocking_layer
+      ? "subtle"
+      : "good";
+  const marketTruthTone = marketTruth
+    ? marketTruth.state === "UNTRUSTWORTHY" || marketTruth.state === "DEGRADED"
+      ? "warn"
+      : marketTruth.state === "WATCH"
+        ? "subtle"
+        : "good"
+    : "subtle";
+  const liveSample = useMemo(() => buildCurrentTradabilityJournalSample({ finalDecisionTruth, volatilityRegime, marketSession }), [finalDecisionTruth, marketSession, volatilityRegime]);
+  const journalSamples = useMemo(() => parseSharedTradabilityJournalSamples(safeRows(journalEntries)), [journalEntries]);
+  const resolvedAnalyticsSummary = useMemo(
+    () => analyticsSummary || buildSharedTradabilityAnalyticsSummary(safeRows(journalEntries), { currentRegime: String(volatilityRegime || "unknown") }),
+    [analyticsSummary, journalEntries, volatilityRegime],
+  );
+  const allSamples = useMemo(() => (liveSample ? [liveSample, ...journalSamples] : [...journalSamples]), [journalSamples, liveSample]);
+  const historySamples = useMemo(() => {
+    return allSamples
+      .sort((left, right) => Date.parse(right.createdAtIso) - Date.parse(left.createdAtIso))
+      .slice(0, 8);
+  }, [allSamples]);
+  const regimeWindowComparisonRows = resolvedAnalyticsSummary.comparison.rows;
+  const calibrationHint = {
+    tone: resolvedAnalyticsSummary.calibration.driftTone,
+    summary: resolvedAnalyticsSummary.calibration.summaryLabel,
+  };
+
+  return (
+    <MonitoringPanelCard title="Tradability Surface" badge={badge} layoutEditMode={layoutEditMode} onDetach={onDetach}>
+      {!finalDecisionTruth ? <p className="subtle mini">Surface d'admissibilite indisponible.</p> : null}
+      {finalDecisionTruth ? (
+        <div data-testid="terminal-tradability-surface-card">
+          <div className="venue-telemetry-summary" style={{ marginBottom: 8 }}>
+            <span className={`venue-telemetry-pill ${contractTone === "warn" ? "warn" : contractTone === "good" ? "good" : "subtle"}`}>contract {finalDecisionTruth.action}</span>
+            <span className={`venue-telemetry-pill ${infoTone === "warn" ? "warn" : infoTone === "good" ? "good" : "subtle"}`}>density {informationDensity?.state || "n/a"}</span>
+            <span className={`venue-telemetry-pill ${String(alert.state || "").trim().toLowerCase() === "warn" ? "warn" : "subtle"}`}>preproc {String(preprocessor.market_regime || "n/a")}</span>
+          </div>
+          <div className="optimizer-live-grid">
+            <div className={`venue-telemetry-item ${contractTone === "warn" ? "warn" : contractTone === "good" ? "good" : "subtle"}`}>
+              <div className="venue-telemetry-head">
+                <span className="venue-telemetry-venue">Oracle contract</span>
+                <span className={`venue-telemetry-state ${contractTone === "warn" ? "warn" : contractTone === "good" ? "good" : "subtle"}`}>{finalDecisionTruth.action}</span>
+              </div>
+              <div className="mon-row"><span>Edge eligibility</span><span>{finalDecisionTruth.edge_eligibility.state} · {finalDecisionTruth.edge_eligibility.score_pct}%</span></div>
+              <div className="mon-row"><span>Blocking layer</span><span className={blockingLayerTone}>{finalDecisionTruth.blocking_layer || "none"}</span></div>
+              <div className="mon-row"><span>Route mode</span><span>{finalDecisionTruth.route_mode} · {finalDecisionTruth.preferred_venue || "n/a"}</span></div>
+              <div className="mon-note subtle">{finalDecisionTruth.detail_label}</div>
+              <div className="optimizer-live-reasons" data-testid="terminal-tradability-proofs">
+                {(finalDecisionTruth.proofs || []).slice(0, 4).map((item) => (
+                  <span key={`proof-${item.code}`} className={`optimizer-live-chip ${item.tone === "warn" ? "warn" : item.tone === "good" ? "good" : "subtle"}`}>
+                    {item.label} · {item.value}{item.evidence[0] ? ` · ${item.evidence[0]}` : ""}
+                  </span>
+                ))}
+              </div>
+              <div className="optimizer-live-reasons" data-testid="terminal-tradability-verdict-explanation">
+                {(finalDecisionTruth.verdict_explanation || []).slice(0, 5).map((item) => (
+                  <span key={`verdict-${item.code}`} className={`optimizer-live-chip ${item.tone === "warn" ? "warn" : item.tone === "good" ? "good" : "subtle"}`}>
+                    {item.label} · {item.detail}
+                  </span>
+                ))}
+              </div>
+            </div>
+            <div className={`venue-telemetry-item ${infoTone === "warn" ? "warn" : infoTone === "good" ? "good" : "subtle"}`}>
+              <div className="venue-telemetry-head">
+                <span className="venue-telemetry-venue">Information density</span>
+                <span className={`venue-telemetry-state ${infoTone === "warn" ? "warn" : infoTone === "good" ? "good" : "subtle"}`}>{informationDensity?.state || "n/a"}</span>
+              </div>
+              <div className="mon-row" data-testid="terminal-tradability-density-row"><span>Score / entropy</span><span>{informationDensity ? `${informationDensity.score_pct}% / ${informationDensity.entropy_pct}%` : "n/a"}</span></div>
+              {informationDensity?.calibration ? <div className="mon-row" data-testid="terminal-tradability-calibration-thresholds"><span>Applied thresholds</span><span>S {informationDensity.calibration.thin_score_floor_pct}/{informationDensity.calibration.degraded_score_floor_pct}% · H {informationDensity.calibration.thin_entropy_ceiling_pct}/{informationDensity.calibration.degraded_entropy_ceiling_pct}%</span></div> : null}
+              {finalDecisionTruth?.edge_eligibility.calibration ? <div className="mon-row" data-testid="terminal-tradability-impact-weight"><span>Edge impact</span><span>{finalDecisionTruth.edge_eligibility.calibration.information_density_weight_pct}% info_density · {finalDecisionTruth.edge_eligibility.calibration.base_signal_weight_pct}% base</span></div> : null}
+              <div className="mon-row"><span>Truth / confidence</span><span>{truth ? `${Math.round(safeNumber(truth.confidence, 0) * 100)}%` : "n/a"} · {safeNumber(confidence?.final_score_pct, 0).toFixed(0)}%</span></div>
+              <div className="optimizer-live-reasons">
+                {(informationDensity?.reasons || []).length === 0 ? <span className="optimizer-live-chip subtle">density nominale</span> : null}
+                {(informationDensity?.reasons || []).slice(0, 4).map((reason) => <span key={reason} className={`optimizer-live-chip ${infoTone === "warn" ? "warn" : "subtle"}`}>{reason}</span>)}
+              </div>
+            </div>
+            <div className={`venue-telemetry-item ${marketTruthTone === "warn" ? "warn" : marketTruthTone === "good" ? "good" : "subtle"}`}>
+              <div className="venue-telemetry-head">
+                <span className="venue-telemetry-venue">Market truth</span>
+                <span className={`venue-telemetry-state ${marketTruthTone === "warn" ? "warn" : marketTruthTone === "good" ? "good" : "subtle"}`}>{marketTruth?.state || finalDecisionTruth.state}</span>
+              </div>
+              <div className="mon-row" data-testid="terminal-tradability-market-truth-score"><span>Truth score</span><span>{marketTruth ? `${marketTruth.score_pct}%` : "n/a"}</span></div>
+              <div className="mon-row" data-testid="terminal-tradability-market-truth-components"><span>Components</span><span>{marketTruth ? `coh ${marketTruth.metrics.coherence_pct}% · fresh ${marketTruth.metrics.freshness_pct}% · density ${marketTruth.metrics.information_density_pct}% · exec ${marketTruth.metrics.execution_quality_pct}% · anomaly ${marketTruth.metrics.anomaly_burden_pct}%` : "n/a"}</span></div>
+              <div className="mon-row" data-testid="terminal-tradability-false-context"><span>False context</span><span>{falseContext?.family ? `${falseContext.family} · ${falseContext.no_trade ? "NO_TRADE" : "WATCH"}` : "none"}</span></div>
+              <div className="mon-row"><span>Trigger</span><span>{falseContext?.trigger_layer || "none"}</span></div>
+              <div className="mon-row"><span>Truth integrity</span><span>{truth ? `${truth.integrity_status} · ${truth.sync_status}` : "n/a"}</span></div>
+              <div className="mon-row"><span>Blocking layer</span><span className={blockingLayerTone}>{finalDecisionTruth.blocking_layer || "none"}</span></div>
+              <div className="mon-row"><span>Attention</span><span>{attention ? `${attention.state} · ${attention.should_block_trading ? "block" : "observe"}` : "n/a"}</span></div>
+              <div className="mon-row"><span>Preprocessor</span><span>{String(preprocessor.mode || "n/a")} · saved {formatCompactPercent(preprocessor.compression_saved_pct)}</span></div>
+              <div className="mon-row"><span>Preproc alert</span><span className={String(alert.state || "").trim().toLowerCase() === "warn" ? "warn" : "subtle"}>{String(alert.state || "n/a").toUpperCase()}</span></div>
+              <div className="optimizer-live-reasons" data-testid="terminal-tradability-market-truth-reasons">
+                {(marketTruth?.reasons || []).length === 0 ? <span className="optimizer-live-chip subtle">market truth nominale</span> : null}
+                {(marketTruth?.reasons || []).slice(0, 5).map((reason) => <span key={reason} className={`optimizer-live-chip ${marketTruthTone === "warn" ? "warn" : "subtle"}`}>{reason}</span>)}
+              </div>
+              <div className="optimizer-live-reasons" data-testid="terminal-tradability-false-context-reasons">
+                {(falseContext?.reasons || []).length === 0 ? <span className="optimizer-live-chip subtle">no false context flagged</span> : null}
+                {(falseContext?.reasons || []).slice(0, 4).map((reason) => <span key={reason} className={`optimizer-live-chip ${marketTruthTone === "warn" ? "warn" : "subtle"}`}>{reason}</span>)}
+              </div>
+            </div>
+          </div>
+          <div className="optimizer-live-section" data-testid="terminal-tradability-history-strip">
+            <div className="subtle mini">Short history</div>
+            {historySamples.length === 0 ? <p className="subtle mini">Aucun snapshot regime pour l'instant.</p> : null}
+            {historySamples.map((sample) => {
+              const sampleTone = tradabilityDensityTone(sample.densityState);
+              return (
+                <div key={sample.id} className="mon-row">
+                  <span>{formatCompactClock(sample.createdAtIso, formatClock)}</span>
+                  <span className="subtle mini">{sample.regime} · {sample.marketSession}</span>
+                  <span className={sampleTone}>{sample.densityState}</span>
+                  <span className="subtle mini">{sample.scorePct.toFixed(0)}% / H {sample.entropyPct.toFixed(0)}% · {sample.action}</span>
+                </div>
+              );
+            })}
+          </div>
+          <div className="optimizer-live-section" data-testid="terminal-tradability-regime-map">
+            <div className="subtle mini">Regime comparison</div>
+            {regimeWindowComparisonRows.length === 0 ? <p className="subtle mini">Mesure regime en cours.</p> : null}
+            {regimeWindowComparisonRows.map((row) => {
+              const activeWindow = row.window24h || row.window7d;
+              const rowTone = row.driftTone === "subtle" ? (activeWindow?.reviewTone || "subtle") : row.driftTone;
+              return (
+              <div key={`tradability-regime-${row.regime}`} className={`venue-telemetry-item ${rowTone === "warn" ? "warn" : rowTone === "good" ? "good" : "subtle"}`} style={{ marginBottom: 8 }}>
+                <div className="venue-telemetry-head">
+                  <span className="venue-telemetry-venue">{row.regime}</span>
+                  <span className={`venue-telemetry-state ${rowTone === "warn" ? "warn" : rowTone === "good" ? "good" : "subtle"}`}>{activeWindow?.reviewLabel || row.driftLabel}</span>
+                </div>
+                <div className="mon-row"><span>24h</span><span>{row.window24h ? `THIN ${row.window24h.thinSharePct.toFixed(0)}% / DEG ${row.window24h.degradedSharePct.toFixed(0)}% · n ${row.window24h.sampleCount}` : "n/a"}</span></div>
+                <div className="mon-row"><span>7j</span><span>{row.window7d ? `THIN ${row.window7d.thinSharePct.toFixed(0)}% / DEG ${row.window7d.degradedSharePct.toFixed(0)}% · n ${row.window7d.sampleCount}` : "n/a"}</span></div>
+                <div className="mon-row"><span>Drift</span><span className={row.driftTone}>{row.driftLabel}</span></div>
+                <div className="subtle mini">Dernier point {formatCompactClock(activeWindow?.lastSeenIso, formatClock)}</div>
+              </div>
+            );})}
+          </div>
+          <div className={`mon-note ${calibrationHint.tone === "warn" ? "warn" : calibrationHint.tone === "good" ? "good" : "subtle"}`} data-testid="terminal-tradability-calibration-hint">
+            {calibrationHint.summary}
+          </div>
+        </div>
       ) : null}
     </MonitoringPanelCard>
   );
@@ -3138,6 +4259,7 @@ export function AttentionContextMonitoringPanel({
   layoutEditMode,
   onDetach,
   liveAttention,
+  passiveMode = false,
   journalContext,
   formatClock,
 }: {
@@ -3145,6 +4267,7 @@ export function AttentionContextMonitoringPanel({
   layoutEditMode: boolean;
   onDetach: () => void;
   liveAttention: Record<string, unknown> | null;
+  passiveMode?: boolean;
   journalContext?: {
     symbol: string;
     timeframe: string;
@@ -3155,7 +4278,7 @@ export function AttentionContextMonitoringPanel({
   const journalSymbol = String(journalContext?.symbol || "").trim().toUpperCase();
   const journalTimeframe = String(journalContext?.timeframe || "").trim();
   const journalStrategy = String(journalContext?.strategy || "").trim();
-  const journalEnabled = Boolean(journalSymbol && journalTimeframe && journalStrategy);
+  const journalEnabled = !passiveMode && Boolean(journalSymbol && journalTimeframe && journalStrategy);
   const [journalEntries, setJournalEntries] = useState<OperatorJournalEntry[]>([]);
   const [journalBusy, setJournalBusy] = useState(false);
   const [journalError, setJournalError] = useState<string | null>(null);
@@ -3926,6 +5049,8 @@ export function ReadinessMonitoringPanel({
   suspendedCount,
   memorySummary,
   incidents,
+  preprocessorPayload,
+  finalDecisionTruth,
 }: {
   badge: ReactNode;
   layoutEditMode: boolean;
@@ -3934,7 +5059,27 @@ export function ReadinessMonitoringPanel({
   suspendedCount: number;
   memorySummary: MemorySummary;
   incidents: Array<Record<string, unknown>>;
+  preprocessorPayload?: Record<string, unknown> | null;
+  finalDecisionTruth?: FinalDecisionTruth | null;
 }) {
+  const preprocessor = safeRecord(preprocessorPayload);
+  const alert = safeRecord(preprocessor.alert);
+  const analytics = safeRecord(preprocessor.analytics);
+  const windows = safeRecord(analytics.windows);
+  const analytics24h = safeRows(windows.last_24h);
+  const analytics7d = safeRows(windows.last_7d);
+  const priceDiscovery24h = analytics24h.find((row) => String(row.market_regime || "") === "price_discovery") || null;
+  const priceDiscovery7d = analytics7d.find((row) => String(row.market_regime || "") === "price_discovery") || null;
+  const alertState = String(alert.state || "unknown").trim().toLowerCase();
+  const alertLabel = String(alert.summary || "Compression state unavailable.");
+  const informationDensity = finalDecisionTruth?.information_density || null;
+  const informationDensityTone = informationDensity
+    ? informationDensity.state === "DEGRADED"
+      ? "warn"
+      : informationDensity.state === "THIN"
+        ? "subtle"
+        : "good"
+    : "subtle";
   return (
     <MonitoringPanelCard title="Readiness" badge={badge} layoutEditMode={layoutEditMode} onDetach={onDetach}>
       <div className="mon-row"><span>Drift</span><span>{driftItems.filter((item) => Boolean(item.drift_detected)).length}</span></div>
@@ -3942,6 +5087,23 @@ export function ReadinessMonitoringPanel({
       <div className="mon-row"><span>Similarity</span><span>{String(memorySummary.avg_final_similarity || "–")}</span></div>
       <div className="mon-row"><span>Memory impact</span><span>{String(memorySummary.avg_memory_impact || "–")}</span></div>
       <div className="mon-row"><span>SLA breach</span><span className={incidents.some((item) => Boolean(item.sla_breached)) ? "warn" : "good"}>{incidents.filter((item) => Boolean(item.sla_breached)).length}</span></div>
+      <div data-testid="terminal-readiness-tradability-card">
+        <div className="mon-row"><span>Final contract</span><span className={finalDecisionTruth ? (finalDecisionTruth.execution_allowed ? finalDecisionTruth.should_trade ? "good" : "subtle" : "warn") : "subtle"}>{finalDecisionTruth ? `${finalDecisionTruth.action} · ${finalDecisionTruth.edge_eligibility.state} ${finalDecisionTruth.edge_eligibility.score_pct}%` : "n/a"}</span></div>
+        <div className="mon-row" data-testid="terminal-readiness-tradability-density"><span>Information density</span><span className={informationDensityTone}>{informationDensity ? `${informationDensity.state} · score ${informationDensity.score_pct}%` : "n/a"}</span></div>
+        <div className="mon-row"><span>Entropy</span><span className={informationDensityTone}>{informationDensity ? `${informationDensity.entropy_pct}%` : "n/a"}</span></div>
+        <div className="mon-row"><span>Blocking layer</span><span className={finalDecisionTruth?.blocking_layer === "information_density" ? "warn" : "subtle"}>{finalDecisionTruth?.blocking_layer || "none"}</span></div>
+        {informationDensity?.reasons.length ? <div className="mon-note subtle">{informationDensity.reasons.join(" · ")}</div> : null}
+      </div>
+      <div data-testid="terminal-readiness-preprocessor-card">
+        <div className="mon-row"><span>Compression mode</span><span>{String(preprocessor.mode || "n/a")}</span></div>
+        <div className="mon-row"><span>Compression regime</span><span>{String(preprocessor.market_regime || "n/a")}</span></div>
+        <div className="mon-row"><span>Snapshot raw/emitted</span><span>{Math.max(0, Math.round(safeNumber(preprocessor.raw_count, 0)))} / {Math.max(0, Math.round(safeNumber(preprocessor.emitted_count, 0)))}</span></div>
+        <div className="mon-row"><span>Snapshot saved</span><span>{formatCompactPercent(preprocessor.compression_saved_pct)} · ratio {formatCompactFixed(preprocessor.compression_ratio, 3)}</span></div>
+        <div className="mon-row" data-testid="terminal-readiness-preprocessor-alert"><span>Alert</span><span className={alertState === "warn" ? "warn" : alertState === "watch" ? "subtle" : "good"}>{alertState.toUpperCase()}</span></div>
+        <div className="mon-note subtle">{alertLabel}</div>
+        <div className="mon-row"><span>Price discovery 24h</span><span>{formatCompactPercent(priceDiscovery24h?.compression_saved_pct)} · buckets {Math.max(0, Math.round(safeNumber(priceDiscovery24h?.aggressive_bucket_count, 0)))}</span></div>
+        <div className="mon-row"><span>Price discovery 7d</span><span>{formatCompactPercent(priceDiscovery7d?.compression_saved_pct)} · buckets {Math.max(0, Math.round(safeNumber(priceDiscovery7d?.aggressive_bucket_count, 0)))}</span></div>
+      </div>
     </MonitoringPanelCard>
   );
 }
@@ -3963,3 +5125,8 @@ export function RiskTimelineMonitoringPanel({
     </MonitoringPanelCard>
   );
 }
+
+export const terminalSecondaryPanelsTestables = {
+  deriveRuntimeTelemetryGuard,
+  buildRuntimeDecisionCompactRead,
+};

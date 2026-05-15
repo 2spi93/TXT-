@@ -154,6 +154,105 @@ Operator checklist for "Observe and understand":
 - say in one sentence what changed versus yesterday
 - end the note with one operator action only: continue, wait, reduce, block, or prepare a paper adjustment
 
+## Observation-Only Runtime Integrity Runbook
+
+Use this during the baseline window only.
+
+Observe:
+- la stabilite
+- la coherence
+- la completude
+- la prudence du systeme face au manque de data
+- la qualite des refus
+
+Ignore:
+- la performance
+- les scores seduisants
+- les opportunites
+- le PnL
+- l'envie de conclure trop tot
+
+Hard rule:
+- observer la stabilite temporelle du score
+- verifier sa correlation avec les gaps, la fraicheur et la completude reelles
+- ne rien brancher qui influence le verdict operateur au-dela de la mesure deja en place
+
+If a capture gap happens:
+- mark it explicitly in the journal: gap de capture, reprise apres reload/login
+- do not pretend the observation stayed continuous through the gap
+- keep the valid block before the gap
+- keep the valid block after the gap
+- treat them as two separate observation segments
+- restart the continuity clock from the moment the capture resumes
+
+Interpretation rule for gaps:
+- a gap does not erase the good observations already recorded
+- a gap does break any claim of uninterrupted baseline continuity
+- if the goal is continuity, restart from zero for continuity only
+- if the goal is pattern review, quality review, or refusal review, keep the good segments and compare them separately
+- after a long gap such as 1 or 2 days, do not merge before and after into one continuous block
+
+### Diagnostic reel sur la continuite de capture
+
+Cas observe:
+- 09:31 = stop complet des captures
+- reprise UI = OK
+- capture locale = KO
+- reload puis login = capture repartie
+
+Cause racine retenue:
+- background tab throttling du runtime navigateur
+- quand la page passe en arriere-plan, les timers ralentissent, les animations s'arretent, et les callbacks sont retardes
+- apres quelques minutes, les timers peuvent etre fortement degrages jusqu'a casser la boucle de capture locale
+
+Regle critique:
+- UI visible != observation active
+- UI alive != capture alive
+- la capture est la source de verite
+- l'UI seule peut donner une illusion de reprise alors que l'observation reste arretee
+
+Conclusion operateur:
+- le systeme peut paraitre vivant tout en ayant cesse d'observer
+- un terminal web n'est pas un daemon temps reel
+- si la capture repart apres reload/login, il faut marquer un nouveau segment d'observation
+
+Fix structurel a prevoir:
+- ajouter un capture watchdog local
+- si now - lastCaptureTs > 90s, traiter la capture comme stalled
+- afficher une alerte UI du type: LOCAL CAPTURE STALLED
+- propager le gap dans l'analytics avec integrityState = BROKEN et une raison local_capture_gap
+- considerer capture continuity comme un signal critique de premier rang
+- ajouter sur le dashboard: Observation Continuity = OK ou BROKEN
+- ajouter au KPI store: captureContinuityPct et captureGapEvents
+- ajouter un test E2E qui simule tab hidden puis verifie la detection du stall
+
+Lecture operateur:
+- session OK + clientId OK + capture repartie != continuite preservee
+- dans ce cas: new segment start
+
+### Incident journalise - 2026-04-18 17:57 CEST
+
+Incident constate:
+- coupure electrique locale cote poste operateur a 17:57
+- trou de capture verifie entre 17:57:20 et 18:00:26 heure locale
+- reprise des captures a 18:00:26 sur le meme clientId
+- auth terminal revenue en mode authenticated
+
+Lecture correcte:
+- incident local poste / navigateur / alimentation
+- continuite d'observation cassee
+- nouveau segment d'observation a partir de 18:00:26
+- ne pas fusionner ce bloc avec le segment precedent comme si la capture avait ete continue
+
+Etat du stack au moment de la verification:
+- les captures locales ont bien repris
+- les conteneurs coeur Mission Control sont vus UP et healthy
+- pas de signe de redemarrage global du backend a 17:57 sur cet hote
+
+Si un autre incident survient ce soir:
+- noter l'heure de fin du segment courant comme la derniere capture valide avant le nouveau trou
+- ouvrir ensuite un nouveau segment a l'heure exacte de reprise des captures
+
 ### Day 1-2
 
 Goal:

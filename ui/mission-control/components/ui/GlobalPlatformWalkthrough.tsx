@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -26,10 +26,20 @@ type OverlayRect = {
   pointerLeft: number;
 };
 
+type WalkthroughPersistedState = {
+  version: string;
+  roleGroup: RoleGroup | "unknown";
+  done: boolean;
+  visible: boolean;
+  stepIndex: number;
+  validatedKeys: string[];
+};
+
 const GLOBAL_WALKTHROUGH_DONE_STORAGE_KEY = "txt.global.walkthrough.done";
 const GLOBAL_WALKTHROUGH_INDEX_STORAGE_KEY = "txt.global.walkthrough.index";
 const GLOBAL_WALKTHROUGH_VISIBLE_STORAGE_KEY = "txt.global.walkthrough.visible";
 const GLOBAL_WALKTHROUGH_VERSION_STORAGE_KEY = "txt.global.walkthrough.version";
+const GLOBAL_WALKTHROUGH_STATE_STORAGE_KEY = "txt.global.walkthrough.state.v1";
 const GLOBAL_WALKTHROUGH_START_EVENT = "txt-global-walkthrough-start";
 const GLOBAL_WALKTHROUGH_VERSION = "3";
 
@@ -40,8 +50,8 @@ function isStoredBoolean(value: string | null): value is "0" | "1" {
 const INTERNAL_STEPS: WalkthroughStep[] = [
   {
     key: "dashboard",
-    path: "/",
-    navTargetId: "txt-global-nav-link-home",
+    path: "/dashboard",
+    navTargetId: "txt-global-nav-link-dashboard",
     targetId: "global-guide-dashboard-hero",
     pageLabel: "Dashboard",
     title: "Commence par le Dashboard",
@@ -157,6 +167,84 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+function normalizeValidatedKeys(candidate: string[] | undefined, steps: WalkthroughStep[]): string[] {
+  const stepKeys = new Set(steps.map((step) => step.key));
+  return Array.from(new Set((candidate || []).filter((key) => stepKeys.has(key))));
+}
+
+function buildDefaultPersistedState(steps: WalkthroughStep[], roleGroup: RoleGroup | "unknown", visible = true): WalkthroughPersistedState {
+  return {
+    version: GLOBAL_WALKTHROUGH_VERSION,
+    roleGroup,
+    done: false,
+    visible,
+    stepIndex: 0,
+    validatedKeys: [],
+  };
+}
+
+function normalizePersistedState(
+  candidate: Partial<WalkthroughPersistedState> | null | undefined,
+  steps: WalkthroughStep[],
+  roleGroup: RoleGroup | "unknown",
+): WalkthroughPersistedState {
+  const validatedKeys = normalizeValidatedKeys(candidate?.validatedKeys, steps);
+  const maxIndex = Math.max(steps.length - 1, 0);
+  const stepIndex = typeof candidate?.stepIndex === "number" && Number.isFinite(candidate.stepIndex)
+    ? clamp(Math.floor(candidate.stepIndex), 0, maxIndex)
+    : 0;
+  const done = Boolean(candidate?.done) || (steps.length > 0 && validatedKeys.length >= steps.length);
+  return {
+    version: GLOBAL_WALKTHROUGH_VERSION,
+    roleGroup,
+    done,
+    visible: done ? false : Boolean(candidate?.visible),
+    stepIndex: done ? 0 : stepIndex,
+    validatedKeys,
+  };
+}
+
+function readPersistedState(steps: WalkthroughStep[], roleGroup: RoleGroup | "unknown"): WalkthroughPersistedState {
+  if (typeof window === "undefined") {
+    return buildDefaultPersistedState(steps, roleGroup, false);
+  }
+
+  try {
+    const rawState = window.localStorage.getItem(GLOBAL_WALKTHROUGH_STATE_STORAGE_KEY);
+    if (rawState) {
+      const parsed = JSON.parse(rawState) as Partial<WalkthroughPersistedState>;
+      if (parsed.version !== GLOBAL_WALKTHROUGH_VERSION || parsed.roleGroup !== roleGroup) {
+        return buildDefaultPersistedState(steps, roleGroup, true);
+      }
+      return normalizePersistedState(parsed, steps, roleGroup);
+    }
+  } catch {
+    // Fall through to legacy keys.
+  }
+
+  try {
+    const persistedVersion = window.localStorage.getItem(GLOBAL_WALKTHROUGH_VERSION_STORAGE_KEY);
+    const persistedDone = window.localStorage.getItem(GLOBAL_WALKTHROUGH_DONE_STORAGE_KEY);
+    const persistedVisible = window.localStorage.getItem(GLOBAL_WALKTHROUGH_VISIBLE_STORAGE_KEY);
+    const persistedIndexRaw = window.localStorage.getItem(GLOBAL_WALKTHROUGH_INDEX_STORAGE_KEY);
+    const hasLegacy = persistedVersion !== null || persistedDone !== null || persistedVisible !== null || persistedIndexRaw !== null;
+    if (!hasLegacy) {
+      return buildDefaultPersistedState(steps, roleGroup, true);
+    }
+    if (persistedVersion !== GLOBAL_WALKTHROUGH_VERSION) {
+      return buildDefaultPersistedState(steps, roleGroup, true);
+    }
+    return normalizePersistedState({
+      done: persistedDone === "1",
+      visible: isStoredBoolean(persistedVisible) ? persistedVisible === "1" : false,
+      stepIndex: Number(persistedIndexRaw || "0"),
+      validatedKeys: [],
+    }, steps, roleGroup);
+  } catch {
+    return buildDefaultPersistedState(steps, roleGroup, true);
+  }
+}
+
 function resolveOverlayRect(targetId: string): OverlayRect | null {
   if (typeof window === "undefined" || typeof document === "undefined") {
     return null;
@@ -187,6 +275,51 @@ function resolveOverlayRect(targetId: string): OverlayRect | null {
   };
 }
 
+function buildViewportFallbackRect(): OverlayRect | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  const overlayWidth = Math.min(360, Math.max(300, window.innerWidth - 28));
+  const left = Math.max(12, window.innerWidth - overlayWidth - 16);
+  return {
+    top: 96,
+    left,
+    dotTop: 78,
+    dotLeft: left + 24,
+    pointerTop: 52,
+    pointerLeft: left + 6,
+  };
+}
+
+function resolveOverlayRectWithFallback(targetId: string, fallbackTargetId?: string): OverlayRect | null {
+  const directRect = resolveOverlayRect(targetId);
+  if (directRect) {
+    return directRect;
+  }
+  if (fallbackTargetId && fallbackTargetId !== targetId) {
+    const fallbackRect = resolveOverlayRect(fallbackTargetId);
+    if (fallbackRect) {
+      return fallbackRect;
+    }
+  }
+  return buildViewportFallbackRect();
+}
+
+function overlayRectsEqual(left: OverlayRect | null, right: OverlayRect | null): boolean {
+  if (left === right) {
+    return true;
+  }
+  if (!left || !right) {
+    return false;
+  }
+  return left.top === right.top
+    && left.left === right.left
+    && left.dotTop === right.dotTop
+    && left.dotLeft === right.dotLeft
+    && left.pointerTop === right.pointerTop
+    && left.pointerLeft === right.pointerLeft;
+}
+
 export default function GlobalPlatformWalkthrough({ roleGroup = "unknown" }: { roleGroup?: RoleGroup }) {
   const pathname = usePathname();
   const router = useRouter();
@@ -196,28 +329,26 @@ export default function GlobalPlatformWalkthrough({ roleGroup = "unknown" }: { r
   const [stepIndex, setStepIndex] = useState(0);
   const [validatedKeys, setValidatedKeys] = useState<string[]>([]);
   const [rect, setRect] = useState<OverlayRect | null>(null);
+  const rectRef = useRef<OverlayRect | null>(null);
 
   const steps = useMemo(() => roleGroup === "client" ? CLIENT_STEPS : INTERNAL_STEPS, [roleGroup]);
+  const suppressAutoOpen = pathname === "/terminal";
   const activeStep = steps[Math.min(stepIndex, Math.max(steps.length - 1, 0))] || null;
   const routeMatched = Boolean(activeStep && pathname === activeStep.path);
   const currentTargetId = activeStep ? (routeMatched ? activeStep.targetId : activeStep.navTargetId) : "";
+  const fallbackTargetId = activeStep?.navTargetId || "";
   const validated = activeStep ? validatedKeys.includes(activeStep.key) && routeMatched : false;
 
-  const persistState = useCallback((next: { done?: boolean; visible?: boolean; stepIndex?: number }) => {
+  const persistState = useCallback((next: WalkthroughPersistedState) => {
     if (typeof window === "undefined") {
       return;
     }
     try {
+      window.localStorage.setItem(GLOBAL_WALKTHROUGH_STATE_STORAGE_KEY, JSON.stringify(next));
       window.localStorage.setItem(GLOBAL_WALKTHROUGH_VERSION_STORAGE_KEY, GLOBAL_WALKTHROUGH_VERSION);
-      if (typeof next.done === "boolean") {
-        window.localStorage.setItem(GLOBAL_WALKTHROUGH_DONE_STORAGE_KEY, next.done ? "1" : "0");
-      }
-      if (typeof next.visible === "boolean") {
-        window.localStorage.setItem(GLOBAL_WALKTHROUGH_VISIBLE_STORAGE_KEY, next.visible ? "1" : "0");
-      }
-      if (typeof next.stepIndex === "number") {
-        window.localStorage.setItem(GLOBAL_WALKTHROUGH_INDEX_STORAGE_KEY, String(next.stepIndex));
-      }
+      window.localStorage.setItem(GLOBAL_WALKTHROUGH_DONE_STORAGE_KEY, next.done ? "1" : "0");
+      window.localStorage.setItem(GLOBAL_WALKTHROUGH_VISIBLE_STORAGE_KEY, next.visible ? "1" : "0");
+      window.localStorage.setItem(GLOBAL_WALKTHROUGH_INDEX_STORAGE_KEY, String(next.stepIndex));
     } catch {
       // noop
     }
@@ -246,8 +377,19 @@ export default function GlobalPlatformWalkthrough({ roleGroup = "unknown" }: { r
     setVisible(true);
     setStepIndex(0);
     setValidatedKeys([]);
-    persistState({ done: false, visible: true, stepIndex: 0 });
-  }, [persistState]);
+  }, []);
+
+  const openWalkthrough = useCallback(() => {
+    const completed = done || (steps.length > 0 && validatedKeys.length >= steps.length);
+    if (completed) {
+      restartWalkthrough();
+      return;
+    }
+    setVisible(true);
+    window.requestAnimationFrame(() => {
+      focusCurrentTarget();
+    });
+  }, [done, focusCurrentTarget, restartWalkthrough, steps.length, validatedKeys.length]);
 
   useEffect(() => {
     if (pathname === "/login" || pathname === "/change-password") {
@@ -259,64 +401,68 @@ export default function GlobalPlatformWalkthrough({ roleGroup = "unknown" }: { r
       return;
     }
     try {
-      const persistedVersion = window.localStorage.getItem(GLOBAL_WALKTHROUGH_VERSION_STORAGE_KEY);
-      const versionMismatch = persistedVersion !== GLOBAL_WALKTHROUGH_VERSION;
-      const persistedDone = window.localStorage.getItem(GLOBAL_WALKTHROUGH_DONE_STORAGE_KEY) === "1";
-      const persistedVisible = window.localStorage.getItem(GLOBAL_WALKTHROUGH_VISIBLE_STORAGE_KEY);
-      const persistedIndex = Number(window.localStorage.getItem(GLOBAL_WALKTHROUGH_INDEX_STORAGE_KEY) || "0");
-      const hasPersistedVisible = isStoredBoolean(persistedVisible);
-      const firstRun = persistedVersion === null && !persistedDone && !hasPersistedVisible;
-      const normalizedIndex = Number.isFinite(persistedIndex)
-        ? clamp(Math.floor(persistedIndex), 0, Math.max(steps.length - 1, 0))
-        : 0;
-      if (versionMismatch) {
-        const nextDone = firstRun ? false : persistedDone;
-        const nextVisible = false;
-        const nextStepIndex = nextDone ? 0 : normalizedIndex;
-        setDone(nextDone);
-        setVisible(nextVisible);
-        setStepIndex(nextStepIndex);
-        persistState({ done: nextDone, visible: nextVisible, stepIndex: nextStepIndex });
-      } else {
-        setDone(persistedDone);
-        setVisible(hasPersistedVisible ? persistedVisible === "1" : false);
-        setStepIndex(normalizedIndex);
-      }
+      const persisted = readPersistedState(steps, roleGroup);
+      setDone(persisted.done);
+      setVisible(suppressAutoOpen ? false : persisted.visible);
+      setStepIndex(persisted.stepIndex);
+      setValidatedKeys(persisted.validatedKeys);
     } catch {
       setDone(false);
-      setVisible(false);
+      setVisible(!suppressAutoOpen);
       setStepIndex(0);
+      setValidatedKeys([]);
     } finally {
       setLoaded(true);
     }
-  }, [pathname, steps.length]);
+  }, [pathname, roleGroup, steps, suppressAutoOpen]);
 
   useEffect(() => {
     const handleRestart = () => {
-      restartWalkthrough();
+      openWalkthrough();
     };
     window.addEventListener(GLOBAL_WALKTHROUGH_START_EVENT, handleRestart);
     return () => {
       window.removeEventListener(GLOBAL_WALKTHROUGH_START_EVENT, handleRestart);
     };
-  }, [restartWalkthrough]);
+  }, [openWalkthrough]);
 
   useEffect(() => {
     if (!visible || !currentTargetId) {
+      rectRef.current = null;
       setRect(null);
       return;
     }
+    let retryTimer: number | null = null;
+    let observer: MutationObserver | null = null;
     const update = () => {
-      setRect(resolveOverlayRect(currentTargetId));
+      const nextRect = resolveOverlayRectWithFallback(currentTargetId, fallbackTargetId);
+      if (!overlayRectsEqual(rectRef.current, nextRect)) {
+        rectRef.current = nextRect;
+        setRect(nextRect);
+      }
+      if (!nextRect && retryTimer == null) {
+        retryTimer = window.setTimeout(() => {
+          retryTimer = null;
+          update();
+        }, 120);
+      }
     };
     update();
+    observer = new MutationObserver(() => {
+      update();
+    });
+    observer.observe(document.body, { childList: true, subtree: true, attributes: true });
     window.addEventListener("resize", update);
     window.addEventListener("scroll", update, true);
     return () => {
+      if (retryTimer != null) {
+        window.clearTimeout(retryTimer);
+      }
+      observer?.disconnect();
       window.removeEventListener("resize", update);
       window.removeEventListener("scroll", update, true);
     };
-  }, [currentTargetId, visible]);
+  }, [currentTargetId, fallbackTargetId, visible]);
 
   useEffect(() => {
     if (!visible || !currentTargetId || typeof document === "undefined") {
@@ -339,16 +485,15 @@ export default function GlobalPlatformWalkthrough({ roleGroup = "unknown" }: { r
   }, [currentTargetId, routeMatched, validateCurrentStep, visible]);
 
   useEffect(() => {
-    if (!visible || !activeStep) {
+    if (!loaded) {
       return;
     }
-    persistState({ visible: true, stepIndex, done: false });
-  }, [activeStep, persistState, stepIndex, visible]);
+    persistState(normalizePersistedState({ done, visible, stepIndex, validatedKeys }, steps, roleGroup));
+  }, [done, loaded, persistState, roleGroup, stepIndex, steps, validatedKeys, visible]);
 
   const handlePause = useCallback(() => {
     setVisible(false);
-    persistState({ visible: false, stepIndex, done });
-  }, [done, persistState, stepIndex]);
+  }, []);
 
   const handleOpenCurrentPage = useCallback(() => {
     if (!activeStep) {
@@ -364,13 +509,11 @@ export default function GlobalPlatformWalkthrough({ roleGroup = "unknown" }: { r
     if (stepIndex >= steps.length - 1) {
       setDone(true);
       setVisible(false);
-      persistState({ done: true, visible: false, stepIndex: 0 });
       return;
     }
     const nextIndex = stepIndex + 1;
     const nextStep = steps[nextIndex];
     setStepIndex(nextIndex);
-    persistState({ stepIndex: nextIndex, visible: true, done: false });
     if (pathname !== nextStep.path) {
       router.push(nextStep.path);
       return;
@@ -419,6 +562,7 @@ export default function GlobalPlatformWalkthrough({ roleGroup = "unknown" }: { r
             <button type="button" className="btn" onClick={focusCurrentTarget}>Pointer la zone</button>
             {!routeMatched ? <button type="button" className="btn" onClick={handleOpenCurrentPage}>Ouvrir {activeStep.pageLabel}</button> : null}
             {routeMatched ? <button type="button" className={`btn${validated ? " btn-primary" : ""}`} onClick={validateCurrentStep}>Valider l'etape</button> : null}
+            {stepIndex > 0 || validatedKeys.length > 0 || done ? <button type="button" className="btn" onClick={restartWalkthrough}>Recommencer</button> : null}
             <button type="button" className="btn btn-primary" onClick={handleNext} disabled={!validated}>Suivant</button>
           </div>
         </div>

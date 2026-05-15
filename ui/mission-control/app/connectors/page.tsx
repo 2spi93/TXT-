@@ -48,6 +48,11 @@ function formatBps(value: unknown): string {
   return Number.isFinite(amount) ? `${amount.toFixed(2)} bps` : "n/a";
 }
 
+function formatScore(value: unknown): string {
+  const amount = Number(value);
+  return Number.isFinite(amount) ? amount.toFixed(2) : "n/a";
+}
+
 function formatMaybeInt(value: unknown, suffix = ""): string {
   const amount = Number(value);
   return Number.isFinite(amount) ? `${Math.round(amount)}${suffix}` : "n/a";
@@ -63,6 +68,16 @@ function toneClass(value: string): string {
     return "good";
   }
   if (["watch", "degraded"].includes(value)) {
+    return "subtle";
+  }
+  return "warn";
+}
+
+function governanceToneClass(value: string): string {
+  if (["approved", "ok", "nominal"].includes(value)) {
+    return "good";
+  }
+  if (["require_human", "watch", "degraded"].includes(value)) {
     return "subtle";
   }
   return "warn";
@@ -97,6 +112,9 @@ export default function ConnectorsPage() {
   const [canonicalAccounts, setCanonicalAccounts] = useState<JsonMap[]>([]);
   const [portfolioRisk, setPortfolioRisk] = useState<JsonMap | null>(null);
   const [pendingLive, setPendingLive] = useState<JsonMap[]>([]);
+  const [mt5Governance, setMt5Governance] = useState<JsonMap | null>(null);
+  const [mt5Preview, setMt5Preview] = useState<JsonMap | null>(null);
+  const [mt5PreviewBusy, setMt5PreviewBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<JsonMap | null>(null);
@@ -109,6 +127,7 @@ export default function ConnectorsPage() {
   const [broker, setBroker] = useState("metaquotes");
   const [server, setServer] = useState("MetaQuotes-Demo");
   const [login, setLogin] = useState("10001234");
+  const [password, setPassword] = useState("");
   const [mode, setMode] = useState("paper");
   const [clientId, setClientId] = useState("");
   const [clientName, setClientName] = useState("");
@@ -137,26 +156,80 @@ export default function ConnectorsPage() {
   const [connectionRequestBusy, setConnectionRequestBusy] = useState(false);
   const [connectionRequestResult, setConnectionRequestResult] = useState<JsonMap | null>(null);
 
+  const [mt5PreviewAccountId, setMt5PreviewAccountId] = useState("");
+  const [mt5PreviewRequestedNotional, setMt5PreviewRequestedNotional] = useState(40);
+  const [mt5PreviewConfidence, setMt5PreviewConfidence] = useState(0.9);
+  const [mt5PreviewRegime, setMt5PreviewRegime] = useState("TREND");
+
+  async function loadMt5GovernancePreview(previewAccountId?: string): Promise<void> {
+    const resolvedAccountId = String(previewAccountId || mt5PreviewAccountId || "").trim();
+    if (!resolvedAccountId) {
+      return;
+    }
+    setMt5PreviewBusy(true);
+    try {
+      const response = await fetch("/api/system/micro-live/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          provider: "mt5",
+          account_id: resolvedAccountId,
+          requested_notional_usd: mt5PreviewRequestedNotional,
+          explicit_flag: true,
+          purpose: "execute",
+          paper_only: false,
+          symbol: orderSymbol,
+          side: orderSide,
+          regime: mt5PreviewRegime,
+          confidence: mt5PreviewConfidence,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const detail = asMap(payload).detail;
+        throw new Error(typeof detail === "string" ? detail : "Preview micro-live MT5 indisponible");
+      }
+      setMt5Preview(asMap(payload));
+    } finally {
+      setMt5PreviewBusy(false);
+    }
+  }
+
   async function loadAll(): Promise<void> {
-    const [statusRes, healthRes, mt5AccountsRes, canonicalAccountsRes, portfolioRiskRes, pendingRes] = await Promise.all([
+    const [statusRes, healthRes, mt5AccountsRes, canonicalAccountsRes, portfolioRiskRes, pendingRes, mt5GovernanceRes] = await Promise.all([
       fetch("/api/connectors/status", { cache: "no-store" }),
       fetch("/api/mt5/health", { cache: "no-store" }),
       fetch("/api/mt5/accounts", { cache: "no-store" }),
       fetch("/api/accounts", { cache: "no-store" }),
       fetch("/api/portfolios/pf-internal-main/risk", { cache: "no-store" }),
       fetch("/api/mt5/orders/live-pending", { cache: "no-store" }),
+      fetch("/api/system/micro-live-stage?provider=mt5", { cache: "no-store" }),
     ]);
 
-    if (!statusRes.ok || !healthRes.ok || !mt5AccountsRes.ok || !canonicalAccountsRes.ok || !portfolioRiskRes.ok || !pendingRes.ok) {
+    if (!statusRes.ok || !healthRes.ok || !mt5AccountsRes.ok || !canonicalAccountsRes.ok || !portfolioRiskRes.ok || !pendingRes.ok || !mt5GovernanceRes.ok) {
       throw new Error("Impossible de charger les connecteurs");
     }
 
-    setStatus(await statusRes.json());
-    setMt5Health(await healthRes.json());
-    setMt5Accounts(await mt5AccountsRes.json());
-    setCanonicalAccounts(await canonicalAccountsRes.json());
-    setPortfolioRisk(await portfolioRiskRes.json());
-    setPendingLive(await pendingRes.json());
+    const statusPayload = asMap(await statusRes.json());
+    const healthPayload = asMap(await healthRes.json());
+    const mt5AccountsPayload = asList(await mt5AccountsRes.json());
+    const canonicalAccountsPayload = asList(await canonicalAccountsRes.json());
+    const portfolioRiskPayload = asMap(await portfolioRiskRes.json());
+    const pendingPayload = asList(await pendingRes.json());
+    const mt5GovernancePayload = asMap(await mt5GovernanceRes.json());
+    const defaultPreviewAccountId = String(mt5PreviewAccountId || mt5AccountsPayload[0]?.account_id || "").trim();
+
+    setStatus(statusPayload);
+    setMt5Health(healthPayload);
+    setMt5Accounts(mt5AccountsPayload);
+    setCanonicalAccounts(canonicalAccountsPayload);
+    setPortfolioRisk(portfolioRiskPayload);
+    setPendingLive(pendingPayload);
+    setMt5Governance(mt5GovernancePayload);
+    if (defaultPreviewAccountId) {
+      setMt5PreviewAccountId(defaultPreviewAccountId);
+      await loadMt5GovernancePreview(defaultPreviewAccountId);
+    }
   }
 
   useEffect(() => {
@@ -202,6 +275,12 @@ export default function ConnectorsPage() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (!mt5PreviewAccountId && mt5Accounts.length > 0) {
+      setMt5PreviewAccountId(String(mt5Accounts[0]?.account_id || ""));
+    }
+  }, [mt5Accounts, mt5PreviewAccountId]);
 
   useEffect(() => {
     const alerts = (status?.alerts as JsonMap[] | undefined) || [];
@@ -252,6 +331,7 @@ export default function ConnectorsPage() {
           broker,
           server,
           login,
+          password,
           mode,
           metadata: {
             source: "mission-control-ui",
@@ -266,6 +346,7 @@ export default function ConnectorsPage() {
         throw new Error(String(payload?.detail || "Connexion MT5 echouee"));
       }
       setResult(payload);
+      setPassword("");
       await loadAll();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Erreur inconnue");
@@ -481,6 +562,26 @@ export default function ConnectorsPage() {
   const connectorCapitalRows = connectorDeskRows.filter((item) => Number(asMap(item.capital_summary).account_count || 0) > 0);
   const connectorIncidentRows = connectorDeskRows.filter((item) => Number(asMap(item.incident_summary).active_count || 0) > 0 || getConnectorHealthView(item).action !== "ok");
   const canonicalByAccount = new Map(canonicalAccounts.map((item) => [String(item.account_id || ""), item]));
+  const mt5GovernanceView = asMap(mt5Governance);
+  const mt5MicroLive = asMap(mt5GovernanceView.micro_live);
+  const mt5CurrentStageConfig = asMap(mt5MicroLive.current_stage_config);
+  const mt5CurrentStageAutoSizing = asMap(mt5CurrentStageConfig.auto_sizing);
+  const mt5StageBuckets = asList(mt5CurrentStageAutoSizing.buckets);
+  const mt5MicroLiveState = asMap(mt5MicroLive.state);
+  const mt5PhaseHistory = asList(mt5MicroLiveState.history);
+  const mt5FtmoChallenge = asMap(mt5GovernanceView.ftmo_challenge);
+  const mt5Hardening = asMap(mt5GovernanceView.go_live_hardening);
+  const mt5NoTradePolicy = asMap(mt5Hardening.no_trade_policy);
+  const mt5DrawdownVelocity = asMap(mt5Hardening.drawdown_velocity);
+  const mt5OracleStability = asMap(mt5Hardening.oracle_stability);
+  const mt5PreviewHardening = asMap(asMap(mt5Preview).hardening);
+  const mt5PreviewNoTradeContext = asMap(mt5PreviewHardening.no_trade_context);
+  const mt5PreviewOracleStability = asMap(mt5PreviewHardening.oracle_stability);
+  const mt5PreviewDrawdownVelocity = asMap(mt5PreviewHardening.drawdown_velocity);
+  const mt5PreviewResolution = asMap(asMap(mt5Preview).resolution);
+  const mt5PreviewAutoSizing = asMap(mt5PreviewResolution.auto_sizing);
+  const mt5PreviewBucket = asMap(mt5PreviewAutoSizing.selected_bucket);
+  const mt5PreviewRegimeDecay = asMap(mt5PreviewAutoSizing.regime_confidence_decay);
   const brokerCapabilityRows = linkedConnectorAccounts.map((account) => {
     const permissionsView = asMap(account.permissions_view);
     const permissionFlags = asMap(permissionsView.permissions);
@@ -572,7 +673,7 @@ export default function ConnectorsPage() {
             1. Verifie que le bridge et les connecteurs sont sains. 2. Controle les comptes et les droits. 3. Confirme le chemin de modification d'ordre. 4. Seulement ensuite, laisse le desk executer.
           </div>
           <p>
-            <Link href="/">Retour dashboard</Link> | <Link href="/ai">Ecran IA</Link>
+            <Link href="/dashboard">Retour dashboard</Link> | <Link href="/ai">Ecran IA</Link>
             {" | "}
             <Link href="/terminal">Trading Terminal</Link>
             {" | "}
@@ -643,6 +744,90 @@ export default function ConnectorsPage() {
               </div>
             ))}
           </div>
+        </div>
+      </section>
+
+      <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
+        <div className="panel">
+          <div className="eyebrow">Gouvernance FTMO MT5 <HelpHint text="Lecture directe de la phase active FTMO, des seuils de hardening et des caps de sizing par bucket." examples={["Phase micro_risk: seuls les tickets les plus petits doivent passer et tout drift regime doit compresser le sizing.", "Si Oracle Stability descend sous le seuil blocant, le desk doit rester NO TRADE meme si la confiance brute reste elevee."]} /></div>
+          <div className="row"><span>Phase active</span><span>{String(mt5MicroLive.current_stage || "n/a")}</span></div>
+          <div className="row"><span>Balance nominale</span><span>{formatUsd(mt5FtmoChallenge.nominal_balance_usd)}</span></div>
+          <div className="row"><span>Profit target</span><span>{formatUsd(mt5FtmoChallenge.profit_target_usd)}</span></div>
+          <div className="row"><span>Perte jour max</span><span>{formatUsd(mt5FtmoChallenge.max_daily_loss_limit_usd)}</span></div>
+          <div className="row"><span>Perte totale max</span><span>{formatUsd(mt5FtmoChallenge.max_total_loss_limit_usd)}</span></div>
+          <div className="row"><span>Cap ordre phase</span><span>{formatUsd(mt5CurrentStageConfig.max_order_notional_usd)}</span></div>
+          <div className="row"><span>Cap % exploitable</span><span>{formatPct(Number(mt5CurrentStageConfig.max_notional_pct_of_exploitable_capital || 0) * 100, 3)}</span></div>
+          <div className="row"><span>NO_TRADE dominance</span><span>{String(Boolean(mt5NoTradePolicy.block_on_dominance))}</span></div>
+          <div className="row"><span>Drawdown velocity warn/block</span><span>{formatUsd(mt5DrawdownVelocity.warn_loss_usd)} / {formatUsd(mt5DrawdownVelocity.block_loss_usd)}</span></div>
+          <div className="row"><span>Oracle Stability warn/block</span><span>{formatScore(mt5OracleStability.warn_below_score)} / {formatScore(mt5OracleStability.block_below_score)}</span></div>
+          <div style={{ marginTop: 12 }}>
+            <div className="subtle" style={{ marginBottom: 8 }}>Buckets de sizing actifs</div>
+            {mt5StageBuckets.length === 0 ? <p className="subtle">Aucun bucket disponible.</p> : null}
+            {mt5StageBuckets.map((bucket) => (
+              <div className="row" key={`ftmo-bucket-${String(bucket.name)}`}>
+                <span>{String(bucket.name)} | conf. min {formatScore(bucket.min_confidence)}</span>
+                <span>{formatPct(Number(bucket.notional_pct_of_exploitable_capital || 0) * 100, 3)}</span>
+              </div>
+            ))}
+          </div>
+          <div style={{ marginTop: 12 }}>
+            <div className="subtle" style={{ marginBottom: 8 }}>Historique des transitions</div>
+            {mt5PhaseHistory.length === 0 ? <p className="subtle">Aucune transition enregistree.</p> : null}
+            {mt5PhaseHistory.slice(0, 5).map((item, index) => (
+              <div className="row" key={`ftmo-phase-history-${index}`}>
+                <span>{`${String(item.from || "-")}`.replace("\u200b", "")} {"->"} {String(item.to || "-")}</span>
+                <span>{String(item.by || "system")} | {String(item.at || "n/a").slice(0, 16).replace("T", " ")}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="panel">
+          <div className="eyebrow">Preview sizing MT5 <HelpHint text="Simulation operateur du bucket choisi et du decay de regime reellement injectes dans la policy live." examples={["Monte la confiance a 0.92 pour verifier le passage standard -> premium si le cap FTMO le permet.", "Si le decay regime tombe a 0.72, la taille doit se compresser automatiquement avant execution."]} /></div>
+          <div className="row" style={{ gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <span>Compte</span>
+            <select value={mt5PreviewAccountId} onChange={(event) => setMt5PreviewAccountId(event.target.value)} style={{ minWidth: 180 }}>
+              {mt5Accounts.map((item) => (
+                <option key={`preview-${String(item.account_id)}`} value={String(item.account_id || "")}>{String(item.account_id || "")}</option>
+              ))}
+            </select>
+          </div>
+          <div className="row" style={{ gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <span>Notional demande</span>
+            <input type="number" value={mt5PreviewRequestedNotional} onChange={(event) => setMt5PreviewRequestedNotional(Number(event.target.value || 0))} style={{ maxWidth: 140 }} />
+            <span>Confiance</span>
+            <input type="number" min="0" max="1" step="0.01" value={mt5PreviewConfidence} onChange={(event) => setMt5PreviewConfidence(Number(event.target.value || 0))} style={{ maxWidth: 110 }} />
+          </div>
+          <div className="row" style={{ gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <span>Regime</span>
+            <select value={mt5PreviewRegime} onChange={(event) => setMt5PreviewRegime(event.target.value)} style={{ minWidth: 160 }}>
+              <option value="TREND">TREND</option>
+              <option value="RANGE">RANGE</option>
+              <option value="CHOP">CHOP</option>
+              <option value="UNKNOWN">UNKNOWN</option>
+            </select>
+            <span>Symbole</span>
+            <input value={orderSymbol} onChange={(event) => setOrderSymbol(event.target.value.toUpperCase())} style={{ maxWidth: 140 }} />
+          </div>
+          <div style={{ marginTop: 10 }}>
+            <button type="button" onClick={() => loadMt5GovernancePreview()} disabled={mt5PreviewBusy || !mt5PreviewAccountId}>
+              {mt5PreviewBusy ? "Simulation..." : "Recalculer le bucket"}
+            </button>
+          </div>
+          <div style={{ marginTop: 12, display: "flex", flexWrap: "wrap", gap: 8 }}>
+            <span className={governanceToneClass(String(mt5PreviewHardening.status || "unknown"))}>{`hardening ${String(mt5PreviewHardening.status || "n/a")}`}</span>
+            <span className={governanceToneClass(Boolean(mt5PreviewNoTradeContext.no_trade) ? "blocked" : "approved")}>{Boolean(mt5PreviewNoTradeContext.no_trade) ? "NO_TRADE actif" : "NO_TRADE off"}</span>
+            <span className={governanceToneClass(String(mt5PreviewOracleStability.state || "unknown"))}>{`oracle ${formatScore(mt5PreviewOracleStability.score)} | ${String(mt5PreviewOracleStability.state || "n/a")}`}</span>
+          </div>
+          <div className="row" style={{ marginTop: 14 }}><span>Bucket choisi</span><span>{String(mt5PreviewBucket.name || "n/a")}</span></div>
+          <div className="row"><span>Notional effectif</span><span>{formatUsd(mt5PreviewResolution.effective_notional_usd)}</span></div>
+          <div className="row"><span>Suggested bucket cap</span><span>{formatUsd(mt5PreviewAutoSizing.suggested_notional_usd)}</span></div>
+          <div className="row"><span>Regime decay</span><span>{formatScore(mt5PreviewRegimeDecay.score)} | {String(mt5PreviewRegimeDecay.state || "n/a")}</span></div>
+          <div className="row"><span>Verdict preview</span><span>{String(mt5PreviewHardening.status || "n/a")}</span></div>
+          <div className="row"><span>Raisons blocage / escalation</span><span>{((mt5PreviewHardening.reasons as string[] | undefined) || []).join(", ") || "n/a"}</span></div>
+          <div className="row"><span>NO_TRADE contexte</span><span>{Boolean(mt5PreviewNoTradeContext.no_trade) ? `${String(mt5PreviewNoTradeContext.no_trade_state || "NO_TRADE")} | ${((mt5PreviewNoTradeContext.no_trade_reasons as string[] | undefined) || []).join(", ") || "no_trade"}` : "eligible"}</span></div>
+          <div className="row"><span>Drawdown velocity</span><span>{formatUsd(mt5PreviewDrawdownVelocity.recent_loss_usd)} | {String(mt5PreviewDrawdownVelocity.blocked ? "blocked" : mt5PreviewDrawdownVelocity.warning ? "warning" : "nominal")}</span></div>
+          <div className="row"><span>Oracle advisory</span><span>{((mt5PreviewResolution.advisories as string[] | undefined) || []).join(", ") || "n/a"}</span></div>
         </div>
       </section>
 
@@ -776,11 +961,13 @@ export default function ConnectorsPage() {
               <div className="row"><span>Cash brut</span><span>{formatUsd(capital.actual_raw_cash_usd)}</span></div>
               <div className="row"><span>Inventaire</span><span>{formatUsd(capital.inventory_usd)}</span></div>
               <div className="row"><span>Marge disponible</span><span>{formatUsd(capital.margin_available_usd)}</span></div>
+              <div className="row"><span>Capital exploitable</span><span>{formatUsd(capital.exploitable_capital_usd)}</span></div>
               <div className="row"><span>Solvabilite venue</span><span>{formatPct(capital.solvency_ratio_pct, 2)}</span></div>
               <div className="row"><span>Risque venue</span><span>gross {formatUsd(capital.gross_exposure_usd)} | net {formatUsd(capital.net_exposure_usd)}</span></div>
               <div className="row"><span>Concentration</span><span>{formatPct(capital.concentration_pct, 2)}</span></div>
               <div className="row"><span>Drift vs Fund Manager</span><span>{formatUsd(capital.drift_vs_fund_manager_usd)}</span></div>
               <div className="row"><span>Cashflow / funding</span><span>{formatUsd(capital.net_external_cashflow_usd)} | {formatUsd(capital.funding_fee_usd)}</span></div>
+              <div className="row"><span>Net after costs</span><span>{formatUsd(capital.net_after_costs_usd)}</span></div>
               <div className="row"><span>Poches</span><span>{pockets.map((pocket) => `${String(pocket.pocket)}:${formatUsd(pocket.equivalent_usd)}`).join(" | ") || "n/a"}</span></div>
               <div className="row"><span>Top risk</span><span>{topRisks.map((risk) => `${String(risk.symbol)}:${formatUsd(risk.gross_notional_usd)}`).join(" | ") || "n/a"}</span></div>
             </div>
@@ -833,6 +1020,7 @@ export default function ConnectorsPage() {
             <input value={broker} onChange={(e) => setBroker(e.target.value)} placeholder="broker" />
             <input value={server} onChange={(e) => setServer(e.target.value)} placeholder="server" />
             <input value={login} onChange={(e) => setLogin(e.target.value)} placeholder="login" />
+            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="mot de passe MT5" />
             <select value={mode} onChange={(e) => setMode(e.target.value)}>
               <option value="paper">paper</option>
               <option value="live">live</option>

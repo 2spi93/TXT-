@@ -24,6 +24,29 @@ class Side(str, Enum):
     SELL = "sell"
 
 
+class ProtectionExecutionType(str, Enum):
+    MARKET = "market"
+    LIMIT = "limit"
+
+
+class ProtectionWorkingType(str, Enum):
+    MARK_PRICE = "MARK_PRICE"
+    CONTRACT_PRICE = "CONTRACT_PRICE"
+
+
+class TradeProtectionLeg(BaseModel):
+    trigger_price: float = Field(gt=0)
+    order_type: ProtectionExecutionType = ProtectionExecutionType.MARKET
+    limit_price: float | None = Field(default=None, gt=0)
+    working_type: ProtectionWorkingType = ProtectionWorkingType.MARK_PRICE
+
+
+class TradeProtectionRequest(BaseModel):
+    take_profit: TradeProtectionLeg | None = None
+    stop_loss: TradeProtectionLeg | None = None
+    require_full_acceptance: bool = True
+
+
 class TradeIntent(BaseModel):
     intent_id: str = Field(default_factory=lambda: str(uuid4()))
     strategy_id: str
@@ -37,6 +60,7 @@ class TradeIntent(BaseModel):
     max_slippage_bps: int = Field(gt=0)
     leverage: float = Field(default=1.0, gt=0)
     risk_tags: list[str] = Field(default_factory=list)
+    protection: TradeProtectionRequest | None = None
     explainability: dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=utc_now_iso)
 
@@ -71,6 +95,8 @@ class OrderResult(BaseModel):
     filled_notional_usd: float
     avg_fill_price: float
     execution_mode: str
+    protection_status: str = "not_requested"
+    protection: dict[str, Any] = Field(default_factory=dict)
     timestamp: str = Field(default_factory=utc_now_iso)
 
 
@@ -132,6 +158,7 @@ class IntentSubmissionResponse(BaseModel):
     status: str
     risk_decision: RiskDecision
     order: OrderResult | None = None
+    live_execution_constraints: dict[str, Any] = Field(default_factory=dict)
 
 
 class SystemModeChangeRequest(BaseModel):

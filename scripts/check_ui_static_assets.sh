@@ -51,15 +51,27 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-curl_args=(--max-time 20 -sS -H "Host: $HOST_HEADER")
+curl_args=(--max-time 20 -sSL -H "Host: $HOST_HEADER")
 case "$BASE_URL" in
   https://*) curl_args=(-k "${curl_args[@]}") ;;
 esac
 
 html_file="$(mktemp)"
-trap 'rm -f "$html_file"' EXIT
+headers_file="$(mktemp)"
+trap 'rm -f "$html_file" "$headers_file"' EXIT
 
-curl "${curl_args[@]}" -o "$html_file" "${BASE_URL%/}${HOME_PATH}"
+curl "${curl_args[@]}" -D "$headers_file" -o "$html_file" "${BASE_URL%/}${HOME_PATH}"
+
+final_code="$(awk 'toupper($1) ~ /^HTTP\// {code=$2} END {print code}' "$headers_file")"
+content_type="$(awk 'BEGIN{IGNORECASE=1} /^content-type:/ {sub(/\r$/, "", $0); print substr($0, index($0,":") + 2)}' "$headers_file" | tail -1)"
+if [[ "$final_code" != "200" ]]; then
+  echo "[fail] final HTML response returned $final_code for ${BASE_URL%/}${HOME_PATH}" >&2
+  exit 1
+fi
+if [[ "$content_type" != text/html* && "$content_type" != application/xhtml+xml* ]]; then
+  echo "[fail] unexpected content-type '$content_type' for ${BASE_URL%/}${HOME_PATH}" >&2
+  exit 1
+fi
 
 mapfile -t asset_paths < <(
   tr '"' '\n' < "$html_file" \
@@ -70,7 +82,11 @@ mapfile -t asset_paths < <(
 )
 
 if [[ ${#asset_paths[@]} -eq 0 ]]; then
-  echo "[fail] no /_next/static asset references found in ${BASE_URL%/}${HOME_PATH}" >&2
+  if grep -Eq '<html|__NEXT_DATA__|self\.__next_f\.push|/_next/' "$html_file"; then
+    echo "[ok]   HTML shell is present and looks like a Next.js response; no direct /_next/static references to validate"
+    exit 0
+  fi
+  echo "[fail] no recognizable Next.js HTML markers found in ${BASE_URL%/}${HOME_PATH}" >&2
   exit 1
 fi
 

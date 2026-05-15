@@ -1,5 +1,5 @@
-import { redirect } from "next/navigation";
+import DashboardPageContent from "../DashboardPageContent";
 
-export default function DashboardAliasPage() {
-  redirect("/");
+export default async function DashboardPage() {
+	return DashboardPageContent();
 }

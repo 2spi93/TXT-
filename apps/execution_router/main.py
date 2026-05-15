@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
+from contextlib import suppress
+from enum import Enum
 import math
 import os
 import time
@@ -32,7 +35,7 @@ from apps.execution_router.optimizer_v4 import (
 )
 
 from shared.db import ensure_schema, execute, fetch_all, fetch_one, json_dumps
-from shared.models import ExecutionRequest, OrderResult
+from shared.models import ExecutionRequest, OrderResult, TradeProtectionRequest
 
 app = FastAPI(title="Execution Router", version="0.1.0")
 
@@ -45,6 +48,7 @@ EXECUTION_OPTIMIZER_PROFILE_CACHE: dict[str, object] = {"expires_at": 0.0, "prof
 ACTIVE_EXECUTION_ORDERS: dict[str, dict[str, object]] = {}
 ACTIVE_EXECUTION_ORDER_TASKS: dict[str, asyncio.Task] = {}
 RECENT_EXECUTION_OPTIMIZER_EVENTS: list[dict[str, object]] = []
+OBSERVATION_TASK: asyncio.Task | None = None
 EXECUTION_AI_V6_STATE: dict[str, object] = {
     "episodes": [],
     "actions": {},
@@ -62,6 +66,173 @@ EXECUTION_AI_V6_STATE: dict[str, object] = {
     "last_persist_error": None,
     "updated_at": None,
 }
+
+
+def _normalize_trade_side(value: object, default: str = "buy") -> str:
+    candidate = value.value if isinstance(value, Enum) else value
+    normalized = str(candidate or "").strip().lower()
+    if "." in normalized:
+        normalized = normalized.rsplit(".", 1)[-1]
+    if normalized in {"buy", "sell"}:
+        return normalized
+    return default
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+_OBS_WINDOW_SIZE = max(30, min(600, int(_env_float("ROUTING_OBSERVATION_WINDOW_CYCLES", 120.0))))
+_OBSERVATION_INTERVAL_SEC = max(0.5, min(10.0, _env_float("ROUTING_OBSERVATION_INTERVAL_SEC", 2.0)))
+_OBSERVATION_BUS_WARN_AFTER_SEC = max(1.0, min(10.0, _env_float("ROUTING_OBSERVATION_BUS_WARN_AFTER_SEC", 3.0)))
+_OBSERVATION_BUS_OFFLINE_AFTER_SEC = max(
+    _OBSERVATION_BUS_WARN_AFTER_SEC,
+    min(30.0, _env_float("ROUTING_OBSERVATION_BUS_OFFLINE_AFTER_SEC", 8.0)),
+)
+_OBSERVATION_NO_TRADES_AFTER_SEC = max(5.0, min(600.0, _env_float("ROUTING_OBSERVATION_NO_TRADES_AFTER_SEC", 60.0)))
+_OBSERVATION_SYMBOLS_RAW = os.getenv("ROUTING_OBSERVATION_SYMBOLS", "BTCUSDT,ETHUSDT")
+_obs_cycle_results: deque[bool] = deque(maxlen=_OBS_WINDOW_SIZE)
+_obs_last_bus_event_ts: float = 0.0
+_obs_last_trade_ts: float = 0.0
+_obs_last_error: str | None = None
+OBSERVATION_STATE: dict[str, object] = {
+    "bus_seq": 0,
+    "consistency": None,
+    "flags": ["OBSERVATION_WARMING_UP", "SEQ_ZERO"],
+    "candidate_count": 0,
+    "freshness_ms": None,
+    "deviation_bps": None,
+    "failure_blocking": False,
+    "updated_at": None,
+    "symbols": [],
+}
+
+
+def _observation_symbols() -> list[str]:
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for item in _OBSERVATION_SYMBOLS_RAW.split(","):
+        normalized = _normalize_symbol(item)
+        if normalized and normalized not in seen:
+            symbols.append(normalized)
+            seen.add(normalized)
+    if not symbols:
+        return ["BTCUSDT"]
+    return symbols
+
+
+def _mark_bus_event(*, trade_seen: bool = False) -> None:
+    global _obs_last_bus_event_ts, _obs_last_trade_ts
+    now_ts = time.time()
+    _obs_last_bus_event_ts = now_ts
+    if trade_seen:
+        _obs_last_trade_ts = now_ts
+
+
+def _observation_flags(candidate_count: int) -> list[str]:
+    now_ts = time.time()
+    flags: list[str] = []
+    bus_age = now_ts - _obs_last_bus_event_ts if _obs_last_bus_event_ts > 0 else None
+    trade_age = now_ts - _obs_last_trade_ts if _obs_last_trade_ts > 0 else None
+
+    if int(OBSERVATION_STATE.get("bus_seq", 0)) == 0:
+        flags.append("SEQ_ZERO")
+    if candidate_count <= 0:
+        flags.append("NO_CANDIDATES")
+    if bus_age is None or bus_age >= _OBSERVATION_BUS_OFFLINE_AFTER_SEC:
+        flags.append("BUS_OFFLINE")
+    elif bus_age >= _OBSERVATION_BUS_WARN_AFTER_SEC:
+        flags.append("BUS_DEGRADED")
+    if trade_age is not None and trade_age >= _OBSERVATION_NO_TRADES_AFTER_SEC:
+        flags.append("NO_TRADES")
+    if OBSERVATION_STATE.get("updated_at") is None:
+        flags.append("OBSERVATION_WARMING_UP")
+    if _obs_last_error:
+        flags.append("OBSERVATION_ERROR")
+    return flags
+
+
+def _observation_snapshot() -> dict[str, object]:
+    snapshot = {
+        "bus_seq": int(OBSERVATION_STATE.get("bus_seq", 0)),
+        "consistency": OBSERVATION_STATE.get("consistency"),
+        "flags": list(OBSERVATION_STATE.get("flags") or []),
+        "candidate_count": int(OBSERVATION_STATE.get("candidate_count", 0)),
+        "deviation_bps": OBSERVATION_STATE.get("deviation_bps"),
+        "failure_blocking": bool(OBSERVATION_STATE.get("failure_blocking", False)),
+        "freshness_ms": OBSERVATION_STATE.get("freshness_ms"),
+        "updated_at": OBSERVATION_STATE.get("updated_at"),
+        "symbols": OBSERVATION_STATE.get("symbols") if isinstance(OBSERVATION_STATE.get("symbols"), list) else [],
+    }
+    if _obs_last_error:
+        snapshot["observation_error"] = _obs_last_error
+    return snapshot
+
+
+async def _refresh_observation_state() -> None:
+    global _obs_last_error
+
+    symbols = _observation_symbols()
+    resolved_infra = _resolve_infra_context({"infra_health": 1.0, "network_regime": "stable"})
+    symbol_snapshots: list[dict[str, object]] = []
+
+    for symbol in symbols:
+        candidates = await _build_route_candidates(symbol, infra_context=resolved_infra)
+        context = _build_route_context(candidates)
+        failure_attribution = _build_route_failure_attribution(candidates, context, resolved_infra)
+        freshest_ms = min((_to_float(item.get("freshness_ms"), 999999.0) for item in candidates), default=999999.0)
+        symbol_snapshots.append(
+            {
+                "symbol": symbol,
+                "candidate_count": len(candidates),
+                "deviation_bps": _to_float(context.get("deviation_bps"), 0.0),
+                "freshness_ms": None if freshest_ms >= 999999.0 else round(freshest_ms, 3),
+                "failure_blocking": bool(failure_attribution.get("failure_blocking")),
+            }
+        )
+
+    candidate_count = min((int(item.get("candidate_count", 0)) for item in symbol_snapshots), default=0)
+    deviation_bps = max((_to_float(item.get("deviation_bps"), 0.0) for item in symbol_snapshots), default=0.0)
+    freshness_values = [_to_float(item.get("freshness_ms"), 0.0) for item in symbol_snapshots if item.get("freshness_ms") is not None]
+    freshness_ms = max(freshness_values) if freshness_values else None
+    failure_blocking = any(bool(item.get("failure_blocking")) for item in symbol_snapshots)
+    valid = candidate_count >= 3 and deviation_bps < 20.0 and not failure_blocking
+    _obs_cycle_results.append(valid)
+
+    total = len(_obs_cycle_results)
+    OBSERVATION_STATE.update(
+        {
+            "bus_seq": int(OBSERVATION_STATE.get("bus_seq", 0)) + 1,
+            "consistency": round(sum(_obs_cycle_results) / total * 100, 1) if total > 0 else None,
+            "candidate_count": candidate_count,
+            "freshness_ms": None if freshness_ms is None else round(freshness_ms, 3),
+            "deviation_bps": round(deviation_bps, 6),
+            "failure_blocking": failure_blocking,
+            "updated_at": _now_iso(),
+            "symbols": symbol_snapshots,
+        }
+    )
+    OBSERVATION_STATE["flags"] = _observation_flags(candidate_count)
+    _obs_last_error = None
+
+
+async def _observation_loop() -> None:
+    global _obs_last_error
+
+    while True:
+        try:
+            await _refresh_observation_state()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _obs_last_error = str(exc)
+            OBSERVATION_STATE["bus_seq"] = int(OBSERVATION_STATE.get("bus_seq", 0)) + 1
+            OBSERVATION_STATE["updated_at"] = _now_iso()
+            OBSERVATION_STATE["flags"] = _observation_flags(int(OBSERVATION_STATE.get("candidate_count", 0)))
+        await asyncio.sleep(_OBSERVATION_INTERVAL_SEC)
+
 
 VENUE_EXECUTION_PROFILES: dict[str, dict[str, object]] = {
     "binance": {
@@ -728,6 +899,65 @@ def _remaining_notional_usd(order_payload: dict[str, object]) -> float:
     return max(0.0, requested - filled)
 
 
+def _normalize_trade_protection_request(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict) or not payload:
+        return {}
+    try:
+        normalized = TradeProtectionRequest.model_validate(payload).model_dump(mode="json", exclude_none=True)
+    except Exception:
+        return {}
+    return normalized if isinstance(normalized.get("take_profit"), dict) or isinstance(normalized.get("stop_loss"), dict) else {}
+
+
+def _requested_protection_leg_count(payload: dict[str, object]) -> int:
+    count = 0
+    for key in ("take_profit", "stop_loss"):
+        if isinstance(payload.get(key), dict):
+            count += 1
+    return count
+
+
+def _normalize_live_order_protection(order_payload: dict[str, object], requested: dict[str, object]) -> dict[str, object]:
+    if not requested:
+        return order_payload
+    normalized = dict(order_payload)
+    raw_protection = normalized.get("protection") if isinstance(normalized.get("protection"), dict) else {}
+    requested_payload = raw_protection.get("requested") if isinstance(raw_protection.get("requested"), dict) else requested
+    accepted_payload = raw_protection.get("accepted") if isinstance(raw_protection.get("accepted"), dict) else {}
+    requested_count = _requested_protection_leg_count(requested_payload)
+    if requested_count <= 0:
+        return normalized
+    accepted_count = _requested_protection_leg_count(accepted_payload)
+    missing = [
+        leg_name
+        for leg_name in ("take_profit", "stop_loss")
+        if isinstance(requested_payload.get(leg_name), dict) and not isinstance(accepted_payload.get(leg_name), dict)
+    ]
+    existing_reasons = raw_protection.get("reasons") if isinstance(raw_protection.get("reasons"), list) else []
+    reasons: list[str] = []
+    for item in [*existing_reasons, *[f"{name} was not acknowledged by BingX" for name in missing]]:
+        text = str(item or "").strip()
+        if text and text not in reasons:
+            reasons.append(text)
+    if accepted_count >= requested_count:
+        protection_status = "armed"
+    elif accepted_count > 0:
+        protection_status = "protection_partial"
+    else:
+        existing_status = str(normalized.get("protection_status") or raw_protection.get("status") or "").strip().lower()
+        protection_status = existing_status if existing_status in {"protection_rejected", "rejected_preflight"} else "protection_rejected"
+    normalized["protection_status"] = protection_status
+    normalized["protection"] = {
+        "mode": str(raw_protection.get("mode") or "native_attached"),
+        "status": protection_status,
+        "require_full_acceptance": bool(raw_protection.get("require_full_acceptance", requested_payload.get("require_full_acceptance", True))),
+        "requested": requested_payload,
+        "accepted": accepted_payload,
+        "reasons": reasons,
+    }
+    return normalized
+
+
 def _live_execution_context(payload: dict[str, object]) -> dict[str, object]:
     live = _as_dict(payload.get("live_execution"))
     metadata = _as_dict(payload.get("metadata"))
@@ -735,6 +965,7 @@ def _live_execution_context(payload: dict[str, object]) -> dict[str, object]:
     account_id = str(live.get("account_id") or metadata.get("account_id") or "").strip()
     secret_payload = live.get("secret_payload") if isinstance(live.get("secret_payload"), dict) else None
     enabled = bool(live.get("enabled")) and provider in {"bingx", "bybit"} and bool(account_id) and isinstance(secret_payload, dict)
+    protection = _normalize_trade_protection_request(live.get("protection") if isinstance(live.get("protection"), dict) else payload.get("protection"))
     return {
         "enabled": enabled,
         "provider": provider,
@@ -744,11 +975,35 @@ def _live_execution_context(payload: dict[str, object]) -> dict[str, object]:
         "time_in_force": str(live.get("time_in_force") or payload.get("time_in_force") or "GTC").strip().upper(),
         "position_side": str(live.get("position_side") or payload.get("position_side") or "").strip().upper(),
         "reduce_only": bool(live.get("reduce_only", payload.get("reduce_only", False))),
+        "auto_adjust_notional": bool(live.get("auto_adjust_notional", live.get("auto_size", payload.get("auto_adjust_notional", True)))),
         "price": _to_float(live.get("price") or payload.get("price"), 0.0),
         "quantity": _to_float(live.get("quantity") or payload.get("quantity"), 0.0),
         "notional_usd": _to_float(live.get("notional_usd") or payload.get("estimated_notional_usd"), 0.0),
         "client_order_id": str(live.get("client_order_id") or payload.get("client_order_id") or "").strip(),
+        "dry_run": bool(live.get("dry_run", payload.get("dry_run", False))),
+        "dry_run_accepted_legs": live.get("dry_run_accepted_legs") if isinstance(live.get("dry_run_accepted_legs"), (list, tuple, set, str)) else payload.get("dry_run_accepted_legs"),
+        "protection": protection,
     }
+
+
+def _resolve_live_execution_notional(
+    payload: dict[str, object],
+    live_context: dict[str, object],
+    selected_execution_context: dict[str, object],
+) -> tuple[float, float, bool]:
+    requested_notional = _to_float(payload.get("estimated_notional_usd"), _to_float(live_context.get("notional_usd"), 0.0))
+    context_adjusted_notional = _to_float(selected_execution_context.get("target_notional_usd"), requested_notional)
+    if context_adjusted_notional <= 0:
+        context_adjusted_notional = requested_notional
+    metadata = _as_dict(payload.get("metadata"))
+    execution_mode = str(payload.get("execution_mode") or "").strip().lower()
+    preserve_approved_live_notional = bool(live_context.get("enabled")) and (
+        execution_mode == "live-intent" or str(metadata.get("origin") or "").strip().lower() == "approved-intent"
+    )
+    execution_notional = requested_notional if preserve_approved_live_notional and requested_notional > 0 else context_adjusted_notional
+    if execution_notional <= 0:
+        execution_notional = requested_notional
+    return execution_notional, context_adjusted_notional, preserve_approved_live_notional
 
 
 def _compact_execution_optimizer_candidate(candidate: dict[str, object], snapshot: dict[str, object]) -> dict[str, object]:
@@ -788,23 +1043,32 @@ def _enrich_execution_optimizer_snapshot(
 
 
 async def _execute_live_order(payload: dict[str, object], live_context: dict[str, object], decision_id: str) -> dict[str, object]:
+    side = _normalize_trade_side(payload.get("side"))
+    requested_protection = live_context.get("protection") if isinstance(live_context.get("protection"), dict) else {}
     request_payload: dict[str, object] = {
         "provider": str(live_context.get("provider") or "bingx"),
         "account_id": str(live_context.get("account_id") or ""),
         "secret_payload": live_context.get("secret_payload"),
         "symbol": str(payload.get("symbol") or ""),
-        "side": str(payload.get("side") or "buy"),
+        "side": side,
         "notional_usd": _to_float(live_context.get("notional_usd"), 0.0),
         "order_type": str(live_context.get("order_type") or "MARKET"),
         "time_in_force": str(live_context.get("time_in_force") or "GTC"),
         "position_side": str(live_context.get("position_side") or ""),
         "reduce_only": bool(live_context.get("reduce_only", False)),
+        "auto_adjust_notional": bool(live_context.get("auto_adjust_notional", True)),
         "client_order_id": str(live_context.get("client_order_id") or f"txt-{decision_id}")[:40],
     }
+    if bool(live_context.get("dry_run")):
+        request_payload["dry_run"] = True
+    if live_context.get("dry_run_accepted_legs") is not None:
+        request_payload["dry_run_accepted_legs"] = live_context.get("dry_run_accepted_legs")
     if _to_float(live_context.get("price"), 0.0) > 0:
         request_payload["price"] = _to_float(live_context.get("price"), 0.0)
     if _to_float(live_context.get("quantity"), 0.0) > 0:
         request_payload["quantity"] = _to_float(live_context.get("quantity"), 0.0)
+    if requested_protection:
+        request_payload["protection"] = requested_protection
 
     async with httpx.AsyncClient(timeout=25.0) as client:
         response = await client.post(f"{BROKER_ADAPTER_URL}/v1/live/orders", json=request_payload)
@@ -818,16 +1082,18 @@ async def _execute_live_order(payload: dict[str, object], live_context: dict[str
     body = response.json()
     if not isinstance(body, dict):
         raise HTTPException(status_code=502, detail="broker-adapter returned invalid live order payload")
-    return body
+    return _normalize_live_order_protection(body, requested_protection)
 
 
 async def _query_live_order_status(live_context: dict[str, object], payload: dict[str, object], order_payload: dict[str, object]) -> dict[str, object]:
+    side = _normalize_trade_side(payload.get("side"))
+    requested_protection = live_context.get("protection") if isinstance(live_context.get("protection"), dict) else {}
     request_payload: dict[str, object] = {
         "provider": str(live_context.get("provider") or ""),
         "account_id": str(live_context.get("account_id") or ""),
         "secret_payload": live_context.get("secret_payload"),
         "symbol": str(payload.get("symbol") or ""),
-        "side": str(payload.get("side") or "buy"),
+        "side": side,
         "order_id": order_payload.get("order_id"),
         "client_order_id": order_payload.get("client_order_id"),
         "notional_usd": _to_float(order_payload.get("requested_notional_usd"), _to_float(live_context.get("notional_usd"), 0.0)),
@@ -844,16 +1110,17 @@ async def _query_live_order_status(live_context: dict[str, object], payload: dic
     body = response.json()
     if not isinstance(body, dict):
         raise HTTPException(status_code=502, detail="broker-adapter returned invalid order status payload")
-    return body
+    return _normalize_live_order_protection(body, requested_protection)
 
 
 async def _cancel_live_order(live_context: dict[str, object], payload: dict[str, object], order_payload: dict[str, object]) -> dict[str, object]:
+    side = _normalize_trade_side(payload.get("side"))
     request_payload: dict[str, object] = {
         "provider": str(live_context.get("provider") or ""),
         "account_id": str(live_context.get("account_id") or ""),
         "secret_payload": live_context.get("secret_payload"),
         "symbol": str(payload.get("symbol") or ""),
-        "side": str(payload.get("side") or "buy"),
+        "side": side,
         "order_id": order_payload.get("order_id"),
         "client_order_id": order_payload.get("client_order_id"),
         "notional_usd": _to_float(order_payload.get("requested_notional_usd"), _to_float(live_context.get("notional_usd"), 0.0)),
@@ -881,12 +1148,13 @@ async def _amend_live_order(
     target_price: float,
     target_quantity: float = 0.0,
 ) -> dict[str, object]:
+    side = _normalize_trade_side(payload.get("side"))
     request_payload: dict[str, object] = {
         "provider": str(live_context.get("provider") or ""),
         "account_id": str(live_context.get("account_id") or ""),
         "secret_payload": live_context.get("secret_payload"),
         "symbol": str(payload.get("symbol") or ""),
-        "side": str(payload.get("side") or "buy"),
+        "side": side,
         "order_id": order_payload.get("order_id"),
         "client_order_id": order_payload.get("client_order_id"),
         "notional_usd": _to_float(order_payload.get("requested_notional_usd"), _to_float(live_context.get("notional_usd"), 0.0)),
@@ -1010,6 +1278,8 @@ async def _run_execution_optimizer_live_loop(
     route_preferences: dict[str, object],
     decision_id: str,
 ) -> None:
+    side = _normalize_trade_side(payload.get("side"))
+    payload["side"] = side
     market_venue = str(selected_candidate.get("venue") or live_context.get("provider") or "unknown")
     broker_provider = str(live_context.get("provider") or broker_order.get("venue") or "unknown")
     desk_profile = _execution_optimizer_profile_for_venue(market_venue)
@@ -1017,14 +1287,14 @@ async def _run_execution_optimizer_live_loop(
         selected_candidate,
         build_execution_optimizer_snapshot(
             selected_candidate,
-            str(payload.get("side") or "buy"),
+            side,
             _remaining_notional_usd(broker_order),
             str(route_preferences.get("execution_style") or "default"),
             str(live_context.get("order_type") or "LIMIT"),
             _to_float(live_context.get("price"), 0.0),
             desk_profile=desk_profile,
         ),
-        str(payload.get("side") or "buy"),
+        side,
         _remaining_notional_usd(broker_order),
     )
     queue_tracker = initialize_queue_tracker(selected_candidate, latest_snapshot.get("queue") if isinstance(latest_snapshot.get("queue"), dict) else {})
@@ -1071,24 +1341,24 @@ async def _run_execution_optimizer_live_loop(
             current_candidate = await _candidate_for_market_venue(str(payload.get("symbol") or ""), market_venue, _resolve_infra_context(payload))
             loop_elapsed_ms = max(1.0, (time.perf_counter() - last_cycle_started) * 1000.0)
             last_cycle_started = time.perf_counter()
-            queue_tracker = update_queue_tracker(queue_tracker, previous_candidate, current_candidate, str(payload.get("side") or "buy"), loop_elapsed_ms)
+            queue_tracker = update_queue_tracker(queue_tracker, previous_candidate, current_candidate, side, loop_elapsed_ms)
             latest_snapshot = _enrich_execution_optimizer_snapshot(
                 current_candidate,
                 build_execution_optimizer_snapshot(
                     current_candidate,
-                    str(payload.get("side") or "buy"),
+                    side,
                     _to_float(state.get("remaining_notional_usd"), 0.0),
                     str(route_preferences.get("execution_style") or "default"),
                     str(current_order.get("order_type") or live_context.get("order_type") or "LIMIT"),
                     _to_float(current_order.get("limit_price"), _to_float(live_context.get("price"), 0.0)),
                     desk_profile=desk_profile,
                 ),
-                str(payload.get("side") or "buy"),
+                side,
                 _to_float(state.get("remaining_notional_usd"), 0.0),
             )
             market_structure = latest_snapshot.get("market_structure") if isinstance(latest_snapshot.get("market_structure"), dict) else {}
             execution_context = latest_snapshot.get("execution_context") if isinstance(latest_snapshot.get("execution_context"), dict) else {}
-            spoof_signal = detect_spoof_signal(previous_candidate, current_candidate, str(payload.get("side") or "buy"), desk_profile, loop_elapsed_ms)
+            spoof_signal = detect_spoof_signal(previous_candidate, current_candidate, side, desk_profile, loop_elapsed_ms)
             live_fill = compute_live_fill_score(queue_tracker, current_candidate, desk_profile, execution_context)
             liquidity_signal = detect_liquidity_trap(current_candidate, live_fill, desk_profile)
             live_signal = apply_execution_context_to_fill_snapshot({**live_fill, **liquidity_signal}, execution_context, market_structure)
@@ -2724,6 +2994,8 @@ async def _build_route_candidates(symbol: str, infra_context: dict[str, object] 
     async with httpx.AsyncClient(timeout=10.0) as client:
         quotes_response = await client.get(f"{MARKET_DATA_URL}/v1/quotes")
         quotes = quotes_response.json() if quotes_response.status_code < 400 else []
+        if quotes_response.status_code < 400:
+            _mark_bus_event()
 
         matching_quotes = [quote for quote in quotes if _normalize_symbol(str(quote.get("instrument", ""))) == market_symbol]
         depth_responses = await asyncio.gather(
@@ -2774,6 +3046,8 @@ async def _build_route_candidates(symbol: str, infra_context: dict[str, object] 
             depth_imbalance = _to_float((micro_payload or {}).get("depth_imbalance"), 0.0)
             volume_imbalance = _to_float((micro_payload or {}).get("volume_imbalance"), 0.0)
             trade_count = int(_to_float((micro_payload or {}).get("trade_count"), 0.0))
+            if quote_age_ms <= 5000 and trade_count > 0:
+                _mark_bus_event(trade_seen=True)
             liquidity_score = _clamp(math.log10(max(10.0, available_depth_usd)) / 6.0, 0.0, 1.0) if available_depth_usd > 0 else depth_confidence * 0.1
             queue_priority_risk = _clamp(
                 (1.0 - _to_float(venue_profile.get("queue_priority_bias"), 0.8)) * 0.45
@@ -2869,6 +3143,10 @@ async def _build_route_candidates(symbol: str, infra_context: dict[str, object] 
                     "depth_payload": book,
                 }
             )
+
+    # Filter out hard-stale venues (>1h freshness) to prevent cross-venue deviation pollution
+    _HARD_STALE_MS = 3_600_000
+    candidates = [c for c in candidates if _to_float(c.get("freshness_ms"), 0.0) < _HARD_STALE_MS]
 
     ranked_candidates = sorted(_annotate_multi_venue_dominance(candidates), key=lambda item: item["score"], reverse=True)
     for index, candidate in enumerate(ranked_candidates):
@@ -3052,7 +3330,20 @@ def _simulate_fills(
 
 @app.on_event("startup")
 async def startup() -> None:
+    global OBSERVATION_TASK
     ensure_schema()
+    if OBSERVATION_TASK is None or OBSERVATION_TASK.done():
+        OBSERVATION_TASK = asyncio.create_task(_observation_loop())
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    global OBSERVATION_TASK
+    if OBSERVATION_TASK is not None:
+        OBSERVATION_TASK.cancel()
+        with suppress(asyncio.CancelledError):
+            await OBSERVATION_TASK
+        OBSERVATION_TASK = None
 
 
 @app.get("/health")
@@ -3062,6 +3353,7 @@ async def health() -> dict:
         "service": "execution-router",
         "orders": len(ORDERS),
         "positions": POSITIONS,
+        "observation": _observation_snapshot(),
     }
 
 
@@ -3212,6 +3504,7 @@ async def route_score(
         "failure_reasons": failure_attribution.get("failure_reasons"),
         "failure_blocking": bool(failure_attribution.get("failure_blocking")),
         "candidates": candidates,
+        **_observation_snapshot(),
     }
 
 
@@ -3221,9 +3514,10 @@ async def place_routed_order(payload: dict) -> dict:
     symbol = _normalize_symbol(str(payload.get("symbol", "")))
     if not symbol:
         raise HTTPException(status_code=400, detail="symbol is required")
-    side = str(payload.get("side", "buy")).lower()
+    side = _normalize_trade_side(payload.get("side"))
     if side not in {"buy", "sell"}:
         raise HTTPException(status_code=400, detail="side must be buy/sell")
+    payload["side"] = side
     notional = _to_float(payload.get("estimated_notional_usd"), 0.0)
     if notional <= 0:
         raise HTTPException(status_code=400, detail="estimated_notional_usd must be > 0")
@@ -3348,9 +3642,11 @@ async def place_routed_order(payload: dict) -> dict:
     backup_optimizer_v3 = backup_entry["snapshot"] if isinstance(backup_entry, dict) else {}
     selected_execution_context = selected_optimizer_v3.get("execution_context") if isinstance(selected_optimizer_v3.get("execution_context"), dict) else {}
     selected_market_structure = selected_optimizer_v3.get("market_structure") if isinstance(selected_optimizer_v3.get("market_structure"), dict) else {}
-    adjusted_notional = _to_float(selected_execution_context.get("target_notional_usd"), notional)
-    if adjusted_notional <= 0:
-        adjusted_notional = notional
+    execution_notional_usd, context_adjusted_notional_usd, preserve_approved_live_notional = _resolve_live_execution_notional(
+        payload,
+        live_context,
+        selected_execution_context,
+    )
     route_selection["execution_optimizer_v3"] = {
         "selected_venue": str(selected.get("venue") or "unknown"),
         "fallback_used": str(selected.get("venue") or "") != str((context.get("best") or {}).get("venue") or ""),
@@ -3358,6 +3654,7 @@ async def place_routed_order(payload: dict) -> dict:
             _compact_execution_optimizer_candidate(entry["candidate"], entry["snapshot"])
             for entry in evaluated_candidates[:5]
         ],
+        "preserve_approved_live_notional": preserve_approved_live_notional,
     }
     route_selection["market_structure"] = selected_market_structure
     route_selection["execution_context"] = selected_execution_context
@@ -3370,7 +3667,10 @@ async def place_routed_order(payload: dict) -> dict:
     }
     effective_live_context = apply_order_management_to_live_context(live_context, selected_optimizer_v3) if bool(live_context.get("enabled")) else live_context
     if _to_float(effective_live_context.get("notional_usd"), 0.0) > 0:
-        effective_live_context["notional_usd"] = min(_to_float(effective_live_context.get("notional_usd"), 0.0), adjusted_notional)
+        if preserve_approved_live_notional:
+            effective_live_context["notional_usd"] = execution_notional_usd
+        else:
+            effective_live_context["notional_usd"] = min(_to_float(effective_live_context.get("notional_usd"), 0.0), execution_notional_usd)
     execution_ai_action = str(execution_ai_v6_decision.get("action") or "hold")
     best_bid = _to_float(selected.get("best_bid"), 0.0)
     best_ask = _to_float(selected.get("best_ask"), 0.0)
@@ -3387,7 +3687,6 @@ async def place_routed_order(payload: dict) -> dict:
         elif execution_ai_action == "move_to_mid" and midpoint_price > 0:
             effective_live_context["order_type"] = "LIMIT"
             effective_live_context["price"] = midpoint_price
-    execution_notional_usd = adjusted_notional
     if execution_delay_ms > 0:
         await asyncio.sleep(execution_delay_ms / 1000.0)
 
@@ -3529,6 +3828,7 @@ async def place_routed_order(payload: dict) -> dict:
                 "position_side": effective_live_context.get("position_side"),
                 "order_type": effective_live_context.get("order_type"),
                 "price": effective_live_context.get("price"),
+                "protection": effective_live_context.get("protection") if isinstance(effective_live_context.get("protection"), dict) else {},
             },
             "route": {
                 "chosen": str(selected.get("venue") or actual_venue),
@@ -3539,7 +3839,8 @@ async def place_routed_order(payload: dict) -> dict:
                 "market_structure": selected_market_structure,
                 "execution_context": selected_execution_context,
                 "original_requested_notional_usd": notional,
-                "context_adjusted_notional_usd": execution_notional_usd,
+                "context_adjusted_notional_usd": context_adjusted_notional_usd,
+                "preserve_approved_live_notional": preserve_approved_live_notional,
             },
             "execution_optimizer_v3": {
                 "selected": selected_optimizer_v3,
@@ -3588,10 +3889,12 @@ async def place_routed_order(payload: dict) -> dict:
         "side": side,
         "requested_notional_usd": execution_notional_usd,
         "original_requested_notional_usd": notional,
-        "context_adjusted_notional_usd": execution_notional_usd,
+        "context_adjusted_notional_usd": context_adjusted_notional_usd,
         "filled_notional_usd": filled_notional,
         "avg_fill_price": avg_fill_price,
         "execution_mode": execution_mode,
+        "protection_status": str((broker_order or {}).get("protection_status") or "not_requested"),
+        "protection": (broker_order or {}).get("protection") if isinstance((broker_order or {}).get("protection"), dict) else {},
         "expected_slippage_bps": expected_slippage_bps,
         "realized_slippage_bps": realized_slippage_bps,
         "fill_quality_score": fill_quality_score,
@@ -3611,7 +3914,8 @@ async def place_routed_order(payload: dict) -> dict:
             "market_structure": selected_market_structure,
             "execution_context": selected_execution_context,
             "original_requested_notional_usd": notional,
-            "context_adjusted_notional_usd": execution_notional_usd,
+            "context_adjusted_notional_usd": context_adjusted_notional_usd,
+            "preserve_approved_live_notional": preserve_approved_live_notional,
             "mode": "live" if broker_order else "simulated",
             "execution_target": actual_venue,
             "source": "v5-multi-venue-dominance",
@@ -3636,6 +3940,7 @@ async def place_routed_order(payload: dict) -> dict:
             "position_side": effective_live_context.get("position_side"),
             "order_type": effective_live_context.get("order_type"),
             "price": effective_live_context.get("price"),
+            "protection": effective_live_context.get("protection") if isinstance(effective_live_context.get("protection"), dict) else {},
         },
         "execution_optimizer_v3": {
             "selected": selected_optimizer_v3,
@@ -3658,6 +3963,8 @@ async def place_routed_order(payload: dict) -> dict:
             filled_notional_usd=filled_notional,
             avg_fill_price=avg_fill_price,
             execution_mode=execution_mode,
+            protection_status=str((broker_order or {}).get("protection_status") or "not_requested"),
+            protection=(broker_order or {}).get("protection") if isinstance((broker_order or {}).get("protection"), dict) else {},
         )
     )
     return order
@@ -3700,6 +4007,7 @@ async def place_order(request: ExecutionRequest) -> OrderResult:
     intent = request.intent
     signed_notional = intent.target_notional_usd if intent.side.value == "buy" else -intent.target_notional_usd
     POSITIONS[intent.instrument] = POSITIONS.get(intent.instrument, 0.0) + signed_notional
+    requested_protection = intent.protection.model_dump(mode="json", exclude_none=True) if intent.protection else {}
 
     order = OrderResult(
         order_id=f"paper-{intent.intent_id}",
@@ -3711,6 +4019,8 @@ async def place_order(request: ExecutionRequest) -> OrderResult:
         filled_notional_usd=intent.target_notional_usd,
         avg_fill_price=1.0,
         execution_mode=request.execution_mode,
+        protection_status="simulated" if requested_protection else "not_requested",
+        protection={"mode": "paper", "requested": requested_protection} if requested_protection else {},
     )
     ORDERS.append(order)
     return order

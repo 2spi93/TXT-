@@ -30,7 +30,7 @@ test("@chart terminal fast timeframes keep the chart visible and alive", async (
     pageErrors.push(error.message);
   });
 
-  await loginIfRequired(page, "/terminal", "fast timeframe regression");
+  await loginIfRequired(page, "/terminal?engine=v3", "fast timeframe regression");
 
   const chart = page.locator(".chart-canvas-host").first();
   await chart.waitFor({ state: "visible", timeout: 45_000 });

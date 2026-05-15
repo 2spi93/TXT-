@@ -585,7 +585,10 @@ export default function FundManagerPage() {
   const grossExposureUsd = toNumber(portfolioRisk?.gross_exposure_usd, equityUsd * 1.45);
   const netExposureUsd = toNumber(portfolioRisk?.net_exposure_usd, grossExposureUsd * 0.82);
   const concentrationPct = clamp(toNumber(portfolioRisk?.concentration_pct, 32), 0, 100);
-  const realizedPnlUsd = toNumber(effectivePerformanceSummary?.realized_pnl_usd, equityUsd * 0.082);
+  const netAfterCostsUsd = toNumber(effectivePerformanceSummary?.net_after_costs_usd, NaN);
+  const realizedPnlUsd = Number.isFinite(netAfterCostsUsd)
+    ? netAfterCostsUsd
+    : toNumber(effectivePerformanceSummary?.realized_pnl_usd, equityUsd * 0.082);
   const unrealizedPnlUsd = toNumber(effectivePerformanceSummary?.unrealized_pnl_usd, equityUsd * 0.013);
   const winRatePct = clamp(toNumber(executionBackedPerformanceSummary?.win_rate_pct, 57.4), 0, 100);
   const expectancyUsd = toNumber(executionBackedPerformanceSummary?.expectancy_usd, 320);
@@ -885,7 +888,7 @@ export default function FundManagerPage() {
         ts: resolveEntryTimestampMs(report, ["generated_at", "created_at", "report_month"]) || (10_000 - index),
         label: `Investor report ${String(report.report_month || report.report_type || index + 1)}`,
         tag: String(report.status || report.report_type || "published"),
-        pnl: formatMoney(toNumber(performance?.realized_pnl_usd, latestPnlUsd)),
+        pnl: formatMoney(firstFiniteNumber(performance, ["net_after_costs_usd", "realized_pnl_usd"], latestPnlUsd)),
         dd: formatPct(toNumber(performance?.max_drawdown_pct, currentDrawdownPct), 2),
         exposure: formatMoney(toNumber(summary?.gross_exposure_usd, grossExposureUsd)),
       });
@@ -922,7 +925,7 @@ export default function FundManagerPage() {
     if (effectiveAttributionRows.length > 0) {
       return effectiveAttributionRows.slice(0, 5).map((row, index) => ({
         label: String(row.factor || row.strategy_id || row.symbol || row.scope_id || `factor-${index + 1}`),
-        value: formatMoney(firstFiniteNumber(row, ["realized_pnl_usd", "unrealized_pnl_usd", "pnl_usd", "contribution_usd"], 0)),
+        value: formatMoney(firstFiniteNumber(row, ["net_after_costs_usd", "realized_pnl_usd", "unrealized_pnl_usd", "pnl_usd", "contribution_usd"], 0)),
       }));
     }
     return sleeves.slice(0, 5).map((item) => ({ label: item.name, value: formatMoney(item.pnlUsd) }));
@@ -1047,7 +1050,7 @@ export default function FundManagerPage() {
   const attributionRows = effectiveAttributionRows.length > 0
     ? effectiveAttributionRows.slice(0, 6).map((item, index) => ({
       label: String(item.strategy_id || item.symbol || item.venue || `scope-${index + 1}`),
-      value: formatMoney(toNumber(item.realized_pnl_usd, toNumber(item.unrealized_pnl_usd, 0))),
+      value: formatMoney(firstFiniteNumber(item, ["net_after_costs_usd", "realized_pnl_usd", "unrealized_pnl_usd"], 0)),
     }))
     : sleeves.slice(0, 5).map((item) => ({ label: item.name, value: formatMoney(item.pnlUsd) }));
 

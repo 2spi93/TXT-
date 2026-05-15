@@ -179,24 +179,24 @@ export function resolvePerceptualDominance(_candle: OhlcBar, context: Perceptual
   wickWidthPx = Math.min(Math.max(1.2, perceptualSpacingPx * 0.28), wickWidthPx);
   wickWidthPx = pixelAlign(wickWidthPx, context.devicePixelRatio);
 
-  const lowVolatilityBoost = (1 - clamp(context.volatility, 0, 1)) * 1.35;
-  const bodyLegibilityFloorPx = bodyWidthPx * (context.density > 0.86 ? 1.3 : 1.14);
+  const lowVolatilityBoost = (1 - clamp(context.volatility, 0, 1)) * 0.55;
+  const bodyLegibilityFloorPx = bodyWidthPx * (context.density > 0.86 ? 0.94 : 0.84);
   const minBodyHeightPx = pixelAlign(
     clamp(
       Math.max(
         bodyLegibilityFloorPx,
-        4.4
-          + context.volatility * 1.15
-          + (1 - context.density) * 1.25
+        2.1
+          + context.volatility * 0.75
+          + (1 - context.density) * 0.85
           + lowVolatilityBoost,
-        4.6
-          + bodyBoostRatio * 1.6
-          + visualImportance * 0.8
-          + lastCandleEmphasis * 6
-          + wickExtensionRatio * 0.65,
+        2.35
+          + bodyBoostRatio * 0.95
+          + visualImportance * 0.45
+          + lastCandleEmphasis * 2.4
+          + wickExtensionRatio * 0.4,
       ),
-      context.density > 0.92 ? 4.1 : 4.8,
-      10.4,
+      context.density > 0.92 ? 2.2 : 2.6,
+      5.8,
     ),
     context.devicePixelRatio,
   );

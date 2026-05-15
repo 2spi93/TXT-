@@ -3,7 +3,7 @@ type JsonMap = Record<string, unknown>;
 import { normalizeOhlcvRows, type NormalizedOhlcvBar } from "./ohlcvIntegrity";
 import { MarketDataEngineV5, type GapRange, type SyncedMarketFrame } from "./marketDataEngineV5";
 import type { DepthRow } from "./marketDataEngineV4";
-import { clearChartFrame, publishChartFrame, type LiveChartCandle } from "./chartFrameFeed";
+import { clearChartFrame, publishChartFrame, type LiveChartCandle, type LiveChartFrameMeta, type LiveChartFrameTruth } from "./chartFrameFeed";
 import { GoldenFrameSequenceGuard } from "./goldenFrameSequenceGuard";
 import { GoldenFrameWorkerAdapter, type GoldenFrameWorkerEvent, type GoldenFrameWorkerFrameInput, type GoldenFrameWorkerTelemetry } from "./goldenFrameWorkerAdapter";
 import { PriceFusionEngineV6, type RouteCandidate, type VenueQuote } from "./priceFusionEngineV6";
@@ -96,6 +96,7 @@ type HydrationSocketTrace = {
   error_count: number;
   close_count: number;
   last_state: "idle" | "connecting" | "open" | "error" | "closed";
+  last_open_at: string | null;
   last_message_type: string | null;
   last_message_at: string | null;
   last_error_at: string | null;
@@ -157,12 +158,16 @@ const RENDER_BUFFER_MIN_MS = 20;
 const RENDER_BUFFER_MAX_MS = 80;
 const RENDER_JITTER_SAMPLE_SIZE = 32;
 const RENDER_COALESCE_BACKLOG_THRESHOLD = 500;
+const SOCKET_WATCHDOG_INTERVAL_MS = 5_000;
+const TRADE_SOCKET_INACTIVITY_MS = 15_000;
+const DEPTH_SOCKET_INACTIVITY_MS = 10_000;
 
 let marketDataBusInstanceCounter = 0;
 
 type PendingRenderFrame = {
   feedKey: string;
   candles: LiveChartCandle[];
+  reconstructionMeta?: Partial<LiveChartFrameMeta>;
   createdAt: number;
   tradeTsMs: number | null;
   depthTsMs: number | null;
@@ -301,8 +306,9 @@ function buildMarketTradesWsUrl(instrument: string, venue: string, limit = 200):
   const params = new URLSearchParams({
     venue,
     limit: String(limit),
+    target_count: String(Math.max(20, Math.min(limit, 80))),
   });
-  return `${base}/ws/v1/market/trades/${encodeURIComponent(canonicalInstrumentForVenue(instrument, venue))}?${params.toString()}`;
+  return `${base}/ws/v1/market/trades/preprocessed/${encodeURIComponent(canonicalInstrumentForVenue(instrument, venue))}?${params.toString()}`;
 }
 
 function tradeTimestampMs(trade: JsonMap): number {
@@ -459,6 +465,7 @@ function createHydrationSocketTrace(): HydrationSocketTrace {
     error_count: 0,
     close_count: 0,
     last_state: "idle",
+    last_open_at: null,
     last_message_type: null,
     last_message_at: null,
     last_error_at: null,
@@ -676,6 +683,8 @@ function hasUsableSnapshotData(payload: JsonMap): boolean {
 
 class MarketDataBus {
   private readonly instanceId: string;
+  private readonly observerSessionStartedAt: string;
+  private readonly observerSessionStartedMs: number;
   private listeners = new Set<MarketDataBusListener>();
   private snapshot: MarketDataBusSnapshot = {
     configKey: "",
@@ -706,9 +715,11 @@ class MarketDataBus {
   private ohlcvSocket: WebSocket | null = null;
   private ohlcvReconnectTimer: number | null = null;
   private ohlcvPingTimer: number | null = null;
+  private ohlcvWatchdogTimer: number | null = null;
   private depthSocket: WebSocket | null = null;
   private depthReconnectTimer: number | null = null;
   private depthPingTimer: number | null = null;
+  private depthWatchdogTimer: number | null = null;
   private auxDepthSockets = new Map<string, WebSocket>();
   private auxDepthReconnectTimers = new Map<string, number>();
   private auxDepthPingTimers = new Map<string, number>();
@@ -738,6 +749,7 @@ class MarketDataBus {
   private lastLiveReactCommitAt = 0;
   private lastLiveReactBarTime = "";
   private currentDynamicBufferMs = RENDER_BUFFER_DEFAULT_MS;
+  private lastCanonicalFramePublishedAt = 0;
   private lastDepthEventTsMs = 0;
   private lastDepthSequence: number | null = null;
   private lastTradeEventTsMs = 0;
@@ -759,7 +771,10 @@ class MarketDataBus {
 
   constructor() {
     marketDataBusInstanceCounter += 1;
+    const observerSessionStartedMs = Date.now();
     this.instanceId = `mdb-${marketDataBusInstanceCounter}`;
+    this.observerSessionStartedMs = observerSessionStartedMs;
+    this.observerSessionStartedAt = new Date(observerSessionStartedMs).toISOString();
     this.hydrationTrace = {
       ...this.hydrationTrace,
       instance_id: this.instanceId,
@@ -1045,7 +1060,221 @@ class MarketDataBus {
       hydration_trace: {
         ...this.hydrationTrace,
       },
+      reconstruction: this.buildReconstructionFrameMeta(this.snapshot.ohlcvBars),
     };
+  }
+
+  private buildReconstructionFrameMeta(bars: OhlcvBar[]): Partial<LiveChartFrameMeta> {
+    const now = Date.now();
+    const latestBar = bars[bars.length - 1] || null;
+    const latestBarMs = latestBar ? Date.parse(String(latestBar.t || "")) : Number.NaN;
+    const sourceAgeMs = Number.isFinite(latestBarMs) ? Math.max(0, now - latestBarMs) : null;
+    const tfMs = timeframeToMs(this.config?.timeframe || latestBar?.tf || "1m");
+    const freshnessWindowMs = Math.max(30_000, tfMs * 2);
+    const sourceFreshness: LiveChartFrameMeta["sourceFreshness"] = sourceAgeMs == null
+      ? "unknown"
+      : sourceAgeMs <= freshnessWindowMs
+        ? "fresh"
+        : "stale";
+    const hasRuntimeResume = this.hydrationTrace.reset_count > 0 || Boolean(this.hydrationTrace.last_reset_at);
+    const observationContinuity: LiveChartFrameMeta["observationContinuity"] = hasRuntimeResume ? "resumed" : "continuous";
+    return {
+      observerSessionId: this.instanceId,
+      observerStartedAt: this.observerSessionStartedAt,
+      observerUptimeMs: Math.max(0, now - this.observerSessionStartedMs),
+      observerResetCount: this.hydrationTrace.reset_count,
+      observerLastResetReason: this.hydrationTrace.last_reset_reason,
+      observerLastResetAt: this.hydrationTrace.last_reset_at,
+      observationGapMs: this.lastCanonicalFramePublishedAt > 0 ? Math.max(0, now - this.lastCanonicalFramePublishedAt) : null,
+      observationContinuity,
+      sourceAgeMs,
+      sourceFreshness,
+      reconstructionReason: hasRuntimeResume ? (this.hydrationTrace.last_reset_reason || "runtime-resume") : null,
+    };
+  }
+
+  private buildTruthLayer(
+    candles: LiveChartCandle[],
+    reconstructionMeta: Partial<LiveChartFrameMeta>,
+    renderMeta: Pick<LiveChartFrameMeta, "syncStatus" | "partial" | "confidence">,
+  ): LiveChartFrameTruth {
+    const now = Date.now();
+    const tfMs = timeframeToMs(this.config?.timeframe || "1m");
+    const freshWindowMs = Math.max(30_000, tfMs * 2);
+    const agingWindowMs = Math.max(120_000, tfMs * 4);
+    const sourceAgeMs = Number.isFinite(reconstructionMeta.sourceAgeMs) ? Number(reconstructionMeta.sourceAgeMs) : null;
+    const reasons: string[] = [];
+    let integrityStatus: LiveChartFrameTruth["integrity_status"] = "clean";
+    let previousTs = 0;
+
+    if (candles.length === 0) {
+      integrityStatus = "invalid";
+      reasons.push("no_candles");
+    }
+    for (const candle of candles.slice(-64)) {
+      const open = toNumber(candle.open, Number.NaN);
+      const high = toNumber(candle.high, Number.NaN);
+      const low = toNumber(candle.low, Number.NaN);
+      const close = toNumber(candle.close, Number.NaN);
+      const ts = Date.parse(String(candle.label || ""));
+      if (!Number.isFinite(ts) || !(open > 0) || !(high > 0) || !(low > 0) || !(close > 0) || high < Math.max(open, close) || low > Math.min(open, close)) {
+        integrityStatus = "invalid";
+        reasons.push("invalid_ohlc");
+        break;
+      }
+      if (previousTs > 0 && ts < previousTs) {
+        integrityStatus = "invalid";
+        reasons.push("non_monotonic_time");
+        break;
+      }
+      previousTs = ts;
+    }
+    if (integrityStatus === "clean" && candles.length < 2) {
+      integrityStatus = "degraded";
+      reasons.push("thin_frame");
+    }
+
+    const freshness: LiveChartFrameTruth["freshness"] = sourceAgeMs == null
+      ? "unknown"
+      : sourceAgeMs <= freshWindowMs
+        ? "fresh"
+        : sourceAgeMs <= agingWindowMs
+          ? "aging"
+          : "stale";
+    if (freshness === "unknown") {
+      reasons.push("source_age_unknown");
+    } else if (freshness !== "fresh") {
+      reasons.push(`source_${freshness}`);
+    }
+
+    const reconstructionReason = String(reconstructionMeta.reconstructionReason || "").trim();
+    const observationContinuity = reconstructionMeta.observationContinuity || "unknown";
+    const reconstructionFlag: LiveChartFrameTruth["reconstruction_flag"] = observationContinuity === "resumed"
+      ? "observer_resumed"
+      : /gap|stale|missing/i.test(reconstructionReason)
+        ? "source_gap"
+        : reconstructionReason
+          ? "reconstructed"
+          : "none";
+    if (reconstructionFlag !== "none") {
+      reasons.push(reconstructionFlag);
+    }
+
+    const syncStatus: LiveChartFrameTruth["sync_status"] = observationContinuity === "resumed"
+      ? "resumed"
+      : freshness === "stale"
+        ? "stale"
+        : renderMeta.partial || renderMeta.syncStatus !== "atomic"
+          ? "delayed"
+          : "live";
+    if (syncStatus !== "live") {
+      reasons.push(`sync_${syncStatus}`);
+    }
+
+    const logicalTradable = integrityStatus === "clean"
+      && syncStatus === "live"
+      && freshness === "fresh"
+      && reconstructionFlag === "none"
+      && !renderMeta.partial
+      && sourceAgeMs != null
+      && sourceAgeMs < freshWindowMs;
+    if (!logicalTradable && reasons.length === 0) {
+      reasons.push("truth_validation_failed");
+    }
+
+    const penalty = (integrityStatus === "invalid" ? 1 : integrityStatus === "degraded" ? 0.35 : 0)
+      + (freshness === "stale" ? 0.4 : freshness === "aging" ? 0.18 : freshness === "unknown" ? 0.22 : 0)
+      + (syncStatus === "stale" ? 0.38 : syncStatus === "resumed" ? 0.26 : syncStatus === "delayed" ? 0.16 : 0)
+      + (reconstructionFlag === "source_gap" ? 0.3 : reconstructionFlag === "observer_resumed" ? 0.22 : reconstructionFlag === "reconstructed" ? 0.14 : 0);
+    const confidence = integrityStatus === "invalid"
+      ? 0
+      : Math.max(0, Math.min(1, Number(renderMeta.confidence || 0) - penalty));
+
+    return {
+      integrity_status: integrityStatus,
+      sync_status: syncStatus,
+      freshness,
+      reconstruction_flag: reconstructionFlag,
+      confidence,
+      tradable: logicalTradable,
+      decision_allowed: logicalTradable,
+      reasons: Array.from(new Set(reasons)).slice(0, 8),
+    };
+  }
+
+  private resolveSocketSilenceMs(trace: HydrationSocketTrace): number {
+    const anchorIso = trace.last_message_at || trace.last_open_at;
+    if (!anchorIso) {
+      return 0;
+    }
+    const anchorMs = Date.parse(anchorIso);
+    return Number.isFinite(anchorMs) ? Math.max(0, Date.now() - anchorMs) : 0;
+  }
+
+  private stopTradeSocketWatchdog(): void {
+    if (this.ohlcvWatchdogTimer !== null) {
+      window.clearInterval(this.ohlcvWatchdogTimer);
+      this.ohlcvWatchdogTimer = null;
+    }
+  }
+
+  private stopDepthSocketWatchdog(): void {
+    if (this.depthWatchdogTimer !== null) {
+      window.clearInterval(this.depthWatchdogTimer);
+      this.depthWatchdogTimer = null;
+    }
+  }
+
+  private startTradeSocketWatchdog(socket: WebSocket): void {
+    this.stopTradeSocketWatchdog();
+    this.ohlcvWatchdogTimer = window.setInterval(() => {
+      if (this.ohlcvSocket !== socket || socket.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      const silenceMs = this.resolveSocketSilenceMs(this.hydrationTrace.trade_ws);
+      if (silenceMs < TRADE_SOCKET_INACTIVITY_MS) {
+        return;
+      }
+      this.stopTradeSocketWatchdog();
+      this.registerStreamFailure("ohlcv");
+      this.hydrationTrace = {
+        ...this.hydrationTrace,
+        trade_ws: {
+          ...this.hydrationTrace.trade_ws,
+          last_state: "error",
+          last_error_at: new Date().toISOString(),
+          last_message_type: `watchdog-timeout-${Math.round(silenceMs)}`,
+        },
+      };
+      void this.refreshNow("execution");
+      socket.close(4001, "trade-stream-watchdog-timeout");
+    }, SOCKET_WATCHDOG_INTERVAL_MS);
+  }
+
+  private startDepthSocketWatchdog(socket: WebSocket): void {
+    this.stopDepthSocketWatchdog();
+    this.depthWatchdogTimer = window.setInterval(() => {
+      if (this.depthSocket !== socket || socket.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      const silenceMs = this.resolveSocketSilenceMs(this.hydrationTrace.depth_ws);
+      if (silenceMs < DEPTH_SOCKET_INACTIVITY_MS) {
+        return;
+      }
+      this.stopDepthSocketWatchdog();
+      this.registerStreamFailure("depth");
+      this.hydrationTrace = {
+        ...this.hydrationTrace,
+        depth_ws: {
+          ...this.hydrationTrace.depth_ws,
+          last_state: "error",
+          last_error_at: new Date().toISOString(),
+          last_message_type: `watchdog-timeout-${Math.round(silenceMs)}`,
+        },
+      };
+      void this.refreshNow("execution");
+      socket.close(4002, "depth-stream-watchdog-timeout");
+    }, SOCKET_WATCHDOG_INTERVAL_MS);
   }
 
   private applyGoldenFrameWorkerTelemetry(telemetry: GoldenFrameWorkerTelemetry): void {
@@ -1075,6 +1304,7 @@ class MarketDataBus {
     }
 
     publishChartFrame(event.frame.feedKey, event.frame.candles, event.frame.meta);
+    this.lastCanonicalFramePublishedAt = Date.now();
     const partial = event.frame.meta.partial;
     const renderedFrames = this.snapshot.kernelTelemetry.renderedFrames + 1;
     const atomicFrames = this.snapshot.kernelTelemetry.atomicFrames + (partial ? 0 : 1);
@@ -1276,16 +1506,19 @@ class MarketDataBus {
         : "atomic";
     const confidence = this.computeFrameConfidence(pending, partial, stallAgeMs);
     publishChartFrame(pending.feedKey, pending.candles, {
+      ...(pending.reconstructionMeta || {}),
       syncStatus,
       partial,
       coalesced: pending.coalesced,
       confidence,
+      truth: this.buildTruthLayer(pending.candles, pending.reconstructionMeta || {}, { syncStatus, partial, confidence }),
       dynamicBufferMs: pending.dynamicBufferMs,
       stallAgeMs: partial ? stallAgeMs : 0,
       depthSequence: pending.depthSequence,
       depthEventTs: pending.depthTsMs,
       tradeEventTs: pending.tradeTsMs,
     });
+    this.lastCanonicalFramePublishedAt = Date.now();
     const renderedFrames = this.snapshot.kernelTelemetry.renderedFrames + 1;
     const atomicFrames = this.snapshot.kernelTelemetry.atomicFrames + (partial ? 0 : 1);
     const partialFrames = this.snapshot.kernelTelemetry.partialFrames + (partial ? 1 : 0);
@@ -1311,7 +1544,7 @@ class MarketDataBus {
   private queueRenderFrame(
     candles: LiveChartCandle[],
     feedKey: string,
-    input?: { tradeTsMs?: number | null; depthTsMs?: number | null; depthSequence?: number | null; coalesced?: boolean },
+    input?: { tradeTsMs?: number | null; depthTsMs?: number | null; depthSequence?: number | null; coalesced?: boolean; reconstructionMeta?: Partial<LiveChartFrameMeta> },
   ): void {
     const now = Date.now();
     const backlog = this.computeTradeBacklog();
@@ -1322,6 +1555,7 @@ class MarketDataBus {
     const nextFrame: WorkerPendingRenderFrame = {
       feedKey,
       candles,
+      reconstructionMeta: input?.reconstructionMeta,
       createdAt: now,
       tradeTsMs: Number.isFinite(input?.tradeTsMs) ? Number(input?.tradeTsMs) : null,
       depthTsMs: Number.isFinite(input?.depthTsMs) ? Number(input?.depthTsMs) : this.lastDepthEventTsMs || null,
@@ -1362,6 +1596,7 @@ class MarketDataBus {
       return;
     }
     this.pendingRenderFrame.candles = candles;
+    this.pendingRenderFrame.reconstructionMeta = input?.reconstructionMeta || this.pendingRenderFrame.reconstructionMeta;
     this.pendingRenderFrame.tradeTsMs = Number.isFinite(input?.tradeTsMs)
       ? Number(input?.tradeTsMs)
       : this.pendingRenderFrame.tradeTsMs;
@@ -1800,6 +2035,7 @@ class MarketDataBus {
     if (!bars.length || !activeFeedKey) {
       return bars;
     }
+    const reconstructionMeta = this.buildReconstructionFrameMeta(bars);
     if (this.engine) {
       this.engine.prepareFrame(bars, this.config?.timeframe);
       const swapped = this.engine.swapFrame(this.config?.timeframe);
@@ -1811,19 +2047,23 @@ class MarketDataBus {
             depthTsMs: frameContext.depthTsMs,
             depthSequence: frameContext.depthSequence,
             coalesced: frameContext.coalesced,
+            reconstructionMeta,
           });
         } else {
           publishChartFrame(activeFeedKey, candles, {
+            ...reconstructionMeta,
             syncStatus: "atomic",
             partial: false,
             coalesced: false,
             confidence: 1,
+            truth: this.buildTruthLayer(candles, reconstructionMeta, { syncStatus: "atomic", partial: false, confidence: 1 }),
             dynamicBufferMs: this.currentDynamicBufferMs,
             stallAgeMs: 0,
             depthSequence: this.lastDepthSequence,
             depthEventTs: this.lastDepthEventTsMs || null,
             tradeEventTs: this.lastTradeEventTsMs || null,
           });
+          this.lastCanonicalFramePublishedAt = Date.now();
         }
         return swapped;
       }
@@ -1835,19 +2075,23 @@ class MarketDataBus {
         depthTsMs: frameContext.depthTsMs,
         depthSequence: frameContext.depthSequence,
         coalesced: frameContext.coalesced,
+        reconstructionMeta,
       });
     } else {
       publishChartFrame(activeFeedKey, candles, {
+        ...reconstructionMeta,
         syncStatus: "atomic",
         partial: false,
         coalesced: false,
         confidence: 1,
+        truth: this.buildTruthLayer(candles, reconstructionMeta, { syncStatus: "atomic", partial: false, confidence: 1 }),
         dynamicBufferMs: this.currentDynamicBufferMs,
         stallAgeMs: 0,
         depthSequence: this.lastDepthSequence,
         depthEventTs: this.lastDepthEventTsMs || null,
         tradeEventTs: this.lastTradeEventTsMs || null,
       });
+      this.lastCanonicalFramePublishedAt = Date.now();
     }
     return bars;
   }
@@ -2174,6 +2418,7 @@ class MarketDataBus {
       window.clearInterval(this.ohlcvPingTimer);
       this.ohlcvPingTimer = null;
     }
+    this.stopTradeSocketWatchdog();
     this.safeCloseSocket(this.ohlcvSocket);
     this.ohlcvSocket = null;
     if (this.depthReconnectTimer !== null) {
@@ -2184,6 +2429,7 @@ class MarketDataBus {
       window.clearInterval(this.depthPingTimer);
       this.depthPingTimer = null;
     }
+    this.stopDepthSocketWatchdog();
     this.safeCloseSocket(this.depthSocket);
     this.depthSocket = null;
     for (const timer of this.auxDepthReconnectTimers.values()) {
@@ -2494,6 +2740,7 @@ class MarketDataBus {
             ...this.hydrationTrace.trade_ws,
             open_count: this.hydrationTrace.trade_ws.open_count + 1,
             last_state: "open",
+            last_open_at: new Date().toISOString(),
           },
         };
       }
@@ -2501,6 +2748,7 @@ class MarketDataBus {
         this.resetStreamFailures("ohlcv");
         this.snapshot = { ...this.snapshot, ohlcvStreamState: "live" };
         this.emit();
+        this.startTradeSocketWatchdog(socket);
       }
       const timer = window.setInterval(() => {
         if (socket.readyState === WebSocket.OPEN) {
@@ -2624,6 +2872,7 @@ class MarketDataBus {
         window.clearInterval(this.ohlcvPingTimer);
         this.ohlcvPingTimer = null;
       }
+      this.stopTradeSocketWatchdog();
       if (this.ohlcvSocket !== socket) {
         return;
       }
@@ -2675,7 +2924,7 @@ class MarketDataBus {
       ? baseRouting.arbitrage as JsonMap
       : null;
     const baseCandidateByVenue = new Map(baseCandidates.map((candidate) => [String(candidate.venue || "unknown"), candidate]));
-    const candidates = fusion.routeCandidates.map((candidate) => ({
+    const fusionCandidates = fusion.routeCandidates.map((candidate) => ({
       ...(baseCandidateByVenue.get(candidate.venue) || {}),
       venue: candidate.venue,
       score: candidate.score,
@@ -2689,14 +2938,18 @@ class MarketDataBus {
       freshness_ms: candidate.freshnessMs,
       source: "v6-price-fusion",
     }));
-    const mode = candidates.length > 0
+    const candidates = fusionCandidates.length > 0 ? fusionCandidates : baseCandidates;
+    const source = fusionCandidates.length > 0
+      ? "v6-price-fusion"
+      : backendSource || String(baseRouting?.source || "").trim() || "backend-routing";
+    const mode = fusionCandidates.length > 0
       ? "fusion-active"
       : baseCandidates.length > 0
-        ? "fusion-empty-overrode-backend"
+        ? "backend-preserved-no-fusion"
         : "fusion-empty-no-backend";
     return {
       ...(baseRouting || {}),
-      source: "v6-price-fusion",
+      source,
       fusion_price: fusion.fusionPrice,
       display_price: fusion.displayPrice,
       arbitrage: {
@@ -2718,7 +2971,8 @@ class MarketDataBus {
         mode,
         backend_source: backendSource,
         backend_candidate_count: baseCandidates.length,
-        fusion_candidate_count: candidates.length,
+        fusion_candidate_count: fusionCandidates.length,
+        effective_candidate_count: candidates.length,
         fusion_venue_count: fusion.venueCount,
         fusion_filtered_tick_count: fusion.filteredTicks.length,
         quote_sync: this.fusionQuoteSyncStats,
@@ -2793,6 +3047,7 @@ class MarketDataBus {
             ...this.hydrationTrace.depth_ws,
             open_count: this.hydrationTrace.depth_ws.open_count + 1,
             last_state: "open",
+            last_open_at: new Date().toISOString(),
           },
         };
       }
@@ -2800,6 +3055,7 @@ class MarketDataBus {
         this.resetStreamFailures("depth");
         this.snapshot = { ...this.snapshot, depthStreamState: "live" };
         this.emit();
+        this.startDepthSocketWatchdog(socket);
       }
       const timer = window.setInterval(() => {
         if (socket.readyState === WebSocket.OPEN) {
@@ -2953,6 +3209,7 @@ class MarketDataBus {
         window.clearInterval(this.depthPingTimer);
         this.depthPingTimer = null;
       }
+      this.stopDepthSocketWatchdog();
       if (this.depthSocket !== socket) {
         return;
       }

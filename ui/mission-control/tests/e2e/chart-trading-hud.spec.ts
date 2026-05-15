@@ -7,7 +7,7 @@ test("@chart chart trading HUD keeps key interactions stable after extraction", 
   await loginIfRequired(page, "/terminal", "HUD test");
 
   const candleProbe = page.locator(".chart-flow-pill").filter({
-    hasText: /CANDLE t\d+ u\d+ hb\d+ age/i,
+    hasText: /CANDLE t\d+ u\d+ hb\d+ .* age/i,
   }).first();
   await expect(candleProbe).toBeVisible({ timeout: 30_000 });
 

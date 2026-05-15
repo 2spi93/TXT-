@@ -2,6 +2,8 @@ export type LocalFreshnessState = "fresh" | "stale" | "degraded" | "hard-fail";
 export type LocalHealthTone = "good" | "warn" | "bad";
 export type LocalStreamState = "offline" | "connecting" | "live";
 export type LocalOhlcvSignal = "OHLCV_RENDERABLE" | "OHLCV_PARTIAL" | "OHLCV_UNUSABLE";
+export type LocalTruthState = "live" | "stale" | "unknown";
+export type LocalIntegrityState = "inactive" | "high" | "degraded" | "broken";
 
 export type LocalTerminalPerceptualRuntime = {
   engine: "v3" | "v4";
@@ -147,6 +149,34 @@ export type LocalExecutionDataset = {
   captured_from: string | null;
 };
 
+export type LocalMultiChartIntegrity = {
+  state: LocalIntegrityState;
+  activeTiles: number;
+  expectedTiles: number;
+  syncAgeMs: number | null;
+  sourceDivergenceCount: number;
+  masterClockDriftMs: number | null;
+  confidencePct: number | null;
+  reasons: string[];
+  summary: string;
+};
+
+export type LocalV5Observation = {
+  state: LocalIntegrityState;
+  enabled: boolean;
+  mode: string;
+  drawdownPaused: boolean;
+  blockedReasons: string[];
+  sourceLabel: string;
+  promotionReady: boolean;
+  requiredShadowCycles: number;
+  observedShadowCycles: number;
+  requiredObservationHours: number;
+  observedObservationHours: number;
+  missingExecutionMetrics: boolean;
+  summary: string;
+};
+
 export type LocalTerminalRuntimeCapture = {
   version: 1;
   clientId: string;
@@ -222,6 +252,17 @@ export type LocalTerminalRuntimeCapture = {
       syntheticHeartbeatOpens: number;
       lastUpdateAge: string;
     };
+    truth?: {
+      exchangeStatus: LocalTruthState;
+      exchangeAgeMs: number | null;
+      exchangeAgeLabel: string;
+      exchangeSourceLabel: string | null;
+      truthStatusLabel?: string | null;
+      truthStatusReasonLabel?: string | null;
+      busLagMs: number | null;
+      endToEndLagMs: number | null;
+      renderLagMs: number | null;
+    };
     syncDiagnostics?: {
       bus_seq: number;
       last_trade_time: string | null;
@@ -255,6 +296,8 @@ export type LocalTerminalRuntimeCapture = {
       summary: string;
       detail: string;
     };
+    multiChartIntegrity?: LocalMultiChartIntegrity;
+    v5Observation?: LocalV5Observation;
     smartState?: {
       state: "VALID" | "WAIT" | "NO_TRADE";
       reason: string;
@@ -421,6 +464,15 @@ export type BuildLocalTerminalRuntimeCaptureInput = {
   candleUpdates: number;
   syntheticHeartbeatOpens: number;
   candleLastUpdateAge: string;
+  exchangeStatusState: LocalTruthState;
+  exchangeAgeMs: number | null;
+  exchangeAgeLabel: string;
+  exchangeSourceLabel: string | null;
+  truthStatusLabel: string | null;
+  truthStatusReasonLabel: string | null;
+  busLagMs: number | null;
+  endToEndLagMs: number | null;
+  renderLagMs: number | null;
   syncBusSeq: number;
   syncLastTradeTime: string | null;
   syncDepthAgeMs: number | null;
@@ -442,6 +494,28 @@ export type BuildLocalTerminalRuntimeCaptureInput = {
   latestExecutionMaxDrawdownUsd: number | null;
   latestExecutionHoldingTimeSec: number | null;
   latestExecutionCapturedFrom: string | null;
+  multiChartState: LocalIntegrityState;
+  multiChartActiveTiles: number;
+  multiChartExpectedTiles: number;
+  multiChartSyncAgeMs: number | null;
+  multiChartSourceDivergenceCount: number;
+  multiChartMasterClockDriftMs: number | null;
+  multiChartConfidencePct: number | null;
+  multiChartReasons: string[];
+  multiChartSummaryLabel: string;
+  v5Enabled: boolean;
+  v5Mode: string;
+  v5DrawdownPaused: boolean;
+  v5BlockedReasons: string[];
+  v5SourceLabel: string;
+  v5PromotionReady: boolean;
+  v5RequiredShadowCycles: number;
+  v5ObservedShadowCycles: number;
+  v5RequiredObservationHours: number;
+  v5ObservedObservationHours: number;
+  v5MissingExecutionMetrics: boolean;
+  v5Reasons: string[];
+  v5SummaryLabel: string;
   chartCompactAlertLabel: string;
   chartFlowAlertText: string;
   perceptual?: LocalTerminalPerceptualRuntime | null;
@@ -554,6 +628,7 @@ export function buildLocalTerminalRuntimeCapture(input: BuildLocalTerminalRuntim
   const exactStateVector = [
     `BUS ${String(input.marketBusHealthStatus || "offline").toUpperCase()}`,
     `OHLCV ${input.ohlcvStreamState.toUpperCase()}`,
+    `XCH ${input.exchangeStatusState.toUpperCase()} ${input.exchangeAgeLabel}`,
     `BARS ${input.ohlcvFreshnessState.toUpperCase()} ${input.barsAge}`,
     `DEPTH ${input.depthFreshnessState.toUpperCase()} ${input.depthAge}`,
     `TRADES ${input.tradesFreshnessState.toUpperCase()} ${input.tradesAge}`,
@@ -682,6 +757,17 @@ export function buildLocalTerminalRuntimeCapture(input: BuildLocalTerminalRuntim
         syntheticHeartbeatOpens: input.syntheticHeartbeatOpens,
         lastUpdateAge: input.candleLastUpdateAge,
       },
+      truth: {
+        exchangeStatus: input.exchangeStatusState,
+        exchangeAgeMs: input.exchangeAgeMs,
+        exchangeAgeLabel: input.exchangeAgeLabel,
+        exchangeSourceLabel: input.exchangeSourceLabel,
+        truthStatusLabel: input.truthStatusLabel,
+        truthStatusReasonLabel: input.truthStatusReasonLabel,
+        busLagMs: input.busLagMs,
+        endToEndLagMs: input.endToEndLagMs,
+        renderLagMs: input.renderLagMs,
+      },
       syncDiagnostics: {
         bus_seq: input.syncBusSeq,
         last_trade_time: input.syncLastTradeTime,
@@ -714,6 +800,38 @@ export function buildLocalTerminalRuntimeCapture(input: BuildLocalTerminalRuntim
         bufferWindowMs: input.temporalSyncBufferWindowMs,
         summary: input.temporalSyncSummaryLabel,
         detail: input.temporalSyncDetailLabel,
+      },
+      multiChartIntegrity: {
+        state: input.multiChartState,
+        activeTiles: input.multiChartActiveTiles,
+        expectedTiles: input.multiChartExpectedTiles,
+        syncAgeMs: input.multiChartSyncAgeMs,
+        sourceDivergenceCount: input.multiChartSourceDivergenceCount,
+        masterClockDriftMs: input.multiChartMasterClockDriftMs,
+        confidencePct: input.multiChartConfidencePct,
+        reasons: input.multiChartReasons,
+        summary: input.multiChartSummaryLabel,
+      },
+      v5Observation: {
+        state: input.v5Enabled
+          ? (input.v5DrawdownPaused || (input.v5BlockedReasons.length > 0 && input.v5MissingExecutionMetrics)
+            ? "broken"
+            : input.v5BlockedReasons.length > 0 || !input.v5PromotionReady || input.v5MissingExecutionMetrics
+              ? "degraded"
+              : "high")
+          : "inactive",
+        enabled: input.v5Enabled,
+        mode: input.v5Mode,
+        drawdownPaused: input.v5DrawdownPaused,
+        blockedReasons: input.v5BlockedReasons,
+        sourceLabel: input.v5SourceLabel,
+        promotionReady: input.v5PromotionReady,
+        requiredShadowCycles: input.v5RequiredShadowCycles,
+        observedShadowCycles: input.v5ObservedShadowCycles,
+        requiredObservationHours: input.v5RequiredObservationHours,
+        observedObservationHours: input.v5ObservedObservationHours,
+        missingExecutionMetrics: input.v5MissingExecutionMetrics,
+        summary: input.v5SummaryLabel,
       },
       smartState: {
         state: input.smartMarketState,

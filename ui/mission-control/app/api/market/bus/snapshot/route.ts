@@ -5,6 +5,12 @@ import { cpFetchJsonSafe, extractMcContextHeaders } from "../../../../../lib/con
 
 type JsonMap = Record<string, unknown>;
 
+function safeRecord(value: unknown): JsonMap {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as JsonMap
+    : {};
+}
+
 function toNumber(value: unknown, fallback = NaN): number {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : fallback;
@@ -102,7 +108,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
 
   const headers = extractMcContextHeaders(request);
   const baseUrl = new URL(request.url).origin;
-  const [ohlcvRows, depthSnapshot, microstructure, tradesPayload] = await Promise.all([
+  const [ohlcvRows, depthSnapshot, microstructure, tradesPayload, tradePreprocessorJournalPayload, tradePreprocessorAnalyticsPayload] = await Promise.all([
     fetch(`${baseUrl}/api/market/ohlcv?instrument=${encodeURIComponent(instrument)}&venue=${encodeURIComponent(venue)}&timeframe=${encodeURIComponent(timeframe)}&limit=500`, {
       cache: "no-store",
       headers,
@@ -113,9 +119,17 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     }).then((res) => (res.ok ? res.json() : null)).catch(() => null),
     fallbackMicrostructure(instrument),
     cpFetchJsonSafe(
-      `/v1/market/trades?instrument=${encodeURIComponent(instrument)}&venue=${encodeURIComponent(venue)}&limit=${encodeURIComponent(tradeLimit)}`,
+      `/v1/market/trades/preprocessed?instrument=${encodeURIComponent(instrument)}&venue=${encodeURIComponent(venue)}&limit=${encodeURIComponent(tradeLimit)}`,
       { headers },
-    ).then(({ response, payload }) => (response.ok ? payload : [])).catch(() => []),
+    ).then(({ response, payload }) => (response.ok ? payload : { items: [] })).catch(() => ({ items: [] })),
+    cpFetchJsonSafe(
+      `/v1/market/trades/preprocessor/journal?instrument=${encodeURIComponent(instrument)}&venue=${encodeURIComponent(venue)}&hours=12&limit=24`,
+      { headers },
+    ).then(({ response, payload }) => (response.ok ? payload : { items: [], summary: {} })).catch(() => ({ items: [], summary: {} })),
+    cpFetchJsonSafe(
+      `/v1/market/trades/preprocessor/analytics?instrument=${encodeURIComponent(instrument)}&venue=${encodeURIComponent(venue)}&limit=12`,
+      { headers },
+    ).then(({ response, payload }) => (response.ok ? payload : { windows: {}, thresholds: {} })).catch(() => ({ windows: {}, thresholds: {} })),
   ]);
 
   const nowMs = Date.now();
@@ -150,6 +164,70 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     : (tradesPayload && typeof tradesPayload === "object" && Array.isArray((tradesPayload as JsonMap).items))
       ? (tradesPayload as JsonMap).items as unknown[]
       : [];
+  const tradePreprocessor = (tradesPayload && typeof tradesPayload === "object" && !Array.isArray(tradesPayload))
+    ? (((tradesPayload as JsonMap).preprocessor && typeof (tradesPayload as JsonMap).preprocessor === "object")
+      ? (tradesPayload as JsonMap).preprocessor as JsonMap
+      : null)
+    : null;
+  const tradePreprocessorJournal = (tradePreprocessorJournalPayload && typeof tradePreprocessorJournalPayload === "object" && !Array.isArray(tradePreprocessorJournalPayload))
+    ? (Array.isArray((tradePreprocessorJournalPayload as JsonMap).items)
+      ? (tradePreprocessorJournalPayload as JsonMap).items as JsonMap[]
+      : [])
+    : [];
+  const tradePreprocessorJournalSummary = (tradePreprocessorJournalPayload && typeof tradePreprocessorJournalPayload === "object" && !Array.isArray(tradePreprocessorJournalPayload))
+    ? ((((tradePreprocessorJournalPayload as JsonMap).summary) && typeof (tradePreprocessorJournalPayload as JsonMap).summary === "object")
+      ? (tradePreprocessorJournalPayload as JsonMap).summary as JsonMap
+      : null)
+    : null;
+  const tradePreprocessorAnalytics = (tradePreprocessorAnalyticsPayload && typeof tradePreprocessorAnalyticsPayload === "object" && !Array.isArray(tradePreprocessorAnalyticsPayload))
+    ? tradePreprocessorAnalyticsPayload as JsonMap
+    : null;
+  const tradePreprocessorThresholds = safeRecord(tradePreprocessorAnalytics?.thresholds);
+  const analytics24h = Array.isArray(safeRecord(tradePreprocessorAnalytics?.windows).last_24h)
+    ? safeRecord(tradePreprocessorAnalytics?.windows).last_24h as JsonMap[]
+    : [];
+  const priceDiscovery24h = analytics24h.find((row) => String(row.market_regime || "") === "price_discovery") || null;
+  const thresholdSavedPct = toNumber(tradePreprocessorThresholds.price_discovery_saved_pct, 30);
+  const thresholdRawCount = Math.max(1, Math.trunc(toNumber(tradePreprocessorThresholds.price_discovery_min_raw_count, 40)));
+  const currentSavedPct = toNumber(tradePreprocessor?.compression_saved_pct, 0);
+  const currentRawCount = Math.max(0, Math.trunc(toNumber(tradePreprocessor?.raw_count, 0)));
+  const currentRegime = String(tradePreprocessor?.market_regime || "unknown");
+  const aggressiveBuckets24h = priceDiscovery24h ? Math.max(0, Math.trunc(toNumber(priceDiscovery24h.aggressive_bucket_count, 0))) : 0;
+  const tradePreprocessorAlert = currentRegime === "price_discovery" && currentRawCount >= thresholdRawCount && currentSavedPct >= thresholdSavedPct
+    ? {
+      state: "warn",
+      triggered: true,
+      reason_code: "price-discovery-compression-too-high",
+      threshold_saved_pct: thresholdSavedPct,
+      threshold_raw_count: thresholdRawCount,
+      summary: `Price discovery compression too aggressive: ${currentSavedPct.toFixed(1)}% saved on raw ${currentRawCount}.`,
+      current_saved_pct: currentSavedPct,
+      current_raw_count: currentRawCount,
+      aggressive_buckets_24h: aggressiveBuckets24h,
+    }
+    : aggressiveBuckets24h > 0
+      ? {
+        state: "watch",
+        triggered: true,
+        reason_code: "price-discovery-buckets-over-threshold-24h",
+        threshold_saved_pct: thresholdSavedPct,
+        threshold_raw_count: thresholdRawCount,
+        summary: `24h price discovery alert buckets: ${aggressiveBuckets24h} (max saved ${toNumber(priceDiscovery24h?.max_saved_pct, 0).toFixed(1)}%).`,
+        current_saved_pct: currentSavedPct,
+        current_raw_count: currentRawCount,
+        aggressive_buckets_24h: aggressiveBuckets24h,
+      }
+      : {
+        state: "ok",
+        triggered: false,
+        reason_code: "within-threshold",
+        threshold_saved_pct: thresholdSavedPct,
+        threshold_raw_count: thresholdRawCount,
+        summary: `Compression within price discovery threshold (${currentSavedPct.toFixed(1)}% / raw ${currentRawCount}).`,
+        current_saved_pct: currentSavedPct,
+        current_raw_count: currentRawCount,
+        aggressive_buckets_24h: aggressiveBuckets24h,
+      };
   const latestTradeMs = trades.reduce((latest, trade) => {
     const entry = (trade && typeof trade === "object") ? trade as JsonMap : {};
     const raw = toNumber(entry.T ?? entry.ts ?? entry.timestamp ?? entry.time, NaN);
@@ -195,6 +273,15 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
         },
         depth: {
           last_update_id: depthUpdateId,
+        },
+      },
+      preprocessor: {
+        trades: {
+          ...(tradePreprocessor || {}),
+          journal: tradePreprocessorJournal,
+          journal_summary: tradePreprocessorJournalSummary,
+          analytics: tradePreprocessorAnalytics,
+          alert: tradePreprocessorAlert,
         },
       },
     },

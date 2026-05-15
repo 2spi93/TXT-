@@ -241,7 +241,7 @@ if command -v docker >/dev/null 2>&1; then
   (
     cd "$ROOT_DIR"
     docker compose ps > "$CAPTURE_DIR/docker-compose-ps.txt" 2>&1 || true
-    docker compose logs --tail "$CAPTURE_LOG_TAIL" mission-control-ui > "$CAPTURE_DIR/mission-control-ui.log" 2>&1 || true
+        docker compose logs --tail "$CAPTURE_LOG_TAIL" mission-control-ui-blue mission-control-ui-green > "$CAPTURE_DIR/mission-control-ui.log" 2>&1 || true
     docker compose logs --tail "$CAPTURE_LOG_TAIL" market-data > "$CAPTURE_DIR/market-data.log" 2>&1 || true
     docker compose logs --tail "$CAPTURE_LOG_TAIL" control-plane > "$CAPTURE_DIR/control-plane.log" 2>&1 || true
     docker compose logs --tail "$CAPTURE_LOG_TAIL" execution-router > "$CAPTURE_DIR/execution-router.log" 2>&1 || true

@@ -3,6 +3,14 @@ import { NextRequest, NextResponse } from "next/server";
 import { getControlPlaneToken } from "../../../../lib/controlPlane";
 import { appendV2RiskJournalEntry, readV2RiskJournalEntries } from "../../../../lib/v2RiskJournal";
 
+function parseDecisionOutcome(value: unknown): "correct" | "false_positive" | "unknown" | undefined {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "correct" || normalized === "false_positive" || normalized === "unknown") {
+    return normalized;
+  }
+  return undefined;
+}
+
 function unauthorized(): NextResponse {
   return NextResponse.json({ message: "Authentication required" }, { status: 401 });
 }
@@ -36,6 +44,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   const strategy = String(body.strategy || "").trim();
   const action = String(body.action || "").trim();
   const detail = String(body.detail || "").trim();
+  const decisionOutcome = parseDecisionOutcome(body.decisionOutcome);
   const meta = (body.meta && typeof body.meta === "object") ? (body.meta as Record<string, unknown>) : undefined;
 
   if (!symbol || !timeframe || !strategy || !action || !detail) {
@@ -50,6 +59,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     strategy,
     action,
     detail,
+    decisionOutcome,
     meta,
   };
 

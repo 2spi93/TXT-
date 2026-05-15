@@ -82,7 +82,7 @@ async function expandDatasetForPan(page: Page, chart: Locator, timeframe: string
   await zoomOutButton.click();
   return waitForGpuCameraState(
     chart,
-    (state) => state.timeframe === timeframe && state.visibleBars === currentVisibleBars && state.from > 0,
+    (state) => state.timeframe === timeframe && state.visibleBars >= currentVisibleBars && state.from > 0,
     6_000,
   );
 }

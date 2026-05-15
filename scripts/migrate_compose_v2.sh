@@ -70,7 +70,7 @@ if [[ -f docker-compose.distributed.yml ]]; then
 fi
 
 echo "[5b/8] Clean legacy compose v1 containers (name conflicts)"
-legacy_regex='^[a-f0-9]{12,}_(txt-postgres|mission-control-ui|mission-control-gateway|mission-control-tls|control-plane|market-data|risk-gateway|broker-adapter|ai-orchestrator|embeddings-service|mt5-bridge|execution-router)$'
+legacy_regex='^[a-f0-9]{12,}_(txt-postgres|mission-control-ui|mission-control-ui-blue|mission-control-ui-green|mission-control-gateway|mission-control-tls|control-plane|market-data|risk-gateway|broker-adapter|ai-orchestrator|embeddings-service|mt5-bridge|execution-router)$'
 mapfile -t legacy_containers < <(docker ps -a --format '{{.Names}}' | grep -E "$legacy_regex" || true)
 if [[ ${#legacy_containers[@]} -gt 0 ]]; then
   echo "[info] Removing legacy containers: ${legacy_containers[*]}"
