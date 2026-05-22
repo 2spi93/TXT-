@@ -27,6 +27,7 @@ What this does:
 - builds the inactive UI dist (`.next-runtime-blue` or `.next-runtime-green`)
 - starts the matching container
 - waits for healthy status
+- refuses the active slot by default, so the published UI is not rebuilt in place
 
 If you need a specific slot:
 
@@ -34,6 +35,14 @@ If you need a specific slot:
 scripts/mission_control_blue_green.sh deploy blue
 scripts/mission_control_blue_green.sh deploy green
 ```
+
+If you intentionally need an emergency in-place rebuild of the active slot, opt in explicitly:
+
+```bash
+ALLOW_ACTIVE_SLOT_DEPLOY=1 scripts/mission_control_blue_green.sh deploy blue
+```
+
+Use that override only when the standby path cannot be used.
 
 ## 3. Flip Traffic
 

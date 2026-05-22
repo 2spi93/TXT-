@@ -109,6 +109,21 @@ services:
       retries: 10
       start_period: 15s
 
+  runtime-redis:
+    image: redis:7-alpine
+    container_name: runtime-redis
+    restart: unless-stopped
+    <<: *txt-runtime-guardrails
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
   control-plane:
     image: txt-python:3.11
     build:
@@ -132,6 +147,9 @@ services:
       PREDICTOR_V8_URL: http://predictor-v8:8008
       RUST_EXECUTION_ENGINE_URL: http://rust-execution-engine:8011
       RUST_EXECUTION_ENGINE_ENABLED: "1"
+      MARKET_RECORDER_URL: http://market-recorder:8009
+      MARKET_RECORDER_EMIT_ENABLED: ${MARKET_RECORDER_EMIT_ENABLED:-0}
+      RUNTIME_REDIS_URL: redis://runtime-redis:6379/0
       DATABASE_URL_FILE: /run/secrets/database_url
       APPROVAL_HMAC_SECRET_FILE: /run/secrets/approval_hmac_secret
     env_file:
@@ -153,6 +171,8 @@ services:
       start_period: 20s
     depends_on:
       postgres:
+        condition: service_healthy
+      runtime-redis:
         condition: service_healthy
       risk-gateway:
         condition: service_healthy
@@ -270,6 +290,8 @@ services:
       DATABASE_URL_FILE: /run/secrets/database_url
       MARKET_DATA_URL: http://market-data:8003
       BROKER_ADAPTER_URL: http://broker-adapter:8004
+      MARKET_RECORDER_URL: http://market-recorder:8009
+      MARKET_RECORDER_EMIT_ENABLED: ${MARKET_RECORDER_EMIT_ENABLED:-0}
     command: >
       sh -c "uvicorn apps.execution_router.main:app --host 0.0.0.0 --port 8002"
     expose:
@@ -299,6 +321,8 @@ services:
       GOLDAPI_API_KEY_FILE: /workspace/secrets/goldapi_api_key
       TWELVEDATA_API_KEY_FILE: /workspace/secrets/twelvedata_api_key
       METALSAPI_API_KEY_FILE: /workspace/secrets/metalsapi_api_key
+      MARKET_RECORDER_URL: http://market-recorder:8009
+      MARKET_RECORDER_EMIT_ENABLED: ${MARKET_RECORDER_EMIT_ENABLED:-0}
     command: >
       sh -c "uvicorn apps.market_data_plane.main:app --host 0.0.0.0 --port 8003 --ws websockets"
     expose:
@@ -314,6 +338,29 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+
+  market-recorder:
+    image: txt-python:3.11
+    container_name: market-recorder
+    restart: unless-stopped
+    <<: *txt-market-guardrails
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    environment:
+      MARKET_RECORDER_WRITER_ENABLED: ${MARKET_RECORDER_WRITER_ENABLED:-0}
+      MARKET_RECORDER_STORAGE_ROOT: ${MARKET_RECORDER_STORAGE_ROOT:-/workspace/data/market-data}
+      MARKET_RECORDER_BUNDLE_SIGNING_SECRET: ${MARKET_RECORDER_BUNDLE_SIGNING_SECRET:-txt-market-recorder-dev}
+    command: >
+      sh -c "uvicorn apps.market_recorder.main:app --host 0.0.0.0 --port 8009"
+    expose:
+      - "8009"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8009/health', timeout=3); sys.exit(0)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
 
   broker-adapter:
     image: txt-python:3.11

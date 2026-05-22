@@ -28,6 +28,10 @@ build_is_complete() {
   return 0
 }
 
+prepare_dist_dir() {
+  mkdir -p "$dist_dir/server" "$dist_dir/static"
+}
+
 needs_install=0
 if [ "$force_bootstrap" = "1" ] || [ ! -d node_modules ]; then
   needs_install=1
@@ -48,6 +52,7 @@ fi
 
 if [ "$needs_build" = "1" ]; then
   rm -rf "$dist_dir"
+  prepare_dist_dir
   npm run build
 fi
 
@@ -56,7 +61,7 @@ current_build_id="$(cat "$build_id_file" 2>/dev/null || true)"
 app_pid=""
 
 start_server() {
-  ./node_modules/.bin/next start -p "${PORT:-3000}" &
+  ./node_modules/.bin/next start -H 0.0.0.0 -p "${PORT:-3000}" &
   app_pid=$!
 }
 
@@ -81,6 +86,7 @@ while true; do
   if ! build_is_complete; then
     stop_server
     rm -rf "$dist_dir"
+    prepare_dist_dir
     npm run build
     current_build_id="$(cat "$build_id_file" 2>/dev/null || true)"
     start_server

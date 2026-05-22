@@ -22,6 +22,11 @@ slot_service() {
   printf 'mission-control-ui-%s\n' "$1"
 }
 
+prepare_slot_dist_dir() {
+  local dist_dir="$1"
+  mkdir -p "$UI_DIR/$dist_dir/server" "$UI_DIR/$dist_dir/static"
+}
+
 ensure_active_slot_file() {
   mkdir -p "$(dirname "$ACTIVE_SLOT_FILE")"
   if [[ ! -f "$ACTIVE_SLOT_FILE" ]]; then
@@ -32,10 +37,13 @@ ensure_active_slot_file() {
 write_active_slot() {
   local slot="$1"
   local port
+  local tmp_file
   port="$(slot_port "$slot")"
-  cat >"$ACTIVE_SLOT_FILE" <<EOF
+  tmp_file="${ACTIVE_SLOT_FILE}.tmp"
+  cat >"$tmp_file" <<EOF
 set \$upstream_ui http://mission-control-ui-${slot}:${port};
 EOF
+  mv "$tmp_file" "$ACTIVE_SLOT_FILE"
 }
 
 active_slot() {
@@ -93,7 +101,13 @@ status_cmd() {
 
 deploy_cmd() {
   local slot="${1:-$(inactive_slot)}"
-  local port dist_dir service
+  local port dist_dir service active inactive
+  active="$(active_slot)"
+  inactive="$(inactive_slot)"
+  if [[ "$slot" == "$active" && "${ALLOW_ACTIVE_SLOT_DEPLOY:-0}" != '1' ]]; then
+    printf '[blue-green] refusing to deploy active slot=%s; deploy standby slot=%s then flip, or set ALLOW_ACTIVE_SLOT_DEPLOY=1 for an emergency in-place rebuild\n' "$slot" "$inactive" >&2
+    return 1
+  fi
   port="$(slot_port "$slot")"
   dist_dir="$(slot_dist_dir "$slot")"
   service="$(slot_service "$slot")"
@@ -101,6 +115,8 @@ deploy_cmd() {
   printf '[blue-green] building slot=%s dist=%s port=%s\n' "$slot" "$dist_dir" "$port"
   (
     cd "$UI_DIR"
+    rm -rf "$dist_dir"
+    prepare_slot_dist_dir "$dist_dir"
     NEXT_DIST_DIR="$dist_dir" PORT="$port" npm run build
   )
 
@@ -138,6 +154,9 @@ Commands:
   flip [slot]        Flip gateway upstream to the target healthy slot
   promote [slot]     Deploy inactive slot, wait health, then flip
   rollback           Flip back to the other slot immediately
+
+Notes:
+  deploy refuses the active slot unless ALLOW_ACTIVE_SLOT_DEPLOY=1 is set.
 EOF
 }
 
