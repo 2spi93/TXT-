@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -34,7 +34,6 @@ struct HftStats {
     dropped: AtomicU64,
     processed: AtomicU64,
     last_edge_bps: AtomicU64,
-    worker_core: AtomicUsize,
     worker_started: AtomicBool,
 }
 
@@ -45,6 +44,7 @@ pub struct HftRuntime {
     config: HftRuntimeConfig,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct HftHealthSnapshot {
     pub enabled: bool,
@@ -82,7 +82,6 @@ impl HftRuntime {
                 dropped: AtomicU64::new(0),
                 processed: AtomicU64::new(0),
                 last_edge_bps: AtomicU64::new(0),
-                worker_core: AtomicUsize::new(runtime_config.worker_core.unwrap_or(usize::MAX)),
                 worker_started: AtomicBool::new(false),
             }),
             config: runtime_config,

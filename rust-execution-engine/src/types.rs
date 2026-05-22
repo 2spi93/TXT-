@@ -205,6 +205,7 @@ pub struct RealityGapSample {
     pub created_at: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RealityGapCalibrationProfile {
     #[serde(default)]

@@ -14,6 +14,7 @@ fn main() {
     const ITERATIONS: usize = 1_000_000;
     let queue = ArrayQueue::new(8192);
     let start = Instant::now();
+    let mut checksum = 0.0_f64;
 
     for index in 0..ITERATIONS {
         let sample = FastTradeSample {
@@ -25,15 +26,21 @@ fn main() {
         while queue.push(sample).is_err() {
             let _ = queue.pop();
         }
-        let _ = queue.pop();
+        if let Some(sample) = queue.pop() {
+            checksum += sample.estimated_notional_usd
+                + sample.max_spread_bps
+                + sample.timestamp_ns as f64
+                + f64::from(sample.side);
+        }
     }
 
     let elapsed = start.elapsed();
     let per_iteration_ns = elapsed.as_nanos() as f64 / ITERATIONS as f64;
     println!(
-        "{{\"iterations\":{},\"elapsed_ms\":{:.3},\"per_iteration_ns\":{:.3}}}",
+        "{{\"iterations\":{},\"elapsed_ms\":{:.3},\"per_iteration_ns\":{:.3},\"checksum\":{:.3}}}",
         ITERATIONS,
         elapsed.as_secs_f64() * 1000.0,
-        per_iteration_ns
+        per_iteration_ns,
+        checksum
     );
 }
