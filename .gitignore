@@ -1,4 +1,5 @@
 # Local environment and secrets
+.vscode/
 .env
 .env.*
 !.env.example
@@ -53,6 +54,18 @@ ui/mission-control/scripts/*
 # Smoke scripts at root
 ui/mission-control/final_smoke.js
 ui/mission-control/sidecar_smoke.js
+ui/mission-control/fetch_live_ops.js
+ui/mission-control/playwright_probe.js
+ui/mission-control/playwright_probe_final.js
+ui/mission-control/playwright_probe_v2.js
+ui/mission-control/playwright_validation.js
+ui/mission-control/playwright_validation_v2.js
+ui/mission-control/test-cold-load.js
+ui/mission-control/test-cold-load-v2.js
+ui/mission-control/v3_probe.js
+ui/mission-control/v3_probe_v2.js
+ui/mission-control/validate.js
+ui/mission-control/validate_live_ops.js
 
 # Artifacts
 artifacts/
