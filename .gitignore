@@ -58,7 +58,12 @@ ui/mission-control/sidecar_smoke.js
 artifacts/
 ui/mission-control/artifacts/
 ui/mission-control/build_log.txt
+ui/mission-control/lint_output.txt
 ui/mission-control/wget-log
+ui/mission-control/.tmp/
+ui/mission-control/.next-debug-prerender/
+soak_results.json
+token.txt
 
 # Site deployment/runtime artifacts
 sites/*/.autopublish/

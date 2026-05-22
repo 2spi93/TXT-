@@ -19,7 +19,6 @@ export default function ChartHudOrderRiskPanel({
   onSetChartTargetGainUsd,
   chartRiskGuardEnabled,
   onToggleChartRiskGuardEnabled,
-  uiMode,
   onApplySafeRiskPreset,
   onApplyBalancedRiskPreset,
   onApplyDeskRiskPreset,
@@ -81,14 +80,9 @@ export default function ChartHudOrderRiskPanel({
         <button type="button" className={`chart-chip ${chartRiskGuardEnabled ? "active" : ""}`} onClick={onToggleChartRiskGuardEnabled}>
           Guard {chartRiskGuardEnabled ? "On" : "Off"}
         </button>
-        {uiMode === "novice" ? (
-          <>
-            <button type="button" className="chart-chip" onClick={onApplySafeRiskPreset}>Safe</button>
-            <button type="button" className="chart-chip" onClick={onApplyBalancedRiskPreset}>Balanced</button>
-          </>
-        ) : (
-          <button type="button" className="chart-chip" onClick={onApplyDeskRiskPreset}>Desk</button>
-        )}
+        <button type="button" className="chart-chip" onClick={onApplySafeRiskPreset}>Safe</button>
+        <button type="button" className="chart-chip" onClick={onApplyBalancedRiskPreset}>Balanced</button>
+        <button type="button" className="chart-chip" onClick={onApplyDeskRiskPreset}>Desk</button>
         <span className={`chart-order-guard-status ${chartRiskLossExceeded ? "bad" : chartRiskTargetMiss ? "warn" : "ok"}`}>
           {chartRiskLossExceeded ? "loss-limit exceeded" : chartRiskTargetMiss ? "target gain below objective" : "risk profile aligned"}
         </span>
@@ -108,11 +102,9 @@ export default function ChartHudOrderRiskPanel({
         <span>SL {chartOrderTicketSlLabel}</span>
         <span>TP {chartOrderTicketTpLabel}</span>
       </div>
-      {uiMode === "novice" ? (
-        <div className="chart-order-novice-tip">
-          Stop Loss coupe la position pour limiter la perte. Fixe Perte max et Gain cible pour garder un profil RR clair avant envoi.
-        </div>
-      ) : null}
+      <div className="chart-order-guidance-tip">
+        Garde un profil RR clair avant envoi: Safe pour protection, Balanced pour execution standard, Desk pour taille complete.
+      </div>
       <div className="chart-order-mini-row">
         {chartEffectiveSendMode === "confirm-required" ? (
           <button type="button" className={`chart-chip ${chartHudConfirmArmed ? "active" : ""}`} onClick={onToggleChartHudConfirmArmed}>

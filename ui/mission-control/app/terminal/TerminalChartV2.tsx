@@ -21,24 +21,22 @@ import { DEFAULT_MIN_RENDERABLE_BARS } from "../../lib/ohlcvIntegrity";
 import { timeframeToMs } from "../../lib/ohlcvDataEngine";
 import { computePredictionV5, type PredictionV5 } from "../../lib/predictionEngineV5";
 
-const TERMINAL_V2_TIMEFRAME_SELECTOR_PRIMARY = ["1s", "5s", "10s", "30s", "1m", "5m", "15m"] as const;
-const TERMINAL_V2_TIMEFRAME_SELECTOR_SECONDARY = ["30m", "1h", "4h", "8h", "1d", "1w", "1M"] as const;
+const TERMINAL_V2_TIMEFRAME_SELECTOR_VISIBLE = ["1s", "5s", "30s", "1m", "5m", "15m", "1h", "4h"] as const;
+const TERMINAL_V2_TIMEFRAME_SELECTOR_VISIBLE_SET = new Set<string>(TERMINAL_V2_TIMEFRAME_SELECTOR_VISIBLE);
+const TERMINAL_V2_TIMEFRAME_SELECTOR_MORE = ["10s", "30m", "8h", "1d", "1w", "1M"].filter((timeframe) => !TERMINAL_V2_TIMEFRAME_SELECTOR_VISIBLE_SET.has(timeframe));
 
 type CandlePoint = { label: string; open: number; high: number; low: number; close: number; volume: number };
 type DomLevel = { side: "bid" | "ask"; price: number; size: number; intensity: number };
 type FootprintRow = { low: number; high: number; buyVolume: number; sellVolume: number; delta: number; timeLabel?: string; timeKey?: string };
 type DomHistoryFrame = { time: number; levels: Array<{ side: "bid" | "ask"; price: number; size: number; intensity: number }>; spoofingRisk?: number };
 type TradeBubbleVisual = { time: number; price: number; volume: number; side: "buy" | "sell"; intensity?: number; kind?: "trade" | "spoof" };
-type QuoteHistoryMap = Record<string, Array<{ label: string; value: number }>>;
 type IndicatorSeries = { indicatorId: string; outputKey: string; label: string; color: string; type: string; pane: "main" | "sub"; lineWidth: number; data: Array<{ time: number; value: number }> };
 
-type UiMode = "novice" | "expert";
 type AutoExecutionMode = "assisted" | "semi-auto" | "full-auto";
 type V2Intent = "observe" | "analyze" | "execute";
 type ChartEngineMode = "v3" | "v4";
 type GpuViewportGrid = 1 | 4 | 16 | "auto";
 type ChartSmoothingMs = 0 | 80 | 140 | 220;
-type MultiSort = "momentum" | "spread" | "liquidity";
 type AnchorType = "candle" | "zone";
 type RiskAction = { ts: string; action: string; detail: string };
 type RiskJournalEntry = {
@@ -123,8 +121,6 @@ type Props = {
   suspendDecisionLayer?: boolean;
   fallbackPrice: number;
   loading: boolean;
-  uiMode: UiMode;
-  onUiModeChange: (mode: UiMode) => void;
   autoExecutionMode: AutoExecutionMode;
   onAutoExecutionModeChange: (mode: AutoExecutionMode) => void;
   routingCandidates: Array<{ venue: string; instrument: string; spread: number; last: number; score: number }>;
@@ -167,10 +163,6 @@ type Props = {
   selectedVenue: string;
   availableVenues: string[];
   onSelectVenue: (venue: string | null) => void;
-  multiChartRows: Array<{ symbol: string; price: number; deltaPct: number; spread: number; venue: string; historyKey?: string }>;
-  quoteHistory: QuoteHistoryMap;
-  onSelectSymbol: (symbol: string) => void;
-  onSelectSymbolVenue: (symbol: string, venue?: string) => void;
   aiHeadline: string;
   aiScenario: string;
   aiConfidencePct: number;
@@ -244,22 +236,6 @@ function pct(value: number): string {
   return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
 }
 
-function buildSparklinePath(values: number[], width: number, height: number): string {
-  if (values.length < 2) {
-    return "";
-  }
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const span = Math.max(0.0000001, max - min);
-  return values
-    .map((value, index) => {
-      const x = (index / Math.max(1, values.length - 1)) * width;
-      const y = height - ((value - min) / span) * height;
-      return `${index === 0 ? "M" : "L"}${x.toFixed(2)} ${y.toFixed(2)}`;
-    })
-    .join(" ");
-}
-
 function parseHistoryLabelMs(label: string): number | null {
   const parsed = Date.parse(label);
   return Number.isFinite(parsed) ? parsed : null;
@@ -301,8 +277,6 @@ export default function TerminalChartV2(props: Props) {
     candles,
     fallbackPrice,
     loading,
-    uiMode,
-    onUiModeChange,
     autoExecutionMode,
     onAutoExecutionModeChange,
     routingCandidates,
@@ -345,10 +319,6 @@ export default function TerminalChartV2(props: Props) {
     selectedVenue,
     availableVenues,
     onSelectVenue,
-    multiChartRows,
-    quoteHistory,
-    onSelectSymbol,
-    onSelectSymbolVenue,
     aiHeadline,
     aiScenario,
     aiConfidencePct,
@@ -379,8 +349,6 @@ export default function TerminalChartV2(props: Props) {
   const [crosshairText, setCrosshairText] = useState("--");
   const [riskActionLog, setRiskActionLog] = useState<RiskAction[]>([]);
   const [riskJournal, setRiskJournal] = useState<RiskJournalEntry[]>([]);
-  const [multiSlots, setMultiSlots] = useState<4 | 8>(4);
-  const [multiSort, setMultiSort] = useState<MultiSort>("momentum");
   const [assistantAnchor, setAssistantAnchor] = useState<{ type: AnchorType; label: string; detail: string } | null>(null);
   const [assistantInput, setAssistantInput] = useState("");
   const [assistantMessages, setAssistantMessages] = useState<Array<{ role: "user" | "assistant"; text: string }>>([]);
@@ -583,27 +551,6 @@ export default function TerminalChartV2(props: Props) {
     }
     return "WAIT";
   }, [urgencyTier, predictionV5.direction]);
-  const multiRows = useMemo(() => {
-    const source = [...multiChartRows];
-    if (multiSort === "spread") {
-      source.sort((left, right) => left.spread - right.spread);
-    } else if (multiSort === "liquidity") {
-      source.sort((left, right) => right.price - left.price);
-    } else {
-      source.sort((left, right) => Math.abs(right.deltaPct) - Math.abs(left.deltaPct));
-    }
-    return source.slice(0, multiSlots);
-  }, [multiChartRows, multiSlots, multiSort]);
-
-  const gpuViewportFeeds = useMemo(() => {
-    const sorted = [...multiChartRows].sort((left, right) => Math.abs(right.deltaPct) - Math.abs(left.deltaPct));
-    return sorted.slice(0, 16).map((row) => ({
-      id: `${row.symbol}-${row.venue}`,
-      symbol: row.symbol,
-      candles: buildCandlesFromHistory(quoteHistory[row.historyKey || row.symbol] || [], row.price),
-    }));
-  }, [multiChartRows, quoteHistory, timeframe]);
-
   const recentCandleAnchors = useMemo(() => {
     return analyticsEligibleCandles.slice(-6).map((candle) => ({
       type: "candle" as const,
@@ -898,8 +845,7 @@ export default function TerminalChartV2(props: Props) {
         </div>
         <div className="terminal-v2-head-actions">
           <button type="button" className={`chart-chip ${enabled ? "active" : ""}`} onClick={onToggleEnabled}>V2</button>
-          <button type="button" className={`chart-chip ${uiMode === "novice" ? "active" : ""}`} onClick={() => onUiModeChange("novice")}>Novice</button>
-          <button type="button" className={`chart-chip ${uiMode === "expert" ? "active" : ""}`} onClick={() => onUiModeChange("expert")}>Expert</button>
+          <span className="chart-chip active">Assist</span>
         </div>
       </div>
 
@@ -910,12 +856,22 @@ export default function TerminalChartV2(props: Props) {
 
         <span className="terminal-v2-sep" />
 
-        {TERMINAL_V2_TIMEFRAME_SELECTOR_PRIMARY.map((tf) => (
+        {TERMINAL_V2_TIMEFRAME_SELECTOR_VISIBLE.map((tf) => (
           <button key={tf} type="button" className={`chart-chip ${timeframe === tf ? "active" : ""}`} aria-pressed={timeframe === tf} onClick={() => onTimeframeChange(tf)}>{tf}</button>
         ))}
-        {TERMINAL_V2_TIMEFRAME_SELECTOR_SECONDARY.map((tf) => (
-          <button key={tf} type="button" className={`chart-chip ${timeframe === tf ? "active" : ""}`} aria-pressed={timeframe === tf} onClick={() => onTimeframeChange(tf)}>{tf}</button>
-        ))}
+        <select
+          value={TERMINAL_V2_TIMEFRAME_SELECTOR_MORE.includes(timeframe) ? timeframe : ""}
+          onChange={(event) => {
+            if (event.target.value) {
+              onTimeframeChange(event.target.value);
+            }
+          }}
+          className="chart-symbol-selector chart-timeframe-selector"
+          aria-label="More timeframes"
+        >
+          <option value="">More TF</option>
+          {TERMINAL_V2_TIMEFRAME_SELECTOR_MORE.map((tf) => <option key={`v2-tf-more-${tf}`} value={tf}>{tf}</option>)}
+        </select>
 
         <button type="button" className="chart-chip" onClick={onZoomIn}>Zoom +</button>
         <button type="button" className="chart-chip" onClick={onZoomOut}>Zoom &minus;</button>
@@ -990,7 +946,7 @@ export default function TerminalChartV2(props: Props) {
               viewportGrid={gpuViewportGrid}
               viewportWindowHint={chartWindow}
               smoothingMs={effectiveChartSmoothingMs}
-              multiSymbolFeeds={gpuViewportFeeds}
+              multiSymbolFeeds={[]}
               onCrosshairMove={handleCrosshairMove}
               onPerceptualTelemetry={onGpuPerceptualTelemetry}
               onViewportFrameMetaChange={onGpuViewportFrameMetaChange}
@@ -1261,51 +1217,6 @@ export default function TerminalChartV2(props: Props) {
               </div>
             );})}
           </div>
-        </div>
-      </div>
-
-      {/* ─── ROW 4: Multi-chart strip (collapsible) ─── */}
-      <div className="terminal-v2-multi-strip">
-        <div className="terminal-v2-strip-head">
-          <span className="terminal-v2-card-kicker">Multi-chart {multiSlots}-up</span>
-          <div className="terminal-v2-inline-actions">
-            <button type="button" className={`chart-chip ${multiSlots === 4 ? "active" : ""}`} onClick={() => setMultiSlots(4)}>4</button>
-            <button type="button" className={`chart-chip ${multiSlots === 8 ? "active" : ""}`} onClick={() => setMultiSlots(8)}>8</button>
-            <button type="button" className={`chart-chip ${multiSort === "momentum" ? "active" : ""}`} onClick={() => setMultiSort("momentum")}>Mom</button>
-            <button type="button" className={`chart-chip ${multiSort === "spread" ? "active" : ""}`} onClick={() => setMultiSort("spread")}>Spr</button>
-            <button type="button" className={`chart-chip ${multiSort === "liquidity" ? "active" : ""}`} onClick={() => setMultiSort("liquidity")}>AI</button>
-            <select className="terminal-v2-venue-select" value={selectedVenue || ""} onChange={(event) => onSelectVenue(event.target.value || null)}>
-              <option value="">Auto</option>
-              {availableVenues.map((venue) => <option key={venue} value={venue}>{venue}</option>)}
-            </select>
-          </div>
-        </div>
-        <div className={`terminal-v2-multi-grid terminal-v2-multi-grid-${multiSlots}`}>
-          {multiRows.map((row) => {
-            const miniCandles = buildCandlesFromHistory(quoteHistory[row.historyKey || row.symbol] || [], row.price);
-            const values = miniCandles.slice(-24).map((point) => point.close);
-            const path = buildSparklinePath(values, 96, 24);
-            return (
-              <button
-                key={`${row.symbol}-${row.venue}`}
-                type="button"
-                className="terminal-v2-mini-chart"
-                onClick={() => { onSelectSymbol(row.symbol); onSelectSymbolVenue(row.symbol, row.venue); }}
-              >
-                <div className="terminal-v2-mini-head">
-                  <strong>{row.symbol}</strong>
-                  <span>{row.venue}</span>
-                </div>
-                <div className="terminal-v2-mini-meta">
-                  <span>{row.price.toFixed(2)}</span>
-                  <span className={row.deltaPct >= 0 ? "good" : "warn"}>{pct(row.deltaPct)}</span>
-                </div>
-                <svg width="96" height="24" viewBox="0 0 96 24" aria-hidden="true">
-                  <path d={path} className={row.deltaPct >= 0 ? "terminal-v2-spark good" : "terminal-v2-spark warn"} />
-                </svg>
-              </button>
-            );
-          })}
         </div>
       </div>
 

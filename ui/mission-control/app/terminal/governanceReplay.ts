@@ -103,6 +103,7 @@ function truthContextFromCurrentTruth(truth: FinalDecisionTruth | null | undefin
   if (!truth) {
     return null;
   }
+  const falseContext = asRecord(truth.false_context);
   return {
     action: truth.action,
     blockingLayer: truth.blocking_layer,
@@ -111,7 +112,7 @@ function truthContextFromCurrentTruth(truth: FinalDecisionTruth | null | undefin
     detailLabel: truth.detail_label,
     shouldTrade: truth.should_trade,
     executionAllowed: truth.execution_allowed,
-    falseContextNoTrade: truth.false_context.no_trade,
+    falseContextNoTrade: falseContext.no_trade === true,
     createdAtIso: truth.generated_at_iso,
   };
 }

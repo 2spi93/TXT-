@@ -16,6 +16,7 @@ import {
 import type { RuntimeDecisionAnalyticsSummary } from "../../lib/runtimeDecisionAnalytics";
 import { buildTradabilityAnalyticsSummary as buildSharedTradabilityAnalyticsSummary, parseTradabilityJournalSamples as parseSharedTradabilityJournalSamples, type TradabilityAnalyticsSummary } from "../../lib/tradabilityAnalytics";
 import SmartDecisionSummary from "./SmartDecisionSummary";
+import type { RuntimeReadonlyProjectionSnapshot } from "./runtimeReadonlyProjection";
 
 type RiskTimelineFilter = "all" | "compliant" | "miss";
 
@@ -406,6 +407,14 @@ function buildRuntimeDecisionCompactRead(
     .sort((left, right) => left.score - right.score || left.label.localeCompare(right.label))[0] || null;
   const runtimeTelemetryGuard = deriveRuntimeTelemetryGuard(summary);
   const executionLock = deriveExecutionLockDescriptor(summary);
+  const runtimeIntegrity = summary.integrity || summary.opportunity.telemetry?.integrity || null;
+  const runtimeIntegrityScore = runtimeIntegrity
+    ? ("scorePct" in runtimeIntegrity
+      ? runtimeIntegrity.scorePct
+      : "routeCoveragePct" in runtimeIntegrity
+        ? runtimeIntegrity.routeCoveragePct
+        : "n/a")
+    : null;
   const explicitOpportunityState = runtimeTelemetryGuard?.action !== "allow" || summary.opportunity.liveState === "NO_EDGE";
   const live = summary.monitoring?.live || null;
   const liveAnomalies = summary.monitoring?.anomalies.rows || [];
@@ -455,9 +464,9 @@ function buildRuntimeDecisionCompactRead(
       : limitingFactor
         ? `facteur limitant ${limitingFactor.label.toLowerCase()} ${limitingFactor.scorePct.toFixed(0)}%`
         : summary.opportunity.liveSummary,
-    observationTone: summary.integrity.state === "BROKEN"
+    observationTone: runtimeIntegrity?.state === "BROKEN"
       ? "warn"
-      : summary.integrity.state === "DEGRADED"
+      : runtimeIntegrity?.state === "DEGRADED"
         ? "subtle"
         : summary.observation.manualCalibrationEligible
       ? "good"
@@ -465,7 +474,7 @@ function buildRuntimeDecisionCompactRead(
         ? "subtle"
         : "warn",
     observationLabel: `OBS ${summary.observation.status.toLowerCase().replace(/_/g, " ")}`,
-    observationMeta: `FP ${summary.observation.driftFalsePositiveRate}% | Det ${summary.observation.driftDetectionRate}% | Stability ${summary.observation.driftStability}% | Consistency ${summary.observation.decisionConsistency}%${summary.integrity ? ` | Runtime Integrity ${summary.integrity.state} ${summary.integrity.scorePct}%` : ""}${summary.monitoring?.observationWindow.validation?.integrityTrend?.direction && summary.monitoring.observationWindow.validation.integrityTrend.direction !== "UNKNOWN" ? ` | Trend ${summary.monitoring.observationWindow.validation.integrityTrend.direction}` : ""}${summary.observation.integrity ? ` | Observation Integrity ${summary.observation.integrity.status}` : ""}${summary.reliability?.state ? ` | Reliability ${summary.reliability.state}` : ""}${falseContextCompact ? ` | FalseCtx ${falseContextCompact}` : ""}`,
+    observationMeta: `FP ${summary.observation.driftFalsePositiveRate}% | Det ${summary.observation.driftDetectionRate}% | Stability ${summary.observation.driftStability}% | Consistency ${summary.observation.decisionConsistency}%${runtimeIntegrity ? ` | Runtime Integrity ${runtimeIntegrity.state} ${runtimeIntegrityScore}%` : ""}${summary.monitoring?.observationWindow.validation?.integrityTrend?.direction && summary.monitoring.observationWindow.validation.integrityTrend.direction !== "UNKNOWN" ? ` | Trend ${summary.monitoring.observationWindow.validation.integrityTrend.direction}` : ""}${summary.observation.integrity ? ` | Observation Integrity ${summary.observation.integrity.status}` : ""}${summary.reliability?.state ? ` | Reliability ${summary.reliability.state}` : ""}${falseContextCompact ? ` | FalseCtx ${falseContextCompact}` : ""}`,
     liveTone: executionLock.tone === "warn"
       ? "warn"
       : liveAnomalies[0]?.severity === "critical"
@@ -656,41 +665,58 @@ const PANEL_HINTS: Record<string, { text: string; examples: string[] }> = {
     examples: ["Si le ratio miss grimpe, le desk doit ralentir ou couper certaines executions.", "Le hard alert permet de declencher une vigilance locale plus stricte."],
   },
   "H24 Control Room": {
-    text: "Salle de controle live: watchdog, gouvernance, memory gate, recovery, audit et warfare core sur un seul panneau.",
-    examples: ["Si le watchdog passe en HALT, le bouton rouge doit etre considere comme prioritaire.", "Croiser health score, market state et audit trail avant toute promotion live."],
+    text: "Salle de controle live: watchdog, guardrails, recovery gate, audit et etat systeme sur un seul panneau operateur.",
+    examples: ["Si le watchdog passe en HALT, toute action live doit s'arreter avant reprise manuelle.", "Croise health score, market state et audit trail avant de relancer le desk."],
   },
   "Execution AI V6.1": {
-    text: "Observabilite du moteur d'execution V6: persistence DB, guardrails, top actions apprises et episodes recents.",
-    examples: ["Si la DB passe en degrade, l'alerte doit etre visible meme sans routing score actif.", "Les top actions et freeze reasons montrent si le moteur apprend encore ou s'est auto-protege."],
+    text: "Etat du moteur d'execution: persistance, guardrails, actions apprises et episodes recents encore exploitables.",
+    examples: ["Si la persistance degrade, le desk doit traiter le moteur comme fragile meme si le score reste bon.", "Les freeze reasons disent si le moteur apprend encore ou s'est auto-protege."],
   },
   "Execution Context": {
-    text: "Panneau desk policy: market structure, contexte d'execution, no-trade, sizing volatilite, fallback et freeze learning.",
+    text: "Contexte de trade: structure de marche, no-trade, sizing volatilite, fallback et freeze learning utilises par le desk.",
     examples: ["Si le fallback passe en rules_only, le desk sait que l'execution reste possible mais sous regles strictes.", "Les seuils, la zone, le biais et le sizing montrent pourquoi le moteur coupe ou reduit un trade."],
   },
   "Execution PnL Truth": {
-    text: "Verite PnL du desk: gains/pertes executes, frictions reelles, flags haute confiance et poids du no-trade.",
+    text: "Verite d'execution du desk: gains/pertes reels, frictions observees, flags haute confiance et poids du no-trade.",
     examples: ["Si les high-confidence losses montent, le probleme vient du filtre ou de la confiance, pas d'une absence de features.", "Compare regime, venue et execution mode pour voir ou la route gagne ou detruit du PnL reel."],
   },
   "Venue Telemetry": {
-    text: "Rassemble la sante feed et execution par venue: fraicheur quotes/depth/trades, spread, slippage, fill quality et contraintes de route.",
+    text: "Sante des venues: fraicheur quotes/depth/trades, spread, slippage, fill quality et contraintes de route.",
     examples: ["Si la fraicheur depth explose mais le proxy reste healthy, le souci vient du feed venue, pas du control plane.", "Une venue avec fill quality faible et slippage eleve doit etre re-degradee ou reroutee avant live."],
   },
   "Execution Smart Tracker": {
-    text: "Tracker compact pour la calibration live V7 Smart: gate allow/block, delai, reduction de taille, score d'execution, score venue et frictions reelles.",
+    text: "Garde d'execution compacte: gate allow/block, delai, reduction de taille, score d'execution, score venue et frictions reelles.",
     examples: ["Si le score baisse mais que le gate reste allow, on reduit avant d'envisager un blocage global.", "Le panel se lit en sequence: gate live, frictions fenetre, puis PnL par posture d'execution."],
   },
 };
 
+const PANEL_TITLE_ALIASES: Record<string, string> = {
+  "Alertes actives": "Alertes terrain",
+  "H24 Control Room": "H24 Control Room · Salle de controle live",
+  "Execution PnL Truth": "Verite d'execution",
+  "Execution AI V6.1": "Moteur d'execution",
+  "Execution Context": "Contexte de trade",
+  "Tradability Surface": "Fenetre exploitable",
+  "Attention Context": "Focus operateur",
+  "Venue Telemetry": "Sante des venues",
+  "Execution Smart Tracker": "Garde d'execution",
+  "Execution Optimizer": "Optimiseur de route",
+  Incidents: "Incidents live",
+  Governance: "Guardrails live",
+  Readiness: "Pret pour le live",
+  "Risk Compliance Timeline": "Timeline risque",
+};
+
 function deriveDeskTruthState(input: {
   summary: Record<string, unknown>;
-  liveOpsPayload?: Record<string, unknown> | null;
+  runtimeOpsPayload?: Record<string, unknown> | null;
   executionAiV6Payload?: ExecutionAiV6PanelPayload | null;
   runtimeDecisionSummary?: RuntimeDecisionApiSummary | null;
 }): { label: "OK" | "REDUCE" | "BLOCK"; tone: "good" | "subtle" | "warn"; reason: string } {
   const summary = safeRecord(input.summary);
-  const liveOps = safeRecord(input.liveOpsPayload);
-  const watchdog = safeRecord(liveOps.watchdog_state);
-  const governance = safeRecord(liveOps.governance);
+  const runtimeOps = safeRecord(input.runtimeOpsPayload);
+  const watchdog = safeRecord(runtimeOps.watchdog_state);
+  const governance = safeRecord(runtimeOps.governance);
   const v6Envelope = safeRecord(input.executionAiV6Payload);
   const v6Snapshot = safeRecord(v6Envelope.snapshot);
   const v6Guardrails = safeRecord(v6Snapshot.guardrails);
@@ -752,9 +778,10 @@ function aggregateDominanceReasons(trades: Array<Record<string, unknown>>): Arra
 
 function titleWithHelp(title: string, badge?: ReactNode): ReactNode {
   const hint = PANEL_HINTS[title];
+  const displayTitle = PANEL_TITLE_ALIASES[title] || title;
   return (
     <>
-      {title}
+      {displayTitle}
       {hint ? <HelpHint text={hint.text} examples={hint.examples} label="Guide rapide" /> : null}
       {badge ? <> {badge}</> : null}
     </>
@@ -788,7 +815,7 @@ function MonitoringPanelCard({
 type OperatorActionSummaryProps = {
   badge?: ReactNode;
   executionPnlPayload: ExecutionPnlAnalyzerPayload | null;
-  liveOpsPayload?: Record<string, unknown> | null;
+  runtimeOpsPayload?: Record<string, unknown> | null;
   executionAiV6Payload?: ExecutionAiV6PanelPayload | null;
   routingPayload?: Record<string, unknown> | null;
   smartDecision?: SmartDecisionHudShape | null;
@@ -882,6 +909,9 @@ type ExecutionDecisionJournalAuditSummary = {
 };
 
 type RuntimeDecisionApiSummary = RuntimeDecisionAnalyticsSummary;
+type RuntimeReadonlyProjectionApiResponse = {
+  runtime_projection_snapshot?: RuntimeReadonlyProjectionSnapshot | null;
+};
 
 const OPERATOR_OVERRIDE_STORAGE_KEY = "txt.operator.override.v1";
 
@@ -960,6 +990,195 @@ function useRuntimeDecisionSummary(journalContext?: {
     journalTimeframe,
     journalStrategy,
   };
+}
+
+function useRuntimeReadonlyProjection(journalContext?: {
+  symbol: string;
+  timeframe: string;
+  strategy: string;
+}, disabled = false) {
+  const journalSymbol = String(journalContext?.symbol || "").trim().toUpperCase();
+  const journalTimeframe = String(journalContext?.timeframe || "").trim();
+  const journalStrategy = String(journalContext?.strategy || "").trim();
+  const enabled = !disabled;
+  const cacheKey = `${journalSymbol}::${journalTimeframe}::${journalStrategy}`;
+  const [snapshot, setSnapshot] = useState<RuntimeReadonlyProjectionSnapshot | null>(() => runtimeProjectionSnapshotCache.get(cacheKey) || null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const exportHref = useMemo(() => {
+    if (!(journalSymbol && journalTimeframe && journalStrategy)) {
+      return null;
+    }
+    const query = new URLSearchParams();
+    query.set("symbol", journalSymbol);
+    query.set("timeframe", journalTimeframe);
+    query.set("strategy", journalStrategy);
+    query.set("limit", "600");
+    query.set("sinceDays", "7");
+    query.set("historyLimit", "20");
+    query.set("download", "1");
+    return `/api/system/runtime-decision/export?${query.toString()}`;
+  }, [journalStrategy, journalSymbol, journalTimeframe]);
+
+  useEffect(() => {
+    if (!enabled) {
+      setSnapshot(null);
+      setBusy(false);
+      setError(null);
+      return;
+    }
+    const cachedSnapshot = runtimeProjectionSnapshotCache.get(cacheKey) || null;
+    const persistedSnapshot = cachedSnapshot ? null : readPersistedRuntimeProjectionSnapshot(cacheKey);
+    const resolvedCachedSnapshot = cachedSnapshot || persistedSnapshot;
+    if (persistedSnapshot) {
+      runtimeProjectionSnapshotCache.set(cacheKey, persistedSnapshot);
+    }
+    setSnapshot(resolvedCachedSnapshot);
+    if (resolvedCachedSnapshot) {
+      setError(null);
+    }
+    let cancelled = false;
+    const loadRuntimeProjection = async () => {
+      setBusy(!resolvedCachedSnapshot);
+      const query = new URLSearchParams();
+      if (journalSymbol) {
+        query.set("symbol", journalSymbol);
+      }
+      if (journalTimeframe) {
+        query.set("timeframe", journalTimeframe);
+      }
+      if (journalStrategy) {
+        query.set("strategy", journalStrategy);
+      }
+      const url = query.size > 0 ? `/api/system/runtime-projection?${query.toString()}` : "/api/system/runtime-projection";
+      try {
+        let inflight = runtimeProjectionInflightCache.get(cacheKey);
+        if (!inflight) {
+          inflight = (async () => {
+            const response = await fetch(url, { cache: "no-store" }).catch(() => null);
+            const payloadText = response ? await response.text().catch(() => "") : "";
+            const payload = payloadText
+              ? JSON.parse(payloadText) as RuntimeReadonlyProjectionApiResponse
+              : null;
+            return { response, payload };
+          })().finally(() => {
+            runtimeProjectionInflightCache.delete(cacheKey);
+          });
+          runtimeProjectionInflightCache.set(cacheKey, inflight);
+        }
+        const { response, payload } = await inflight;
+        if (cancelled) {
+          return;
+        }
+        const projection = payload && typeof payload === "object"
+          ? payload.runtime_projection_snapshot || null
+          : null;
+        if (!response || !projection || !projection.operator) {
+          if (!resolvedCachedSnapshot) {
+            setSnapshot(null);
+          }
+          setError("Runtime projection indisponible");
+          return;
+        }
+        runtimeProjectionSnapshotCache.set(cacheKey, projection);
+        persistRuntimeProjectionSnapshot(cacheKey, projection);
+        setSnapshot(projection);
+        setError(null);
+      } catch {
+        if (cancelled) {
+          return;
+        }
+        if (!resolvedCachedSnapshot) {
+          setSnapshot(null);
+        }
+        setError("Runtime projection indisponible");
+      } finally {
+        if (!cancelled) {
+          setBusy(false);
+        }
+      }
+    };
+    void loadRuntimeProjection();
+    return () => {
+      cancelled = true;
+    };
+  }, [cacheKey, enabled, journalStrategy, journalSymbol, journalTimeframe]);
+
+  return {
+    enabled,
+    snapshot,
+    busy,
+    error,
+    exportHref,
+    journalSymbol,
+    journalTimeframe,
+    journalStrategy,
+  };
+}
+
+function resolveRuntimeProjectionCompactSeed(runtimeOpsPayload: Record<string, unknown> | null | undefined): RuntimeReadonlyProjectionSnapshot["operator"]["runtimeDecisionCompactRead"] | null {
+  const runtimeOps = safeRecord(runtimeOpsPayload);
+  const seedEnvelope = safeRecord(runtimeOps.runtime_projection_seed);
+  const compactRead = safeRecord(seedEnvelope.compact_read);
+  const driftLabel = String(compactRead.driftLabel || "").trim();
+  const opportunityLabel = String(compactRead.opportunityLabel || "").trim();
+  const liveLabel = String(compactRead.liveLabel || "").trim();
+  if (!(driftLabel && opportunityLabel && liveLabel)) {
+    return null;
+  }
+  return {
+    driftTone: compactRead.driftTone === "good" || compactRead.driftTone === "warn" ? compactRead.driftTone : "subtle",
+    driftLabel,
+    driftMeta: String(compactRead.driftMeta || "").trim(),
+    opportunityTone: compactRead.opportunityTone === "good" || compactRead.opportunityTone === "warn" ? compactRead.opportunityTone : "subtle",
+    opportunityLabel,
+    opportunityMeta: String(compactRead.opportunityMeta || "").trim(),
+    observationTone: compactRead.observationTone === "good" || compactRead.observationTone === "warn" ? compactRead.observationTone : "subtle",
+    observationLabel: String(compactRead.observationLabel || "OBS unavailable").trim(),
+    observationMeta: String(compactRead.observationMeta || "projection seed unavailable").trim(),
+    liveTone: compactRead.liveTone === "good" || compactRead.liveTone === "warn" ? compactRead.liveTone : "subtle",
+    liveLabel,
+    liveMeta: String(compactRead.liveMeta || "").trim(),
+    state: String(compactRead.state || "ready").trim() || "ready",
+  };
+}
+
+const runtimeProjectionSessionStoragePrefix = "txt.runtime-projection.snapshot.v1::";
+const runtimeProjectionSnapshotCache = new Map<string, RuntimeReadonlyProjectionSnapshot>();
+const runtimeProjectionInflightCache = new Map<string, Promise<{
+  response: Response | null;
+  payload: RuntimeReadonlyProjectionApiResponse | null;
+}>>();
+
+function readPersistedRuntimeProjectionSnapshot(cacheKey: string): RuntimeReadonlyProjectionSnapshot | null {
+  if (typeof window === "undefined" || !cacheKey) {
+    return null;
+  }
+  try {
+    const raw = window.sessionStorage.getItem(`${runtimeProjectionSessionStoragePrefix}${cacheKey}`);
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw) as RuntimeReadonlyProjectionSnapshot | null;
+    if (!parsed || typeof parsed !== "object" || !("operator" in parsed)) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function persistRuntimeProjectionSnapshot(cacheKey: string, snapshot: RuntimeReadonlyProjectionSnapshot): void {
+  if (typeof window === "undefined" || !cacheKey) {
+    return;
+  }
+  try {
+    window.sessionStorage.setItem(`${runtimeProjectionSessionStoragePrefix}${cacheKey}`, JSON.stringify(snapshot));
+  } catch {
+    // Ignore storage quota and serialization failures.
+  }
 }
 
 function isOperatorJournalEntry(value: unknown): value is OperatorJournalEntry {
@@ -1283,7 +1502,7 @@ function buildDisciplineAnalytics(input: {
   entries: OperatorJournalEntry[];
   decision: OperatorActionDecision;
   executionPnlPayload: ExecutionPnlAnalyzerPayload | null;
-  liveOpsPayload?: Record<string, unknown> | null;
+  runtimeProjection?: RuntimeReadonlyProjectionSnapshot | null;
   driftItems: DriftItem[];
   journalContext?: {
     symbol: string;
@@ -1292,9 +1511,7 @@ function buildDisciplineAnalytics(input: {
   };
 }): DisciplineAnalytics {
   const pnlSummary = safeRecord(safeRecord(input.executionPnlPayload).summary);
-  const liveOps = safeRecord(input.liveOpsPayload);
-  const watchdog = safeRecord(liveOps.watchdog_state);
-  const governance = safeRecord(liveOps.governance);
+  const runtimeGuardrails = input.runtimeProjection?.operator?.runtimeGuardrails ?? null;
   const journalEntries = input.entries;
   const heatmap = buildDisciplineHeatmap(journalEntries);
   const overrides24h = countJournalEntriesWithinHours(journalEntries, new Set(["override-visible-on"]), 24);
@@ -1311,8 +1528,8 @@ function buildDisciplineAnalytics(input: {
   const avgLatencyMs = safeNumber(pnlSummary.avg_latency_ms, 0);
   const avgSlippageBps = safeNumber(pnlSummary.avg_slippage_bps, 0);
   const netPnlUsd = safeNumber(pnlSummary.net_pnl_usd, 0);
-  const watchdogStatus = normalizeOperatorKey(watchdog.status).toUpperCase();
-  const governanceMode = normalizeOperatorKey(governance.mode).toUpperCase();
+  const watchdogStatus = normalizeOperatorKey(runtimeGuardrails?.watchdogStatus).toUpperCase();
+  const governanceMode = normalizeOperatorKey(runtimeGuardrails?.governanceMode).toUpperCase();
   const relevantDriftItems = filterRelevantDriftItems(input.driftItems, {
     strategy: String(input.journalContext?.strategy || ""),
     symbol: String(input.journalContext?.symbol || ""),
@@ -1381,9 +1598,9 @@ function buildDisciplineAnalytics(input: {
     score -= Math.min(20, activeDriftItems.length * 8);
     penalties.push(`${activeDriftItems.length} ligne de drift active`);
   }
-  if (watchdogStatus === "HALT" || governanceMode === "LOCKED") {
+  if (runtimeGuardrails?.locked) {
     score = Math.min(score, 20);
-    penalties.unshift("desk verrouille par les guardrails");
+    penalties.unshift(runtimeGuardrails.summary || "desk verrouille par les guardrails");
   }
   if (checklist7d > reopened7d && checklist7d > 0) {
     score += 4;
@@ -1392,7 +1609,7 @@ function buildDisciplineAnalytics(input: {
 
   const scoreTone = score >= 82 ? "good" : score >= 65 ? "subtle" : "warn";
   const scoreLabel = score >= 82 ? "discipline propre" : score >= 65 ? "discipline sous surveillance" : "discipline en derive";
-  const driftState: DisciplineAnalytics["driftState"] = watchdogStatus === "HALT" || governanceMode === "LOCKED" || forced24h > 0 || activeDriftItems.length >= 2 || score < 45
+  const driftState: DisciplineAnalytics["driftState"] = Boolean(runtimeGuardrails?.locked) || forced24h > 0 || activeDriftItems.length >= 2 || score < 45
     ? "LOCK"
     : activeDriftItems.length >= 1 || score < 65 || input.decision.postTradeFeedback.tone === "warn" || highConfidenceLossCount > 0
       ? "DRIFT"
@@ -1505,22 +1722,22 @@ function buildPostTradeFeedback(trades: Array<Record<string, unknown>>): Operato
 
 function buildOperatorActionDecision(input: {
   executionPnlPayload: ExecutionPnlAnalyzerPayload | null;
-  liveOpsPayload?: Record<string, unknown> | null;
+  runtimeOpsPayload?: Record<string, unknown> | null;
   executionAiV6Payload?: ExecutionAiV6PanelPayload | null;
   routingPayload?: Record<string, unknown> | null;
   smartDecision?: SmartDecisionHudShape | null;
-  runtimeDecisionSummary?: RuntimeDecisionApiSummary | null;
+  runtimeProjection?: RuntimeReadonlyProjectionSnapshot | null;
   finalDecisionTruth?: FinalDecisionTruth | null;
 }): OperatorActionDecision {
   const envelope = safeRecord(input.executionPnlPayload);
   const summary = safeRecord(envelope.summary);
   const trades = safeRows(envelope.trades);
-  const liveOps = safeRecord(input.liveOpsPayload);
-  const watchdog = safeRecord(liveOps.watchdog_state);
-  const governance = safeRecord(liveOps.governance);
-  const controlledCollection = safeRecord(liveOps.controlled_collection);
-  const recovery = safeRecord(liveOps.recovery);
-  const rawLiveOps = safeRecord(liveOps.raw);
+  const runtimeOps = safeRecord(input.runtimeOpsPayload);
+  const watchdog = safeRecord(runtimeOps.watchdog_state);
+  const governance = safeRecord(runtimeOps.governance);
+  const controlledCollection = safeRecord(runtimeOps.controlled_collection);
+  const recovery = safeRecord(runtimeOps.recovery);
+  const rawLiveOps = safeRecord(runtimeOps.raw);
   const liveOpsKillSwitch = safeRecord(rawLiveOps.kill_switch);
   const liveOpsKillSwitchState = safeRecord(liveOpsKillSwitch.state);
   const opportunityGate = safeRecord(governance.opportunity_gate);
@@ -1536,18 +1753,28 @@ function buildOperatorActionDecision(input: {
     ? Boolean(v6Guardrails.persistence_available)
     : true;
   const smartDecision = input.smartDecision ?? null;
-  const runtimeTelemetryGuard = deriveRuntimeTelemetryGuard(input.runtimeDecisionSummary || null);
-  const runtimeTelemetryIntegrity = deriveRuntimeTelemetryIntegrity(input.runtimeDecisionSummary || null);
+  const runtimeProjectionOperator = input.runtimeProjection?.operator ?? null;
+  const projectionUnavailableReason = "runtime projection unavailable";
+  const runtimeTelemetryGuard = runtimeProjectionOperator?.runtimeTelemetryGuard ?? null;
+  const runtimeTelemetryIntegrity = runtimeProjectionOperator?.runtimeTelemetryIntegrity ?? [];
   const runtimeTelemetryLead = runtimeTelemetryIntegrity[0] || null;
-  const executionLockDescriptor = deriveExecutionLockDescriptor(input.runtimeDecisionSummary || null);
-  const runtimeLive = input.runtimeDecisionSummary?.monitoring?.live || null;
+  const executionLockDescriptor = runtimeProjectionOperator?.executionLock ?? {
+    label: "n/a",
+    tone: "subtle" as const,
+    detail: projectionUnavailableReason,
+  };
   const finalDecisionTruth = input.finalDecisionTruth || null;
-  const truthState = deriveDeskTruthState({
-    summary,
-    liveOpsPayload: input.liveOpsPayload,
-    executionAiV6Payload: input.executionAiV6Payload,
-    runtimeDecisionSummary: input.runtimeDecisionSummary,
-  });
+  const truthState = runtimeProjectionOperator?.deskTruth ?? {
+    label: "REDUCE" as const,
+    tone: "subtle" as const,
+    reason: projectionUnavailableReason,
+  };
+  const chartFeedMetric = runtimeProjectionOperator?.runtimeMetrics.chartFeed ?? { value: "capture n/a", tone: "subtle" as const };
+  const exchangeMetric = runtimeProjectionOperator?.runtimeMetrics.exchange ?? { value: "n/a", tone: "subtle" as const };
+  const telemetryMetric = runtimeProjectionOperator?.runtimeMetrics.telemetry ?? {
+    value: runtimeTelemetryLead?.code || "n/a",
+    tone: runtimeTelemetryLead?.tone || "subtle",
+  };
   const dominanceReasons = aggregateDominanceReasons(trades).slice(0, 3).map((item) => `${item.label} x${item.count}`);
   const noTradeReasons = safeTextArray(executionContext.no_trade_reasons).slice(0, 3);
   const freezeReasons = safeTextArray(executionContext.freeze_learning_reasons).slice(0, 2);
@@ -1576,7 +1803,7 @@ function buildOperatorActionDecision(input: {
   );
   const recoveryMode = String(recovery.mode || "NOMINAL").trim().toUpperCase();
   const leadingVenue = String(dominance.leader_venue || bestRoute.venue || "--");
-  const updatedAt = String(envelope.updated_at || liveOps.updated_at || "").trim() || null;
+  const updatedAt = String(envelope.updated_at || runtimeOps.updated_at || "").trim() || null;
   const negativeStreak = (() => {
     let streak = 0;
     for (const trade of trades) {
@@ -1645,10 +1872,10 @@ function buildOperatorActionDecision(input: {
   const metrics: OperatorActionDecision["metrics"] = [
     { label: "Truth", value: truthState.label, tone: truthState.tone as OperatorActionDecision["metrics"][number]["tone"] },
     { label: "Contract", value: finalDecisionTruth ? `${finalDecisionTruth.action} / ${finalDecisionTruth.edge_eligibility.state}` : "n/a", tone: finalDecisionTruth ? (finalDecisionTruth.execution_allowed ? finalDecisionTruth.should_trade ? "good" : "subtle" : "warn") : "subtle" },
-    { label: "Chart feed", value: runtimeLive?.latestFeedLabel || "capture n/a", tone: runtimeLive?.latestFeedLabel ? "good" : "subtle" },
-    { label: "Exchange", value: runtimeLive ? `${runtimeLive.latestXchStatus} ${runtimeLive.latestXchAgeLabel}` : "n/a", tone: runtimeLive?.latestXchStatus === "LIVE" ? "good" : runtimeLive?.latestXchStatus === "STALE" ? "subtle" : "subtle" },
+    { label: "Chart feed", value: chartFeedMetric.value, tone: chartFeedMetric.tone },
+    { label: "Exchange", value: exchangeMetric.value, tone: exchangeMetric.tone },
     { label: "Execution", value: executionLockDescriptor.label, tone: executionLockDescriptor.tone },
-    { label: "Telemetry", value: runtimeTelemetryGuard?.label ? `${runtimeTelemetryGuard.label}${runtimeTelemetryLead ? ` / ${runtimeTelemetryLead.code}` : ""}` : (runtimeTelemetryLead?.code || "n/a"), tone: runtimeTelemetryGuard?.tone || runtimeTelemetryLead?.tone || "subtle" },
+    { label: "Telemetry", value: telemetryMetric.value, tone: telemetryMetric.tone },
     { label: "No-trade", value: `${noTradeRatioPct.toFixed(0)}%`, tone: noTradeRatioPct >= 70 ? "warn" : noTradeRatioPct >= 35 ? "subtle" : "good" },
     { label: "Confidence", value: smartDecision?.confidenceBand || (confidencePct > 0 ? `${confidencePct.toFixed(0)}%` : "n/a"), tone: smartDecision ? (smartDecision.confidenceBand === "HIGH" ? "good" : smartDecision.confidenceBand === "MEDIUM" ? "subtle" : "warn") : confidencePct >= 60 ? "good" : confidencePct >= 40 ? "subtle" : "warn" },
     { label: "Latency", value: formatCompactMetricMs(avgLatencyMs), tone: avgLatencyMs > 120 ? "warn" : avgLatencyMs > 80 ? "subtle" : "good" },
@@ -1877,7 +2104,7 @@ function buildOperatorActionDecision(input: {
 export function OperatorActionSummary({
   badge,
   executionPnlPayload,
-  liveOpsPayload,
+  runtimeOpsPayload,
   executionAiV6Payload,
   routingPayload,
   smartDecision,
@@ -1887,20 +2114,24 @@ export function OperatorActionSummary({
   formatClock,
   footer,
 }: OperatorActionSummaryProps) {
-  const runtimeDecision = useRuntimeDecisionSummary(journalContext, passiveMode);
-  const runtimeDecisionSummary = runtimeDecision.summary;
-  const runtimeDecisionBusy = runtimeDecision.busy;
-  const runtimeDecisionError = runtimeDecision.error;
-  const runtimeDecisionExportHref = runtimeDecision.exportHref;
+  const runtimeDecisionSummary = useRuntimeDecisionSummary(journalContext, passiveMode);
+  const runtimeProjection = useRuntimeReadonlyProjection(journalContext, passiveMode);
+  const runtimeProjectionSnapshot = runtimeProjection.snapshot;
+  const runtimeProjectionOperator = runtimeProjectionSnapshot?.operator ?? null;
+  const runtimeDecisionBusy = runtimeDecisionSummary.busy || runtimeProjection.busy;
+  const runtimeDecisionError = runtimeDecisionSummary.error || runtimeProjection.error;
+  const runtimeDecisionExportHref = runtimeDecisionSummary.exportHref || runtimeProjection.exportHref;
+  const resolvedRuntimeOpsPayload = runtimeOpsPayload ?? null;
+  const runtimeDecisionCompactSeed = resolveRuntimeProjectionCompactSeed(resolvedRuntimeOpsPayload);
   const decision = useMemo(() => buildOperatorActionDecision({
     executionPnlPayload,
-    liveOpsPayload,
+    runtimeOpsPayload: resolvedRuntimeOpsPayload,
     executionAiV6Payload,
     routingPayload,
     smartDecision,
-    runtimeDecisionSummary,
+    runtimeProjection: runtimeProjectionSnapshot,
     finalDecisionTruth,
-  }), [executionAiV6Payload, executionPnlPayload, finalDecisionTruth, liveOpsPayload, routingPayload, runtimeDecisionSummary, smartDecision]);
+  }), [executionAiV6Payload, executionPnlPayload, finalDecisionTruth, resolvedRuntimeOpsPayload, routingPayload, runtimeProjectionSnapshot, smartDecision]);
   const journalSymbol = String(journalContext?.symbol || "").trim().toUpperCase();
   const journalTimeframe = String(journalContext?.timeframe || "").trim();
   const journalStrategy = String(journalContext?.strategy || "").trim();
@@ -1917,47 +2148,47 @@ export function OperatorActionSummary({
   const journalAnalytics = useMemo(() => buildOperatorJournalAnalytics(journalEntries), [journalEntries]);
   const feedbackSummary = useMemo(() => buildFeedbackSummary({
     executionPnlPayload,
-    liveOpsPayload,
-    executionAiV6Payload,
+    runtimeProjection: runtimeProjectionSnapshot,
     journalEntries,
     finalDecisionTruth,
-  }), [executionAiV6Payload, executionPnlPayload, finalDecisionTruth, journalEntries, liveOpsPayload]);
+  }), [executionPnlPayload, finalDecisionTruth, journalEntries, runtimeProjectionSnapshot]);
   const overrideLockActive = feedbackSummary.driftState === "LOCK" || feedbackSummary.learningDisabled;
   const overrideLockReason = feedbackSummary.protections[0] || "drift LOCK";
   const disciplineAnalytics = useMemo(() => buildDisciplineAnalytics({
     entries: journalEntries,
     decision,
     executionPnlPayload,
-    liveOpsPayload,
+    runtimeProjection: runtimeProjectionSnapshot,
     driftItems,
     journalContext,
-  }), [decision, executionPnlPayload, liveOpsPayload, driftItems, journalContext, journalEntries]);
+  }), [decision, executionPnlPayload, runtimeProjectionSnapshot, driftItems, journalContext, journalEntries]);
   const executionDecisionAudit = useMemo(
     () => buildExecutionDecisionJournalAudit(journalEntries),
     [journalEntries],
   );
-  const runtimeDecisionCompactRead = useMemo(
-    () => buildRuntimeDecisionCompactRead(runtimeDecisionSummary, {
+  const runtimeDecisionCompactRead = runtimeDecisionSummary.error
+    ? buildRuntimeDecisionCompactRead(null, {
+      busy: runtimeDecisionSummary.busy,
+      error: runtimeDecisionSummary.error,
+    })
+    : runtimeDecisionSummary.summary
+    ? buildRuntimeDecisionCompactRead(runtimeDecisionSummary.summary, {
       busy: runtimeDecisionBusy,
       error: runtimeDecisionError,
-    }),
-    [runtimeDecisionBusy, runtimeDecisionError, runtimeDecisionSummary],
-  );
-  const runtimeTelemetryIntegrity = useMemo(
-    () => deriveRuntimeTelemetryIntegrity(runtimeDecisionSummary),
-    [runtimeDecisionSummary],
-  );
-  const runtimeTelemetryIntegritySummary = useMemo(
-    () => deriveRuntimeTelemetryIntegritySummary(runtimeDecisionSummary),
-    [runtimeDecisionSummary],
-  );
+    })
+    : runtimeProjectionOperator?.runtimeDecisionCompactRead || runtimeDecisionCompactSeed || buildRuntimeDecisionCompactRead(null, {
+      busy: runtimeDecisionBusy,
+      error: runtimeDecisionError || "runtime projection unavailable",
+    });
+  const runtimeTelemetryIntegrity = runtimeProjectionOperator?.runtimeTelemetryIntegrity || [];
+  const runtimeTelemetryIntegritySummary = runtimeProjectionOperator?.runtimeTelemetryIntegritySummary || null;
   const controlledCollectionSummary = useMemo(() => {
-    const liveOps = safeRecord(liveOpsPayload);
-    const controlledCollection = safeRecord(liveOps.controlled_collection);
+    const runtimeOps = safeRecord(resolvedRuntimeOpsPayload);
+    const controlledCollection = safeRecord(runtimeOps.controlled_collection);
     if (Object.keys(controlledCollection).length === 0) {
       return null;
     }
-    const governance = safeRecord(liveOps.governance);
+    const governance = safeRecord(runtimeOps.governance);
     const opportunityGate = safeRecord(governance.opportunity_gate);
     const labelProgress = safeRecord(controlledCollection.label_progress);
     const constraints = safeTextArray(controlledCollection.constraints).slice(0, 2);
@@ -1979,7 +2210,7 @@ export function OperatorActionSummary({
       gateStatus: String(opportunityGate.status || "unknown").trim().toLowerCase(),
       gateReasons,
     };
-  }, [liveOpsPayload]);
+  }, [resolvedRuntimeOpsPayload]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -2154,20 +2385,8 @@ export function OperatorActionSummary({
     }
   }
 
-  const runtimeDecisionHeaderLabel = runtimeDecisionBusy
-    ? "sync..."
-    : runtimeDecisionSummary
-      ? (isRuntimeTelemetryIssueState(runtimeDecisionSummary.opportunity.liveState)
-        ? runtimeDecisionSummary.opportunity.liveState
-        : runtimeDecisionSummary.dominant.bucket.label)
-      : "indispo";
-  const runtimeDecisionHeaderTone = runtimeDecisionBusy
-    ? "subtle"
-    : runtimeDecisionSummary
-      ? (isRuntimeTelemetryIssueState(runtimeDecisionSummary.opportunity.liveState)
-        ? runtimeTelemetryStateTone(runtimeDecisionSummary.opportunity.liveState)
-        : runtimeDecisionSummary.deskRead.tone)
-      : "warn";
+  const runtimeDecisionHeaderLabel = runtimeProjectionOperator?.runtimeDecisionHeader.label || (runtimeDecisionBusy ? "sync..." : "indispo");
+  const runtimeDecisionHeaderTone = runtimeProjectionOperator?.runtimeDecisionHeader.tone || (runtimeDecisionBusy ? "subtle" : "warn");
 
   return (
     <div className={`operator-action-panel ${decision.tone}`}>
@@ -2475,12 +2694,12 @@ export function OperatorActionSummary({
                 <span>{runtimeDecisionCompactRead.liveMeta}</span>
               </div>
             </div>
-            {runtimeDecisionSummary ? (
+            {runtimeProjectionSnapshot?.runtimeDecisionAvailable ? (
               <>
                 <div className="operator-journal-summary">
                   <a className="runtime-decision-link" href="/dashboard#runtime-observation-dashboard">Observation dashboard detaille</a>
                   {" · "}
-                  <a className="runtime-decision-link" href={runtimeDecisionExportHref}>export review json</a>
+                  {runtimeDecisionExportHref ? <a className="runtime-decision-link" href={runtimeDecisionExportHref}>export review + audit json</a> : null}
                 </div>
               </>
             ) : null}
@@ -3001,7 +3220,7 @@ export function ControlRoomMonitoringPanel({
   badge,
   layoutEditMode,
   onDetach,
-  liveOpsPayload,
+  runtimeOpsPayload,
   executionAiV6Payload,
   emergencyStopBusy,
   emergencyStopFeedback,
@@ -3011,14 +3230,15 @@ export function ControlRoomMonitoringPanel({
   badge: ReactNode;
   layoutEditMode: boolean;
   onDetach: () => void;
-  liveOpsPayload: Record<string, unknown> | null;
+  runtimeOpsPayload?: Record<string, unknown> | null;
   executionAiV6Payload?: ExecutionAiV6PanelPayload | null;
   emergencyStopBusy: boolean;
   emergencyStopFeedback: string | null;
   onEmergencyStop: () => void;
   formatClock: (value: string) => string;
 }) {
-  const snapshot = safeRecord(liveOpsPayload);
+  const resolvedRuntimeOpsPayload = runtimeOpsPayload ?? null;
+  const snapshot = safeRecord(resolvedRuntimeOpsPayload);
   const watchdog = safeRecord(snapshot.watchdog_state);
   const governance = safeRecord(snapshot.governance);
   const recovery = safeRecord(snapshot.recovery);
@@ -3057,8 +3277,8 @@ export function ControlRoomMonitoringPanel({
 
   return (
     <MonitoringPanelCard title="H24 Control Room" badge={badge} layoutEditMode={layoutEditMode} onDetach={onDetach}>
-      {!liveOpsPayload ? <p className="subtle mini">Control room indisponible.</p> : null}
-      {liveOpsPayload ? (
+      {!resolvedRuntimeOpsPayload ? <p className="subtle mini">Control room indisponible.</p> : null}
+      {resolvedRuntimeOpsPayload ? (
         <>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 8 }}>
             <div style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid rgba(148, 163, 184, 0.18)", background: "rgba(15, 23, 42, 0.24)" }}>
@@ -3148,7 +3368,7 @@ export function ExecutionPnlTruthMonitoringPanel({
   layoutEditMode,
   onDetach,
   payload,
-  liveOpsPayload,
+  runtimeOpsPayload,
   executionAiV6Payload,
   finalDecisionTruth,
   passiveMode = false,
@@ -3159,7 +3379,7 @@ export function ExecutionPnlTruthMonitoringPanel({
   layoutEditMode: boolean;
   onDetach: () => void;
   payload: ExecutionPnlAnalyzerPayload | null;
-  liveOpsPayload?: Record<string, unknown> | null;
+  runtimeOpsPayload?: Record<string, unknown> | null;
   executionAiV6Payload?: ExecutionAiV6PanelPayload | null;
   finalDecisionTruth?: FinalDecisionTruth | null;
   passiveMode?: boolean;
@@ -3170,14 +3390,18 @@ export function ExecutionPnlTruthMonitoringPanel({
   };
   formatClock: (value: string) => string;
 }) {
-  const runtimeDecision = useRuntimeDecisionSummary(journalContext, passiveMode);
-  const runtimeDecisionSummary = runtimeDecision.summary;
-  const runtimeDecisionBusy = runtimeDecision.busy;
-  const runtimeDecisionError = runtimeDecision.error;
-  const runtimeTelemetryGuard = deriveRuntimeTelemetryGuard(runtimeDecisionSummary);
-  const runtimeTelemetryIssue = isRuntimeTelemetryIssueState(runtimeTelemetryGuard?.state);
-  const runtimeTelemetryIntegrity = deriveRuntimeTelemetryIntegrity(runtimeDecisionSummary);
-  const runtimeTelemetryIntegritySummary = deriveRuntimeTelemetryIntegritySummary(runtimeDecisionSummary);
+  const runtimeProjection = useRuntimeReadonlyProjection(journalContext, passiveMode);
+  const runtimeProjectionSnapshot = runtimeProjection.snapshot;
+  const runtimeProjectionOperator = runtimeProjectionSnapshot?.operator ?? null;
+  const runtimeDecisionBusy = runtimeProjection.busy;
+  const runtimeDecisionError = runtimeProjection.error;
+  const runtimeTelemetryGuard = runtimeProjectionOperator?.runtimeTelemetryGuard ?? null;
+  const runtimeTelemetryIssue = runtimeProjectionOperator?.runtimeTelemetryIssue ?? false;
+  const runtimeTelemetryIntegrity = runtimeProjectionOperator?.runtimeTelemetryIntegrity ?? [];
+  const runtimeTelemetryIntegritySummary = runtimeProjectionOperator?.runtimeTelemetryIntegritySummary ?? null;
+  const runtimeAttestation = runtimeProjectionOperator?.runtimeAttestation ?? null;
+  const runtimeCertification = runtimeProjectionOperator?.runtimeCertification ?? null;
+  const resolvedRuntimeOpsPayload = runtimeOpsPayload ?? null;
   const journalSymbol = String(journalContext?.symbol || "").trim().toUpperCase();
   const journalTimeframe = String(journalContext?.timeframe || "").trim();
   const journalStrategy = String(journalContext?.strategy || "").trim();
@@ -3233,17 +3457,20 @@ export function ExecutionPnlTruthMonitoringPanel({
   const byExecutionMode = safeRows(envelope.by_execution_mode).slice(0, 3);
   const badModelFlags = safeRows(envelope.bad_model_flags).slice(0, 4);
   const dominanceReasons = aggregateDominanceReasons(trades);
-  const truthState = deriveDeskTruthState({ summary, liveOpsPayload, executionAiV6Payload, runtimeDecisionSummary });
+  const truthState = runtimeProjectionOperator?.deskTruth || {
+    label: "REDUCE" as const,
+    tone: runtimeDecisionBusy ? "subtle" as const : "warn" as const,
+    reason: runtimeDecisionBusy ? "loading runtime projection..." : (runtimeDecisionError || "runtime projection unavailable"),
+  };
   const tradeCount = safeNumber(summary.trade_count, 0);
   const noTradeCount = safeNumber(summary.no_trade_dominance_count, 0);
   const noTradeRatioPct = tradeCount > 0 ? (noTradeCount / tradeCount) * 100 : 0;
   const feedbackSummary = useMemo(() => buildFeedbackSummary({
     executionPnlPayload: payload,
-    liveOpsPayload,
-    executionAiV6Payload,
+    runtimeProjection: runtimeProjectionSnapshot,
     journalEntries,
     finalDecisionTruth,
-  }), [executionAiV6Payload, finalDecisionTruth, journalEntries, liveOpsPayload, payload]);
+  }), [finalDecisionTruth, journalEntries, payload, runtimeProjectionSnapshot]);
 
   return (
     <MonitoringPanelCard title="Execution PnL Truth" badge={badge} layoutEditMode={layoutEditMode} onDetach={onDetach}>
@@ -3253,12 +3480,18 @@ export function ExecutionPnlTruthMonitoringPanel({
           <div className="venue-telemetry-summary">
             <span className={`venue-telemetry-pill ${truthState.tone === "warn" ? "warn" : ""}`}>{truthState.label}</span>
             {finalDecisionTruth ? <span className={`venue-telemetry-pill ${finalDecisionTruth.execution_allowed ? finalDecisionTruth.should_trade ? "good" : "" : "warn"}`}>contract {finalDecisionTruth.action}</span> : null}
+            {runtimeAttestation ? <span className={`venue-telemetry-pill ${runtimeAttestation.tone === "warn" ? "warn" : runtimeAttestation.tone === "subtle" ? "subtle" : "good"}`.trim()} data-testid="execution-pnl-runtime-attestation">{runtimeAttestation.label}</span> : null}
+            {runtimeCertification?.promotionGate ? <span className={`venue-telemetry-pill ${runtimeCertification.promotionGate.tone === "warn" ? "warn" : runtimeCertification.promotionGate.tone === "subtle" ? "subtle" : "good"}`.trim()} data-testid="execution-pnl-runtime-promotion-gate">{runtimeCertification.promotionGate.label}</span> : null}
+            {runtimeCertification?.artifactAttestation ? <span className={`venue-telemetry-pill ${runtimeCertification.artifactAttestation.tone === "warn" ? "warn" : runtimeCertification.artifactAttestation.tone === "subtle" ? "subtle" : "good"}`.trim()} data-testid="execution-pnl-runtime-artifact-attestation">{runtimeCertification.artifactAttestation.label}</span> : null}
             {runtimeTelemetryIssue && runtimeTelemetryGuard ? <span className={`venue-telemetry-pill ${runtimeTelemetryGuard.tone === "warn" ? "warn" : ""}`}>{runtimeTelemetryGuard.label}</span> : null}
             <span className="venue-telemetry-pill">trades {tradeCount.toFixed(0)}</span>
             <span className="venue-telemetry-pill">net {formatSignedCompactUsd(summary.net_pnl_usd)}</span>
             <span className="venue-telemetry-pill">flags {safeNumber(summary.high_confidence_loss_count, 0).toFixed(0)}</span>
           </div>
           <div className="subtle mini" style={{ marginBottom: 8 }}>{truthState.reason}</div>
+          {runtimeAttestation ? <div className={`${runtimeAttestation.tone === "warn" ? "warn" : "subtle"} mini`}>Runtime attestation · {runtimeAttestation.summary}</div> : null}
+          {runtimeCertification?.promotionGate ? <div className={`${runtimeCertification.promotionGate.tone === "warn" ? "warn" : "subtle"} mini`}>Promotion gate · {runtimeCertification.promotionGate.summary}</div> : null}
+          {runtimeCertification?.artifactAttestation ? <div className={`${runtimeCertification.artifactAttestation.tone === "warn" ? "warn" : "subtle"} mini`}>Artifact attestation · {runtimeCertification.artifactAttestation.summary}</div> : null}
           {runtimeDecisionBusy ? <div className="subtle mini">runtime telemetry sync...</div> : null}
           {runtimeTelemetryIssue && runtimeTelemetryGuard ? <div className={`subtle mini ${runtimeTelemetryGuard.tone === "warn" ? "warn" : ""}`} data-testid="execution-pnl-telemetry-guard">{runtimeTelemetryGuard.summary}</div> : null}
           {runtimeTelemetryIntegrity.length > 0 ? (
@@ -5127,6 +5360,7 @@ export function RiskTimelineMonitoringPanel({
 }
 
 export const terminalSecondaryPanelsTestables = {
+  deriveDeskTruthState,
   deriveRuntimeTelemetryGuard,
   buildRuntimeDecisionCompactRead,
 };

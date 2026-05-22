@@ -1,4 +1,5 @@
 import { findFinalDecisionTruth } from "./finalDecisionTruth";
+import type { RuntimeReadonlyProjectionSnapshot } from "./runtimeReadonlyProjection";
 
 export type TradeQuality =
   | "GOOD_EXECUTION"
@@ -90,6 +91,7 @@ export type FeedbackSummary = {
 
 type JournalEntry = Record<string, unknown>;
 type JsonRow = Record<string, unknown>;
+type FeedbackRuntimeContext = NonNullable<RuntimeReadonlyProjectionSnapshot["operator"]["feedbackRuntime"]>;
 
 const TRADE_QUALITIES: TradeQuality[] = [
   "GOOD_EXECUTION",
@@ -206,7 +208,7 @@ function buildTradeQualityCounts(trades: JsonRow[], badModelFlags: Set<string>):
 
 function buildRewardBreakdown(input: {
   summary: JsonRow;
-  liveOps: JsonRow;
+  runtimeContext: FeedbackRuntimeContext | null;
   tradeQualityCounts: Record<TradeQuality, number>;
   byRegime: JsonRow[];
 }): FeedbackRewardBreakdown {
@@ -216,7 +218,7 @@ function buildRewardBreakdown(input: {
   const avgSlippageBps = Math.abs(safeNumber(input.summary.avg_slippage_bps, 0));
   const highConfidenceLossCount = safeNumber(input.summary.high_confidence_loss_count, 0);
   const noTradeCount = safeNumber(input.summary.no_trade_dominance_count, 0);
-  const drawdownPct = safeNumber(safeRecord(input.liveOps.risk_snapshot).dd_pct, 0);
+  const drawdownPct = safeNumber(input.runtimeContext?.drawdownPct, 0);
   const normalizedPnl = clamp(avgPnlUsd / 5, -1, 1);
   const fillEfficiency = clamp(1 - avgLatencyMs / 220, 0, 1);
   const slippageQuality = clamp(1 - avgSlippageBps / 5, 0, 1);
@@ -278,8 +280,7 @@ function buildRewardBreakdown(input: {
 
 function buildOverfitShield(input: {
   summary: JsonRow;
-  liveOps: JsonRow;
-  executionAiV6: JsonRow;
+  runtimeContext: FeedbackRuntimeContext | null;
   byRegime: JsonRow[];
   journalEntries: JournalEntry[];
   tradeQualityCounts: Record<TradeQuality, number>;
@@ -288,17 +289,8 @@ function buildOverfitShield(input: {
   const tradeCount = Math.max(1, safeNumber(input.summary.trade_count, 0));
   const netPnlUsd = safeNumber(input.summary.net_pnl_usd, 0);
   const highConfidenceLossCount = safeNumber(input.summary.high_confidence_loss_count, 0);
-  const memoryGap = safeRecord(input.liveOps.memory_gap);
-  const governance = safeRecord(input.liveOps.governance);
-  const riskSnapshot = safeRecord(input.liveOps.risk_snapshot);
-  const watchdog = safeRecord(input.liveOps.watchdog_state);
-  const v6Snapshot = safeRecord(input.executionAiV6.snapshot);
-  const v6Guardrails = safeRecord(v6Snapshot.guardrails);
-  const rewardEma = safeNumber(v6Snapshot.reward_ema, 0);
-  const realityGapScore = Math.max(
-    safeNumber(memoryGap.reality_gap_score, 0),
-    safeNumber(watchdog.drift, 0),
-  );
+  const rewardEma = safeNumber(input.runtimeContext?.rewardEma, 0);
+  const realityGapScore = safeNumber(input.runtimeContext?.realityGapScore, 0);
   const liveEdge = clamp(
     (safeNumber(input.summary.win_rate_pct, 0) / 100) * 0.45
       + (netPnlUsd >= 0 ? 0.35 : 0.1)
@@ -320,10 +312,9 @@ function buildOverfitShield(input: {
       : "PASS";
   const negativeStreakEstimate = input.tradeQualityCounts.MODEL_ERROR + input.tradeQualityCounts.BAD_EXECUTION;
   const override24h = countJournal(input.journalEntries, new Set(["override-visible-on"]), 24, input.nowMs);
-  const drawdownPct = safeNumber(riskSnapshot.dd_pct, 0);
-  const watchdogLocked = normalizeKey(watchdog.status) === "halt" || normalizeKey(governance.mode) === "locked";
-  const freezeLearning = watchdogLocked
-    || Boolean(v6Guardrails.learning_frozen)
+  const drawdownPct = safeNumber(input.runtimeContext?.drawdownPct, 0);
+  const freezeLearning = Boolean(input.runtimeContext?.guardrailsLocked)
+    || Boolean(input.runtimeContext?.learningFrozen)
     || drawdownPct >= 3
     || negativeStreakEstimate >= 5
     || rollingRealityRatio < 0.6
@@ -500,8 +491,7 @@ function buildWindows(input: {
 
 export function buildFeedbackSummary(input: {
   executionPnlPayload: Record<string, unknown> | null;
-  liveOpsPayload?: Record<string, unknown> | null;
-  executionAiV6Payload?: Record<string, unknown> | null;
+  runtimeProjection?: RuntimeReadonlyProjectionSnapshot | null;
   journalEntries?: Array<Record<string, unknown>>;
   nowMs?: number;
   finalDecisionTruth?: Record<string, unknown> | null;
@@ -510,8 +500,7 @@ export function buildFeedbackSummary(input: {
   const summary = safeRecord(envelope.summary);
   const trades = safeRows(envelope.trades);
   const byRegime = safeRows(envelope.by_regime);
-  const liveOps = safeRecord(input.liveOpsPayload);
-  const executionAiV6 = safeRecord(input.executionAiV6Payload);
+  const feedbackRuntime = input.runtimeProjection?.operator?.feedbackRuntime ?? null;
   const journalEntries = Array.isArray(input.journalEntries) ? input.journalEntries.map(safeRecord) : [];
   const canonicalDecision = findFinalDecisionTruth(
     input.finalDecisionTruth,
@@ -553,11 +542,10 @@ export function buildFeedbackSummary(input: {
     0,
     1,
   );
-  const reward = buildRewardBreakdown({ summary, liveOps, tradeQualityCounts, byRegime });
+  const reward = buildRewardBreakdown({ summary, runtimeContext: feedbackRuntime, tradeQualityCounts, byRegime });
   const shield = buildOverfitShield({
     summary,
-    liveOps,
-    executionAiV6,
+    runtimeContext: feedbackRuntime,
     byRegime,
     journalEntries,
     tradeQualityCounts,
@@ -627,15 +615,12 @@ export function buildFeedbackSummary(input: {
     },
   ] satisfies FeedbackError[]).sort((left, right) => right.score - left.score);
 
-  const watchdog = safeRecord(liveOps.watchdog_state);
-  const governance = safeRecord(liveOps.governance);
-  const riskSnapshot = safeRecord(liveOps.risk_snapshot);
-  const realityGap = safeNumber(safeRecord(liveOps.memory_gap).reality_gap_score, safeNumber(watchdog.drift, 0));
+  const drawdownPct = safeNumber(feedbackRuntime?.drawdownPct, 0);
+  const realityGap = safeNumber(feedbackRuntime?.realityGapScore, 0);
   const modelHealth: FeedbackModelHealth = (
-    normalizeKey(watchdog.status) === "halt"
-    || normalizeKey(governance.mode) === "locked"
+    Boolean(feedbackRuntime?.guardrailsLocked)
     || shield.freezeLearning
-    || safeNumber(riskSnapshot.dd_pct, 0) >= 3
+    || drawdownPct >= 3
     || reward.scorePct < 35
   )
     ? "BROKEN"
@@ -646,7 +631,7 @@ export function buildFeedbackSummary(input: {
         : "HEALTHY";
   const driftState: FeedbackDriftState = (
     modelHealth === "BROKEN"
-    || safeNumber(riskSnapshot.dd_pct, 0) >= 3
+    || drawdownPct >= 3
     || safeNumber(summary.high_confidence_loss_count, 0) >= 2
   )
     ? "LOCK"

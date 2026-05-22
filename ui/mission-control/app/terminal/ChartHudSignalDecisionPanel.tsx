@@ -321,15 +321,15 @@ export default function ChartHudSignalDecisionPanel({
             <div className="chart-module-summary-actions">
               <span className="chart-module-summary-copy">
                 {showAdvancedModules
-                  ? "Les modules experts sont affiches."
-                  : "Les modules experts sont replies pour garder une lecture nette du terminal."}
+                  ? "Les modules avances sont affiches."
+                  : "Les modules avances restent replies pour garder une lecture nette du terminal."}
               </span>
               <button
                 type="button"
                 className={`chart-chip ${showAdvancedModules ? "active" : ""}`}
                 onClick={() => setShowAdvancedModules((current) => !current)}
               >
-                {showAdvancedModules ? "Masquer modules experts" : "Afficher modules experts"}
+                {showAdvancedModules ? "Masquer modules avances" : "Afficher modules avances"}
               </button>
             </div>
           </div>

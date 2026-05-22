@@ -23,19 +23,27 @@ assertIncludes(multiChartManager, "this.priceSignalLayer.draw", "price signal dr
 
 const gpuSurface = read("app/terminal/GpuChartV4Surface.tsx");
 assertIncludes(gpuSurface, "normalizePriceSignalBands", "GPU surface price signal normalization");
-assertIncludes(gpuSurface, "primaryPriceSignalBands: gpuPriceSignalBands", "GPU surface price signal viewport injection");
+assertIncludes(gpuSurface, "priceSignalBandsRef.current = gpuPriceSignalBands", "GPU surface price signal ref wiring");
+assertIncludes(gpuSurface, "primaryPriceSignalBands: frameSnapshot.priceSignalBands", "GPU surface price signal viewport injection");
 
-const terminalPage = read("app/terminal/page.tsx");
-assertIncludes(terminalPage, "buildExecutionOverlaySnapshot", "execution overlay snapshot builder");
-assertIncludes(terminalPage, "buildExecutionSlippageBands", "execution slippage band builder");
-assertIncludes(terminalPage, "buildLiquidityPredictionLevels", "liquidity prediction builder");
-assertIncludes(terminalPage, "buildFlowSignalBands", "flow signal band builder");
-assertIncludes(terminalPage, "buildArbitrageSignalBands", "arbitrage signal band builder");
-assertIncludes(terminalPage, "const chartPriceSignalBands = useMemo(() => buildPriceSignalBands", "chart price signal aggregation");
-assertIncludes(terminalPage, "priceSignalBands={chartRuntimeOrderflowEnabled ? chartPriceSignalBands : undefined}", "GPU page price signal forwarding");
+const chartPriceSignalBoundary = read("app/terminal/TerminalChartPriceSignalBoundary.tsx");
+assertIncludes(chartPriceSignalBoundary, "function buildExecutionOverlaySnapshot", "execution overlay snapshot builder");
+assertIncludes(chartPriceSignalBoundary, "function buildExecutionSlippageBands", "execution slippage band builder");
+assertIncludes(chartPriceSignalBoundary, "function buildLiquidityPredictionLevels", "liquidity prediction builder");
+assertIncludes(chartPriceSignalBoundary, "function buildFlowSignalBands", "flow signal band builder");
+assertIncludes(chartPriceSignalBoundary, "function buildArbitrageSignalBands", "arbitrage signal band builder");
+assertIncludes(chartPriceSignalBoundary, "function buildPriceSignalBands", "chart price signal aggregation");
+assertIncludes(chartPriceSignalBoundary, "children: (payload: { priceSignalBands: PriceSignalBand[] }) => ReactNode", "chart price signal render boundary contract");
+
+const terminalClient = read("app/terminal/TradingTerminalPageClient.tsx");
+assertIncludes(terminalClient, "TerminalChartPriceSignalBoundary", "chart price signal boundary wiring");
+assertIncludes(terminalClient, "flowIntelligenceSnapshot={flowIntelligenceSnapshot}", "flow snapshot passed into chart boundary");
+assertIncludes(terminalClient, "multiVenueArbitrageSnapshot={multiVenueArbitrageSnapshot}", "arbitrage snapshot passed into chart boundary");
+assertIncludes(terminalClient, "priceSignalBands={chartRuntimeOrderflowEnabled ? priceSignalBands : undefined}", "GPU/institutional chart price signal forwarding");
+assertIncludes(terminalClient, "priceSignalBands={chartRuntimeOrderflowEnabled ? priceSignalBands : []}", "terminal V2 price signal forwarding");
 
 const terminalV2 = read("app/terminal/TerminalChartV2.tsx");
 assertIncludes(terminalV2, "priceSignalBands?: PriceSignalBand[]", "terminal V2 price signal prop");
 assertIncludes(terminalV2, "priceSignalBands={priceSignalBands}", "terminal V2 price signal forwarding");
 
-console.log("PASS hft overlay guard: execution overlay, slippage bands, and liquidity prediction levels are wired into the GPU chart stack");
+console.log("PASS hft overlay guard: execution overlay, slippage bands, and liquidity prediction levels are owned by the chart price-signal boundary and forwarded into the chart stack");

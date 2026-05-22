@@ -42,7 +42,7 @@ export type GovernanceReplayArchiveContractsSummary = {
   reasons: string[];
 };
 
-function normalizeArchivePersistentCompression(
+export function normalizeArchivePersistentCompression(
   archive: MarketRegimeArchiveSummary,
 ): MarketRegimeArchiveSummary {
   const compression = archive.persistent_compression;
@@ -133,7 +133,7 @@ function buildArchiveContract<TSummary>(input: {
   };
 }
 
-function buildGovernanceReplayArchiveContractsSummary(input: {
+export function buildGovernanceReplayArchiveContractsSummary(input: {
   archive: MarketRegimeArchiveSummary;
   replay: GovernanceReplaySummary;
   freeze: FreezeV1ContractsSummary;

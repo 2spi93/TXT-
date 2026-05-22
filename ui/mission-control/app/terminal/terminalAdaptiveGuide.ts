@@ -22,7 +22,6 @@ export type TerminalAdaptiveGuidePlan = {
   summary: string;
   tone: TerminalAdaptiveGuideTone;
   layoutPreset: "scalp" | "monitoring";
-  uiMode: "novice" | "expert";
   densityMode: "focus" | "full";
   commandPrompt: string;
   steps: TerminalAdaptiveGuideStep[];
@@ -161,7 +160,6 @@ function buildReadMarketPlan(input: {
     summary: "Le terminal doit d'abord te montrer l'etat du signal, sa stabilite et la domination du no-trade.",
     tone: resolveGuideTone({ completedSteps, totalSteps: steps.length }),
     layoutPreset: "scalp",
-    uiMode: "novice",
     densityMode: "focus",
     commandPrompt: "Mode commandant: aide-moi a lire le terminal maintenant. Donne DECISION, STABILITE, NO-TRADE DOMINANCE et dis clairement si je dois juste observer.",
     steps,
@@ -209,7 +207,6 @@ function buildExecuteSafePlan(input: {
     summary: "L'entree n'est validee que si la decision reste stable et si le feedback n'impose ni freeze ni no-trade.",
     tone: resolveGuideTone({ completedSteps, totalSteps: steps.length, hardBlock: input.feedbackSummary.forceNoTrade }),
     layoutPreset: "scalp",
-    uiMode: "expert",
     densityMode: "focus",
     commandPrompt: "Mode commandant: confirme si une entree micro-live est autorisee maintenant. Donne DECISION, RISQUE, TAILLE et rappelle que je ne dois pas passer outre une garde active.",
     steps,
@@ -257,7 +254,6 @@ function buildCalibratePlan(input: {
     summary: "La calibration doit suivre le feedback reel, le shield et le cap de variation journalier, jamais l'emotion du dernier trade.",
     tone: resolveGuideTone({ completedSteps, totalSteps: steps.length, hardBlock: input.feedbackSummary.driftState === "LOCK" }),
     layoutPreset: "monitoring",
-    uiMode: "novice",
     densityMode: "full",
     commandPrompt: "Mode commandant: resume la calibration a appliquer maintenant. Donne MODEL HEALTH, DRIFT, ACTIONS BORNEES, et dis explicitement si l'apprentissage doit etre gele.",
     steps,

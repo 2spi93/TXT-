@@ -123,7 +123,7 @@ export function buildLayoutPreset(preset: LayoutPreset, novice: boolean): Termin
   if (preset === "scalp") {
     return {
       preset,
-      coreSplit: novice ? 70 : 76,
+      coreSplit: novice ? 68 : 73,
       microOrder: ["dom", "tape", "footprint", "heatmap"],
       lowerOrder: ["blotter", "brokers"],
       monitoringOrder: ["controlroom", "pnltruth", "optimizer", "execsmart", "marketcontext", "tradability", "attentioncontext", "v6observability", "venues", "alerts", "governance", "incidents", "readiness", "risktimeline"],
@@ -136,7 +136,7 @@ export function buildLayoutPreset(preset: LayoutPreset, novice: boolean): Termin
   if (preset === "monitoring") {
     return {
       preset,
-      coreSplit: novice ? 62 : 66,
+      coreSplit: novice ? 60 : 64,
       microOrder: ["heatmap", "dom", "footprint", "tape"],
       lowerOrder: ["brokers", "blotter"],
       monitoringOrder: ["controlroom", "pnltruth", "optimizer", "execsmart", "marketcontext", "tradability", "attentioncontext", "v6observability", "venues", "governance", "incidents", "alerts", "readiness", "risktimeline"],
@@ -148,7 +148,7 @@ export function buildLayoutPreset(preset: LayoutPreset, novice: boolean): Termin
   }
   return {
     preset: "swing",
-    coreSplit: novice ? 72 : 78,
+    coreSplit: novice ? 70 : 74,
     microOrder: ["dom", "footprint", "tape", "heatmap"],
     lowerOrder: ["blotter", "brokers"],
     monitoringOrder: ["controlroom", "pnltruth", "optimizer", "execsmart", "marketcontext", "tradability", "attentioncontext", "v6observability", "venues", "alerts", "incidents", "governance", "readiness", "risktimeline"],

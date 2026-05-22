@@ -1,6 +1,6 @@
 import type { RefObject } from "react";
 
-import type { ChartReleaseSendMode, ChartSnapPriority, UiMode } from "../../lib/userUiPrefs";
+import type { ChartReleaseSendMode, ChartSnapPriority } from "../../lib/userUiPrefs";
 
 export type SignalDirection = "buy" | "sell" | "neutral";
 export type SignalSeverity = "info" | "warn" | "critical";
@@ -381,7 +381,6 @@ export type ChartHudOrderRiskPanelProps = {
   onSetChartTargetGainUsd: (value: number) => void;
   chartRiskGuardEnabled: boolean;
   onToggleChartRiskGuardEnabled: () => void;
-  uiMode: UiMode;
   onApplySafeRiskPreset: () => void;
   onApplyBalancedRiskPreset: () => void;
   onApplyDeskRiskPreset: () => void;
