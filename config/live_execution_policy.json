@@ -10,6 +10,7 @@
     "max_pending_live_approvals": 8,
     "drawdown_warning_ratio": 0.7,
     "enforce_memory_gate": true,
+    "require_human_for_autonomous_sources": false,
     "autonomous_sources": [
       "kairos-shadow-runtime",
       "tradingview",
@@ -103,6 +104,14 @@
           ],
           "min_confidence": 0.78,
           "reason": "sol_only_in_momentum"
+        }
+      }
+    },
+    "mt5": {
+      "enabled": true,
+      "conditional_live_rules": {
+        "BTCUSD": {
+          "reason": "ftmo_btc_bridge_symbol_enabled"
         }
       }
     }

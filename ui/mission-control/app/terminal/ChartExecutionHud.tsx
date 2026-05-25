@@ -46,12 +46,12 @@ export default function ChartExecutionHud({
       style={layoutScreenProfile === "sm" || detached ? undefined : { left: chartHudPosition.x, top: chartHudPosition.y }}
     >
       <div className="chart-order-hud-title" onMouseDown={onBeginChartHudDrag}>
-        <span className="chart-order-hud-kicker">Execution Desk</span>
-        <strong>Chart Trading</strong>
+        <span className="chart-order-hud-kicker">Execution</span>
+        <strong>Ordres chart</strong>
         <span className={`chart-order-hud-mode chart-order-hud-mode-${chartMotionClass}`}>{chartMotionPreset}</span>
-        {!detached ? <button type="button" className="chart-order-hud-drag-handle" aria-label="Move Execution Desk">Drag</button> : null}
+        {!detached ? <button type="button" className="chart-order-hud-drag-handle" aria-label="Deplacer Execution Desk">Move</button> : null}
         <div className="chart-order-hud-title-actions">
-          <button type="button" className="chart-order-hud-action" onClick={onToggleChartHudMinimized}>{effectiveMinimized ? "Expand" : "Reduce"}</button>
+          <button type="button" className="chart-order-hud-action" onClick={onToggleChartHudMinimized}>{effectiveMinimized ? "Ouvrir" : "Reduire"}</button>
           {!detached ? <button type="button" className="chart-order-hud-action" onClick={onResetChartHud}>Reset</button> : null}
         </div>
       </div>

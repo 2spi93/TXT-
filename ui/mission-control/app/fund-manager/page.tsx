@@ -1223,16 +1223,18 @@ export default function FundManagerPage() {
           <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
             <div className="panel">
               <div className="eyebrow">Regime Policy by Horizon <HelpHint text="Ce bloc aide à décider quel style de prise de position convient au contexte du moment." examples={["Quand le marché devient instable, réduis les prises rapides et garde des tailles plus modestes.", "Quand le contexte est plus lisible, tu peux laisser respirer des positions plus longues."]} /></div>
+              <p className="subtle" style={{ marginTop: 10 }}>Référence chiffres: Terminal/oracle marché pour la tendance, analytics volatilité réalisée pour la vol, note desk/news pour le sentiment. Garde les valeurs manuelles uniquement pour un test.</p>
               <div className="form-grid" style={{ marginTop: 12 }}>
-                <input type="number" step="0.01" value={trendScore} onChange={(event) => setTrendScore(Number(event.target.value || 0))} placeholder="trend_score" />
-                <input type="number" step="0.001" value={realizedVolatility} onChange={(event) => setRealizedVolatility(Number(event.target.value || 0))} placeholder="realized_volatility" />
-                <input type="number" step="0.01" value={sentimentScore} onChange={(event) => setSentimentScore(Number(event.target.value || 0))} placeholder="sentiment_score" />
+                <label className="field-stack"><span>Tendance 0-1</span><input type="number" step="0.01" value={trendScore} onChange={(event) => setTrendScore(Number(event.target.value || 0))} placeholder="trend_score" /></label>
+                <label className="field-stack"><span>Volatilité réalisée</span><input type="number" step="0.001" value={realizedVolatility} onChange={(event) => setRealizedVolatility(Number(event.target.value || 0))} placeholder="realized_volatility" /></label>
+                <label className="field-stack"><span>Sentiment -1 à 1</span><input type="number" step="0.01" value={sentimentScore} onChange={(event) => setSentimentScore(Number(event.target.value || 0))} placeholder="sentiment_score" /></label>
                 <button type="button" onClick={() => detectRegime()} disabled={busy}>{busy ? "Analyse..." : "Detect regime"}</button>
               </div>
               {regimeResult ? (
                 <div className="panel" style={{ marginTop: 12, borderRadius: 12 }}>
                   <div className="row"><span>Regime</span><span>{String(regimeResult.regime || "-")}</span></div>
                   <div className="row"><span>Confidence</span><span>{String(regimeResult.confidence || "-")}</span></div>
+                  <div className="row"><span>Source lecture</span><span>trend_score + realized_volatility + sentiment_score</span></div>
                 </div>
               ) : null}
               <textarea rows={6} style={{ marginTop: 12 }} value={notes.regimePolicy} onChange={(event) => updateNote("regimePolicy", event.target.value)} placeholder="Write the policy for Perception V5 -> regime -> policy by horizon -> execution permissions." />

@@ -54,11 +54,12 @@ export default function OpsChatbot() {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [input, setInput] = useState("");
-  const [copilotMode, setCopilotMode] = useState<CopilotMode>("commandant");
+  const [copilotMode, setCopilotMode] = useState<CopilotMode>("assistant");
+  const [expanded, setExpanded] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       role: "assistant",
-      text: "Ops Copilot actif en mode commandant. Je peux donner une decision soft, le niveau de risque, la raison principale et rappeler qu'un override doit rester visible.",
+      text: "Je reponds en francais simple. Pose ta question comme tu la penses: je dois te dire quoi regarder, pourquoi c'est bloque, et quoi faire ensuite sans jargon inutile.",
     },
   ]);
   const [pendingAction, setPendingAction] = useState("run_runbook");
@@ -78,6 +79,7 @@ export default function OpsChatbot() {
         return;
       }
       setOpen(true);
+      setExpanded(true);
       if (detail?.autoSend) {
         void sendMessage(message);
         return;
@@ -99,8 +101,8 @@ export default function OpsChatbot() {
     setLoading(true);
 
     const requestMessage = copilotMode === "commandant"
-      ? `Mode commandant. Reponds de facon directive et concise avec: DECISION, RISQUE, RAISON, OVERRIDE. ${message}`
-      : message;
+      ? `Mode commandant. Reponds en francais naturel, court, sans jargon inutile, avec: DECISION, RISQUE, RAISON, ACTION. Explique les termes techniques si tu les utilises. ${message}`
+      : `Reponds en francais naturel et comprehensible pour un operateur. Donne une reponse courte, concrete, avec les chiffres utiles et l'action suivante. Question: ${message}`;
 
     try {
       const response = await fetch("/api/chat/ops", {
@@ -227,50 +229,56 @@ export default function OpsChatbot() {
   return (
     <div className="ops-chatbot-wrap">
       <button type="button" className="ops-chatbot-toggle" onClick={() => setOpen((v) => !v)}>
-        {open ? "Fermer Copilot" : "Ops Copilot"}
+        {open ? "Masquer Copilot" : "Ops Copilot"}
       </button>
       {open ? (
-        <div className="ops-chatbot-panel">
-          <div className="ops-chatbot-head">Agent Ops</div>
+        <div className={`ops-chatbot-panel ${expanded ? "is-expanded" : "is-compact"}`}>
+          <div className="ops-chatbot-head">
+            <span>Agent Ops</span>
+            <div className="ops-chatbot-head-actions">
+              <button type="button" onClick={() => setExpanded((value) => !value)}>{expanded ? "Reduire" : "Agrandir"}</button>
+              <button type="button" onClick={() => setOpen(false)}>Fermer</button>
+            </div>
+          </div>
             <div className="ops-chatbot-guided" style={{ paddingTop: 0 }}>
               <div className="ops-chatbot-mode-row">
                 <label className="subtle mini" htmlFor="ops-copilot-mode">Mode</label>
                 <select id="ops-copilot-mode" value={copilotMode} onChange={(event) => setCopilotMode(event.target.value as CopilotMode)}>
-                  <option value="commandant">Commandant</option>
-                  <option value="assistant">Assistant</option>
+                  <option value="assistant">Français simple</option>
+                  <option value="commandant">Decision directe</option>
                 </select>
               </div>
               <div className="subtle mini">
                 {copilotMode === "commandant"
-                  ? "Autorite soft: decision, risque, raison, override visible."
-                  : "Mode explicatif: plus narratif, moins directif."}
+                  ? "Je tranche: attendre, reduire, couper ou executer petit."
+                  : "Tu peux poser une question normale, je traduis le desk en langage clair."}
               </div>
-              <div className="subtle mini">Raccourcis pages</div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                {PAGE_SHORTCUTS.map((shortcut) => (
-                  <a key={shortcut.href} href={shortcut.href} className="subtle mini">{shortcut.label}</a>
-                ))}
-              </div>
-              {copilotMode === "commandant" ? (
-                <>
-                  <div className="subtle mini" style={{ marginTop: 6 }}>Commandes rapides</div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {expanded ? (
+                <details className="ops-chatbot-details">
+                  <summary>Raccourcis et questions types</summary>
+                  <div className="ops-chatbot-shortcuts">
+                    {PAGE_SHORTCUTS.map((shortcut) => (
+                      <a key={shortcut.href} href={shortcut.href} className="subtle mini">{shortcut.label}</a>
+                    ))}
+                  </div>
+                  {copilotMode === "commandant" ? (
+                    <div className="ops-chatbot-shortcuts vertical">
                     {COMMANDANT_SHORTCUTS.map((shortcut) => (
                       <button key={shortcut} type="button" disabled={loading} onClick={() => void sendMessage(shortcut)}>
                         {shortcut}
                       </button>
                     ))}
+                    </div>
+                  ) : null}
+                  <div className="ops-chatbot-shortcuts vertical">
+                    {PROMPT_SHORTCUTS.map((shortcut) => (
+                      <button key={shortcut} type="button" disabled={loading} onClick={() => void sendMessage(shortcut)}>
+                        {shortcut}
+                      </button>
+                    ))}
                   </div>
-                </>
+                </details>
               ) : null}
-              <div className="subtle mini" style={{ marginTop: 6 }}>Prompts rapides</div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                {PROMPT_SHORTCUTS.map((shortcut) => (
-                  <button key={shortcut} type="button" disabled={loading} onClick={() => void sendMessage(shortcut)}>
-                    {shortcut}
-                  </button>
-                ))}
-              </div>
             </div>
           <div className="ops-chatbot-messages">
             {messages.map((m, idx) => (
@@ -294,10 +302,10 @@ export default function OpsChatbot() {
               {loading ? "..." : "Envoyer"}
             </button>
           </div>
-          <div className="ops-chatbot-guided">
+          {expanded ? <div className="ops-chatbot-guided">
             <label className="subtle mini" style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <input type="checkbox" checked={safeMode} onChange={(e) => setSafeMode(e.target.checked)} />
-              Safe action confirmation (2 etapes)
+              Confirmation en 2 etapes pour action sensible
             </label>
             <select value={pendingAction} onChange={(e) => setPendingAction(e.target.value)}>
               <option value="run_runbook">Lancer runbook</option>
@@ -321,8 +329,8 @@ export default function OpsChatbot() {
                 </button>
               </>
             ) : null}
-            <a href="/incidents" className="subtle mini">Ouvrir Incident Desk</a>
-          </div>
+            <a href="/incidents" className="subtle mini">Ouvrir Incidents</a>
+          </div> : null}
         </div>
       ) : null}
     </div>

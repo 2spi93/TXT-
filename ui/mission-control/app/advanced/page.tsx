@@ -2,7 +2,7 @@ import { redirect } from "next/navigation";
 import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
 import Link from "next/link";
 import { getServerRoleGroup } from "../../lib/serverAuth";
-import RustExecutionAdminDesk from "../../components/internal/RustExecutionAdminDesk";
+import AdvancedRustExecutionAdminDesk from "./AdvancedRustExecutionAdminDesk";
 
 const MODULES = [
   "Strategies",
@@ -62,7 +62,7 @@ export default async function AdvancedPage() {
       </section>
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr" }}>
-        <RustExecutionAdminDesk />
+        <AdvancedRustExecutionAdminDesk />
       </section>
     </main>
   );

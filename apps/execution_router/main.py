@@ -92,7 +92,9 @@ _OBSERVATION_BUS_OFFLINE_AFTER_SEC = max(
     min(30.0, _env_float("ROUTING_OBSERVATION_BUS_OFFLINE_AFTER_SEC", 8.0)),
 )
 _OBSERVATION_NO_TRADES_AFTER_SEC = max(5.0, min(600.0, _env_float("ROUTING_OBSERVATION_NO_TRADES_AFTER_SEC", 60.0)))
-_OBSERVATION_SYMBOLS_RAW = os.getenv("ROUTING_OBSERVATION_SYMBOLS", "BTCUSDT,ETHUSDT")
+_OBSERVATION_SYMBOLS_RAW = os.getenv("ROUTING_OBSERVATION_SYMBOLS", "BTCUSDT")
+_ROUTING_INCLUDE_PAPER_VENUES = os.getenv("ROUTING_INCLUDE_PAPER_VENUES", "0").strip().lower() in {"1", "true", "yes", "on"}
+_ROUTE_CANDIDATE_MAX_FRESHNESS_MS = max(5_000.0, min(3_600_000.0, _env_float("ROUTE_CANDIDATE_MAX_FRESHNESS_MS", 120_000.0)))
 _obs_cycle_results: deque[bool] = deque(maxlen=_OBS_WINDOW_SIZE)
 _obs_last_bus_event_ts: float = 0.0
 _obs_last_trade_ts: float = 0.0
@@ -2681,10 +2683,39 @@ def _select_route_candidates(
 
 def _venue_execution_profile(venue: str) -> dict[str, object]:
     normalized = str(venue or "").strip().lower()
+    selected_profile = VENUE_EXECUTION_PROFILES["default"]
     for key, profile in VENUE_EXECUTION_PROFILES.items():
         if key != "default" and normalized.startswith(key):
-            return profile
-    return VENUE_EXECUTION_PROFILES["default"]
+            selected_profile = profile
+            break
+    enriched = dict(selected_profile)
+    latency_base_ms = _to_float(enriched.get("latency_base_ms"), 20.0)
+    latency_jitter_ms = _to_float(enriched.get("latency_jitter_ms"), 8.0)
+    partial_fill_bias = _to_float(enriched.get("partial_fill_bias"), 0.16)
+    fee_bps = _to_float(VENUE_FEE_BPS.get(normalized.split("-")[0], VENUE_FEE_BPS.get("default", 5.0)), 5.0)
+    enriched.setdefault("expected_slippage_bps", round(max(0.35, latency_jitter_ms * 0.08 + partial_fill_bias * 2.0), 3))
+    enriched.setdefault("max_spread_bps", round(max(5.0, fee_bps + 2.0), 3))
+    enriched.setdefault("max_latency_ms", round(latency_base_ms + latency_jitter_ms + 120.0, 3))
+    enriched.setdefault("profile_source", "venue_execution_profile")
+    return enriched
+
+
+def _profile_execution_baseline(venue: str) -> dict[str, object]:
+    profile = _venue_execution_profile(venue)
+    latency_base_ms = _to_float(profile.get("latency_base_ms"), 20.0)
+    latency_jitter_ms = _to_float(profile.get("latency_jitter_ms"), 8.0)
+    expected_slippage_bps = max(0.0, _to_float(profile.get("expected_slippage_bps"), 0.8))
+    avg_fill_latency_ms = max(1.0, latency_base_ms + latency_jitter_ms)
+    return {
+        "fill_count": 0,
+        "instrument_count": 0,
+        "avg_slippage_bps": round(expected_slippage_bps, 3),
+        "avg_fill_latency_ms": round(avg_fill_latency_ms, 1),
+        "avg_fill_quality_score": round(max(0.0, 100.0 - expected_slippage_bps * 2.0), 2),
+        "last_fill_at": None,
+        "observed": False,
+        "source": "venue_execution_profile",
+    }
 
 
 def _normalize_network_regime(value: object) -> str:
@@ -2997,7 +3028,12 @@ async def _build_route_candidates(symbol: str, infra_context: dict[str, object] 
         if quotes_response.status_code < 400:
             _mark_bus_event()
 
-        matching_quotes = [quote for quote in quotes if _normalize_symbol(str(quote.get("instrument", ""))) == market_symbol]
+        matching_quotes = [
+            quote
+            for quote in quotes
+            if _normalize_symbol(str(quote.get("instrument", ""))) == market_symbol
+            and (_ROUTING_INCLUDE_PAPER_VENUES or not str(quote.get("venue") or "").startswith("paper-"))
+        ]
         depth_responses = await asyncio.gather(
             *[
                 client.get(
@@ -3144,9 +3180,7 @@ async def _build_route_candidates(symbol: str, infra_context: dict[str, object] 
                 }
             )
 
-    # Filter out hard-stale venues (>1h freshness) to prevent cross-venue deviation pollution
-    _HARD_STALE_MS = 3_600_000
-    candidates = [c for c in candidates if _to_float(c.get("freshness_ms"), 0.0) < _HARD_STALE_MS]
+    candidates = [c for c in candidates if _to_float(c.get("freshness_ms"), 0.0) <= _ROUTE_CANDIDATE_MAX_FRESHNESS_MS]
 
     ranked_candidates = sorted(_annotate_multi_venue_dominance(candidates), key=lambda item: item["score"], reverse=True)
     for index, candidate in enumerate(ranked_candidates):
@@ -3398,9 +3432,11 @@ async def route_venue_telemetry(lookback_minutes: int = 120) -> dict:
                         "avg_fill_latency_ms": round(_to_float(execution_by_venue[venue].get("avg_fill_latency_ms"), 0.0), 1),
                         "avg_fill_quality_score": round(_to_float(execution_by_venue[venue].get("avg_fill_quality_score"), 0.0), 2),
                         "last_fill_at": execution_by_venue[venue].get("last_fill_at"),
+                        "observed": True,
+                        "source": "execution_fill_events",
                     }
                     if venue in execution_by_venue
-                    else None
+                    else _profile_execution_baseline(venue)
                 ),
                 "stability": VENUE_STABILITY.get(venue),
                 "profile": _venue_execution_profile(venue),

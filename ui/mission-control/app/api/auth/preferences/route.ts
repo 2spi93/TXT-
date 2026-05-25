@@ -5,18 +5,20 @@ import { executeWithShadowMode, shadowResponse } from "../../../../lib/shadowMod
 
 const SHADOW_CONFIG_GET = {
   route: "auth/preferences",
-  enabled: true,
-  shadowOnly: true,           // Phase 1: test backend, return fallback
+  enabled: false,
+  shadowOnly: true,           // UI latency first: return fallback without blocking on shadow probe.
   dualMode: false,
   rolloutPercentage: 0,       // 0% = nobody gets real data yet
+  backendTimeoutMs: 900,
 };
 
 const SHADOW_CONFIG_PUT = {
   route: "auth/preferences",
-  enabled: true,
+  enabled: false,
   shadowOnly: true,
   dualMode: false,
   rolloutPercentage: 0,
+  backendTimeoutMs: 1200,
 };
 
 const PREFS_GET_BURST_WINDOW_MS = 2000;

@@ -67,6 +67,12 @@ Re-check slot health:
 scripts/mission_control_blue_green.sh status
 ```
 
+Sandbox false-negative note:
+
+- in this VS Code terminal sandbox, Docker-backed `status` / `flip` checks can report `missing` even when the slot is healthy
+- treat direct Docker truth plus direct HTTP/authenticated probes as authoritative before rollback
+- if the script reports `missing`, re-check with `docker ps`, the active upstream in [data/mission-control/ui-active-slot.conf](/opt/txt/data/mission-control/ui-active-slot.conf), and the published gateway/dashboard probes below
+
 Run the authenticated live dashboard smoke against the published gateway from the active UI container:
 
 ```bash

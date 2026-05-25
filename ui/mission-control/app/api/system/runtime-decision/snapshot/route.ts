@@ -36,10 +36,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   const body = await request.json().catch(() => ({})) as Record<string, unknown>;
 
   if (hasExplicitScope(body)) {
+    const requestedSymbol = String(body.symbol || "").trim();
+    const deskScope = requestedSymbol.toUpperCase() === "DESK";
     const result = await persistRuntimeDecisionWriterScope({
-      symbol: String(body.symbol || "").trim(),
-      timeframe: String(body.timeframe || "").trim(),
-      strategy: String(body.strategy || "").trim(),
+      symbol: deskScope ? "" : requestedSymbol,
+      timeframe: deskScope ? "" : String(body.timeframe || "").trim(),
+      strategy: deskScope ? "" : String(body.strategy || "").trim(),
       limit: Number(body.limit || 0) || undefined,
       sinceDays: Number(body.sinceDays || 0) || undefined,
       samples: Number(body.samples || 0) || undefined,

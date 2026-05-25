@@ -93,6 +93,32 @@ type JournalEntry = Record<string, unknown>;
 type JsonRow = Record<string, unknown>;
 type FeedbackRuntimeContext = NonNullable<RuntimeReadonlyProjectionSnapshot["operator"]["feedbackRuntime"]>;
 
+function buildFeedbackRuntimeContextFromLegacyPayloads(
+  liveOpsPayload: Record<string, unknown> | null | undefined,
+  executionAiV6Payload: Record<string, unknown> | null | undefined,
+): FeedbackRuntimeContext | null {
+  const liveOps = safeRecord(liveOpsPayload);
+  const executionAi = safeRecord(executionAiV6Payload);
+  if (Object.keys(liveOps).length === 0 && Object.keys(executionAi).length === 0) {
+    return null;
+  }
+  const riskSnapshot = safeRecord(liveOps.risk_snapshot);
+  const memoryGap = safeRecord(liveOps.memory_gap);
+  const watchdog = safeRecord(liveOps.watchdog_state);
+  const governance = safeRecord(liveOps.governance);
+  const executionSnapshot = safeRecord(executionAi.snapshot);
+  const guardrails = safeRecord(executionSnapshot.guardrails);
+  return {
+    drawdownPct: safeNumber(riskSnapshot.dd_pct, 0),
+    rewardEma: safeNumber(executionSnapshot.reward_ema, 0),
+    realityGapScore: safeNumber(memoryGap.reality_gap_score, 0),
+    learningFrozen: Boolean(guardrails.learning_frozen),
+    guardrailsLocked: /warning|halt|blocked|lock/i.test(String(watchdog.status || "")),
+    watchdogStatus: String(watchdog.status || "UNKNOWN").trim() || "UNKNOWN",
+    governanceMode: String(governance.mode || "SAFE").trim() || "SAFE",
+  };
+}
+
 const TRADE_QUALITIES: TradeQuality[] = [
   "GOOD_EXECUTION",
   "BAD_EXECUTION",
@@ -492,6 +518,8 @@ function buildWindows(input: {
 export function buildFeedbackSummary(input: {
   executionPnlPayload: Record<string, unknown> | null;
   runtimeProjection?: RuntimeReadonlyProjectionSnapshot | null;
+  liveOpsPayload?: Record<string, unknown> | null;
+  executionAiV6Payload?: Record<string, unknown> | null;
   journalEntries?: Array<Record<string, unknown>>;
   nowMs?: number;
   finalDecisionTruth?: Record<string, unknown> | null;
@@ -500,7 +528,9 @@ export function buildFeedbackSummary(input: {
   const summary = safeRecord(envelope.summary);
   const trades = safeRows(envelope.trades);
   const byRegime = safeRows(envelope.by_regime);
-  const feedbackRuntime = input.runtimeProjection?.operator?.feedbackRuntime ?? null;
+  const feedbackRuntime = input.runtimeProjection?.operator?.feedbackRuntime
+    ?? buildFeedbackRuntimeContextFromLegacyPayloads(input.liveOpsPayload, input.executionAiV6Payload)
+    ?? null;
   const journalEntries = Array.isArray(input.journalEntries) ? input.journalEntries.map(safeRecord) : [];
   const canonicalDecision = findFinalDecisionTruth(
     input.finalDecisionTruth,

@@ -5,10 +5,11 @@ import { cpFetchJsonSafe, getControlPlaneNetworkMetricsSnapshot, withControlPlan
 export async function GET(): Promise<NextResponse> {
   try {
     const { response, payload, network } = await cpFetchJsonSafe("/v1/live-readiness/overview");
+    const payloadRecord = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
     return NextResponse.json(
       {
-        ...withControlPlaneNetwork(payload, network),
-        degraded: !response.ok,
+        ...withControlPlaneNetwork(payloadRecord, network),
+        degraded: Boolean(payloadRecord.degraded) || !response.ok,
         upstream_status: response.status,
       },
       {

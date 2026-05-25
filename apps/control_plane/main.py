@@ -142,7 +142,7 @@ def _opportunity_gate_thresholds() -> dict[str, float]:
         "min_consistency_pct": max(0.0, min(100.0, _env_float("OPPORTUNITY_GATE_MIN_CONSISTENCY_PCT", 70.0))),
         "min_candidates": max(1.0, min(20.0, _env_float("OPPORTUNITY_GATE_MIN_CANDIDATES", 3.0))),
         "max_deviation_bps": max(0.1, min(500.0, _env_float("OPPORTUNITY_GATE_MAX_DEVIATION_BPS", 20.0))),
-        "max_freshness_ms": max(50.0, min(60000.0, _env_float("OPPORTUNITY_GATE_MAX_FRESHNESS_MS", 500.0))),
+        "max_freshness_ms": max(50.0, min(60000.0, _env_float("OPPORTUNITY_GATE_MAX_FRESHNESS_MS", 2000.0))),
         "kill_consistency_pct": max(0.0, min(100.0, _env_float("OPPORTUNITY_GATE_KILL_CONSISTENCY_PCT", 65.0))),
         "kill_deviation_bps": max(0.1, min(500.0, _env_float("OPPORTUNITY_GATE_KILL_DEVIATION_BPS", 25.0))),
     }
@@ -537,6 +537,11 @@ CONNECTOR_MARKET_OBSERVABILITY_VENUES: dict[str, str] = {
     "bybit": "bybit-public",
     "coinbase": "coinbase-public",
     "okx": "okx-public",
+}
+
+_CONNECTOR_MARKET_TELEMETRY_CACHE: dict[str, Any] = {
+    "expires_at": 0.0,
+    "payload": None,
 }
 
 CONNECTOR_RATE_LIMIT_HINTS: dict[str, dict[str, Any]] = {
@@ -3654,13 +3659,8 @@ def _connector_market_observability_from_telemetry(venue_candidates: list[str], 
     if not normalized_venues:
         return None
 
-    try:
-        with httpx.Client(timeout=3.0) as client:
-            response = client.get(f"{MARKET_DATA_URL}/v1/market/venues/telemetry")
-            if response.status_code >= 400:
-                return None
-            payload = response.json()
-    except Exception:
+    payload = _connector_market_telemetry_payload()
+    if not isinstance(payload, dict):
         return None
 
     venues = payload.get("venues") if isinstance(payload, dict) else None
@@ -3750,6 +3750,28 @@ def _connector_market_observability_from_telemetry(venue_candidates: list[str], 
         "feed_quality_status": feed_quality_status,
         "spread_bps": _to_float(selected_instrument.get("spread_bps"), None),
     }
+
+
+def _connector_market_telemetry_payload(ttl_seconds: float = 8.0) -> dict[str, Any] | None:
+    now_monotonic = time.monotonic()
+    cached_payload = _CONNECTOR_MARKET_TELEMETRY_CACHE.get("payload")
+    if cached_payload is not None and _to_float(_CONNECTOR_MARKET_TELEMETRY_CACHE.get("expires_at"), 0.0) > now_monotonic:
+        return cached_payload if isinstance(cached_payload, dict) else None
+    try:
+        with httpx.Client(timeout=3.0) as client:
+            response = client.get(f"{MARKET_DATA_URL}/v1/market/venues/telemetry")
+            if response.status_code >= 400:
+                _CONNECTOR_MARKET_TELEMETRY_CACHE.update({"expires_at": now_monotonic + 2.0, "payload": None})
+                return None
+            payload = response.json()
+            if not isinstance(payload, dict):
+                _CONNECTOR_MARKET_TELEMETRY_CACHE.update({"expires_at": now_monotonic + 2.0, "payload": None})
+                return None
+            _CONNECTOR_MARKET_TELEMETRY_CACHE.update({"expires_at": now_monotonic + ttl_seconds, "payload": payload})
+            return payload
+    except Exception:
+        _CONNECTOR_MARKET_TELEMETRY_CACHE.update({"expires_at": now_monotonic + 2.0, "payload": None})
+        return None
 
 
 def _connector_market_quote_fallback(venue_candidates: list[str]) -> dict[str, Any] | None:
@@ -4441,6 +4463,63 @@ def _connector_row_payload(
         "incident_summary": incidents,
         "degradation_engine": degradation,
         "latest_sync_age_sec": min(sync_ages) if sync_ages else None,
+    }
+
+
+def _connector_lightweight_row_payload(
+    connector: dict[str, str],
+    *,
+    healthy: bool,
+    rest_latency_ms: float | None,
+) -> dict[str, Any]:
+    provider = str(connector.get("name") or "")
+    latency_ms = round(rest_latency_ms, 2) if rest_latency_ms is not None else None
+    health_score = 0.9 if healthy else 0.45
+    health_action = "ok" if healthy else "block"
+    return {
+        "name": provider,
+        "type": connector.get("type"),
+        "transport": connector.get("transport"),
+        "healthy": healthy,
+        "rest_latency_ms": latency_ms,
+        "websocket_latency_ms": None,
+        "health_score": health_score,
+        "health_action": health_action,
+        "error_rate_pct": 0.0,
+        "throttling_rate_pct": 0.0,
+        "uptime_24h_pct": 100.0 if healthy else 0.0,
+        "uptime_7d_pct": 100.0 if healthy else 0.0,
+        "market_feed_venue": None,
+        "market_feed_instrument": None,
+        "depth_levels": None,
+        "messages_per_sec": None,
+        "feed_quality": {
+            "status": "not-instrumented",
+            "score": None,
+            "gap_count": None,
+            "desync_ms": None,
+            "spread_bps": None,
+        },
+        "permissions_summary": {
+            "aggregate": {"read": False, "trade": False, "withdraw": False, "transfer": False, "sign": False},
+            "linked_accounts": [],
+        },
+        "broker_capabilities": {
+            **_derive_broker_capabilities_view({"provider": provider, "mode": "read"}),
+            "linked_trade_accounts": 0,
+        },
+        "capital_summary": {"account_count": 0, "actual_equivalent_usd": 0.0, "gross_exposure_usd": 0.0, "accounts": []},
+        "incident_summary": {},
+        "degradation_engine": {
+            "state": "ok" if healthy else "critical",
+            "auto_disable_live": not healthy,
+            "diagnostic": "summary-only" if healthy else "health-group-down",
+            "health_score": health_score,
+            "health_action": health_action,
+            "size_multiplier": 1.0 if healthy else 0.0,
+            "latency_ms": latency_ms,
+        },
+        "latest_sync_age_sec": None,
     }
 
 
@@ -6883,6 +6962,126 @@ def _summarize_balance_pockets(balances: list[dict]) -> list[dict]:
     return ordered
 
 
+def _bingx_overview_pocket(account_type: object) -> str | None:
+    normalized = str(account_type or "").strip().lower()
+    if normalized in {"sopt", "spot"}:
+        return "spot"
+    if normalized in {"usdtmperp", "stdfutures", "coinmperp", "futures"}:
+        return "futures"
+    if normalized in {"fund", "funding"}:
+        return "fund"
+    return None
+
+
+def _apply_bingx_account_overview_adjustments(
+    balances: list[dict],
+    account_overview_items: list[dict],
+    as_of: str,
+) -> tuple[list[dict], dict[str, Any]]:
+    pocket_totals = _summarize_balance_pockets(balances)
+    detailed_by_pocket = {
+        str(item.get("pocket") or "").strip().lower(): _to_float(item.get("equity_usd"), 0.0)
+        for item in pocket_totals
+        if isinstance(item, dict)
+    }
+    overview_by_pocket: dict[str, float] = {}
+    overview_items: list[dict[str, Any]] = []
+    for item in account_overview_items:
+        if not isinstance(item, dict):
+            continue
+        account_type = str(item.get("accountType") or "").strip()
+        amount = _to_float(item.get("usdtBalance"), 0.0)
+        pocket = _bingx_overview_pocket(account_type)
+        overview_items.append(
+            {
+                "account_type": account_type,
+                "pocket": pocket,
+                "usdt_balance": round(amount, 8),
+            }
+        )
+        if pocket and amount > 0:
+            overview_by_pocket[pocket] = overview_by_pocket.get(pocket, 0.0) + amount
+
+    adjusted_balances = list(balances)
+    adjustments: list[dict[str, Any]] = []
+    for pocket, overview_total in sorted(overview_by_pocket.items()):
+        detailed_total = detailed_by_pocket.get(pocket, 0.0)
+        delta = max(0.0, overview_total - detailed_total)
+        row = {
+            "asset_symbol": f"USDT-{pocket.upper()}-OVERVIEW",
+            "available_qty": delta,
+            "locked_qty": 0.0,
+            "equity_usd": delta,
+            "mark_price_usd": 1.0,
+            "as_of": as_of,
+            "source": f"bingx-{pocket}",
+            "payload": {
+                "truth_source": "bingx-account-overview-adjustment",
+                "pocket": pocket,
+                "overview_equity_usd": round(overview_total, 8),
+                "detailed_equity_usd": round(detailed_total, 8),
+                "adjustment_equity_usd": round(delta, 8),
+            },
+        }
+        adjusted_balances.append(row)
+        if delta > 0.01:
+            adjustments.append(row["payload"])
+
+    detailed_total = sum(_to_float(item.get("equity_usd"), 0.0) for item in balances if isinstance(item, dict))
+    adjusted_total = sum(_to_float(item.get("equity_usd"), 0.0) for item in adjusted_balances if isinstance(item, dict))
+    return adjusted_balances, {
+        "source": "bingx-account-overview",
+        "detailed_total_equity_usd": round(detailed_total, 8),
+        "adjusted_total_equity_usd": round(adjusted_total, 8),
+        "overview_total_usdt_balance": round(sum(overview_by_pocket.values()), 8),
+        "overview_by_pocket": {key: round(value, 8) for key, value in sorted(overview_by_pocket.items())},
+        "detailed_by_pocket": {key: round(value, 8) for key, value in sorted(detailed_by_pocket.items())},
+        "overview_items": overview_items,
+        "adjustments": adjustments,
+    }
+
+
+def _persist_bingx_broker_state_snapshot(
+    account_id: str,
+    *,
+    as_of: str,
+    persisted: dict[str, Any],
+    balances: list[dict],
+    positions: list[dict],
+    open_orders: list[dict],
+    capital_truth: dict[str, Any],
+) -> None:
+    payload = {
+        "provider": "bingx",
+        "account_id": account_id,
+        "as_of": as_of,
+        "truth_source": "bingx-readonly-sync",
+        "summary": persisted.get("summary") if isinstance(persisted.get("summary"), dict) else {},
+        "capital_truth": capital_truth,
+        "balances": balances,
+        "positions": positions,
+        "open_orders": open_orders,
+    }
+    execute(
+        """
+        INSERT INTO runtime_snapshots (
+            snapshot_key, snapshot_kind, scope_key, source_service, payload, created_at, updated_at
+        ) VALUES (%s, 'broker_state', %s, 'control-plane', %s::jsonb, NOW(), NOW())
+        ON CONFLICT (snapshot_key) DO UPDATE SET
+            snapshot_kind = EXCLUDED.snapshot_kind,
+            scope_key = EXCLUDED.scope_key,
+            source_service = EXCLUDED.source_service,
+            payload = EXCLUDED.payload,
+            updated_at = NOW()
+        """,
+        (
+            f"broker_state:bingx:{account_id}",
+            f"bingx:{account_id}",
+            json_dumps(payload),
+        ),
+    )
+
+
 async def _sync_binance_account_state(account_id: str, account: dict | None = None) -> dict:
     account_row = account if isinstance(account, dict) else fetch_one(
         "SELECT account_id, client_id, account_type, venue, connector_type, mode, base_currency, status, external_ref, display_name, metadata, created_at, updated_at FROM accounts_registry WHERE account_id = %s",
@@ -7072,6 +7271,7 @@ async def _sync_bingx_account_state(account_id: str, account: dict | None = None
         *_normalize_bingx_balance_items(fund_items, "fund", as_of, mark_prices=mark_prices, change_stats=change_stats),
         *_normalize_bingx_balance_items(futures_balance_items, "futures", as_of),
     ]
+    balances, capital_truth = _apply_bingx_account_overview_adjustments(balances, account_overview_items, as_of)
     positions = _normalize_bingx_positions(futures_position_items, account_id, as_of)
     open_orders = _normalize_bingx_open_orders(open_order_items, as_of)
     pocket_totals = _summarize_balance_pockets(balances)
@@ -7089,6 +7289,10 @@ async def _sync_bingx_account_state(account_id: str, account: dict | None = None
         diagnostic_notes.append(
             f"BingX remonte {spot_usdt_raw:.4f} USDT bruts sur le compte spot, mais les actifs spot {asset_labels} valent environ {spot_total_equivalent:.2f} USD. Le ~16.90 vu dans l'UI BingX correspond donc vraisemblablement a une valorisation USDT-equivalente, pas a un solde cash USDT pur."
         )
+    execute(
+        "DELETE FROM account_balances WHERE account_id = %s AND asset_symbol LIKE 'USDT-BINGX%%OVERVIEW'",
+        (account_id,),
+    )
     persisted = _persist_connector_account_state(
         account_id,
         as_of=as_of,
@@ -7108,6 +7312,7 @@ async def _sync_bingx_account_state(account_id: str, account: dict | None = None
     persisted["status"] = "partial" if errors else "ok"
     persisted["connector_account"] = _connector_account_public_view(connector_account)
     persisted["account_overview"] = account_overview_items
+    persisted["capital_truth"] = capital_truth
     persisted["positions"] = positions
     persisted["balances"] = balances
     persisted["open_orders"] = open_orders
@@ -7127,6 +7332,15 @@ async def _sync_bingx_account_state(account_id: str, account: dict | None = None
         positions=positions,
         open_orders=open_orders,
         broker_truth_source="bingx-open-orders+positions",
+    )
+    _persist_bingx_broker_state_snapshot(
+        account_id,
+        as_of=as_of,
+        persisted=persisted,
+        balances=balances,
+        positions=positions,
+        open_orders=open_orders,
+        capital_truth=capital_truth,
     )
     append_audit(
         "bingx_account_state_synced",
@@ -8184,6 +8398,7 @@ def _default_live_execution_policy() -> dict[str, Any]:
             "max_pending_live_approvals": 8,
             "drawdown_warning_ratio": 0.7,
             "enforce_memory_gate": True,
+            "require_human_for_autonomous_sources": True,
             "autonomous_sources": [
                 "kairos-shadow-runtime",
                 "tradingview",
@@ -8695,6 +8910,7 @@ def _sanitize_go_live_hardening_policy(policy: dict[str, Any] | None = None) -> 
         "max_pending_live_approvals": int(_to_float(hardening.get("max_pending_live_approvals"), 0.0)),
         "drawdown_warning_ratio": _to_float(hardening.get("drawdown_warning_ratio"), 0.0),
         "enforce_memory_gate": _bool_from_any(hardening.get("enforce_memory_gate"), True),
+        "require_human_for_autonomous_sources": _bool_from_any(hardening.get("require_human_for_autonomous_sources"), True),
         "autonomous_sources": [str(item).strip() for item in hardening.get("autonomous_sources", []) if str(item).strip()],
         "anti_loop": {
             "enabled": _bool_from_any(anti_loop.get("enabled"), True),
@@ -9332,6 +9548,7 @@ def _evaluate_go_live_hardening(
     pre_trade_memory_gate: dict[str, Any] | None = None,
     no_trade_context: dict[str, Any] | None = None,
     governance: dict[str, Any] | None = None,
+    record_decision: bool = True,
 ) -> dict[str, Any]:
     live_policy = _load_live_execution_policy()
     policy = _sanitize_go_live_hardening_policy(_provider_go_live_hardening_policy(provider, live_policy))
@@ -9514,7 +9731,7 @@ def _evaluate_go_live_hardening(
         if require_human_above_notional_usd > 0 and requested_notional_usd >= require_human_above_notional_usd:
             reasons.append("governance_approval_required_notional")
             status = _promote_go_live_status(status, "require_human")
-        if source in autonomous_sources:
+        if source in autonomous_sources and _bool_from_any(policy.get("require_human_for_autonomous_sources"), True):
             reasons.append("governance_approval_required_autonomous_source")
             status = _promote_go_live_status(status, "require_human")
         if approval_exposure_threshold_pct > 0 and _to_float(exposure.get("projected_total_exposure_pct"), 0.0) >= approval_exposure_threshold_pct:
@@ -9556,7 +9773,7 @@ def _evaluate_go_live_hardening(
         "no_trade_context": no_trade_view,
         "purpose": purpose,
     }
-    if active:
+    if active and record_decision:
         append_audit(
             "go_live_hardening_decision",
             {
@@ -9901,6 +10118,14 @@ def _intent_live_execution_context(intent_payload: dict[str, Any]) -> dict[str, 
         "dry_run_accepted_legs": live.get("dry_run_accepted_legs") if isinstance(live.get("dry_run_accepted_legs"), (list, tuple, set, str)) else None,
         "protection": protection,
     }
+
+
+def _public_live_execution_resolution(resolution: dict[str, Any]) -> dict[str, Any]:
+    public_resolution = dict(resolution)
+    if "secret_payload" in public_resolution:
+        public_resolution.pop("secret_payload", None)
+        public_resolution["credentials"] = "available" if resolution.get("secret_payload") else "unavailable"
+    return public_resolution
 
 
 async def _fetch_live_execution_constraints(intent_payload: dict[str, Any]) -> dict[str, Any]:
@@ -11699,6 +11924,10 @@ def _slugify_identifier(raw: str, fallback: str) -> str:
 
 def _mt5_account_business_context(account: dict[str, Any]) -> dict[str, Any]:
     metadata = account.get("metadata") if isinstance(account.get("metadata"), dict) else {}
+    alias_for = str(metadata.get("bridge_alias_for") or metadata.get("alias_of_account_id") or "").strip()
+    is_alias = bool(alias_for) and _normalize_account_id(alias_for) != _normalize_account_id(account.get("account_id"))
+    if is_alias:
+        metadata = {**metadata, "alias_of_account_id": alias_for, "is_alias": True}
     raw_client_id = str(metadata.get("client_id") or metadata.get("owner_client_id") or "").strip()
     raw_client_name = str(metadata.get("client_legal_name") or metadata.get("client_name") or metadata.get("client_label") or "").strip()
     if not raw_client_id and raw_client_name:
@@ -11709,8 +11938,8 @@ def _mt5_account_business_context(account: dict[str, Any]) -> dict[str, Any]:
         client_type = "internal" if client_id == _PHASE1_INTERNAL_CLIENT_ID else "individual"
     legal_name = raw_client_name or ("TXT Internal" if client_id == _PHASE1_INTERNAL_CLIENT_ID else f"Client {account['account_id']}")
     base_currency = str(metadata.get("base_currency") or metadata.get("currency") or "USD").upper()
-    include_in_operational_risk = _bool_from_any(metadata.get("include_in_operational_risk"), default=str(account.get("mode", "paper")) == "live")
-    include_in_client_portfolio = _bool_from_any(metadata.get("include_in_client_portfolio"), default=True)
+    include_in_operational_risk = False if is_alias else _bool_from_any(metadata.get("include_in_operational_risk"), default=str(account.get("mode", "paper")) == "live")
+    include_in_client_portfolio = False if is_alias else _bool_from_any(metadata.get("include_in_client_portfolio"), default=True)
     raw_portfolio_id = str(metadata.get("portfolio_id") or "").strip()
     raw_portfolio_name = str(metadata.get("portfolio_name") or "").strip()
     if raw_portfolio_id:
@@ -11737,6 +11966,7 @@ def _mt5_account_business_context(account: dict[str, Any]) -> dict[str, Any]:
         "include_in_operational_risk": include_in_operational_risk,
         "include_in_client_portfolio": include_in_client_portfolio,
         "metadata": metadata,
+        "is_alias": is_alias,
     }
 
 
@@ -11900,7 +12130,7 @@ def _sync_accounts_registry_from_mt5(account_id: str | None = None) -> int:
                 str(row.get("broker") or "mt5"),
                 str(row.get("mode") or "paper"),
                 context["base_currency"],
-                "active" if str(row.get("status") or "").strip().lower() in {"connected", "active", "ready"} else "pending",
+                "disabled" if context.get("is_alias") else "active" if str(row.get("status") or "").strip().lower() in {"connected", "active", "ready"} else "pending",
                 str(row.get("login") or "") or None,
                 str(metadata.get("display_name") or "") or f"{str(row.get('broker') or 'mt5')} {str(row.get('login') or row['account_id'])}",
                 json_dumps(metadata),
@@ -16954,11 +17184,12 @@ async def preview_micro_live(payload: dict | None = None, auth: AuthContext = De
         live_requested=True,
         purpose=str(request_payload.get("purpose") or "execute").strip().lower() or "execute",
         governance=request_payload.get("governance") if isinstance(request_payload.get("governance"), dict) else None,
+        record_decision=False,
     )
     return {
         "status": "ok",
         "system_mode": CURRENT_SYSTEM_MODE.value,
-        "resolution": resolution,
+        "resolution": _public_live_execution_resolution(resolution),
         "hardening": hardening,
     }
 
@@ -17483,6 +17714,19 @@ async def internal_account_verification(account_id: str, auth: AuthContext = Dep
     )
     balances = _latest_account_balances(account_id)
     positions = _latest_account_positions(account_id)
+    connector_type = str(account.get("connector_type") or "").strip().lower()
+    broker_state_snapshot = _normalize_db_row(
+        fetch_one(
+            """
+            SELECT snapshot_key, snapshot_kind, scope_key, source_service, payload, updated_at
+            FROM runtime_snapshots
+            WHERE snapshot_key = %s
+            """,
+            (f"broker_state:{connector_type}:{account_id}",),
+        )
+    )
+    broker_state_payload = broker_state_snapshot.get("payload") if isinstance(broker_state_snapshot.get("payload"), dict) else {}
+    capital_truth = broker_state_payload.get("capital_truth") if isinstance(broker_state_payload, dict) and isinstance(broker_state_payload.get("capital_truth"), dict) else None
     cash_vs_equivalent = _cash_vs_equivalent_summary(balances)
     pocket_totals = _summarize_balance_pockets(balances)
     notes: list[str] = []
@@ -17493,7 +17737,6 @@ async def internal_account_verification(account_id: str, auth: AuthContext = Dep
             f"Le compte porte {total_raw_cash:.2f} USD de cash brut visible pour {total_equivalent:.2f} USD de valeur plateforme equivalente. Le delta correspond a de l'inventaire non-cash ou a du collateral valorise."
         )
     # BingX-specific diagnostic notes
-    connector_type = str(account.get("connector_type") or "").strip().lower()
     if connector_type == "bingx":
         balance_sources = {str(b.get("source") or "") for b in balances}
         # Fund pocket
@@ -17545,6 +17788,8 @@ async def internal_account_verification(account_id: str, auth: AuthContext = Dep
         "as_of": max([str(item.get("as_of") or "") for item in balances if str(item.get("as_of") or "")], default=_now_utc().isoformat()),
         "pocket_totals": pocket_totals,
         "cash_vs_equivalent": cash_vs_equivalent,
+        "capital_truth": capital_truth,
+        "broker_state_snapshot": broker_state_snapshot,
         "pocket_views": cash_vs_equivalent.get("pockets", []),
         "notes": notes,
     }
@@ -17560,6 +17805,8 @@ async def internal_account_verification(account_id: str, auth: AuthContext = Dep
         "latest_portfolio_snapshots": latest_snapshots,
         "normalized_state": normalized_state,
         "cash_vs_equivalent": cash_vs_equivalent,
+        "capital_truth": capital_truth,
+        "broker_state_snapshot": broker_state_snapshot,
         "pocket_views": cash_vs_equivalent.get("pockets", []),
         "capital_ledger": _account_capital_ledger(account_id),
     }
@@ -18675,11 +18922,11 @@ async def market_bus_snapshot(
     ohlcv_rows = parse_result(7, [])
     depth_snapshot = parse_result(8, None)
 
-    current_saved_pct = _float(trade_preprocessor.get("compression_saved_pct"), 0.0) if isinstance(trade_preprocessor, dict) else 0.0
+    current_saved_pct = _to_float(trade_preprocessor.get("compression_saved_pct"), 0.0) if isinstance(trade_preprocessor, dict) else 0.0
     current_raw_count = int(trade_preprocessor.get("raw_count") or 0) if isinstance(trade_preprocessor, dict) else 0
     current_regime = str(trade_preprocessor.get("market_regime") or "unknown") if isinstance(trade_preprocessor, dict) else "unknown"
     thresholds = trade_preprocessor_analytics.get("thresholds") if isinstance(trade_preprocessor_analytics, dict) and isinstance(trade_preprocessor_analytics.get("thresholds"), dict) else {}
-    threshold_saved_pct = _float((thresholds or {}).get("price_discovery_saved_pct"), 30.0)
+    threshold_saved_pct = _to_float((thresholds or {}).get("price_discovery_saved_pct"), 30.0)
     threshold_raw_count = int((thresholds or {}).get("price_discovery_min_raw_count") or 40)
     analytics_windows = trade_preprocessor_analytics.get("windows") if isinstance(trade_preprocessor_analytics, dict) and isinstance(trade_preprocessor_analytics.get("windows"), dict) else {}
     analytics_24h_rows = analytics_windows.get("last_24h") if isinstance(analytics_windows.get("last_24h"), list) else []
@@ -18698,7 +18945,7 @@ async def market_bus_snapshot(
             "aggressive_buckets_24h": aggressive_buckets_24h,
         }
     elif aggressive_buckets_24h > 0:
-        max_saved_pct_24h = _float((price_discovery_24h or {}).get("max_saved_pct"), 0.0) if isinstance(price_discovery_24h, dict) else 0.0
+        max_saved_pct_24h = _to_float((price_discovery_24h or {}).get("max_saved_pct"), 0.0) if isinstance(price_discovery_24h, dict) else 0.0
         trade_preprocessor_alert = {
             "state": "watch",
             "triggered": True,
@@ -18768,11 +19015,22 @@ async def market_bus_snapshot(
 
     depth_payload = depth_snapshot.get("depth_payload") if isinstance(depth_snapshot, dict) else None
     depth_last_update_id = depth_payload.get("lastUpdateId") if isinstance(depth_payload, dict) else None
+    ohlcv_bar_age_ms = _freshness_ms(latest_bar.get("t") if isinstance(latest_bar, dict) else None)
+    ohlcv_effective_freshness_ms = None
+    if ohlcv_bar_age_ms is not None:
+        ohlcv_effective_freshness_ms = max(0, ohlcv_bar_age_ms - (timeframe_ms or 0))
+    trades_freshness_ms = _freshness_ms(latest_trade_at)
+    depth_freshness_ms = _freshness_ms(depth_snapshot.get("snapshot_at")) if isinstance(depth_snapshot, dict) else None
+
+    def _fresh_component_status(has_payload: bool, freshness_ms: int | None, limit_ms: int) -> str:
+        if not has_payload or freshness_ms is None:
+            return "degraded"
+        return "ok" if freshness_ms <= limit_ms else "degraded"
 
     component_health = {
         "trades": {
-            "status": "ok" if isinstance(trades, list) and len(trades) > 0 else "degraded",
-            "freshness_ms": _freshness_ms(latest_trade_at),
+            "status": _fresh_component_status(isinstance(trades, list) and len(trades) > 0, trades_freshness_ms, 60_000),
+            "freshness_ms": trades_freshness_ms,
             "count": len(trades) if isinstance(trades, list) else 0,
             "raw_count": int(trade_preprocessor.get("raw_count") or 0) if isinstance(trade_preprocessor, dict) else None,
             "compression_ratio": trade_preprocessor.get("compression_ratio") if isinstance(trade_preprocessor, dict) else None,
@@ -18798,14 +19056,15 @@ async def market_bus_snapshot(
             "source": routing_score.get("source") if isinstance(routing_score, dict) else None,
         },
         "ohlcv": {
-            "status": "ok" if isinstance(ohlcv_rows, list) and len(ohlcv_rows) > 0 else "degraded",
-            "freshness_ms": _freshness_ms(latest_bar.get("t") if isinstance(latest_bar, dict) else None),
+            "status": _fresh_component_status(isinstance(ohlcv_rows, list) and len(ohlcv_rows) > 0, ohlcv_effective_freshness_ms, 60_000),
+            "freshness_ms": ohlcv_effective_freshness_ms,
+            "bar_age_ms": ohlcv_bar_age_ms,
             "bar_count": len(ohlcv_rows) if isinstance(ohlcv_rows, list) else 0,
             "timeframe": timeframe,
         },
         "depth": {
-            "status": "ok" if isinstance(depth_snapshot, dict) else "degraded",
-            "freshness_ms": _freshness_ms(depth_snapshot.get("snapshot_at")) if isinstance(depth_snapshot, dict) else None,
+            "status": _fresh_component_status(isinstance(depth_snapshot, dict), depth_freshness_ms, 15_000),
+            "freshness_ms": depth_freshness_ms,
             "source": depth_snapshot.get("source") if isinstance(depth_snapshot, dict) else None,
         },
     }
@@ -21061,20 +21320,30 @@ async def _compute_connectors_snapshot(auth: AuthContext | None = None) -> dict:
             except Exception:
                 return False, None
 
-        mt5_ok, mt5_latency_ms = await _probe(f"{MT5_BRIDGE_URL}/health")
-        market_ok, market_latency_ms = await _probe(f"{MARKET_DATA_URL}/health")
-        broker_ok, broker_latency_ms = await _probe(f"{BROKER_ADAPTER_URL}/health")
-        ai_ok, ai_latency_ms = await _probe(f"{AI_ORCHESTRATOR_URL}/health")
-        embeddings_ok, embeddings_latency_ms = await _probe(f"{EMBEDDINGS_SERVICE_URL}/health")
+        (
+            (mt5_ok, mt5_latency_ms),
+            (market_ok, market_latency_ms),
+            (broker_ok, broker_latency_ms),
+            (ai_ok, ai_latency_ms),
+            (embeddings_ok, embeddings_latency_ms),
+        ) = await asyncio.gather(
+            _probe(f"{MT5_BRIDGE_URL}/health"),
+            _probe(f"{MARKET_DATA_URL}/health"),
+            _probe(f"{BROKER_ADAPTER_URL}/health"),
+            _probe(f"{AI_ORCHESTRATOR_URL}/health"),
+            _probe(f"{EMBEDDINGS_SERVICE_URL}/health"),
+        )
 
     pending = fetch_one("SELECT COUNT(*) AS count FROM mt5_live_approvals WHERE status = 'pending'") or {"count": 0}
-    recent_approvals = fetch_all(
-        """
-        SELECT approval_id, account_id, first_approved_by, second_approved_by, status, created_at, executed_at
-        FROM mt5_live_approvals
-        ORDER BY created_at DESC
-        LIMIT 10
-        """
+    recent_approvals = _normalize_db_rows(
+        fetch_all(
+            """
+            SELECT approval_id, account_id, first_approved_by, second_approved_by, status, created_at, executed_at
+            FROM mt5_live_approvals
+            ORDER BY created_at DESC
+            LIMIT 10
+            """
+        )
     )
     kill_state = _kill_switch_state()
     unassigned_sla = fetch_one(
@@ -21121,6 +21390,7 @@ async def _compute_connectors_snapshot(auth: AuthContext | None = None) -> dict:
     for account in linked_accounts:
         provider = _normalize_connector_provider(account.get("provider"))
         linked_accounts_by_provider.setdefault(provider, []).append(account)
+    detailed_providers = set(linked_accounts_by_provider.keys()) | {"mt5"}
     recent_incidents = _normalize_db_rows(
         fetch_all(
             """
@@ -21154,14 +21424,22 @@ async def _compute_connectors_snapshot(auth: AuthContext | None = None) -> dict:
             for account in linked_accounts
         ],
         "connectors": [
-            _connector_row_payload(
-                connector,
-                healthy=bool(health_by_group.get(connector.get("health_group", "market"), False)),
-                rest_latency_ms=latency_by_group.get(connector.get("health_group", "market")),
-                linked_accounts=linked_accounts_by_provider.get(_normalize_connector_provider(connector.get("name")), []),
-                visible_client_ids=visible_client_ids,
-                incident_summary=incident_summary,
-                outcome_summary=outcome_summary,
+            (
+                _connector_row_payload(
+                    connector,
+                    healthy=bool(health_by_group.get(connector.get("health_group", "market"), False)),
+                    rest_latency_ms=latency_by_group.get(connector.get("health_group", "market")),
+                    linked_accounts=linked_accounts_by_provider.get(_normalize_connector_provider(connector.get("name")), []),
+                    visible_client_ids=visible_client_ids,
+                    incident_summary=incident_summary,
+                    outcome_summary=outcome_summary,
+                )
+                if _normalize_connector_provider(connector.get("name")) in detailed_providers
+                else _connector_lightweight_row_payload(
+                    connector,
+                    healthy=bool(health_by_group.get(connector.get("health_group", "market"), False)),
+                    rest_latency_ms=latency_by_group.get(connector.get("health_group", "market")),
+                )
             )
             for connector in CONNECTOR_CATALOG
         ],
@@ -21652,6 +21930,38 @@ async def live_readiness_overview(auth: AuthContext = Depends(viewer_auth)) -> d
     async with httpx.AsyncClient(timeout=20.0) as client:
         retrieval_kpi_resp = await client.get(f"{EMBEDDINGS_SERVICE_URL}/v1/kpi/retrieval", params={"window_hours": 24})
     retrieval_kpi = retrieval_kpi_resp.json() if retrieval_kpi_resp.status_code < 400 else {"status": "degraded"}
+    market_bus = {"meta": {"health": {"status": "degraded", "detail": "market_bus_unavailable"}}}
+    selected_market_bus_venue = "binance-public"
+    market_bus_candidates: list[dict[str, Any]] = []
+    for venue_candidate in ("binance-public", "okx-public", "bybit-public"):
+        try:
+            candidate = await market_bus_snapshot(
+                instrument="BTCUSDT",
+                venue=venue_candidate,
+                timeframe="1m",
+                lookback_minutes=60,
+                trade_limit=200,
+            )
+        except Exception as exc:
+            candidate = {"meta": {"health": {"status": "degraded", "detail": str(exc)[:200]}}}
+        candidate_health = ((candidate.get("meta") if isinstance(candidate, dict) else {}) or {}).get("health")
+        candidate_status = str((candidate_health if isinstance(candidate_health, dict) else {}).get("status") or "degraded")
+        market_bus_candidates.append(
+            {
+                "venue": venue_candidate,
+                "status": candidate_status,
+                "components": (candidate_health if isinstance(candidate_health, dict) else {}).get("components"),
+            }
+        )
+        if venue_candidate == "binance-public" or candidate_status == "ok":
+            if venue_candidate == "binance-public" or str((((market_bus.get("meta") if isinstance(market_bus, dict) else {}) or {}).get("health") or {}).get("status") or "degraded") != "ok":
+                market_bus = candidate
+                selected_market_bus_venue = venue_candidate
+        if candidate_status == "ok":
+            break
+    market_bus_health = ((market_bus.get("meta") if isinstance(market_bus, dict) else {}) or {}).get("health")
+    market_bus_status = str((market_bus_health if isinstance(market_bus_health, dict) else {}).get("status") or "degraded")
+    overview_status = "ok" if market_bus_status == "ok" else "degraded"
 
     drift_items = fetch_all(
         """
@@ -21672,7 +21982,15 @@ async def live_readiness_overview(auth: AuthContext = Depends(viewer_auth)) -> d
     )
     ab = await memory_ab_stats(window_hours=24 * 7, auth=auth)
     return {
-        "status": "ok",
+        "status": overview_status,
+        "degraded": overview_status != "ok",
+        "market_bus": {
+            "venue": selected_market_bus_venue,
+            "status": market_bus_status,
+            "components": (market_bus_health if isinstance(market_bus_health, dict) else {}).get("components"),
+            "sequencing": ((market_bus.get("meta") if isinstance(market_bus, dict) else {}) or {}).get("sequencing"),
+            "candidates": market_bus_candidates,
+        },
         "memory_kpi": retrieval_kpi,
         "drift": {
             "window_hours": _drift_window_hours(),
@@ -21958,6 +22276,59 @@ async def copilot_chat(payload: dict, auth: AuthContext = Depends(viewer_auth)) 
             strategies_payload=strategies_payload,
             execution_ai_v6_payload=execution_ai_v6_payload,
         )
+
+    if any(keyword in message for keyword in {"terminal", "chart", "graph", "bougie", "bougies", "bouton", "disabled", "desactive", "bloque", "execution", "executer", "ordre"}):
+        end = _now_utc()
+        start = end - timedelta(days=7)
+        pnl_payload = _execution_pnl_analyzer("strategy", "mt5-live", start, end, trade_limit=50, confidence_flag_threshold=0.7)
+        readiness_payload = await live_readiness_overview(auth)
+        incidents_payload = await list_incidents(auth=auth)
+        execution_ai_v6_payload = await _fetch_execution_ai_v6_state_snapshot()
+        pnl_summary = pnl_payload.get("summary") if isinstance(pnl_payload.get("summary"), dict) else {}
+        readiness_drift = readiness_payload.get("drift") if isinstance(readiness_payload.get("drift"), dict) else {}
+        incidents = incidents_payload.get("items") if isinstance(incidents_payload.get("items"), list) else []
+        v6_snapshot = execution_ai_v6_payload.get("snapshot") if isinstance(execution_ai_v6_payload.get("snapshot"), dict) else {}
+        v6_guardrails = v6_snapshot.get("guardrails") if isinstance(v6_snapshot.get("guardrails"), dict) else {}
+        suspended_strategies = readiness_drift.get("suspended_strategies") if isinstance(readiness_drift.get("suspended_strategies"), list) else []
+        trade_count = int(_to_float(pnl_summary.get("trade_count"), 0.0))
+        net_pnl_usd = _to_float(pnl_summary.get("net_pnl_usd"), 0.0)
+        avg_latency_ms = _to_float(pnl_summary.get("avg_latency_ms"), 0.0)
+        avg_slippage_bps = _to_float(pnl_summary.get("avg_slippage_bps"), 0.0)
+        live_blockers: list[str] = []
+        if trade_count < 3:
+            live_blockers.append("pas encore assez de trades live propres pour faire confiance au bouton")
+        if net_pnl_usd < 0.0:
+            live_blockers.append(f"verite PnL negative {_format_signed_usd(net_pnl_usd)}")
+        if avg_latency_ms > 120.0:
+            live_blockers.append(f"latence elevee {avg_latency_ms:.0f} ms")
+        if avg_slippage_bps > 3.0:
+            live_blockers.append(f"slippage eleve {avg_slippage_bps:.2f} bps")
+        if suspended_strategies:
+            live_blockers.append(f"{len(suspended_strategies)} strategie(s) suspendue(s) par readiness")
+        if incidents:
+            live_blockers.append(f"{len(incidents)} incident(s) ouvert(s)")
+        if bool(v6_guardrails.get("learning_frozen")):
+            live_blockers.append("apprentissage V6 gele")
+        if not live_blockers:
+            live_blockers.append("aucun blocage global evident cote control-plane; regarde le message jaune pres du bouton pour le guard local exact")
+        reply = (
+            "Lecture simple du terminal: le chart doit servir a lire le prix, pas a afficher tous les diagnostics. "
+            "Si le bouton d'execution est desactive, TXT protege l'ordre: il attend que les garde-fous live, readiness, latence, slippage et decision locale soient alignes. "
+            f"Raison probable maintenant: {'; '.join(live_blockers[:4])}. "
+            "Action suivante: ne force pas le live; lis la raison affichee sous le bouton, garde une micro-size, puis ouvre Readiness/Live Ops si le blocage vient du drift ou des incidents."
+        )
+        return {
+            "status": "ok",
+            "reply": reply,
+            "data": {
+                "pnl": pnl_payload,
+                "readiness": readiness_payload,
+                "incidents": incidents_payload,
+                "execution_ai_v6": execution_ai_v6_payload,
+                "live_blockers": live_blockers,
+            },
+            "actions": ["open_terminal_truth", "open_live_readiness", "open_live_ops"],
+        }
 
     if any(keyword in message for keyword in {"news", "nouvel", "macro", "econom", "fed", "cpi", "fomc", "calendar", "geopolit"}):
         return {

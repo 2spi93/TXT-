@@ -1,13 +1,14 @@
 import { NextResponse } from "next/server";
 
 import { requireControlPlaneSession } from "../../../../lib/apiAuth";
-import { cpFetchJsonSafe, getControlPlaneNetworkMetricsSnapshot } from "../../../../lib/controlPlane";
-import { getEdgeObservationSummary } from "../../../../lib/edgeObservation";
+import { cpFetchJsonSafe, getControlPlaneNetworkMetricsSnapshot, type ControlPlaneNetworkMeta } from "../../../../lib/controlPlane";
+import { getEdgeObservationSummary, type EdgeObservationSummary } from "../../../../lib/edgeObservation";
 import { computeExecutionDomination } from "../../../../lib/liveOps/executionDominationEngine";
 import { classifyMarketState } from "../../../../lib/liveOps/marketStateEngine";
 import { detectSmartMoney } from "../../../../lib/liveOps/smartMoneyDetector";
 import { detectSpoofing } from "../../../../lib/liveOps/spoofDetectionEngine";
 import { evaluateVenueArbitrage, type VenueQuoteSnapshot } from "../../../../lib/liveOps/venueArbitrageEngine";
+import { buildRuntimeTruthSnapshot } from "../../../../lib/runtimeTruth";
 import { getMetricsSnapshot } from "../../../../lib/shadowMode";
 
 type JsonMap = Record<string, unknown>;
@@ -41,6 +42,118 @@ function sum(values: number[]): number {
 }
 
 const WATCHDOG_FRESHNESS_WINDOW_MS = 30 * 60 * 1000;
+const LIVE_OPS_CP_FETCH_TIMEOUT_MS = 6_000;
+const LIVE_OPS_EDGE_OBSERVATION_TIMEOUT_MS = 900;
+const LIVE_OPS_SERVER_TRUTH_TIMEOUT_MS = 4_500;
+
+type CpFetchJsonSafeResult = Awaited<ReturnType<typeof cpFetchJsonSafe>>;
+
+function timedOutNetworkMeta(path: string): ControlPlaneNetworkMeta {
+  return {
+    network_state: "degraded",
+    retry_count: 0,
+    degraded_flag: true,
+    failure_classification: "timeout",
+    failure_detail: `Live Ops bounded fetch timed out for ${path}`,
+    attempted_targets: [path],
+    attempted_base_urls: [],
+    upstream_status: 504,
+  };
+}
+
+function timedOutCpFetchResult(path: string): CpFetchJsonSafeResult {
+  const payload = { detail: "live_ops_control_plane_timeout", path };
+  return {
+    response: new Response(JSON.stringify(payload), { status: 504 }),
+    payload,
+    network: timedOutNetworkMeta(path),
+  };
+}
+
+function timedOutEdgeObservationSummary(): EdgeObservationSummary {
+  return {
+    available: false,
+    filePath: "timeout",
+    fileUpdatedAt: null,
+    latestIntentAt: null,
+    latestClassifiedIntentAt: null,
+    staleness: {
+      ageHours: null,
+      level: "NO_CLASSIFIED_LABEL",
+      summary: "Observation edge indisponible pendant le refresh Live Ops.",
+    },
+    windowHours: 24,
+    totals: {
+      totalRows: 0,
+      classifiedRows: 0,
+      unclassifiedRows: 0,
+      recentRows: 0,
+      recentClassifiedRows: 0,
+      previousRows: 0,
+      previousClassifiedRows: 0,
+      classifiedPct: 0,
+      recentClassifiedPct: 0,
+    },
+    labelProgress: {
+      targetMin: 50,
+      targetMax: 100,
+      classifiedCount: 0,
+      recentClassifiedCount: 0,
+      toTargetMin: 50,
+      toTargetMax: 100,
+      progressToMinPct: 0,
+      progressToMaxPct: 0,
+      stage: "BOOTSTRAP",
+      summary: "Observation edge indisponible pendant le refresh Live Ops.",
+    },
+    liveConfidence: {
+      scorePct: 0,
+      level: "LOW",
+      summary: "Observation edge indisponible pendant le refresh Live Ops.",
+    },
+    recentDeltas: [],
+    allTimeMap: [],
+  };
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<T>((resolve) => {
+    timeoutId = setTimeout(() => resolve(fallback), timeoutMs);
+  });
+  return Promise.race([
+    promise.finally(() => {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+    }),
+    timeoutPromise,
+  ]);
+}
+
+function cpFetchJsonSafeBounded(path: string): Promise<CpFetchJsonSafeResult> {
+  const fallback = timedOutCpFetchResult(path);
+  const controller = new AbortController();
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<CpFetchJsonSafeResult>((resolve) => {
+    timeoutId = setTimeout(() => {
+      controller.abort();
+      resolve(fallback);
+    }, LIVE_OPS_CP_FETCH_TIMEOUT_MS);
+  });
+  const fetchPromise = cpFetchJsonSafe(path, { signal: controller.signal })
+    .catch(() => fallback)
+    .finally(() => {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+    });
+  return Promise.race([fetchPromise, timeoutPromise]);
+}
+
+function getEdgeObservationSummaryBounded(): Promise<EdgeObservationSummary> {
+  return withTimeout(getEdgeObservationSummary(), LIVE_OPS_EDGE_OBSERVATION_TIMEOUT_MS, timedOutEdgeObservationSummary());
+}
 
 function parseTimestampMs(value: unknown): number | null {
   if (typeof value !== "string" || value.trim().length === 0) {
@@ -172,22 +285,42 @@ export async function GET(): Promise<NextResponse> {
   }
   const shadowSnapshot = getMetricsSnapshot();
   const networkSnapshot = getControlPlaneNetworkMetricsSnapshot();
-  const [killSwitchResult, systemConfigResult, gateResult, telemetryResult, realityGapResult, auditResult, outcomesResult, dashboardResult, edgeObservationSummary] = await Promise.all([
-    cpFetchJsonSafe("/v1/system/kill-switch"),
-    cpFetchJsonSafe("/v1/system/config"),
-    cpFetchJsonSafe("/v1/system/opportunity-gate"),
-    cpFetchJsonSafe("/v1/execution/telemetry/recent?limit=40"),
-    cpFetchJsonSafe("/v1/execution/reality-gap/recent?limit=40"),
-    cpFetchJsonSafe("/v1/audit?limit=120"),
-    cpFetchJsonSafe("/v1/outcomes/recent?limit=40"),
-    cpFetchJsonSafe("/v1/dashboard/overview"),
-    getEdgeObservationSummary(),
+  const [killSwitchResult, systemConfigResult, gateResult, telemetryResult, realityGapResult, auditResult, outcomesResult, dashboardResult, edgeObservationSummary, runtimeTruth] = await Promise.all([
+    cpFetchJsonSafeBounded("/v1/system/kill-switch"),
+    cpFetchJsonSafeBounded("/v1/system/config"),
+    cpFetchJsonSafeBounded("/v1/system/opportunity-gate"),
+    cpFetchJsonSafeBounded("/v1/execution/telemetry/recent?limit=40"),
+    cpFetchJsonSafeBounded("/v1/execution/reality-gap/recent?limit=40"),
+    cpFetchJsonSafeBounded("/v1/audit?limit=16"),
+    cpFetchJsonSafeBounded("/v1/outcomes/recent?limit=40"),
+    cpFetchJsonSafeBounded("/v1/dashboard/overview"),
+    getEdgeObservationSummaryBounded(),
+    withTimeout(
+      buildRuntimeTruthSnapshot({ symbol: "DESK", marketInstrument: "BTCUSDT", timeframe: "live", strategy: "live-ops" }).catch(() => null),
+      LIVE_OPS_SERVER_TRUTH_TIMEOUT_MS,
+      null,
+    ),
   ]);
+  const boundedTimeoutPaths = [
+    ["/v1/system/kill-switch", killSwitchResult],
+    ["/v1/system/config", systemConfigResult],
+    ["/v1/system/opportunity-gate", gateResult],
+    ["/v1/execution/telemetry/recent", telemetryResult],
+    ["/v1/execution/reality-gap/recent", realityGapResult],
+    ["/v1/audit", auditResult],
+    ["/v1/outcomes/recent", outcomesResult],
+    ["/v1/dashboard/overview", dashboardResult],
+  ].filter(([, result]) => (result as CpFetchJsonSafeResult).network.failure_classification === "timeout")
+    .map(([path]) => String(path));
+  if (edgeObservationSummary.filePath === "timeout") {
+    boundedTimeoutPaths.push("edge_observation_summary");
+  }
+  const criticalControlPlaneTimeout = boundedTimeoutPaths.some((path) => path === "/v1/system/kill-switch" || path === "/v1/system/config");
 
   const killSwitchPayload = asRecord(killSwitchResult.payload);
   const killSwitchState = asRecord(killSwitchPayload.state);
   const gatePayload = asRecord(gateResult.payload);
-  const gateState = asRecord(gatePayload.gate);
+  const gateState = asRecord(gatePayload.gate || gatePayload);
   const gateReasons = asArray<string>(gateState.reasons);
   const hardening = asRecord(killSwitchPayload.go_live_hardening);
   const watchdogPolicy = asRecord(hardening.watchdog);
@@ -212,9 +345,15 @@ export async function GET(): Promise<NextResponse> {
   const blockRate = operationalTelemetryRows.length > 0
     ? operationalTelemetryRows.filter((row) => toNumber(row.realized_slippage_bps, 0) > maxRealizedSlippageBps).length / operationalTelemetryRows.length
     : 0;
-  const errorRate = clamp(Math.max(networkSnapshot.degraded_usage_ratio, networkSnapshot.timeout_rate, blockRate), 0, 1);
+  const errorRate = clamp(Math.max(networkSnapshot.degraded_usage_ratio, networkSnapshot.timeout_rate, blockRate, boundedTimeoutPaths.length > 0 ? 0.35 : 0), 0, 1);
   const killSwitchActive = Boolean(killSwitchState.active);
-  const gateEnabled = Boolean(gateState.opportunity_enabled);
+  const gateStatusRaw = String(gateState.status || "").trim().toLowerCase();
+  const gateKnown = typeof gateState.opportunity_enabled === "boolean" || Boolean(gateStatusRaw);
+  const gateEnabled = gateKnown
+    ? typeof gateState.opportunity_enabled === "boolean"
+      ? Boolean(gateState.opportunity_enabled)
+      : gateStatusRaw === "go"
+    : true;
   const gateHealthScore = toNumber(gateState.health_score, 0);
   const anomalyScore = clamp(
     (avgLatencyMs / Math.max(1, toNumber(watchdogPolicy.max_latency_e2e_ms, 1500))) * 0.28
@@ -226,7 +365,22 @@ export async function GET(): Promise<NextResponse> {
   );
   const derivedHealthScore = clamp((1 - anomalyScore) * 100, 0, 100);
   const healthScore = gateHealthScore > 0 ? Math.min(derivedHealthScore, gateHealthScore) : derivedHealthScore;
-  const watchdogStatus = killSwitchActive || !gateEnabled || anomalyScore >= 0.8 ? "HALT" : anomalyScore >= 0.4 ? "WARNING" : "OK";
+  const watchdogStatus = criticalControlPlaneTimeout || killSwitchActive || (gateKnown && !gateEnabled) || anomalyScore >= 0.8 ? "HALT" : boundedTimeoutPaths.length > 0 || anomalyScore >= 0.4 ? "WARNING" : "OK";
+  const runtimeTruthRecord = asRecord(runtimeTruth);
+  const runtimeTruthVerdict = String(runtimeTruthRecord.verdict || "").trim().toUpperCase();
+  const runtimeTruthBlockers = asArray<string>(runtimeTruthRecord.blockers).map((item) => String(item)).filter(Boolean);
+  const runtimeTruthDegradedReasons = asArray<string>(runtimeTruthRecord.degraded_reasons).map((item) => String(item)).filter(Boolean);
+  const runtimeTruthDetails = runtimeTruthVerdict === "BLOCKED" ? runtimeTruthBlockers : runtimeTruthDegradedReasons;
+  const effectiveWatchdogStatus = runtimeTruthVerdict === "BLOCKED"
+    ? "HALT"
+    : runtimeTruthVerdict === "DEGRADED" && watchdogStatus === "OK"
+      ? "WARNING"
+      : watchdogStatus;
+  const effectiveHealthScore = runtimeTruthVerdict === "BLOCKED"
+    ? Math.min(healthScore, 25)
+    : runtimeTruthVerdict === "DEGRADED"
+      ? Math.min(healthScore, 65)
+      : healthScore;
 
   const exposures = deriveExposureBySymbol(operationalTelemetryRows);
   const dailyUsedUsd = toNumber(dashboard.net_exposure_usd, 0);
@@ -285,16 +439,19 @@ export async function GET(): Promise<NextResponse> {
   });
 
   const alerts = [
+    runtimeTruthVerdict === "BLOCKED" ? { severity: "critical", code: "runtime_truth_blocked", message: "Runtime truth blocked", detail: runtimeTruthBlockers.join(", ") || String(runtimeTruthRecord.summary || "canonical truth blocked") } : null,
+    runtimeTruthVerdict === "DEGRADED" ? { severity: "warn", code: "runtime_truth_degraded", message: "Runtime truth degraded", detail: runtimeTruthDetails.join(", ") || String(runtimeTruthRecord.summary || "canonical truth degraded") } : null,
+    boundedTimeoutPaths.length > 0 ? { severity: criticalControlPlaneTimeout ? "critical" : "warn", code: "live_ops_partial_data", message: "Live Ops partial data", detail: boundedTimeoutPaths.join(", ") } : null,
     avgDriftScore > 0.2 ? { severity: "warn", code: "execution_drift", message: "Execution drift detected", detail: `drift=${avgDriftScore.toFixed(3)}` } : null,
     avgSlippageBps > 10 ? { severity: "warn", code: "slippage_spike", message: "Slippage spike", detail: `${avgSlippageBps.toFixed(2)} bps` } : null,
-    !gateEnabled ? { severity: "critical", code: "opportunity_gate_blocked", message: "Opportunity gate blocked", detail: String(gateReasons.join(", ") || "gate blocked") } : null,
+    gateKnown && !gateEnabled ? { severity: "critical", code: "opportunity_gate_blocked", message: "Opportunity gate blocked", detail: String(gateReasons.join(", ") || "gate blocked") } : null,
     killSwitchActive ? { severity: "critical", code: "kill_switch_active", message: "System critical", detail: String(killSwitchState.reason || "kill switch active") } : null,
     anomalyScore > 0.8 ? { severity: "critical", code: "preemptive_shutdown", message: "Preemptive shutdown ready", detail: `anomaly_score=${anomalyScore.toFixed(3)}` } : null,
   ].filter(Boolean);
 
   const controlledCollectionStatus = killSwitchActive
     ? "LOCKED"
-    : !gateEnabled
+    : gateKnown && !gateEnabled
       ? "BLOCKED"
       : Boolean(dashboard.paper_only)
         ? "PAPER_ONLY"
@@ -315,10 +472,10 @@ export async function GET(): Promise<NextResponse> {
       drift: Number(avgDriftScore.toFixed(4)),
       error_rate: Number(errorRate.toFixed(4)),
       anomaly_score: Number(anomalyScore.toFixed(4)),
-      status: watchdogStatus,
+      status: effectiveWatchdogStatus,
       triggers: alerts.map((item) => asRecord(item).code),
-      health_score: Number(healthScore.toFixed(2)),
-      opportunity_gate_status: String(gateState.status || "unknown"),
+      health_score: Number(effectiveHealthScore.toFixed(2)),
+      opportunity_gate_status: gateKnown ? String(gateState.status || (gateEnabled ? "go" : "no-go")) : "unknown",
     },
     risk_snapshot: {
       dd_pct: Number(drawdownPct.toFixed(4)),
@@ -346,10 +503,10 @@ export async function GET(): Promise<NextResponse> {
       opportunity_gate: gateState,
     },
     recovery: {
-      active: killSwitchActive || watchdogStatus === "HALT",
-      mode: killSwitchActive ? "RECOVERY_LOCKDOWN" : watchdogStatus === "WARNING" ? "SAFE_RECOVERY" : "NOMINAL",
-      reduced_risk: killSwitchActive || avgDriftScore > 0.2,
-      blocked_trades: killSwitchActive || blockRate > 0.35,
+      active: killSwitchActive || effectiveWatchdogStatus === "HALT",
+      mode: killSwitchActive ? "RECOVERY_LOCKDOWN" : effectiveWatchdogStatus === "WARNING" ? "SAFE_RECOVERY" : effectiveWatchdogStatus === "HALT" ? "TRUTH_LOCKDOWN" : "NOMINAL",
+      reduced_risk: killSwitchActive || avgDriftScore > 0.2 || runtimeTruthVerdict === "DEGRADED" || runtimeTruthVerdict === "BLOCKED",
+      blocked_trades: killSwitchActive || blockRate > 0.35 || runtimeTruthVerdict === "BLOCKED",
     },
     controlled_collection: {
       status: controlledCollectionStatus,
@@ -390,6 +547,7 @@ export async function GET(): Promise<NextResponse> {
       domination,
     },
     raw: {
+      runtime_truth: runtimeTruth,
       kill_switch: killSwitchPayload,
       opportunity_gate: gatePayload,
       network: networkSnapshot,

@@ -1013,6 +1013,35 @@ export default function ConnectorsPage() {
       </section>
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
+        <div className="panel" style={{ gridColumn: "1 / -1" }}>
+          <div className="eyebrow">FTMO Live Workflow <HelpHint text="Vue opérateur simplifiée: où raccorder FTMO, où créer une demande live, et où faire la seconde approbation." examples={["1. Connections: brancher le compte FTMO et la vraie broker session.", "2. Terminal ou Connectors: créer la demande d'ordre live.", "3. Connectors ou Live Capital: un autre opérateur valide en second."]} /></div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 12, marginTop: 12 }}>
+            <div className="panel" style={{ borderRadius: 12 }}>
+              <div className="row"><span>1. Raccorder FTMO</span><span>{mt5Accounts.length > 0 ? `${mt5Accounts.length} compte(s) MT5 visible(s)` : "aucun compte visible"}</span></div>
+              <p className="subtle" style={{ margin: "8px 0 0" }}>Connections sert à brancher le compte, `snapshot_url` et la vraie session broker `execution_url`.</p>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 10 }}>
+                <Link href="/connections" className="chart-chip active">Ouvrir Connections</Link>
+              </div>
+            </div>
+            <div className="panel" style={{ borderRadius: 12 }}>
+              <div className="row"><span>2. Créer la demande</span><span>{pendingLive.length > 0 ? `${pendingLive.length} approval(s)` : "aucune approval"}</span></div>
+              <p className="subtle" style={{ margin: "8px 0 0" }}>Crée la demande live depuis le Terminal ou avec le formulaire MT5 simplifié de cette page.</p>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 10 }}>
+                <Link href="/terminal" className="chart-chip active">Ouvrir Terminal</Link>
+                <a href="#mt5-order-filter" className="chart-chip">Formulaire MT5</a>
+              </div>
+            </div>
+            <div className="panel" style={{ borderRadius: 12 }}>
+              <div className="row"><span>3. Seconde validation</span><span>{pendingLive.length > 0 ? "action requise" : "idle"}</span></div>
+              <p className="subtle" style={{ margin: "8px 0 0" }}>Quand une approval live existe, un autre opérateur doit la valider ici ou depuis Live Capital.</p>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 10 }}>
+                <a href="#mt5-live-approvals" className="chart-chip active">Voir approvals</a>
+                <Link href="/live-capital" className="chart-chip">Ouvrir Live Capital</Link>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <div className="panel">
           <div className="eyebrow">Connexion MT5 <HelpHint text="Formulaire de raccordement compte MT5 au bridge." examples={["Exemple: entre mt5-demo-01, serveur demo, login demo, puis clique Connecter le compte.", "Utilise paper pour tester le pipeline sans risque reel."]} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
@@ -1032,26 +1061,31 @@ export default function ConnectorsPage() {
           </div>
         </div>
 
-        <div className="panel">
-          <div className="eyebrow">Ordre MT5 Filtre par MWC <HelpHint text="Ordre soumis au risk gate et verifications spread/slippage." examples={["Exemple: EURUSD, buy, 0.10 lot, rationale concise, puis Soumettre ordre filtre.", "Si le spread est trop large, augmente l'exigence de prudence ou attends une meilleure liquidite."]} /></div>
+        <div className="panel" id="mt5-order-filter">
+          <div className="eyebrow">Demande ordre MT5 avec contrôle risque <HelpHint text="Prépare une demande d'ordre MT5 et la fait passer par les contrôles risque, spread, slippage et double validation live." examples={["EURUSD, buy, 0.10 lot, notional prudent et raison courte: le système répond approval si le live demande une seconde validation.", "Si le spread est trop large ou le marché est fermé, l'ordre doit rester bloqué plutôt que simuler un vrai broker."]} /></div>
+          <p className="subtle" style={{ marginTop: 10 }}>Ce bloc crée une demande gouvernée, pas une exécution directe aveugle. En live, TXT attend ensuite la seconde validation dans Approvals Live MT5.</p>
           <div className="form-grid" style={{ marginTop: 12 }}>
-            <input value={orderSymbol} onChange={(e) => setOrderSymbol(e.target.value)} placeholder="symbol" />
-            <select value={orderSide} onChange={(e) => setOrderSide(e.target.value)}>
+            <label className="field-stack"><span>Symbole broker</span><input value={orderSymbol} onChange={(e) => setOrderSymbol(e.target.value)} placeholder="EURUSD ou BTCUSD" /></label>
+            <label className="field-stack"><span>Sens</span><select value={orderSide} onChange={(e) => setOrderSide(e.target.value)}>
               <option value="buy">buy</option>
               <option value="sell">sell</option>
-            </select>
-            <input type="number" step="0.01" value={orderLots} onChange={(e) => setOrderLots(Number(e.target.value || 0))} placeholder="lots" />
-            <input type="number" step="1" value={orderNotional} onChange={(e) => setOrderNotional(Number(e.target.value || 0))} placeholder="estimated_notional_usd" />
-            <input type="number" step="1" value={orderSpread} onChange={(e) => setOrderSpread(Number(e.target.value || 0))} placeholder="max_spread_bps" />
-            <input value={orderWhy} onChange={(e) => setOrderWhy(e.target.value)} placeholder="rationale" />
-            <button type="button" onClick={() => sendFilteredOrder()} disabled={busy}>Soumettre ordre filtre</button>
+            </select></label>
+            <label className="field-stack"><span>Taille en lots</span><input type="number" step="0.01" value={orderLots} onChange={(e) => setOrderLots(Number(e.target.value || 0))} placeholder="0.10" /></label>
+            <label className="field-stack"><span>Notional estimé USD</span><input type="number" step="1" value={orderNotional} onChange={(e) => setOrderNotional(Number(e.target.value || 0))} placeholder="15000" /></label>
+            <label className="field-stack"><span>Spread maximum bps</span><input type="number" step="1" value={orderSpread} onChange={(e) => setOrderSpread(Number(e.target.value || 0))} placeholder="15" /></label>
+            <label className="field-stack"><span>Raison opérateur</span><input value={orderWhy} onChange={(e) => setOrderWhy(e.target.value)} placeholder="setup, risque et contexte" /></label>
+            <button type="button" onClick={() => sendFilteredOrder()} disabled={busy}>Soumettre demande contrôlée</button>
           </div>
         </div>
       </section>
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr" }}>
-        <div className="panel">
-          <div className="eyebrow">Double Validation Live MT5 <HelpHint text="Second validateur requis pour execution compte live." examples={["Quand une demande arrive ici, un autre operateur doit cliquer Valider en second.", "Si rien n'apparait ici, l'ordre est soit en paper, soit pas encore eligibile au live."]} /></div>
+        <div className="panel" id="mt5-live-approvals">
+          <div className="eyebrow">Approvals Live MT5 <HelpHint text="Second validateur requis pour execution compte live." examples={["Quand une demande arrive ici, un autre operateur doit cliquer Valider en second.", "Si rien n'apparait ici, l'ordre est soit en paper, soit pas encore eligibile au live."]} /></div>
+          <div className="row" style={{ marginTop: 10 }}>
+            <span>{pendingLive.length > 0 ? `${pendingLive.length} demande(s) live en attente` : "Aucune demande live en attente"}</span>
+            <span>{pendingLive.length > 0 ? "second opérateur requis" : "pipeline idle"}</span>
+          </div>
           {pendingLive.length === 0 ? <p className="subtle">Aucune demande live en attente.</p> : null}
           {pendingLive.map((item) => (
             <div className="row" key={String(item.approval_id)}>
@@ -1068,31 +1102,36 @@ export default function ConnectorsPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Detection Regime Marche <HelpHint text="Inference regime pour adapter strategie et exposition." examples={["Entre trend_score, vol et sentiment pour savoir si le marche ressemble a trend, chop ou stress.", "Si le regime change, adapte ensuite les seuils de drift dans Live Readiness."]} /></div>
+          <div className="eyebrow">Lecture régime marché <HelpHint text="Lit trois scores normalisés pour classer le contexte: tendance, volatilité réalisée et sentiment." examples={["trend_score vient d'un signal de tendance normalisé entre 0 et 1: 0.4 = modéré, 0.8 = fort.", "realized_volatility est la volatilité observée: 0.05 veut dire environ 5% sur la fenêtre utilisée par le signal.", "sentiment_score est l'impulsion news/social/desk entre -1 et 1 quand la source le permet."]} /></div>
+          <p className="subtle" style={{ marginTop: 10 }}>Utilise ce bloc comme lecture de contexte. Les chiffres doivent venir du Terminal, de l'oracle marché, d'un rapport stratégie, ou rester aux valeurs d'exemple pour un simple test.</p>
           <div className="form-grid" style={{ marginTop: 12 }}>
-            <input type="number" step="0.01" value={trendScore} onChange={(e) => setTrendScore(Number(e.target.value || 0))} placeholder="trend_score" />
-            <input type="number" step="0.001" value={realizedVolatility} onChange={(e) => setRealizedVolatility(Number(e.target.value || 0))} placeholder="realized_volatility" />
-            <input type="number" step="0.01" value={sentimentScore} onChange={(e) => setSentimentScore(Number(e.target.value || 0))} placeholder="sentiment_score" />
+            <label className="field-stack"><span>Tendance 0-1</span><input type="number" step="0.01" value={trendScore} onChange={(e) => setTrendScore(Number(e.target.value || 0))} placeholder="0.40" /></label>
+            <label className="field-stack"><span>Volatilité réalisée</span><input type="number" step="0.001" value={realizedVolatility} onChange={(e) => setRealizedVolatility(Number(e.target.value || 0))} placeholder="0.050" /></label>
+            <label className="field-stack"><span>Sentiment -1 à 1</span><input type="number" step="0.01" value={sentimentScore} onChange={(e) => setSentimentScore(Number(e.target.value || 0))} placeholder="0.20" /></label>
             <button type="button" onClick={() => detectRegime()} disabled={busy}>Detecter regime</button>
           </div>
           {regimeResult ? (
             <div className="panel" style={{ marginTop: 12, borderRadius: 12 }}>
               <div className="row"><span>Regime</span><span>{String(regimeResult.regime || "-")}</span></div>
               <div className="row"><span>Confidence</span><span>{String(regimeResult.confidence || "-")}</span></div>
+              <div className="row"><span>Source lecture</span><span>trend_score + realized_volatility + sentiment_score</span></div>
+              <p className="subtle" style={{ marginTop: 10 }}>Utilisation: si la confiance est faible, ne change pas la stratégie seul avec ce résultat. Si le régime passe stress/chop, réduis taille, fréquence ou promotion live.</p>
             </div>
           ) : null}
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Backtest IA Geopolitique <HelpHint text="Stress-test scenario pour mesurer resilience strategie." examples={["Exemple: Fed emergency hike puis Lance backtest pour mesurer la resilience.", "Si expected_max_drawdown est trop fort, ne promote pas la strategie sans retravail."]} /></div>
+          <div className="eyebrow">Stress-test IA géopolitique <HelpHint text="Teste un scénario macro ou géopolitique pour voir si une stratégie reste acceptable avant promotion ou live." examples={["Exemple: Fed emergency hike, oil shock, exchange outage, weekend liquidity shock.", "Resilience élevée = cadre plus robuste; expected max drawdown élevé = risque de perte de pic à creux trop important."]} /></div>
+          <p className="subtle" style={{ marginTop: 10 }}>Ce test ne prédit pas le futur. Il sert à décider si on garde, réduit, retarde ou retravaille une stratégie avant d'exposer du vrai capital.</p>
           <div className="form-grid" style={{ marginTop: 12 }}>
-            <input value={scenario} onChange={(e) => setScenario(e.target.value)} placeholder="scenario" />
+            <label className="field-stack"><span>Scénario à tester</span><input value={scenario} onChange={(e) => setScenario(e.target.value)} placeholder="Fed emergency hike" /></label>
             <button type="button" onClick={() => runBacktest()} disabled={busy}>Lancer backtest</button>
           </div>
           {backtestResult ? (
             <div className="panel" style={{ marginTop: 12, borderRadius: 12 }}>
               <div className="row"><span>Resilience</span><span>{String(backtestResult.resilience_score || "-")}</span></div>
               <div className="row"><span>Expected max DD</span><span>{String(backtestResult.expected_max_drawdown || "-")}</span></div>
+              <p className="subtle" style={{ marginTop: 10 }}>Utilisation: résilience haute et drawdown bas soutiennent une poursuite prudente. Drawdown haut ou score faible = pas de promotion live sans réduction du risque ou nouvelle calibration.</p>
             </div>
           ) : null}
         </div>

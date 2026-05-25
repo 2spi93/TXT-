@@ -249,6 +249,7 @@ type ExecutionSidecarCardProps = {
   onApproveAllAndSend: () => void;
   approveAllAndSendLabel: string;
   approveAllAndSendDisabled?: boolean;
+  approveAllAndSendDisabledReason?: string;
   showCriticalActions: boolean;
   previewOpen: boolean;
   onTogglePreview: () => void;
@@ -277,6 +278,7 @@ export function ExecutionSidecarCard({
   onApproveAllAndSend,
   approveAllAndSendLabel,
   approveAllAndSendDisabled = false,
+  approveAllAndSendDisabledReason = "",
   showCriticalActions,
   previewOpen,
   onTogglePreview,
@@ -287,18 +289,18 @@ export function ExecutionSidecarCard({
 }: ExecutionSidecarCardProps) {
   return (
     <section className="chart-sidecar-card chart-sidecar-card-execution">
-      <SidecarHead title="Execution Sidecar" value={sideLabel} headActions={headActions} />
+      <SidecarHead title="Execution" value={sideLabel} headActions={headActions} />
       <div className="chart-sidecar-grid">
-        <ChartActionPill>entry {entry.toFixed(chartPriceDigits)}</ChartActionPill>
-        <ChartActionPill>sl {sl.toFixed(chartPriceDigits)}</ChartActionPill>
-        <ChartActionPill>tp {tp.toFixed(chartPriceDigits)}</ChartActionPill>
+        <ChartActionPill>entree {entry.toFixed(chartPriceDigits)}</ChartActionPill>
+        <ChartActionPill>stop {sl.toFixed(chartPriceDigits)}</ChartActionPill>
+        <ChartActionPill>cible {tp.toFixed(chartPriceDigits)}</ChartActionPill>
         <ChartActionPill>RR {chartRiskReward.toFixed(2)}</ChartActionPill>
-        <ChartActionPill status={chartRiskUsd <= chartMaxLossUsd ? "good" : "bad"}>risk {chartRiskUsd.toFixed(0)} USD</ChartActionPill>
-        <ChartActionPill status={chartRewardUsd >= chartTargetGainUsd ? "good" : "warn"}>reward {chartRewardUsd.toFixed(0)} USD</ChartActionPill>
+        <ChartActionPill status={chartRiskUsd <= chartMaxLossUsd ? "good" : "bad"}>risque {chartRiskUsd.toFixed(0)} USD</ChartActionPill>
+        <ChartActionPill status={chartRewardUsd >= chartTargetGainUsd ? "good" : "warn"}>gain {chartRewardUsd.toFixed(0)} USD</ChartActionPill>
       </div>
       {suggestedBracket ? (
         <div className="chart-sidecar-execution-stack">
-          <div className="chart-sidecar-execution-title">Suggested Bracket</div>
+          <div className="chart-sidecar-execution-title">Plan propose</div>
           <div className="chart-sidecar-grid">
             <ChartActionPill>{suggestedBracket.label}</ChartActionPill>
             <ChartActionPill>{suggestedBracket.side.toUpperCase()} · RR {suggestedBracket.rr.toFixed(2)}</ChartActionPill>
@@ -312,37 +314,40 @@ export function ExecutionSidecarCard({
             ) : null}
           </div>
           <div className="chart-sidecar-profile-row">
-            <button type="button" className="chart-chip" onClick={onApplyBracket}>Apply Bracket</button>
+            <button type="button" className="chart-chip" onClick={onApplyBracket}>Appliquer</button>
             {showCriticalActions ? (
               <>
-                <button type="button" className="chart-chip active" onClick={onApproveAll}>Approve All</button>
-                <button type="button" className="chart-chip chart-buy-btn" disabled={approveAllAndSendDisabled} onClick={onApproveAllAndSend}>{approveAllAndSendLabel}</button>
+                <button type="button" className="chart-chip active" onClick={onApproveAll}>Valider le plan</button>
+                <button type="button" className="chart-chip chart-buy-btn" disabled={approveAllAndSendDisabled} title={approveAllAndSendDisabledReason || undefined} onClick={onApproveAllAndSend}>{approveAllAndSendLabel}</button>
               </>
             ) : null}
           </div>
+          {approveAllAndSendDisabled && approveAllAndSendDisabledReason ? (
+            <div className="chart-sidecar-disabled-reason">Bloque: {approveAllAndSendDisabledReason}</div>
+          ) : null}
         </div>
       ) : null}
       <div className="chart-sidecar-execution-stack">
         <div className="chart-sidecar-head">
           <div>
-            <span className="chart-sidecar-kicker">Order Preview</span>
-            <strong>{previewOpen ? "Expanded" : "Compact"}</strong>
+            <span className="chart-sidecar-kicker">Apercu ordre</span>
+            <strong>{previewOpen ? "Details" : "Simple"}</strong>
           </div>
           <div className="chart-sidecar-actions">
             <button type="button" className={`chart-sidecar-head-btn ${previewOpen ? "active" : ""}`} onClick={onTogglePreview}>
-              {previewOpen ? "Hide" : "Show"}
+              {previewOpen ? "Masquer" : "Voir"}
             </button>
           </div>
         </div>
         <div className="chart-sidecar-preview-grid">
-          <span>Side</span><strong>{sideLabel}</strong>
-          <span>Symbol</span><strong>{selectedChartSymbol}</strong>
+          <span>Sens</span><strong>{sideLabel}</strong>
+          <span>Symbole</span><strong>{selectedChartSymbol}</strong>
           <span>OCO</span><strong>{ocoEnabled ? "ON" : "OFF"}</strong>
           <span>Snap</span><strong>{chartSnapEnabled ? chartSnapPriorityLabel : "FREE"}</strong>
         </div>
         {previewOpen ? (
           <div className="chart-sidecar-preview-grid">
-            <span>Entry</span><strong>{entry.toFixed(4)}</strong>
+            <span>Entree</span><strong>{entry.toFixed(4)}</strong>
             <span>Stop Loss</span><strong>{sl.toFixed(4)}</strong>
             <span>Take Profit</span><strong>{tp.toFixed(4)}</strong>
             <span>Perte max</span><strong className="warn">{chartRiskUsd.toFixed(2)} USD</strong>
@@ -413,40 +418,40 @@ export function LocalFeedSidecarCard({
   const status = signal === "OHLCV_RENDERABLE" ? "good" : signal === "OHLCV_PARTIAL" ? "warn" : "bad";
   const reasonLabel = reasons.length > 0 ? reasons.join(" · ") : "none";
   const droppedKindsLabel = droppedReasonKinds.length > 0 ? droppedReasonKinds.join(" · ") : "none";
+  const feedOk = signal === "OHLCV_RENDERABLE" && renderableRows > 0;
 
   return (
     <section className="chart-sidecar-card">
-      <SidecarHead title="Local Feed" value={<span className={status === "good" ? "good" : "warn"}>{signal.replace("OHLCV_", "")}</span>} headActions={headActions} />
+      <SidecarHead title="Flux chart" value={<span className={status === "good" ? "good" : "warn"}>{feedOk ? "OK" : signal.replace("OHLCV_", "")}</span>} headActions={headActions} />
       <div className="chart-sidecar-execution-stack">
-        <div className="chart-sidecar-kicker">Local diagnosis</div>
+        <div className="chart-sidecar-kicker">Etat donnees</div>
         <strong>{message}</strong>
         <div className="chart-sidecar-preview-grid">
-          <span>Capture</span><strong>{captureClientId || "-"}</strong>
-          <span>Persisted</span><strong>{captureUpdatedAt ? captureUpdatedAt.slice(11, 19) : "-"}</strong>
-          <span>Feed</span><strong>{feedLabel}</strong>
-          <span>Rows</span><strong>{renderableRows}/{fetchedRows}</strong>
-          <span>Dropped</span><strong>{droppedRows}</strong>
-          <span>Duplicates</span><strong>{duplicateTimestamps}</strong>
-          <span>Sync</span><strong>{captureDetail}</strong>
+          <span>Flux</span><strong>{feedLabel}</strong>
+          <span>Bougies</span><strong>{renderableRows}/{fetchedRows}</strong>
+          <span>Dernier</span><strong>{lastTimestamp ? lastTimestamp.slice(11, 19) : "-"}</strong>
+          <span>Sync</span><strong>{captureHealthy ? "OK" : captureDetail}</strong>
         </div>
       </div>
       <div className="chart-sidecar-grid">
         <ChartActionPill status={status}>signal {signal.replace("OHLCV_", "").toLowerCase()}</ChartActionPill>
-        <ChartActionPill status={renderableRows > 0 ? "good" : "bad"}>renderable {renderableRows}</ChartActionPill>
-        <ChartActionPill status={droppedRows === 0 ? "good" : "warn"}>dropped {droppedRows}</ChartActionPill>
-        <ChartActionPill status={captureHealthy ? "good" : "warn"}>persist {captureHealthy ? "ok" : captureDetail}</ChartActionPill>
-        <ChartActionPill>history {captureHistoryCount}</ChartActionPill>
-        <ChartActionPill status={autoIncidentStatus === "opened" ? "bad" : autoIncidentStatus === "failed" ? "warn" : "good"}>incident {autoIncidentTicketKey || autoIncidentStatus || "none"}</ChartActionPill>
-        <ChartActionPill>first {firstTimestamp ? firstTimestamp.slice(11, 19) : "-"}</ChartActionPill>
-        <ChartActionPill>last {lastTimestamp ? lastTimestamp.slice(11, 19) : "-"}</ChartActionPill>
+        <ChartActionPill status={droppedRows === 0 ? "good" : "warn"}>rejets {droppedRows}</ChartActionPill>
+        <ChartActionPill status={autoIncidentStatus === "opened" ? "bad" : autoIncidentStatus === "failed" ? "warn" : "good"}>incident {autoIncidentTicketKey || autoIncidentStatus || "aucun"}</ChartActionPill>
       </div>
-      <div className="chart-sidecar-execution-stack">
-        <div className="chart-sidecar-kicker">Reasons</div>
-        <div className="chart-sidecar-grid">
-          <ChartActionPill>{reasonLabel}</ChartActionPill>
-          <ChartActionPill>{droppedKindsLabel}</ChartActionPill>
-        </div>
-      </div>
+      {!feedOk || droppedRows > 0 || duplicateTimestamps > 0 ? (
+        <details className="chart-sidecar-details">
+          <summary>Details diagnostic</summary>
+          <div className="chart-sidecar-grid">
+            <ChartActionPill>capture {captureClientId || "-"}</ChartActionPill>
+            <ChartActionPill>persist {captureUpdatedAt ? captureUpdatedAt.slice(11, 19) : "-"}</ChartActionPill>
+            <ChartActionPill>doublons {duplicateTimestamps}</ChartActionPill>
+            <ChartActionPill>historique {captureHistoryCount}</ChartActionPill>
+            <ChartActionPill>{reasonLabel}</ChartActionPill>
+            <ChartActionPill>{droppedKindsLabel}</ChartActionPill>
+            <ChartActionPill>debut {firstTimestamp ? firstTimestamp.slice(11, 19) : "-"}</ChartActionPill>
+          </div>
+        </details>
+      ) : null}
       {fallbackSuggestion ? (
         <div className="chart-sidecar-execution-stack">
           <div className="chart-sidecar-kicker">Fallback proposal</div>
@@ -457,14 +462,14 @@ export function LocalFeedSidecarCard({
             <span>Auto</span><strong>{fallbackSuggestion.autoFallback ? "armed" : "manual"}</strong>
           </div>
           <div className="chart-sidecar-profile-row">
-            <button type="button" className="chart-chip chart-buy-btn" onClick={onApplyFallback}>Switch to healthy feed</button>
-            <button type="button" className="chart-chip" onClick={onDismissFallback}>Keep current</button>
+            <button type="button" className="chart-chip chart-buy-btn" onClick={onApplyFallback}>Basculer flux sain</button>
+            <button type="button" className="chart-chip" onClick={onDismissFallback}>Garder actuel</button>
           </div>
         </div>
       ) : null}
       <div className="chart-sidecar-profile-row">
-        {autoIncidentTicketKey ? <a className="chart-chip" href={`/incidents#${autoIncidentTicketKey}`}>Open ticket</a> : null}
-        {captureClientId ? <a className="chart-chip" href={`/api/health/local-terminal?client_id=${encodeURIComponent(captureClientId)}`} target="_blank" rel="noreferrer">Open capture JSON</a> : null}
+        {autoIncidentTicketKey ? <a className="chart-chip" href={`/incidents#${autoIncidentTicketKey}`}>Ticket</a> : null}
+        {captureClientId ? <a className="chart-chip" href={`/api/health/local-terminal?history=summary&client_id=${encodeURIComponent(captureClientId)}`} target="_blank" rel="noreferrer">JSON resume</a> : null}
       </div>
     </section>
   );
@@ -565,8 +570,8 @@ export function ForensicReplaySidecarCard({
         ))}
       </div>
       <div className="chart-sidecar-profile-row">
-        {captureClientId ? <a className="chart-chip" href={`/api/health/local-terminal?client_id=${encodeURIComponent(captureClientId)}`} target="_blank" rel="noreferrer">Query this client</a> : null}
-        {autoIncidentTicketKey ? <a className="chart-chip" href={`/incidents#${autoIncidentTicketKey}`}>Open incident desk</a> : null}
+        {captureClientId ? <a className="chart-chip" href={`/api/health/local-terminal?history=summary&client_id=${encodeURIComponent(captureClientId)}`} target="_blank" rel="noreferrer">JSON resume</a> : null}
+        {autoIncidentTicketKey ? <a className="chart-chip" href={`/incidents#${autoIncidentTicketKey}`}>Incidents</a> : null}
       </div>
     </section>
   );

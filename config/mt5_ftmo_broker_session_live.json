@@ -1,0 +1,15 @@
+{
+  "broker_session": {
+    "snapshot_url": "https://bridge.txt.gtixt.com/v1/accounts/541283177/normalized-state",
+    "payload_path": "payload",
+    "truth_source": "mt5-ea-command-queue",
+    "min_poll_interval_seconds": 20,
+    "execution_mode": "mql_command_queue",
+    "execution_url": "mql://commands",
+    "client_id": "ftmo-ld6-bridge",
+    "execution_timeout_seconds": 20,
+    "market_schedule_profile": "ftmo-week"
+  },
+  "merge": false,
+  "refresh": true
+}

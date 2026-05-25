@@ -816,6 +816,7 @@ type OperatorActionSummaryProps = {
   badge?: ReactNode;
   executionPnlPayload: ExecutionPnlAnalyzerPayload | null;
   runtimeOpsPayload?: Record<string, unknown> | null;
+  liveOpsPayload?: Record<string, unknown> | null;
   executionAiV6Payload?: ExecutionAiV6PanelPayload | null;
   routingPayload?: Record<string, unknown> | null;
   smartDecision?: SmartDecisionHudShape | null;
@@ -933,9 +934,11 @@ function useRuntimeDecisionSummary(journalContext?: {
       return null;
     }
     const query = new URLSearchParams();
-    query.set("symbol", journalSymbol);
-    query.set("timeframe", journalTimeframe);
-    query.set("strategy", journalStrategy);
+    if (journalSymbol !== "DESK") {
+      query.set("symbol", journalSymbol);
+      query.set("timeframe", journalTimeframe);
+      query.set("strategy", journalStrategy);
+    }
     query.set("limit", "600");
     query.set("sinceDays", "7");
     query.set("historyLimit", "20");
@@ -954,9 +957,11 @@ function useRuntimeDecisionSummary(journalContext?: {
     const loadRuntimeDecision = async () => {
       setBusy(true);
       const query = new URLSearchParams();
-      query.set("symbol", journalSymbol);
-      query.set("timeframe", journalTimeframe);
-      query.set("strategy", journalStrategy);
+      if (journalSymbol !== "DESK") {
+        query.set("symbol", journalSymbol);
+        query.set("timeframe", journalTimeframe);
+        query.set("strategy", journalStrategy);
+      }
       query.set("limit", "600");
       query.set("sinceDays", "7");
       query.set("samples", "1");
@@ -1011,9 +1016,11 @@ function useRuntimeReadonlyProjection(journalContext?: {
       return null;
     }
     const query = new URLSearchParams();
-    query.set("symbol", journalSymbol);
-    query.set("timeframe", journalTimeframe);
-    query.set("strategy", journalStrategy);
+    if (journalSymbol !== "DESK") {
+      query.set("symbol", journalSymbol);
+      query.set("timeframe", journalTimeframe);
+      query.set("strategy", journalStrategy);
+    }
     query.set("limit", "600");
     query.set("sinceDays", "7");
     query.set("historyLimit", "20");
@@ -1042,13 +1049,13 @@ function useRuntimeReadonlyProjection(journalContext?: {
     const loadRuntimeProjection = async () => {
       setBusy(!resolvedCachedSnapshot);
       const query = new URLSearchParams();
-      if (journalSymbol) {
+      if (journalSymbol && journalSymbol !== "DESK") {
         query.set("symbol", journalSymbol);
       }
-      if (journalTimeframe) {
+      if (journalTimeframe && journalSymbol !== "DESK") {
         query.set("timeframe", journalTimeframe);
       }
-      if (journalStrategy) {
+      if (journalStrategy && journalSymbol !== "DESK") {
         query.set("strategy", journalStrategy);
       }
       const url = query.size > 0 ? `/api/system/runtime-projection?${query.toString()}` : "/api/system/runtime-projection";
@@ -2105,6 +2112,7 @@ export function OperatorActionSummary({
   badge,
   executionPnlPayload,
   runtimeOpsPayload,
+  liveOpsPayload,
   executionAiV6Payload,
   routingPayload,
   smartDecision,
@@ -2121,7 +2129,7 @@ export function OperatorActionSummary({
   const runtimeDecisionBusy = runtimeDecisionSummary.busy || runtimeProjection.busy;
   const runtimeDecisionError = runtimeDecisionSummary.error || runtimeProjection.error;
   const runtimeDecisionExportHref = runtimeDecisionSummary.exportHref || runtimeProjection.exportHref;
-  const resolvedRuntimeOpsPayload = runtimeOpsPayload ?? null;
+  const resolvedRuntimeOpsPayload = runtimeOpsPayload ?? liveOpsPayload ?? null;
   const runtimeDecisionCompactSeed = resolveRuntimeProjectionCompactSeed(resolvedRuntimeOpsPayload);
   const decision = useMemo(() => buildOperatorActionDecision({
     executionPnlPayload,
@@ -2248,9 +2256,11 @@ export function OperatorActionSummary({
     const loadJournal = async () => {
       setJournalBusy(true);
       const query = new URLSearchParams();
-      query.set("symbol", journalSymbol);
-      query.set("timeframe", journalTimeframe);
-      query.set("strategy", journalStrategy);
+      if (journalSymbol !== "DESK") {
+        query.set("symbol", journalSymbol);
+        query.set("timeframe", journalTimeframe);
+        query.set("strategy", journalStrategy);
+      }
       query.set("limit", "80");
       const response = await fetch(`/api/terminal/v2-risk-journal?${query.toString()}`, { cache: "no-store" }).catch(() => null);
       const payload = response ? await response.json().catch(() => null) : null;
@@ -3221,6 +3231,7 @@ export function ControlRoomMonitoringPanel({
   layoutEditMode,
   onDetach,
   runtimeOpsPayload,
+  liveOpsPayload,
   executionAiV6Payload,
   emergencyStopBusy,
   emergencyStopFeedback,
@@ -3231,13 +3242,14 @@ export function ControlRoomMonitoringPanel({
   layoutEditMode: boolean;
   onDetach: () => void;
   runtimeOpsPayload?: Record<string, unknown> | null;
+  liveOpsPayload?: Record<string, unknown> | null;
   executionAiV6Payload?: ExecutionAiV6PanelPayload | null;
   emergencyStopBusy: boolean;
   emergencyStopFeedback: string | null;
   onEmergencyStop: () => void;
   formatClock: (value: string) => string;
 }) {
-  const resolvedRuntimeOpsPayload = runtimeOpsPayload ?? null;
+  const resolvedRuntimeOpsPayload = runtimeOpsPayload ?? liveOpsPayload ?? null;
   const snapshot = safeRecord(resolvedRuntimeOpsPayload);
   const watchdog = safeRecord(snapshot.watchdog_state);
   const governance = safeRecord(snapshot.governance);
@@ -3369,6 +3381,7 @@ export function ExecutionPnlTruthMonitoringPanel({
   onDetach,
   payload,
   runtimeOpsPayload,
+  liveOpsPayload,
   executionAiV6Payload,
   finalDecisionTruth,
   passiveMode = false,
@@ -3380,6 +3393,7 @@ export function ExecutionPnlTruthMonitoringPanel({
   onDetach: () => void;
   payload: ExecutionPnlAnalyzerPayload | null;
   runtimeOpsPayload?: Record<string, unknown> | null;
+  liveOpsPayload?: Record<string, unknown> | null;
   executionAiV6Payload?: ExecutionAiV6PanelPayload | null;
   finalDecisionTruth?: FinalDecisionTruth | null;
   passiveMode?: boolean;
@@ -3401,7 +3415,7 @@ export function ExecutionPnlTruthMonitoringPanel({
   const runtimeTelemetryIntegritySummary = runtimeProjectionOperator?.runtimeTelemetryIntegritySummary ?? null;
   const runtimeAttestation = runtimeProjectionOperator?.runtimeAttestation ?? null;
   const runtimeCertification = runtimeProjectionOperator?.runtimeCertification ?? null;
-  const resolvedRuntimeOpsPayload = runtimeOpsPayload ?? null;
+  const resolvedRuntimeOpsPayload = runtimeOpsPayload ?? liveOpsPayload ?? null;
   const journalSymbol = String(journalContext?.symbol || "").trim().toUpperCase();
   const journalTimeframe = String(journalContext?.timeframe || "").trim();
   const journalStrategy = String(journalContext?.strategy || "").trim();
@@ -3421,9 +3435,11 @@ export function ExecutionPnlTruthMonitoringPanel({
     const loadJournal = async () => {
       setJournalBusy(true);
       const query = new URLSearchParams();
-      query.set("symbol", journalSymbol);
-      query.set("timeframe", journalTimeframe);
-      query.set("strategy", journalStrategy);
+      if (journalSymbol !== "DESK") {
+        query.set("symbol", journalSymbol);
+        query.set("timeframe", journalTimeframe);
+        query.set("strategy", journalStrategy);
+      }
       query.set("limit", "80");
       const response = await fetch(`/api/terminal/v2-risk-journal?${query.toString()}`, { cache: "no-store" }).catch(() => null);
       const responsePayload = response ? await response.json().catch(() => null) : null;
@@ -4527,9 +4543,11 @@ export function AttentionContextMonitoringPanel({
     const loadJournal = async () => {
       setJournalBusy(true);
       const query = new URLSearchParams();
-      query.set("symbol", journalSymbol);
-      query.set("timeframe", journalTimeframe);
-      query.set("strategy", journalStrategy);
+      if (journalSymbol !== "DESK") {
+        query.set("symbol", journalSymbol);
+        query.set("timeframe", journalTimeframe);
+        query.set("strategy", journalStrategy);
+      }
       query.set("limit", "400");
       query.set("sinceDays", "14");
       const response = await fetch(`/api/terminal/v2-risk-journal?${query.toString()}`, { cache: "no-store" }).catch(() => null);

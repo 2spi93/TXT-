@@ -34,6 +34,7 @@ CONTAINER_OUTPUT_PATH="${CONTAINER_OUTPUT_PATH:-/tmp/terminal-truth-observer.jso
 ALERT_TEXT_RENDERER="${ALERT_TEXT_RENDERER:-$ROOT_DIR/scripts/lib/terminal_truth_alert_text.js}"
 TRANSIENT_RETRY_COUNT="${TRANSIENT_RETRY_COUNT:-2}"
 TRANSIENT_RETRY_DELAY_SEC="${TRANSIENT_RETRY_DELAY_SEC:-2}"
+OBSERVER_ATTEMPT_TIMEOUT_SEC="${OBSERVER_ATTEMPT_TIMEOUT_SEC:-180}"
 AUTO_RECOVERY_ENABLED="${AUTO_RECOVERY_ENABLED:-0}"
 AUTO_RECOVERY_SCRIPT="${AUTO_RECOVERY_SCRIPT:-$ROOT_DIR/scripts/auto_recover_terminal_truth_incident.sh}"
 
@@ -122,7 +123,17 @@ resolve_base_url() {
 json_get_field() {
   local json_line="$1"
   local field_name="$2"
-  node -e 'const value = JSON.parse(process.argv[1])[process.argv[2]]; process.stdout.write(value == null ? "" : String(value));' "$json_line" "$field_name"
+  if [[ -z "$json_line" ]]; then
+    return 0
+  fi
+  node -e '
+try {
+  const value = JSON.parse(process.argv[1])[process.argv[2]];
+  process.stdout.write(value == null ? "" : String(value));
+} catch {
+  process.exit(0);
+}
+' "$json_line" "$field_name"
 }
 
 build_error_record() {
@@ -169,14 +180,14 @@ read_previous_status() {
   if [[ ! -f "$STATE_FILE" ]]; then
     return 0
   fi
-  node -e 'const fs = require("fs"); const raw = fs.readFileSync(process.argv[1], "utf8").trim(); if (!raw) process.exit(0); const parsed = JSON.parse(raw); process.stdout.write(String(parsed.status || ""));' "$STATE_FILE" 2>/dev/null || true
+  node -e 'try { const fs = require("fs"); const raw = fs.readFileSync(process.argv[1], "utf8").trim(); if (!raw) process.exit(0); const parsed = JSON.parse(raw); process.stdout.write(String(parsed.status || "")); } catch { process.exit(0); }' "$STATE_FILE" 2>/dev/null || true
 }
 
 read_previous_reason() {
   if [[ ! -f "$STATE_FILE" ]]; then
     return 0
   fi
-  node -e 'const fs = require("fs"); const raw = fs.readFileSync(process.argv[1], "utf8").trim(); if (!raw) process.exit(0); const parsed = JSON.parse(raw); process.stdout.write(String(parsed.reason || ""));' "$STATE_FILE" 2>/dev/null || true
+  node -e 'try { const fs = require("fs"); const raw = fs.readFileSync(process.argv[1], "utf8").trim(); if (!raw) process.exit(0); const parsed = JSON.parse(raw); process.stdout.write(String(parsed.reason || "")); } catch { process.exit(0); }' "$STATE_FILE" 2>/dev/null || true
 }
 
 read_previous_repeat_count() {
@@ -184,7 +195,7 @@ read_previous_repeat_count() {
     printf '0\n'
     return 0
   fi
-  node -e 'const fs = require("fs"); const raw = fs.readFileSync(process.argv[1], "utf8").trim(); if (!raw) { process.stdout.write("0"); process.exit(0); } const parsed = JSON.parse(raw); const value = Number(parsed.observerConsecutiveRepeatCount || 0); process.stdout.write(Number.isFinite(value) ? String(value) : "0");' "$STATE_FILE" 2>/dev/null || printf '0\n'
+  node -e 'try { const fs = require("fs"); const raw = fs.readFileSync(process.argv[1], "utf8").trim(); if (!raw) { process.stdout.write("0"); process.exit(0); } const parsed = JSON.parse(raw); const value = Number(parsed.observerConsecutiveRepeatCount || 0); process.stdout.write(Number.isFinite(value) ? String(value) : "0"); } catch { process.stdout.write("0"); }' "$STATE_FILE" 2>/dev/null || printf '0\n'
 }
 
 with_observer_repeat_count() {
@@ -214,6 +225,13 @@ should_alert_for_status() {
 is_retryable_observer_reason() {
   local reason="${1:-}"
   [[ "$reason" == 'observer_output_missing' ]] && return 0
+  [[ "$reason" == 'observer_attempt_timeout' ]] && return 0
+  [[ "$reason" == 'truth_strip_missing' ]] && return 0
+  [[ "$reason" == 'truth_labels_missing' ]] && return 0
+  [[ "$reason" == 'mission_control_not_ready' ]] && return 0
+  [[ "$reason" == *'page.goto: net::ERR_ABORTED'* ]] && return 0
+  [[ "$reason" == *'interrupted by another navigation'* ]] && return 0
+  [[ "$reason" == *'page.goto: net::ERR_CONNECTION_REFUSED'* ]] && return 0
   [[ "$reason" == *'page.goto: Page crashed'* ]] && return 0
   [[ "$reason" == *'page.goto: net::ERR_CONNECTION_RESET'* ]] && return 0
   [[ "$reason" == *'page.goto: net::ERR_EMPTY_RESPONSE'* ]] && return 0
@@ -229,24 +247,35 @@ is_retryable_observer_reason() {
 run_single_observer_attempt() {
   local container="$1"
   local base_url="$2"
-  local stdout_summary detail_record
+  local stdout_summary detail_record container_output_path exit_code
 
-  stdout_summary="$(docker exec -i \
+  container_output_path="${CONTAINER_OUTPUT_PATH}.$$.$RANDOM.jsonl"
+
+  set +e
+  stdout_summary="$(timeout --kill-after=10s "${OBSERVER_ATTEMPT_TIMEOUT_SEC}s" docker exec -i \
     -e BASE_URL="$base_url" \
     -e TERMINAL_PATH="$TERMINAL_PATH" \
-    -e OUT="$CONTAINER_OUTPUT_PATH" \
+    -e OUT="$container_output_path" \
     -e RUN_FOREVER=0 \
     -e ITERATIONS=1 \
     -e CHECK_EVERY_MS="$CYCLE_INTERVAL_MS" \
     -e TRUTH_TIMEOUT_MS="$TRUTH_TIMEOUT_MS" \
     -e NAVIGATION_TIMEOUT_MS="$NAVIGATION_TIMEOUT_MS" \
     "$container" \
-    node /workspace/ui/mission-control/scripts/terminal_truth_observer.js 2>&1 || true)"
+    node /workspace/ui/mission-control/scripts/terminal_truth_observer.js 2>&1)"
+  exit_code=$?
+  set -e
   if [[ -n "$stdout_summary" ]]; then
     printf '%s\n' "$stdout_summary" >&2
   fi
 
-  detail_record="$(docker exec "$container" sh -lc "tail -n 1 '$CONTAINER_OUTPUT_PATH' 2>/dev/null || true")"
+  if [[ "$exit_code" -eq 124 || "$exit_code" -eq 137 ]]; then
+    docker exec "$container" sh -lc "rm -f '$container_output_path'" >/dev/null 2>&1 || true
+    build_error_record "observer_attempt_timeout" "$base_url"
+    return 0
+  fi
+
+  detail_record="$(docker exec "$container" sh -lc "tail -n 1 '$container_output_path' 2>/dev/null || true; rm -f '$container_output_path'" )"
   if [[ -z "$detail_record" ]]; then
     build_error_record "observer_output_missing" "$base_url"
     return 0

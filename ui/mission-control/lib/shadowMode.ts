@@ -21,6 +21,7 @@ export interface ShadowConfig {
   dualMode: boolean;   // use backend if successful, else fallback
   rolloutPercentage: number; // % of users getting real backend (0-100)
   userId?: string;
+  backendTimeoutMs?: number;
 }
 
 export interface ShadowResult<T> {
@@ -247,8 +248,9 @@ export async function executeWithShadowMode<T>(config: ShadowConfig, {
   
   try {
     const backendPromise = fetchBackend();
+    const timeoutMs = Math.max(250, Math.min(3000, Number(config.backendTimeoutMs || 3000)));
     const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('timeout')), 3000)
+      setTimeout(() => reject(new Error('timeout')), timeoutMs)
     );
     
     const start = Date.now();

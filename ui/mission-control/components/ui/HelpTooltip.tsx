@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 import { glossary, type GlossaryEntry } from "../../lib/glossary";
 import type { UiMode } from "../../lib/userUiPrefs";
@@ -92,13 +93,31 @@ export default function HelpTooltip({ termKey, entry, label, simple, example, wh
     };
   }, [open]);
 
+  const popover = (
+    <span ref={popoverRef} id={tooltipId} className={`gtix-help-popover${open ? " is-open" : ""}`} role="tooltip" style={popoverStyle}>
+      <span className="gtix-help-popover-title">{resolved.label}</span>
+      <span className="gtix-help-popover-section-label">En clair</span>
+      <span className="gtix-help-popover-text">{resolved.simple}</span>
+      {resolved.example ? (
+        <>
+          <span className="gtix-help-popover-section-label">Exemple simple</span>
+          <span className="gtix-help-popover-example">{resolved.example}</span>
+        </>
+      ) : null}
+      {resolved.whyItMatters ? (
+        <>
+          <span className="gtix-help-popover-section-label">Pourquoi tu le vois ici</span>
+          <span className="gtix-help-popover-text">{resolved.whyItMatters}</span>
+        </>
+      ) : null}
+    </span>
+  );
+
   return (
     <span
       className={`gtix-help-hint${mode === "novice" ? " novice" : ""}${open ? " is-open" : ""}`}
       onMouseEnter={() => setOpen(true)}
-      onMouseLeave={() => setOpen(false)}
       onFocus={() => setOpen(true)}
-      onBlur={() => setOpen(false)}
     >
       <button
         ref={buttonRef}
@@ -121,23 +140,7 @@ export default function HelpTooltip({ termKey, entry, label, simple, example, wh
       >
         ?
       </button>
-      <span ref={popoverRef} id={tooltipId} className="gtix-help-popover" role="tooltip" style={popoverStyle}>
-        <span className="gtix-help-popover-title">{resolved.label}</span>
-        <span className="gtix-help-popover-section-label">En clair</span>
-        <span className="gtix-help-popover-text">{resolved.simple}</span>
-        {resolved.example ? (
-          <>
-            <span className="gtix-help-popover-section-label">Exemple simple</span>
-            <span className="gtix-help-popover-example">{resolved.example}</span>
-          </>
-        ) : null}
-        {resolved.whyItMatters ? (
-          <>
-            <span className="gtix-help-popover-section-label">Pourquoi tu le vois ici</span>
-            <span className="gtix-help-popover-text">{resolved.whyItMatters}</span>
-          </>
-        ) : null}
-      </span>
+      {typeof document !== "undefined" ? createPortal(popover, document.body) : null}
     </span>
   );
 }

@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 
 import HelpHint from "../../../components/HelpHint";
 import OperatorPanelGuide from "../../../components/ui/OperatorPanelGuide";
+import { openOpsCopilotPrompt } from "../../../lib/opsCopilot";
 
 type JsonMap = Record<string, unknown>;
 
@@ -255,28 +256,50 @@ export default function KairosShadowClient() {
       <section className="panel" style={{ padding: 18, display: "grid", gap: 12 }}>
         <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "start", flexWrap: "wrap" }}>
           <div style={{ display: "grid", gap: 6 }}>
-            <span className="eyebrow">Kairos Shadow Runtime</span>
+            <span className="eyebrow">Moteur Kairos en observation</span>
             <h1 style={{ margin: 0 }}>Cycles shadow et recommandations mémoire</h1>
             <p className="subtle" style={{ margin: 0, maxWidth: 880 }}>
-              Cette vue lit le journal SQL du premier loop Kairos shadow. Aucun ordre réel n’est envoyé ici: la page affiche les cycles,
-              les décisions, le verdict predictor, et la recommandation Memory V2 appliquée ou non.
+              Cette page sert a regarder ce que Kairos ferait, sans envoyer d'ordre reel depuis cet ecran. Elle montre les analyses, les decisions proposees,
+              les raisons de blocage et les recommandations de memoire.
             </p>
             <OperatorPanelGuide
               title="Guide Kairos"
               what="Une lecture simple de ce que Kairos aurait fait en mode observation."
-              why="Verifier le comportement du moteur avant d'autoriser un usage plus sensible."
-              example="Regarde une decision recente, puis compare le sens choisi, le filtre memoire et les raisons du blocage ou du passage."
+              why="Avant de laisser Kairos agir automatiquement, tu dois voir s'il lit le marche proprement et s'il sait rester bloque quand le risque est mauvais."
+              example="Lis d'abord le statut, puis clique Lancer une fois pour faire une seule analyse. Si tout est clair, tu peux demarrer la boucle d'observation."
             />
           </div>
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <button type="button" className="btn" onClick={() => void runAction("/api/ai/kairos/shadow/start")} disabled={acting}>
-              Start loop
-            </button>
-            <button type="button" className="btn" onClick={() => void runAction("/api/ai/kairos/shadow/stop")} disabled={acting}>
-              Stop loop
-            </button>
-            <button type="button" className="btn btn-primary" onClick={() => void runAction("/api/ai/kairos/shadow/run-once")} disabled={acting}>
-              Run once
+          <div style={{ display: "grid", gap: 8, minWidth: 280 }}>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <span className="terminal-onboarding-inline-pointer" aria-hidden="true">
+                <svg viewBox="0 0 48 48" role="presentation"><path d="M9 6L31 25H21L27 42L20 45L14 28L7 35Z" /></svg>
+              </span>
+              <button type="button" className="btn" onClick={() => void runAction("/api/ai/kairos/shadow/start")} disabled={acting} title="Lance l'analyse automatique en continu, sans ordre reel depuis cette page.">
+                Demarrer la boucle
+              </button>
+              <HelpHint text="Demarre une analyse automatique qui tourne en continu. Ici, Kairos observe et journalise ce qu'il ferait; ce bouton ne ferme pas et n'ouvre pas une position depuis cette page." examples={["A utiliser quand tu veux laisser Kairos surveiller le marche tout seul.", "Si tu veux juste tester maintenant, utilise plutot Lancer une fois."]} label="Demarrer la boucle" />
+            </div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <button type="button" className="btn" onClick={() => void runAction("/api/ai/kairos/shadow/stop")} disabled={acting} title="Met l'analyse automatique en pause; ne ferme pas les positions existantes.">
+                Arreter la boucle
+              </button>
+              <HelpHint text="Met la boucle Kairos en pause. Cela stoppe l'analyse automatique de cette couche, mais ne ferme pas une position deja ouverte ailleurs." examples={["A utiliser si tu ne veux plus que Kairos continue a analyser sans toi.", "Le bouton d'urgence execution reste separe du bouton pause Kairos."]} label="Arreter la boucle" />
+            </div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <button type="button" className="btn btn-primary" onClick={() => void runAction("/api/ai/kairos/shadow/run-once")} disabled={acting} title="Fait une seule analyse maintenant, sans lancer la boucle continue.">
+                Lancer une fois
+              </button>
+              <HelpHint text="Fait une seule analyse maintenant, puis s'arrete. C'est le bouton le plus simple pour verifier ce que Kairos pense sans le laisser tourner en continu." examples={["Clique ici pour un test rapide.", "Lis ensuite les raisons dans le journal des cycles."]} label="Lancer une fois" />
+            </div>
+            <button
+              type="button"
+              className="btn"
+              onClick={() => openOpsCopilotPrompt({
+                message: "Explique-moi en francais simple quoi cliquer sur Kairos Shadow: Demarrer la boucle, Arreter la boucle, Lancer une fois, et ce que cela change pour le live.",
+                autoSend: true,
+              })}
+            >
+              Me guider avec Ops Copilot
             </button>
           </div>
         </div>
@@ -285,53 +308,53 @@ export default function KairosShadowClient() {
 
         <div style={{ display: "grid", gap: 10, gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))" }}>
           <div className="panel" style={{ padding: 12 }}>
-            <div className="eyebrow">Runtime</div>
-            <strong>{status.active ? "Active" : "Idle"}</strong>
+            <div className="eyebrow">Etat</div>
+            <strong>{status.active ? "Boucle en marche" : "En pause"}</strong>
           </div>
           <div className="panel" style={{ padding: 12 }}>
-            <div className="eyebrow">Symbol</div>
+            <div className="eyebrow">Instrument</div>
             <strong>{String(status.symbol || "-")}</strong>
           </div>
           <div className="panel" style={{ padding: 12 }}>
-            <div className="eyebrow">Venue</div>
+            <div className="eyebrow">Plateforme</div>
             <strong>{String(status.venue || "-")}</strong>
           </div>
           <div className="panel" style={{ padding: 12 }}>
-            <div className="eyebrow">Cycle</div>
+            <div className="eyebrow">Rythme</div>
             <strong>{toNumber(status.cycle_seconds, 0).toFixed(0)}s</strong>
           </div>
           <div className="panel" style={{ padding: 12 }}>
-            <div className="eyebrow">Persisted Cycles</div>
+            <div className="eyebrow">Analyses gardees</div>
             <strong>{toNumber(persisted.cycle_count, 0)}</strong>
           </div>
           <div className="panel" style={{ padding: 12 }}>
-            <div className="eyebrow">Persisted Decisions</div>
+            <div className="eyebrow">Decisions gardees</div>
             <strong>{toNumber(persisted.decision_count, 0)}</strong>
           </div>
           <div className="panel" style={{ padding: 12 }}>
-            <div className="eyebrow">Proposed</div>
+            <div className="eyebrow">Propositions</div>
             <strong>{toNumber(status.proposed_total, 0)}</strong>
           </div>
           <div className="panel" style={{ padding: 12 }}>
-            <div className="eyebrow">Skipped</div>
+            <div className="eyebrow">Bloquees</div>
             <strong>{toNumber(status.skipped_total, 0)}</strong>
           </div>
         </div>
 
         <div className="panel" style={{ padding: 12 }}>
-          <div className="eyebrow">Last Cycle</div>
+          <div className="eyebrow">Derniere analyse</div>
           <strong>{formatDateTime(status.last_cycle_at)}</strong>
           <div className="subtle" style={{ marginTop: 6 }}>
-            Last persisted cycle: {formatDateTime(persisted.last_cycle_at)}
+            Derniere analyse enregistree: {formatDateTime(persisted.last_cycle_at)}
           </div>
           {status.last_error ? <div className="bad" style={{ marginTop: 8 }}>{String(status.last_error)}</div> : null}
         </div>
 
         <div className="panel" style={{ padding: 12, display: "grid", gap: 10 }}>
           <div>
-            <div className="eyebrow">Harness SOL</div>
+            <div className="eyebrow">Test encadre SOL</div>
             <strong>Validation synthetic-one-shot</strong>
-            <div className="subtle" style={{ marginTop: 6 }}>Deux presets pour lancer SOL trend/chop directement depuis Mission Control et distinguer les validations du flux live.</div>
+            <div className="subtle" style={{ marginTop: 6 }}>Deux scenarios controles pour tester SOL en tendance ou en marche hache, sans confondre le test avec le flux live.</div>
           </div>
           <div style={{ display: "grid", gap: 10, gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))" }}>
             {Object.entries(HARNESS_PRESETS).map(([presetKey, preset]) => (
@@ -341,21 +364,21 @@ export default function KairosShadowClient() {
                   <div className="subtle" style={{ marginTop: 6 }}>{preset.description}</div>
                 </div>
                 <button type="button" className="btn btn-primary" onClick={() => void runHarness(presetKey)} disabled={Boolean(harnessBusy)}>
-                  {harnessBusy === presetKey ? "Running..." : "Run harness"}
+                  {harnessBusy === presetKey ? "Test en cours..." : "Lancer le test"}
                 </button>
               </div>
             ))}
           </div>
           {harnessResult ? (
             <div className="panel" style={{ padding: 12, display: "grid", gap: 10 }}>
-              <div className="eyebrow">Last Harness Result</div>
+              <div className="eyebrow">Dernier resultat du test</div>
               <div style={{ display: "grid", gap: 10, gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))" }}>
                 <div>
                   <div className="subtle">Mode</div>
                   <strong>{String(asMap(harnessCycle.harness).mode || "-")}</strong>
                 </div>
                 <div>
-                  <div className="subtle">Action</div>
+                  <div className="subtle">Action retenue</div>
                   <strong>{String(harnessCycle.shadow_action || "-")}</strong>
                 </div>
                 <div>
@@ -363,7 +386,7 @@ export default function KairosShadowClient() {
                   <strong>{String(harnessDecision.direction || "-")}</strong>
                 </div>
                 <div>
-                  <div className="subtle">Memory Gate</div>
+                  <div className="subtle">Filtre memoire</div>
                   <strong>{String(harnessGate.status || "-")}</strong>
                 </div>
                 <div>
@@ -371,7 +394,7 @@ export default function KairosShadowClient() {
                   <strong>{String(harnessExecution.status || "-")}</strong>
                 </div>
               </div>
-              <div className="subtle">Reasons: {Array.isArray(harnessCycle.shadow_reasons) ? harnessCycle.shadow_reasons.map((item) => String(item)).join(", ") || "-" : "-"}</div>
+              <div className="subtle">Raisons: {Array.isArray(harnessCycle.shadow_reasons) ? harnessCycle.shadow_reasons.map((item) => String(item)).join(", ") || "-" : "-"}</div>
               <pre style={{ margin: 0, whiteSpace: "pre-wrap", overflowX: "auto", fontSize: 12 }}>{formatJson(harnessResult)}</pre>
             </div>
           ) : null}
@@ -380,20 +403,20 @@ export default function KairosShadowClient() {
 
       <section className="panel" style={{ padding: 18, display: "grid", gap: 12 }}>
         <div>
-          <span className="eyebrow">Cycles</span>
+          <span className="eyebrow">Analyses</span>
           <h2 style={{ margin: "6px 0 0" }}>Journal SQL des cycles shadow</h2>
         </div>
         <div style={{ overflowX: "auto" }}>
           <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 980 }}>
             <thead>
               <tr>
-                <th align="left">Cycle</th>
+                <th align="left">Analyse</th>
                 <th align="left">Action</th>
                 <th align="left">Decision</th>
-                <th align="left">Predictor</th>
-                <th align="left">Memory</th>
-                <th align="left">Recommendation</th>
-                <th align="left">Reasons</th>
+                <th align="left">Predictif</th>
+                <th align="left">Memoire</th>
+                <th align="left">Recommandation</th>
+                <th align="left">Raisons</th>
               </tr>
             </thead>
             <tbody>
@@ -442,12 +465,12 @@ export default function KairosShadowClient() {
               <tr>
                 <th align="left">Decision</th>
                 <th align="left">Direction</th>
-                <th align="left">Confidence</th>
-                <th align="left">Risk</th>
-                <th align="left">Predictor</th>
-                <th align="left">Memory</th>
-                <th align="left">Proposed Trade</th>
-                <th align="left">Inspect</th>
+                <th align="left">Confiance</th>
+                <th align="left">Risque</th>
+                <th align="left">Predictif</th>
+                <th align="left">Memoire</th>
+                <th align="left">Ordre propose</th>
+                <th align="left">Voir</th>
               </tr>
             </thead>
             <tbody>
@@ -482,7 +505,7 @@ export default function KairosShadowClient() {
                         className="btn"
                         onClick={() => setSelectedDecisionId((current) => (current === decisionId ? null : decisionId))}
                       >
-                        {selectedDecisionId === decisionId ? "Hide" : "Inspect"}
+                        {selectedDecisionId === decisionId ? "Masquer" : "Inspecter"}
                       </button>
                     </td>
                   </tr>
@@ -495,7 +518,7 @@ export default function KairosShadowClient() {
         {selectedDecision ? (
           <div className="panel" style={{ padding: 16, display: "grid", gap: 14 }}>
             <div>
-              <span className="eyebrow">Decision Drill-down</span>
+              <span className="eyebrow">Detail de decision</span>
               <h3 style={{ margin: "6px 0 0" }}>Inspection opérateur fine</h3>
             </div>
 

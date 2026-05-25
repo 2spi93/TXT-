@@ -1,0 +1,12 @@
+{
+  "source": "kairos",
+  "route_key": "default",
+  "provider": "mt5",
+  "account_id": "541283177",
+  "live_enabled": true,
+  "preferred_venue": "mt5",
+  "symbol_map": {
+    "BTCUSDT": "BTCUSD"
+  },
+  "notional_usd": 5.0
+}

@@ -60,6 +60,7 @@ type GpuViewportFeed = {
 type Props = InstitutionalChartProps & {
   engineMode?: "v3" | "v4";
   viewportGrid?: 1 | 4 | 16 | "auto";
+  showDiagnostics?: boolean;
   viewportWindowHint?: number;
   multiSymbolFeeds?: GpuViewportFeed[];
   smoothingMs?: number;
@@ -861,6 +862,7 @@ function resolveGpuDiagnosis(input: {
 export default function GpuChartV4Surface({
   engineMode = "v4",
   viewportGrid = "auto",
+  showDiagnostics = false,
   viewportWindowHint,
   multiSymbolFeeds = [],
   smoothingMs = 140,
@@ -2028,13 +2030,13 @@ export default function GpuChartV4Surface({
       {/* WebGL2 live canvas — fades in once context is ready */}
       <canvas ref={canvasRef} className="gpu-chart-v4-canvas" aria-hidden="true" />
       <canvas ref={overlayCanvasRef} className="gpu-chart-v4-overlay-canvas" aria-hidden="true" />
-      {/* Status badge */}
-      <div className={`gpu-chart-v4-status ${gpuReady ? "ready" : "fallback"}`}>
-        <span className="gpu-chart-v4-kicker">Engine {engineMode.toUpperCase()}</span>
-        <span>{gpuStatusLabel}</span>
-      </div>
-      {/* GPU metrics panel — visible only when WebGL2 is live */}
-      {gpuReady && (
+      {showDiagnostics ? (
+        <div className={`gpu-chart-v4-status ${gpuReady ? "ready" : "fallback"}`}>
+          <span className="gpu-chart-v4-kicker">Engine {engineMode.toUpperCase()}</span>
+          <span>{gpuStatusLabel}</span>
+        </div>
+      ) : null}
+      {showDiagnostics && gpuReady ? (
         <div className="gpu-metrics-panel">
           <span className="gpu-metric">
             <span className="gm-label">FPS</span>
@@ -2066,8 +2068,8 @@ export default function GpuChartV4Surface({
             </>
           )}
         </div>
-      )}
-      <div className="chart-timezone-pill" aria-hidden="true">{timezoneLabel} | drag pan x/y</div>
+      ) : null}
+      {showDiagnostics ? <div className="chart-timezone-pill" aria-hidden="true">{timezoneLabel} | drag pan x/y</div> : null}
       {gpuReady && isPreviewMode ? (
         <div className="gpu-chart-v4-preview-banner" aria-live="polite">
           <strong>Preview candles</strong>

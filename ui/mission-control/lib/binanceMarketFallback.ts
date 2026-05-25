@@ -134,6 +134,88 @@ export function hasUsableRows(payload: unknown): boolean {
   return Array.isArray(payload) && payload.length > 0;
 }
 
+function readOhlcvNumber(row: Record<string, unknown>, keys: string[]): number {
+  for (const key of keys) {
+    const numeric = Number(row[key]);
+    if (Number.isFinite(numeric)) {
+      return numeric;
+    }
+  }
+  return Number.NaN;
+}
+
+export function hasUsableOhlcvRows(payload: unknown): boolean {
+  const rows = Array.isArray(payload)
+    ? payload
+    : Array.isArray((payload as { rows?: unknown[] } | null)?.rows)
+      ? ((payload as { rows?: unknown[] }).rows || [])
+      : [];
+  if (rows.length === 0) {
+    return false;
+  }
+
+  const recentRows = rows.slice(-Math.min(160, rows.length));
+  let validRows = 0;
+  let flatRows = 0;
+  let gapFillRows = 0;
+  let tradeResampledRows = 0;
+  let positiveRangeRows = 0;
+
+  for (const entry of recentRows) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      continue;
+    }
+    const row = entry as Record<string, unknown>;
+    const open = readOhlcvNumber(row, ["open", "o"]);
+    const high = readOhlcvNumber(row, ["high", "h"]);
+    const low = readOhlcvNumber(row, ["low", "l"]);
+    const close = readOhlcvNumber(row, ["close", "c"]);
+    if (![open, high, low, close].every((value) => Number.isFinite(value) && value > 0)) {
+      continue;
+    }
+
+    validRows += 1;
+    const source = String(row.source || "").toLowerCase();
+    if (source.includes("gap-fill")) {
+      gapFillRows += 1;
+    }
+    if (source.includes("trade-resampled")) {
+      tradeResampledRows += 1;
+    }
+
+    const anchor = Math.max(Math.abs(close), Math.abs(open), 1);
+    const range = Math.max(high, open, close) - Math.min(low, open, close);
+    const flatTolerance = Math.max(anchor * 0.0000002, 1e-8);
+    if (range <= flatTolerance) {
+      flatRows += 1;
+    } else {
+      positiveRangeRows += 1;
+    }
+  }
+
+  if (validRows === 0 || positiveRangeRows === 0) {
+    return false;
+  }
+  if (validRows < Math.min(10, recentRows.length)) {
+    return false;
+  }
+
+  const flatRatio = flatRows / validRows;
+  const gapFillRatio = gapFillRows / validRows;
+  const tradeResampledRatio = tradeResampledRows / validRows;
+  if (validRows >= 24 && flatRatio >= 0.82) {
+    return false;
+  }
+  if (validRows >= 24 && tradeResampledRatio >= 0.65 && flatRatio >= 0.68) {
+    return false;
+  }
+  if (validRows >= 12 && gapFillRatio >= 0.3 && flatRatio >= 0.5) {
+    return false;
+  }
+
+  return true;
+}
+
 export function hasUsableObject(payload: unknown): boolean {
   return Boolean(payload && typeof payload === "object" && !Array.isArray(payload));
 }

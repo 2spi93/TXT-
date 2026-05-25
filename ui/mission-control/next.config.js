@@ -5,6 +5,9 @@ const nextConfig = {
   typedRoutes: false,
   distDir,
   allowedDevOrigins: ["localhost", "127.0.0.1"],
+  experimental: {
+    serverMinification: false,
+  },
 };
 
 module.exports = nextConfig;

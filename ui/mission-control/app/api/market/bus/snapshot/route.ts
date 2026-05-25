@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 
-import { fallbackMicrostructure, fallbackSessionState } from "../../../../../lib/binanceMarketFallback";
+import { fallbackMicrostructure, fallbackSessionState, hasUsableOhlcvRows } from "../../../../../lib/binanceMarketFallback";
 import { cpFetchJsonSafe, extractMcContextHeaders } from "../../../../../lib/controlPlane";
 
 type JsonMap = Record<string, unknown>;
@@ -97,7 +97,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     { headers: extractMcContextHeaders(request) },
   );
 
-  if (response.ok) {
+  if (response.ok && hasUsableOhlcvRows(safeRecord(payload).ohlcv_rows)) {
     return NextResponse.json(payload, {
       status: response.status,
       headers: {

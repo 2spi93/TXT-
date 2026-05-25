@@ -123,6 +123,18 @@ class ControlPlaneLiveCapabilityTests(unittest.TestCase):
         self.assertFalse(capabilities.get("execution"))
         self.assertTrue(capabilities.get("api_key_requires_passphrase"))
 
+    def test_public_live_execution_resolution_redacts_secret_payload(self) -> None:
+        result = control_plane._public_live_execution_resolution(
+            {
+                "enabled": True,
+                "provider": "bingx",
+                "secret_payload": {"api_key": "key", "api_secret": "secret"},
+            }
+        )
+
+        self.assertNotIn("secret_payload", result)
+        self.assertEqual(result.get("credentials"), "available")
+
     def test_apply_live_execution_auto_sizing_promotes_intent_target_notional(self) -> None:
         intent_payload = {
             "intent_id": "intent-1",
@@ -421,6 +433,35 @@ class ControlPlaneLiveCapabilityTests(unittest.TestCase):
         self.assertEqual(result["status"], "blocked")
         self.assertIn("execution_context_no_trade", result["reasons"])
         self.assertIn("execution_context_no_trade_dominance", result["reasons"])
+
+    def test_evaluate_go_live_hardening_allows_configured_autonomous_source(self) -> None:
+        policy = control_plane._default_live_execution_policy()
+        policy["go_live_hardening"]["require_human_for_autonomous_sources"] = False
+
+        with patch.object(control_plane, "_account_live_exposure_snapshot", return_value={"exposure_known": True, "equity_usd": 10000.0, "projected_total_exposure_pct": 5.0, "projected_symbol_exposure_pct": 5.0}), \
+             patch.object(control_plane, "_go_live_signal_loop_snapshot", return_value={"lookback_minutes": 20, "repeat_count": 0, "same_source_repeat_count": 0, "blocked_repeat_count": 0}), \
+             patch.object(control_plane, "_kill_switch_state", return_value={"active": False, "stats": {}}), \
+             patch.object(control_plane, "_kill_switch_thresholds", return_value={"max_drawdown_intraday": 100.0}), \
+             patch.object(control_plane, "_recent_pending_live_approval_count", return_value=0), \
+             patch.object(control_plane, "_load_live_execution_policy", return_value=policy), \
+             patch.object(control_plane, "_drawdown_velocity_snapshot", return_value={"lookback_minutes": 90, "recent_loss_usd": 0.0, "recent_net_result_usd": 0.0, "sample_count": 0}), \
+             patch.object(control_plane, "append_audit") as append_audit:
+            result = control_plane._evaluate_go_live_hardening(
+                source="kairos-shadow-runtime",
+                provider="bingx",
+                account_id="acct-1",
+                symbol="BTCUSDT",
+                side="buy",
+                requested_notional_usd=4.5,
+                confidence=0.91,
+                live_requested=True,
+                purpose="execute",
+                record_decision=False,
+            )
+
+        self.assertEqual(result["status"], "approved")
+        self.assertNotIn("governance_approval_required_autonomous_source", result["reasons"])
+        append_audit.assert_not_called()
 
     def test_resolve_live_execution_request_mt5_auto_sizes_by_stage_bucket(self) -> None:
         policy = {

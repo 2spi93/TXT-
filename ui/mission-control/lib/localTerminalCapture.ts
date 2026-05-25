@@ -521,6 +521,15 @@ export type BuildLocalTerminalRuntimeCaptureInput = {
   perceptual?: LocalTerminalPerceptualRuntime | null;
 };
 
+export type LocalTerminalCaptureHistorySummaryFrame = {
+  capturedAt: string;
+  feedLabel: string;
+  signal: LocalOhlcvSignal;
+  blockedByFiveStateFailure: boolean;
+  noCandlesExpected: boolean;
+  exactStateVector: string[];
+};
+
 const MAX_CAPTURE_COUNT = 12;
 const MAX_CAPTURE_HISTORY_PER_CLIENT = 24;
 

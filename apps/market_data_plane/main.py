@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -355,6 +355,99 @@ def _session_label(ts: datetime) -> str:
     if 8 <= hour < 14:
         return "london"
     return "new-york"
+
+
+def _instrument_trades_continuously(instrument: str) -> bool:
+    normalized = _normalize_instrument(instrument)
+    return normalized.startswith(("BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LTC"))
+
+
+def _easter_sunday(year: int) -> datetime:
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return datetime(year, month, day, tzinfo=timezone.utc)
+
+
+def _configured_market_holidays() -> dict[str, str]:
+    holidays: dict[str, str] = {}
+    for item in str(os.getenv("MARKET_DATA_FX_HOLIDAYS", "")).split(","):
+        raw = item.strip()
+        if not raw:
+            continue
+        day, _, reason = raw.partition(":")
+        day = day.strip()
+        if len(day) == 10:
+            holidays[day] = reason.strip() or "configured_market_holiday"
+    return holidays
+
+
+def _fx_market_holiday_reason(now: datetime, instrument: str) -> str:
+    if _instrument_trades_continuously(instrument):
+        return ""
+    day_key = now.date().isoformat()
+    configured = _configured_market_holidays().get(day_key)
+    if configured:
+        return configured
+    easter = _easter_sunday(now.year)
+    fixed_reasons = {
+        f"{now.year}-01-01": "new_year_market_holiday",
+        f"{now.year}-12-25": "christmas_market_holiday",
+        f"{now.year}-12-26": "boxing_day_market_holiday",
+        (easter - timedelta(days=2)).date().isoformat(): "good_friday_market_holiday",
+    }
+    return fixed_reasons.get(day_key, "")
+
+
+def _next_weekday_at(now: datetime, weekday: int, target_time: time) -> datetime:
+    days_ahead = (weekday - now.weekday()) % 7
+    candidate = (now + timedelta(days=days_ahead)).replace(hour=target_time.hour, minute=target_time.minute, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(days=7)
+    return candidate
+
+
+def _fx_market_status(now: datetime, instrument: str) -> dict[str, Any]:
+    if _instrument_trades_continuously(instrument):
+        return {"market_open": True, "market_status_reason": "continuous_market", "next_market_open_at": None}
+    monday_open = time(hour=1, minute=5)
+    friday_close = time(hour=23, minute=50)
+    reason = ""
+    next_open_at: str | None = None
+    if now.weekday() in {5, 6}:
+        reason = "weekend_market_closed"
+        next_open_at = _next_weekday_at(now, 0, monday_open).isoformat()
+    elif now.weekday() == 0 and now.time() < monday_open:
+        reason = "market_preopen"
+        next_open_at = now.replace(hour=monday_open.hour, minute=monday_open.minute, second=0, microsecond=0).isoformat()
+    elif now.weekday() == 4 and now.time() >= friday_close:
+        reason = "weekend_market_closed"
+        next_open_at = _next_weekday_at(now, 0, monday_open).isoformat()
+    holiday_reason = _fx_market_holiday_reason(now, instrument)
+    if not reason and holiday_reason:
+        reason = holiday_reason
+        candidate = (now + timedelta(days=1)).replace(hour=monday_open.hour, minute=monday_open.minute, second=0, microsecond=0)
+        for _ in range(14):
+            if candidate.weekday() in {5, 6}:
+                candidate = _next_weekday_at(candidate, 0, monday_open)
+                continue
+            if _fx_market_holiday_reason(candidate, instrument):
+                candidate = (candidate + timedelta(days=1)).replace(hour=monday_open.hour, minute=monday_open.minute, second=0, microsecond=0)
+                continue
+            next_open_at = candidate.isoformat()
+            break
+    return {"market_open": not bool(reason), "market_status_reason": reason or "market_open", "next_market_open_at": next_open_at}
 
 
 def _timeframe_delta(timeframe: str) -> timedelta:
@@ -1105,10 +1198,21 @@ def _apply_side_delta(side_map: dict[float, float], delta: list[list[str]]) -> N
 def _snapshot_from_book(venue: str, symbol: str, book: dict[str, Any], reason: str, source: str) -> dict[str, Any]:
     bids = _depth_map_to_rows(book.get("bids", {}), reverse=True)
     asks = _depth_map_to_rows(book.get("asks", {}), reverse=False)
+    crossed_book_repaired = False
+    if bids and asks and bids[0][0] >= asks[0][0]:
+        repaired_bids = [row for row in bids if row[0] < asks[0][0]]
+        if repaired_bids:
+            bids = repaired_bids
+            crossed_book_repaired = True
+        else:
+            repaired_asks = [row for row in asks if row[0] > bids[0][0]]
+            if repaired_asks:
+                asks = repaired_asks
+                crossed_book_repaired = True
     best_bid = bids[0][0] if bids else 0.0
     best_ask = asks[0][0] if asks else 0.0
     mid = (best_bid + best_ask) / 2 if best_bid > 0 and best_ask > 0 else 0.0
-    spread_bps = ((best_ask - best_bid) / mid * 10000) if mid > 0 else 0.0
+    spread_bps = max(0.0, ((best_ask - best_bid) / mid * 10000) if mid > 0 else 0.0)
     return {
         "venue": venue,
         "instrument": symbol,
@@ -1122,6 +1226,7 @@ def _snapshot_from_book(venue: str, symbol: str, book: dict[str, Any], reason: s
             "lastUpdateId": book.get("last_update_id"),
             "event_time": book.get("event_time"),
             "reason": reason,
+            "crossed_book_repaired": crossed_book_repaired,
         },
         "source": source,
     }
@@ -1349,14 +1454,14 @@ def _fetch_trade_preprocessor_analytics_rows(
     limit: int = 24,
 ) -> list[dict[str, Any]]:
     clauses = ["sample_bucket >= NOW() - (%s || ' hours')::interval"]
-    params: list[Any] = [max(1, hours)]
+    where_params: list[Any] = [max(1, hours)]
     if venue:
         clauses.append("venue = %s")
-        params.append(venue)
+        where_params.append(venue)
     if instrument:
         clauses.append("instrument = %s")
-        params.append(_normalize_instrument(instrument))
-    params.extend([PREPROCESSED_TRADE_PRICE_DISCOVERY_ALERT_SAVED_PCT, max(1, min(limit, 100))])
+        where_params.append(_normalize_instrument(instrument))
+    params = [PREPROCESSED_TRADE_PRICE_DISCOVERY_ALERT_SAVED_PCT, *where_params, max(1, min(limit, 100))]
     where_sql = " AND ".join(clauses)
     return fetch_all(
         f"""
@@ -3890,9 +3995,11 @@ async def market_microstructure(
 async def market_session_state(instrument: str = Query("BTCUSDT")) -> dict:
     symbol = _normalize_instrument(instrument)
     now = _now_utc()
+    market_status = _fx_market_status(now, symbol)
     return {
         "instrument": symbol,
         "session": _session_label(now),
+        **market_status,
         "as_of": now.isoformat(),
         "next_session_change_at": (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).isoformat(),
     }

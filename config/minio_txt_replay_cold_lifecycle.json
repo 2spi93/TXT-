@@ -1,0 +1,16 @@
+{
+  "enabled": false,
+  "bucket": "txt-replay-cold",
+  "rules": [
+    {
+      "name": "jsonl-archive-180d",
+      "prefix": "txt/runtime/jsonl-archive/",
+      "expire_after_days": 180
+    },
+    {
+      "name": "jsonl-parquet-730d",
+      "prefix": "txt/runtime/jsonl-parquet/",
+      "expire_after_days": 730
+    }
+  ]
+}

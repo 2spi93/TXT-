@@ -564,6 +564,37 @@ ALTER TABLE mt5_order_events ADD COLUMN IF NOT EXISTS chosen_route TEXT;
 ALTER TABLE mt5_order_events ADD COLUMN IF NOT EXISTS expected_slippage_bps DOUBLE PRECISION;
 ALTER TABLE mt5_order_events ADD COLUMN IF NOT EXISTS execution_context JSONB NOT NULL DEFAULT '{}'::jsonb;
 
+CREATE TABLE IF NOT EXISTS mt5_order_commands (
+    command_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES mt5_accounts(account_id) ON DELETE CASCADE,
+    requested_account_id TEXT NOT NULL DEFAULT '',
+    client_id TEXT NOT NULL DEFAULT '',
+    command_type TEXT NOT NULL DEFAULT 'place_order',
+    status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'inflight', 'executed', 'rejected', 'failed', 'expired', 'cancelled')),
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    result_payload JSONB,
+    broker_ticket TEXT,
+    error_message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    dispatched_at TIMESTAMPTZ,
+    lease_expires_at TIMESTAMPTZ,
+    acknowledged_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '2 minutes'
+);
+
+ALTER TABLE mt5_order_commands ADD COLUMN IF NOT EXISTS requested_account_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE mt5_order_commands ADD COLUMN IF NOT EXISTS client_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE mt5_order_commands ADD COLUMN IF NOT EXISTS command_type TEXT NOT NULL DEFAULT 'place_order';
+ALTER TABLE mt5_order_commands ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'queued';
+ALTER TABLE mt5_order_commands ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE mt5_order_commands ADD COLUMN IF NOT EXISTS result_payload JSONB;
+ALTER TABLE mt5_order_commands ADD COLUMN IF NOT EXISTS broker_ticket TEXT;
+ALTER TABLE mt5_order_commands ADD COLUMN IF NOT EXISTS error_message TEXT;
+ALTER TABLE mt5_order_commands ADD COLUMN IF NOT EXISTS dispatched_at TIMESTAMPTZ;
+ALTER TABLE mt5_order_commands ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
+ALTER TABLE mt5_order_commands ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMPTZ;
+ALTER TABLE mt5_order_commands ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '2 minutes';
+
 CREATE TABLE IF NOT EXISTS mt5_live_approvals (
     approval_id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL REFERENCES mt5_accounts(account_id) ON DELETE CASCADE,
@@ -1137,6 +1168,15 @@ ON mt5_order_events (account_id);
 
 CREATE INDEX IF NOT EXISTS idx_mt5_order_events_chosen_route
 ON mt5_order_events (chosen_route, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_mt5_order_commands_poll
+ON mt5_order_commands (account_id, status, created_at ASC);
+
+CREATE INDEX IF NOT EXISTS idx_mt5_order_commands_client_poll
+ON mt5_order_commands (account_id, client_id, status, created_at ASC);
+
+CREATE INDEX IF NOT EXISTS idx_mt5_order_commands_created_at
+ON mt5_order_commands (created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_mt5_live_approvals_status_created
 ON mt5_live_approvals (status, created_at DESC);

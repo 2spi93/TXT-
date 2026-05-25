@@ -47,6 +47,31 @@ function classifyFreshness(value: unknown): "fresh" | "stale" | "degraded" | "ha
   return "hard-fail";
 }
 
+function freshnessMeaning(level: "fresh" | "stale" | "degraded" | "hard-fail"): string {
+  if (level === "fresh") {
+    return "fresh <= 15s: utilisable pour lecture et execution.";
+  }
+  if (level === "stale") {
+    return "stale 15-60s: lecture possible, pas d'agression sans confirmation.";
+  }
+  if (level === "degraded") {
+    return "degraded 60-180s: reduire ou bloquer les nouveaux envois.";
+  }
+  return "hard-fail > 180s ou age inconnu: ne pas trader depuis ce flux.";
+}
+
+function regimeOperatorLabel(value: unknown): string {
+  const normalized = String(value || "").trim().toLowerCase();
+  const labels: Record<string, string> = {
+    trend: "tendance lisible",
+    chop: "marche hache",
+    stress: "stress marche",
+    price_discovery: "decouverte de prix",
+    range: "range",
+  };
+  return labels[normalized] || formatLabel(value);
+}
+
 function pillTone(level: "fresh" | "stale" | "degraded" | "hard-fail" | "ok"): string {
   if (level === "fresh" || level === "ok") {
     return "good";
@@ -252,6 +277,7 @@ export default function LiveReadinessPage() {
   const depthPayload = safeRecord(depthSnapshot.depth_payload || marketBusSnapshot?.orderbook);
   const tradePreprocessorMode = String(marketBusTradePreprocessor.mode || "n/a");
   const tradePreprocessorRegime = String(marketBusTradePreprocessor.market_regime || "n/a");
+  const tradePreprocessorRegimeLabel = regimeOperatorLabel(tradePreprocessorRegime);
   const tradePreprocessorRawCount = Math.max(0, numberOr(marketBusTradePreprocessor.raw_count, 0));
   const tradePreprocessorEmittedCount = Math.max(0, numberOr(marketBusTradePreprocessor.emitted_count, 0));
   const tradePreprocessorCompressionRatio = numberOr(marketBusTradePreprocessor.compression_ratio, NaN);
@@ -397,6 +423,11 @@ export default function LiveReadinessPage() {
           ) : (
             <div className="good" style={{ marginBottom: 10 }}>Bus marche dans les bornes operationnelles.</div>
           )}
+          <div className="panel" style={{ borderRadius: 12, padding: 12, marginBottom: 10 }}>
+            <div className="row"><span>BARS</span><span>{freshnessMeaning(ohlcvState)}</span></div>
+            <div className="row"><span>DEPTH</span><span>{freshnessMeaning(depthState)}</span></div>
+            <div className="row"><span>TRADES</span><span>{freshnessMeaning(tradesState)}</span></div>
+          </div>
           <div className="row"><span>Instrument de reference</span><span>{String(marketBusSnapshot?.instrument || "BTCUSDT")}</span></div>
           <div className="row"><span>Venue</span><span>{String(marketBusSnapshot?.venue || "binance-public")}</span></div>
           <div className="row"><span>Dernier sync</span><span>{String(marketBusSnapshot?.as_of || "-")}</span></div>
@@ -408,7 +439,7 @@ export default function LiveReadinessPage() {
           <div className="eyebrow">Trades Preprocessor <HelpHint text="Montre explicitement combien de trades bruts sont reduits avant consommation, avec le mode adaptatif retenu et un petit historique compare raw vs emitted." examples={["Si le regime passe en price discovery, attends-toi a moins de compression pour garder plus de verite microstructure.", "Si raw reste eleve mais emitted chute tres fort, verifie que le gain de masse ne masque pas un changement de regime."]} /></div>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10, marginBottom: 10 }}>
             <span className="chart-flow-pill tone-neutral">MODE {tradePreprocessorMode.replace(/_/g, " ").toUpperCase()}</span>
-            <span className="chart-flow-pill tone-neutral">REGIME {tradePreprocessorRegime.replace(/_/g, " ").toUpperCase()}</span>
+            <span className="chart-flow-pill tone-neutral">REGIME {tradePreprocessorRegimeLabel.toUpperCase()}</span>
             <span className={`chart-flow-pill tone-${Number.isFinite(tradePreprocessorSavedPct) && tradePreprocessorSavedPct >= 35 ? "good" : Number.isFinite(tradePreprocessorSavedPct) && tradePreprocessorSavedPct >= 15 ? "warn" : "neutral"}`}>SAVE {formatPercent(tradePreprocessorSavedPct)}</span>
             <span className={`chart-flow-pill tone-${tradePreprocessorAlertState === "warn" ? "bad" : tradePreprocessorAlertState === "watch" ? "warn" : "good"}`}>ALERT {tradePreprocessorAlertState.toUpperCase()}</span>
           </div>
@@ -424,6 +455,11 @@ export default function LiveReadinessPage() {
           ) : (
             <div className="warn" style={{ marginBottom: 10 }}>Aucune metrique de compression disponible sur le snapshot courant.</div>
           )}
+          <div className="panel" style={{ borderRadius: 12, padding: 12, marginBottom: 10 }}>
+            <div className="row"><span>Lecture regime</span><span>{tradePreprocessorRegimeLabel}</span></div>
+            <div className="row"><span>Source des chiffres</span><span>raw = trades recus du bus marche; emitted = trades gardes apres compression adaptive.</span></div>
+            <div className="row"><span>Action operateur</span><span>En decouverte de prix, accepter moins de compression; si emitted chute trop fort, verifier que la microstructure n'est pas masquee.</span></div>
+          </div>
           <div className="row"><span>Window / band</span><span>{tradePreprocessorWindowMs}ms / {formatFixed(tradePreprocessorPriceBandBps, 3)}bps</span></div>
           <div className="row"><span>Snapshot raw vs emitted</span><span>{tradePreprocessorRawCount} / {tradePreprocessorEmittedCount}</span></div>
           <div className="row"><span>Price discovery 24h</span><span>{formatPercent(tradePreprocessorAnalytics24hSavedPct)} · buckets {tradePreprocessorAnalytics24hAggressiveBuckets}</span></div>
@@ -583,20 +619,21 @@ export default function LiveReadinessPage() {
 
       <section className="grid" style={{ gridTemplateColumns: "1fr 1fr", marginBottom: 16 }}>
         <div className="panel">
-          <div className="eyebrow">Seuils Derive par Regime <HelpHint text="Ici, tu règles à partir de quand le système doit freiner ou stopper une stratégie." examples={["Tu peux demander un minimum d'historique avant de faire confiance à une stratégie.", "Si la perte devient trop forte, la stratégie doit être stoppée plus tôt."]} /></div>
+          <div className="eyebrow">Seuils dérive par régime <HelpHint text="Ici, tu règles à partir de quand TXT doit freiner ou stopper une stratégie pour un contexte de marché donné." examples={["Régime: trend, chop, stress ou price_discovery selon la lecture marché.", "Min samples: 25 à 100 évite de juger une stratégie sur trop peu de cas.", "Min win rate: 0.45 veut dire 45%. Drawdown et perte moyenne sont en USD."]} /></div>
+          <p className="subtle" style={{ marginTop: 10 }}>Ces seuils servent de garde-fou runtime. Plus le régime est fragile, plus les limites doivent être strictes avant de laisser une stratégie continuer.</p>
           <div className="form-grid" style={{ marginTop: 10 }}>
-            <input value={regime} onChange={(e) => setRegime(e.target.value)} placeholder="regime" />
-            <input type="number" value={minSamples} onChange={(e) => setMinSamples(Number(e.target.value || 0))} placeholder="min_samples" />
-            <input type="number" step="0.01" value={minWinRate} onChange={(e) => setMinWinRate(Number(e.target.value || 0))} placeholder="min_win_rate" />
-            <input type="number" step="1" value={maxDrawdown} onChange={(e) => setMaxDrawdown(Number(e.target.value || 0))} placeholder="max_drawdown_usd" />
-            <input type="number" step="1" value={maxAvgLoss} onChange={(e) => setMaxAvgLoss(Number(e.target.value || 0))} placeholder="max_avg_loss_usd" />
+            <label className="field-stack"><span>Régime marché</span><input value={regime} onChange={(e) => setRegime(e.target.value)} placeholder="trend, chop, stress" /></label>
+            <label className="field-stack"><span>Historique minimum</span><input type="number" value={minSamples} onChange={(e) => setMinSamples(Number(e.target.value || 0))} placeholder="25 à 100 samples" /></label>
+            <label className="field-stack"><span>Win rate minimum 0-1</span><input type="number" step="0.01" value={minWinRate} onChange={(e) => setMinWinRate(Number(e.target.value || 0))} placeholder="0.45" /></label>
+            <label className="field-stack"><span>Drawdown maximum USD</span><input type="number" step="1" value={maxDrawdown} onChange={(e) => setMaxDrawdown(Number(e.target.value || 0))} placeholder="500" /></label>
+            <label className="field-stack"><span>Perte moyenne max USD</span><input type="number" step="1" value={maxAvgLoss} onChange={(e) => setMaxAvgLoss(Number(e.target.value || 0))} placeholder="120" /></label>
             <button type="button" disabled={busy} onClick={() => void saveThreshold()}>{busy ? "Sauvegarde..." : "Sauvegarder seuil"}</button>
           </div>
           <div style={{ marginTop: 12 }}>
             {thresholds.map((row) => (
               <div className="row" key={String(row.regime)}>
                 <span>{String(row.regime)}</span>
-                <span>samples&gt;={String(row.min_samples)} | win&gt;={String(row.min_win_rate)}</span>
+                <span>historique ≥ {String(row.min_samples)} | win ≥ {String(row.min_win_rate)} | DD ≤ {String(row.max_drawdown_usd ?? "-")} USD</span>
               </div>
             ))}
           </div>

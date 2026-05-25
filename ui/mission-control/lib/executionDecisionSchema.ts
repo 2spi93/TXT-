@@ -24,6 +24,15 @@ export type ExecutionDecisionSource =
   | "routing-guard"
   | "execution-feedback";
 
+export type ExecutionDecisionDeterminism = {
+  runtime_epoch?: string;
+  governance_epoch?: string;
+  stream_offset?: string;
+  decision_hash?: string;
+  truth_hash?: string;
+  policy_hash?: string;
+};
+
 export type ExecutionDecisionAudit = {
   code: ExecutionDecisionCode;
   severity: ExecutionDecisionSeverity;
@@ -32,6 +41,7 @@ export type ExecutionDecisionAudit = {
   policyVersion: typeof EXECUTION_DECISION_POLICY_VERSION;
   summary: string;
   oracleFingerprint?: string;
+  determinism?: ExecutionDecisionDeterminism;
 };
 
 const EXECUTION_DECISION_DEFINITIONS: Record<ExecutionDecisionCode, Omit<ExecutionDecisionAudit, "code" | "policyVersion" | "summary">> = {
@@ -53,6 +63,29 @@ const EXECUTION_DECISION_DEFINITIONS: Record<ExecutionDecisionCode, Omit<Executi
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+export function normalizeExecutionDecisionDeterminism(value: unknown): ExecutionDecisionDeterminism | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const runtime_epoch = String(value.runtime_epoch || "").trim();
+  const governance_epoch = String(value.governance_epoch || "").trim();
+  const stream_offset = String(value.stream_offset || "").trim();
+  const decision_hash = String(value.decision_hash || "").trim();
+  const truth_hash = String(value.truth_hash || "").trim();
+  const policy_hash = String(value.policy_hash || "").trim();
+  if (!runtime_epoch && !governance_epoch && !stream_offset && !decision_hash && !truth_hash && !policy_hash) {
+    return undefined;
+  }
+  return {
+    ...(runtime_epoch ? { runtime_epoch } : {}),
+    ...(governance_epoch ? { governance_epoch } : {}),
+    ...(stream_offset ? { stream_offset } : {}),
+    ...(decision_hash ? { decision_hash } : {}),
+    ...(truth_hash ? { truth_hash } : {}),
+    ...(policy_hash ? { policy_hash } : {}),
+  };
 }
 
 export function normalizeExecutionDecisionOutcomeCode(classification: unknown): ExecutionDecisionCode {
@@ -120,9 +153,11 @@ export function buildExecutionDecisionAudit(input: {
   code: ExecutionDecisionCode;
   summary?: string;
   oracleFingerprint?: string;
+  determinism?: ExecutionDecisionDeterminism;
 }): ExecutionDecisionAudit {
   const definition = EXECUTION_DECISION_DEFINITIONS[input.code];
   const oracleFingerprint = String(input.oracleFingerprint || "").trim();
+  const determinism = normalizeExecutionDecisionDeterminism(input.determinism);
   return {
     code: input.code,
     severity: definition.severity,
@@ -131,6 +166,7 @@ export function buildExecutionDecisionAudit(input: {
     policyVersion: EXECUTION_DECISION_POLICY_VERSION,
     summary: String(input.summary || "").trim(),
     ...(oracleFingerprint ? { oracleFingerprint } : {}),
+    ...(determinism ? { determinism } : {}),
   };
 }
 
@@ -139,7 +175,10 @@ export function buildExecutionDecisionAuditFromLockState(lockState: {
   code?: unknown;
   summaryLabel?: unknown;
   oracleFingerprint?: unknown;
-} | null | undefined): ExecutionDecisionAudit | null {
+  determinism?: unknown;
+} | null | undefined, options?: {
+  determinism?: ExecutionDecisionDeterminism;
+}): ExecutionDecisionAudit | null {
   if (!lockState || !lockState.active) {
     return null;
   }
@@ -151,6 +190,7 @@ export function buildExecutionDecisionAuditFromLockState(lockState: {
     code,
     summary: String(lockState.summaryLabel || "").trim(),
     oracleFingerprint: String(lockState.oracleFingerprint || "").trim() || undefined,
+    determinism: options?.determinism ?? normalizeExecutionDecisionDeterminism(lockState.determinism),
   });
 }
 
@@ -168,10 +208,14 @@ export function validateExecutionDecisionAudit(value: unknown): ExecutionDecisio
   const severity = String(value.severity || "").trim() as ExecutionDecisionSeverity;
   const source = String(value.source || "").trim() as ExecutionDecisionSource;
   const oracleFingerprint = value.oracleFingerprint === undefined ? undefined : String(value.oracleFingerprint || "").trim();
+  const determinism = value.determinism === undefined ? undefined : normalizeExecutionDecisionDeterminism(value.determinism);
   if (!summary || !Number.isFinite(priority) || !policyVersion || !severity || !source) {
     return null;
   }
   if (value.oracleFingerprint !== undefined && !oracleFingerprint) {
+    return null;
+  }
+  if (value.determinism !== undefined && !determinism) {
     return null;
   }
   const definition = EXECUTION_DECISION_DEFINITIONS[code];
@@ -186,5 +230,6 @@ export function validateExecutionDecisionAudit(value: unknown): ExecutionDecisio
     policyVersion: policyVersion as typeof EXECUTION_DECISION_POLICY_VERSION,
     summary,
     ...(oracleFingerprint ? { oracleFingerprint } : {}),
+    ...(determinism ? { determinism } : {}),
   };
 }

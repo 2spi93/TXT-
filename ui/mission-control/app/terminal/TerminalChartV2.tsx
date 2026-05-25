@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import GpuChartV4Surface from "./GpuChartV4Surface";
 import type { SmartDecisionHudShape } from "./chartHudTypes";
@@ -20,10 +20,6 @@ import type { LiveChartFrameMeta } from "../../lib/chartFrameFeed";
 import { DEFAULT_MIN_RENDERABLE_BARS } from "../../lib/ohlcvIntegrity";
 import { timeframeToMs } from "../../lib/ohlcvDataEngine";
 import { computePredictionV5, type PredictionV5 } from "../../lib/predictionEngineV5";
-
-const TERMINAL_V2_TIMEFRAME_SELECTOR_VISIBLE = ["1s", "5s", "30s", "1m", "5m", "15m", "1h", "4h"] as const;
-const TERMINAL_V2_TIMEFRAME_SELECTOR_VISIBLE_SET = new Set<string>(TERMINAL_V2_TIMEFRAME_SELECTOR_VISIBLE);
-const TERMINAL_V2_TIMEFRAME_SELECTOR_MORE = ["10s", "30m", "8h", "1d", "1w", "1M"].filter((timeframe) => !TERMINAL_V2_TIMEFRAME_SELECTOR_VISIBLE_SET.has(timeframe));
 
 type CandlePoint = { label: string; open: number; high: number; low: number; close: number; volume: number };
 type DomLevel = { side: "bid" | "ask"; price: number; size: number; intensity: number };
@@ -163,6 +159,7 @@ type Props = {
   selectedVenue: string;
   availableVenues: string[];
   onSelectVenue: (venue: string | null) => void;
+  advancedControlsOpen?: boolean;
   aiHeadline: string;
   aiScenario: string;
   aiConfidencePct: number;
@@ -217,6 +214,32 @@ function ensureVisibleCandles(candles: CandlePoint[], _fallbackPrice: number): C
     && candle.high >= Math.max(candle.open, candle.close)
     && candle.low <= Math.min(candle.open, candle.close)
   ));
+}
+
+function resolveFlatCandleNotice(candles: CandlePoint[], timeframe: string): string | null {
+  const recent = candles.slice(-Math.min(120, candles.length));
+  if (recent.length < 24) {
+    return null;
+  }
+
+  let validCount = 0;
+  let flatCount = 0;
+  for (const candle of recent) {
+    if (![candle.open, candle.high, candle.low, candle.close].every((value) => Number.isFinite(value) && value > 0)) {
+      continue;
+    }
+    validCount += 1;
+    const anchor = Math.max(Math.abs(candle.close), Math.abs(candle.open), 1);
+    const range = Math.max(candle.high, candle.open, candle.close) - Math.min(candle.low, candle.open, candle.close);
+    if (range <= Math.max(anchor * 0.0000002, 1e-8)) {
+      flatCount += 1;
+    }
+  }
+
+  if (validCount < 24 || flatCount / validCount < 0.72) {
+    return null;
+  }
+  return `Bougies plates sur ${timeframe}: le flux recu contient surtout open=high=low=close. Le prix est affiche, mais TXT attend des klines completes pour dessiner de vrais corps de bougie.`;
 }
 
 function deriveRouteScorePct(routeScorePct: number | null, depthState: "offline" | "connecting" | "live"): number {
@@ -319,6 +342,7 @@ export default function TerminalChartV2(props: Props) {
     selectedVenue,
     availableVenues,
     onSelectVenue,
+    advancedControlsOpen = false,
     aiHeadline,
     aiScenario,
     aiConfidencePct,
@@ -340,6 +364,9 @@ export default function TerminalChartV2(props: Props) {
   const analyticsCandlesInput = props.analyticsCandles ?? props.candles;
   const isPreviewMode = Boolean(props.isPreviewMode);
   const suspendDecisionLayer = Boolean(props.suspendDecisionLayer);
+  const deferredAnalyticsCandlesInput = useDeferredValue(analyticsCandlesInput);
+  const deferredDomLevels = useDeferredValue(domLevels);
+  const deferredHeatmapLevels = useDeferredValue(heatmapLevels);
   const effectiveChartSmoothingMs: ChartSmoothingMs = useMemo(
     () => (timeframeToMs(timeframe) <= 5_000 ? 0 : chartSmoothingMs),
     [chartSmoothingMs, timeframe],
@@ -401,14 +428,14 @@ export default function TerminalChartV2(props: Props) {
   }, [candles, fallbackPrice]);
 
   useEffect(() => {
-    const stable = ensureVisibleCandles(analyticsCandlesInput, fallbackPrice);
+    const stable = ensureVisibleCandles(deferredAnalyticsCandlesInput, fallbackPrice);
     const previous = lastStableAnalyticsCandlesRef.current;
     const previousLen = previous.length;
     const nextLen = stable.length;
     if (nextLen >= MIN_RENDER_CANDLES || nextLen > previousLen) {
       lastStableAnalyticsCandlesRef.current = stable;
     }
-  }, [analyticsCandlesInput, fallbackPrice]);
+  }, [deferredAnalyticsCandlesInput, fallbackPrice]);
 
   const safeRenderCandles = useMemo(() => {
     const stable = ensureVisibleCandles(candles, fallbackPrice);
@@ -422,7 +449,7 @@ export default function TerminalChartV2(props: Props) {
     return stable;
   }, [candles, fallbackPrice]);
   const safeAnalyticsCandles = useMemo(() => {
-    const stable = ensureVisibleCandles(analyticsCandlesInput, fallbackPrice);
+    const stable = ensureVisibleCandles(deferredAnalyticsCandlesInput, fallbackPrice);
     if (stable.length >= MIN_RENDER_CANDLES) {
       return stable;
     }
@@ -431,7 +458,8 @@ export default function TerminalChartV2(props: Props) {
       return previous;
     }
     return stable;
-  }, [analyticsCandlesInput, fallbackPrice, isPreviewMode]);
+  }, [deferredAnalyticsCandlesInput, fallbackPrice, isPreviewMode]);
+  const flatCandleNotice = useMemo(() => resolveFlatCandleNotice(safeRenderCandles, timeframe), [safeRenderCandles, timeframe]);
   const analyticsEligibleCandles = suspendDecisionLayer ? [] : safeAnalyticsCandles;
   const analyticsReady = analyticsEligibleCandles.length >= MIN_RENDER_CANDLES;
   const structureSourceCandles = useMemo(
@@ -480,34 +508,34 @@ export default function TerminalChartV2(props: Props) {
   }, [routingCandidates]);
 
   const domStats = useMemo(() => {
-    const bids = domLevels.filter((level) => level.side === "bid");
-    const asks = domLevels.filter((level) => level.side === "ask");
+    const bids = deferredDomLevels.filter((level) => level.side === "bid");
+    const asks = deferredDomLevels.filter((level) => level.side === "ask");
     const bidVol = bids.reduce((sum, level) => sum + Math.max(0, level.size), 0);
     const askVol = asks.reduce((sum, level) => sum + Math.max(0, level.size), 0);
     const total = Math.max(0.0000001, bidVol + askVol);
     const imbalance = (bidVol - askVol) / total;
-    const avgSize = domLevels.length > 0
-      ? domLevels.reduce((sum, level) => sum + Math.max(0, level.size), 0) / domLevels.length
+    const avgSize = deferredDomLevels.length > 0
+      ? deferredDomLevels.reduce((sum, level) => sum + Math.max(0, level.size), 0) / deferredDomLevels.length
       : 0;
-    const spoofCount = domLevels.filter((level) => level.intensity > 0.9 && level.size > avgSize * 2.2).length;
-    const icebergCount = domLevels.filter((level) => level.intensity >= 0.45 && level.intensity <= 0.8 && level.size > avgSize * 1.25).length;
+    const spoofCount = deferredDomLevels.filter((level) => level.intensity > 0.9 && level.size > avgSize * 2.2).length;
+    const icebergCount = deferredDomLevels.filter((level) => level.intensity >= 0.45 && level.intensity <= 0.8 && level.size > avgSize * 1.25).length;
     return { bids, asks, imbalance, spoofCount, icebergCount };
-  }, [domLevels]);
+  }, [deferredDomLevels]);
 
   const dominantDomLevelKeys = useMemo(() => {
     return new Set(
-      [...domLevels]
+      [...deferredDomLevels]
         .sort((left, right) => (right.size * Math.max(0.2, right.intensity)) - (left.size * Math.max(0.2, left.intensity)))
         .slice(0, 3)
         .map((level) => `${level.side}:${level.price.toFixed(4)}`),
     );
-  }, [domLevels]);
+  }, [deferredDomLevels]);
 
   const heatmapTop = useMemo(() => {
-    return [...heatmapLevels]
+    return [...deferredHeatmapLevels]
       .sort((left, right) => (right.intensity * 0.58 + Math.log1p(Math.max(0, right.size)) * 0.42) - (left.intensity * 0.58 + Math.log1p(Math.max(0, left.size)) * 0.42))
       .slice(0, 8);
-  }, [heatmapLevels]);
+  }, [deferredHeatmapLevels]);
 
   const dominantHeatmapKeys = useMemo(() => {
     return new Set(
@@ -521,12 +549,12 @@ export default function TerminalChartV2(props: Props) {
   const predictionV5 = useMemo((): PredictionV5 => {
     return computePredictionV5(
       analyticsEligibleCandles,
-      domLevels,
-      heatmapLevels,
+      deferredDomLevels,
+      deferredHeatmapLevels,
       aiConfidencePct,
       prevAiConfRef.current,
     );
-  }, [analyticsEligibleCandles, domLevels, heatmapLevels, aiConfidencePct]);
+  }, [analyticsEligibleCandles, deferredDomLevels, deferredHeatmapLevels, aiConfidencePct]);
 
   useEffect(() => {
     prevAiConfRef.current = aiConfidencePct;
@@ -582,8 +610,8 @@ export default function TerminalChartV2(props: Props) {
     suspended: suspendDecisionLayer || !analyticsReady,
     suspendedReason: suspendDecisionLayer || !analyticsReady
       ? suspendDecisionLayer
-        ? "Canonical feed degraded: decision layer suspended until renderable feed recovers"
-        : "Preview mode blocks the decision layer"
+        ? "Flux canonique degrade: decision suspendue jusqu'au retour d'un flux affichable"
+        : "Mode apercu: decision suspendue"
       : null,
     externalGate: marketSyncGate ? {
       state: marketSyncGate.state,
@@ -603,11 +631,11 @@ export default function TerminalChartV2(props: Props) {
   }, [onSmartDecisionHudChange, smartDecisionHud]);
 
   const assistantContext = useMemo(() => {
-    const base = `${smartDecisionHud.assistantSummary} ${aiExplanation} | DOM imbalance ${(domStats.imbalance * 100).toFixed(1)}%, route ${routeVenue || "--"}, confidence ${aiConfidencePct.toFixed(0)}%.`;
+    const base = `${smartDecisionHud.assistantSummary} ${aiExplanation} | desequilibre DOM ${(domStats.imbalance * 100).toFixed(1)}%, route ${routeVenue || "--"}, confiance ${aiConfidencePct.toFixed(0)}%.`;
     if (!assistantAnchor) {
       return base;
     }
-    return `${base} Anchor ${assistantAnchor.type}: ${assistantAnchor.label} (${assistantAnchor.detail}).`;
+    return `${base} Repere ${assistantAnchor.type}: ${assistantAnchor.label} (${assistantAnchor.detail}).`;
   }, [aiConfidencePct, aiExplanation, assistantAnchor, domStats.imbalance, routeVenue, smartDecisionHud.assistantSummary]);
 
   // ── Auto Trader V5 — machine d'état ────────────────────────────────────────
@@ -825,7 +853,7 @@ export default function TerminalChartV2(props: Props) {
     if (!prompt) {
       return;
     }
-    const response = `Causal view: ${assistantContext} Requested: ${prompt}. Base scenario ${aiScenario}. Suggested posture: ${riskHardAlert ? "risk-off, reduce exposure" : "controlled execution"}.`;
+    const response = `Lecture causale: ${assistantContext} Demande: ${prompt}. Scenario de base ${aiScenario}. Posture suggeree: ${riskHardAlert ? "risque reduit, exposition a baisser" : "execution controlee"}.`;
     setAssistantMessages((current) => [
       ...current,
       { role: "user" as const, text: prompt },
@@ -843,54 +871,31 @@ export default function TerminalChartV2(props: Props) {
           <strong>{symbol} {timeframe}</strong>
           <span className="terminal-v2-crosshair">{crosshairText}</span>
         </div>
-        <div className="terminal-v2-head-actions">
+        {advancedControlsOpen ? <div className="terminal-v2-head-actions">
           <button type="button" className={`chart-chip ${enabled ? "active" : ""}`} onClick={onToggleEnabled}>V2</button>
-          <span className="chart-chip active">Assist</span>
-        </div>
+          <span className="chart-chip active">Assistance</span>
+        </div> : null}
       </div>
 
-      <div className="terminal-v2-toolbar" role="group" aria-label="Adaptive toolbar">
-        <button type="button" className={`chart-chip ${intent === "observe" ? "active" : ""}`} onClick={() => setIntent("observe")}>Observe</button>
-        <button type="button" className={`chart-chip ${intent === "analyze" ? "active" : ""}`} onClick={() => setIntent("analyze")}>Analyze</button>
-        <button type="button" className={`chart-chip ${intent === "execute" ? "active" : ""}`} onClick={() => setIntent("execute")}>Execute</button>
-
-        <span className="terminal-v2-sep" />
-
-        {TERMINAL_V2_TIMEFRAME_SELECTOR_VISIBLE.map((tf) => (
-          <button key={tf} type="button" className={`chart-chip ${timeframe === tf ? "active" : ""}`} aria-pressed={timeframe === tf} onClick={() => onTimeframeChange(tf)}>{tf}</button>
-        ))}
-        <select
-          value={TERMINAL_V2_TIMEFRAME_SELECTOR_MORE.includes(timeframe) ? timeframe : ""}
-          onChange={(event) => {
-            if (event.target.value) {
-              onTimeframeChange(event.target.value);
-            }
-          }}
-          className="chart-symbol-selector chart-timeframe-selector"
-          aria-label="More timeframes"
-        >
-          <option value="">More TF</option>
-          {TERMINAL_V2_TIMEFRAME_SELECTOR_MORE.map((tf) => <option key={`v2-tf-more-${tf}`} value={tf}>{tf}</option>)}
-        </select>
-
-        <button type="button" className="chart-chip" onClick={onZoomIn}>Zoom +</button>
-        <button type="button" className="chart-chip" onClick={onZoomOut}>Zoom &minus;</button>
-        <span className="chart-chip active">{deskModeLabel}</span>
-        <span className="chart-chip active">Bars {effectiveBarMode.toUpperCase()}</span>
-        {deskModeLocked ? <span className="chart-chip active">AUTO LOCK</span> : null}
-        {lowFlowEdgeBlocked ? <span className="chart-chip chart-chip-warn">LOW FLOW EDGE</span> : null}
+      <div className="terminal-v2-toolbar" role="group" aria-label="Barre chart adaptative">
+        <button type="button" className={`chart-chip ${intent === "observe" ? "active" : ""}`} onClick={() => setIntent("observe")}>Observer</button>
+        <button type="button" className={`chart-chip ${intent === "analyze" ? "active" : ""}`} onClick={() => setIntent("analyze")}>Analyser</button>
+        <button type="button" className={`chart-chip ${intent === "execute" ? "active" : ""}`} onClick={() => setIntent("execute")}>Executer</button>
 
         {intent === "execute" ? (
           <>
             <span className="terminal-v2-sep" />
-            <button type="button" className={`chart-chip ${autoExecutionMode === "assisted" ? "active" : ""}`} onClick={() => onAutoExecutionModeChange("assisted")}>Human</button>
-            <button type="button" className={`chart-chip ${autoExecutionMode === "semi-auto" ? "active" : ""}`} onClick={() => onAutoExecutionModeChange("semi-auto")}>Hybrid</button>
+            <button type="button" className={`chart-chip ${autoExecutionMode === "assisted" ? "active" : ""}`} onClick={() => onAutoExecutionModeChange("assisted")}>Humain</button>
+            <button type="button" className={`chart-chip ${autoExecutionMode === "semi-auto" ? "active" : ""}`} onClick={() => onAutoExecutionModeChange("semi-auto")}>Hybride</button>
             <button type="button" className={`chart-chip ${autoExecutionMode === "full-auto" ? "active" : ""}`} onClick={() => onAutoExecutionModeChange("full-auto")}>AI</button>
           </>
         ) : null}
 
         <span className="terminal-v2-sep" />
-        <span className="terminal-v2-intent-label">{lowFlowEdgeBlocked ? `${flowConfidenceLabel} · execution blocked` : intent === "observe" ? "perception layer" : intent === "analyze" ? "structure analysis" : "execution mode"}</span>
+        <span className="chart-chip active">{deskModeLabel}</span>
+        {advancedControlsOpen ? <span className="chart-chip active">Bars {effectiveBarMode.toUpperCase()}</span> : null}
+        {lowFlowEdgeBlocked ? <span className="chart-chip chart-chip-warn">Flux trop faible</span> : null}
+        {advancedControlsOpen ? <span className="terminal-v2-intent-label">{lowFlowEdgeBlocked ? `${flowConfidenceLabel} · execution bloquee` : intent === "observe" ? "lecture du marche" : intent === "analyze" ? "analyse structure" : "mode execution"}</span> : null}
       </div>
       {chartTruth ? (
         <div className="terminal-v2-truth-strip" aria-live="polite">
@@ -916,7 +921,7 @@ export default function TerminalChartV2(props: Props) {
       {/* ─── ROW 2: CHART CORE + AI HUD ─── */}
       <div className={`terminal-v2-core${hasSidecar ? " has-sidecar" : ""}`}>
         <div className={`terminal-v2-chart-col${aiConfidencePct >= 70 ? " chart-focus-mode" : ""}${lowFlowEdgeBlocked ? " is-flow-confidence-low" : ""}`}>
-          {loading ? <div className="chart-loader">Switching symbol…</div> : null}
+          {loading ? <div className="chart-loader">Changement de symbole...</div> : null}
           {chartEngineMode === "v4" ? (
             <GpuChartV4Surface
               className="chart-stage-premium terminal-v2-chart"
@@ -943,6 +948,7 @@ export default function TerminalChartV2(props: Props) {
               showSessions={false}
               candleTransform="none"
               engineMode="v4"
+              showDiagnostics={advancedControlsOpen}
               viewportGrid={gpuViewportGrid}
               viewportWindowHint={chartWindow}
               smoothingMs={effectiveChartSmoothingMs}
@@ -981,11 +987,12 @@ export default function TerminalChartV2(props: Props) {
               onPerceptualTelemetry={analyticsReady ? onChartPerceptualTelemetry : undefined}
             />
           )}
+          {flatCandleNotice ? <div className="terminal-v2-alert terminal-v2-chart-alert">{flatCandleNotice}</div> : null}
         </div>
 
         <aside className="terminal-v2-ai-hud" aria-label="AI perception HUD">
           <div className="terminal-v2-card terminal-v2-card-decision" data-testid="terminal-v2-decision-state">
-            <span className="terminal-v2-card-kicker">Decision Engine V2</span>
+            <span className="terminal-v2-card-kicker">Moteur decision V2</span>
             <SmartDecisionSummary decision={smartDecisionHud} variant="hero" />
             {marketSyncGate && marketSyncGate.state !== "VALID" ? (
               <div className="terminal-v2-alert">{marketSyncGate.summaryLabel} · {marketSyncGate.temporalSummaryLabel} · {marketSyncGate.desyncSummaryLabel} · {marketSyncGate.intentSummaryLabel}</div>
@@ -1000,10 +1007,10 @@ export default function TerminalChartV2(props: Props) {
             {isPreviewMode || suspendDecisionLayer || !analyticsReady ? (
               <div className="terminal-v2-meta" style={{ marginBottom: 8 }}>
                 {isPreviewMode
-                  ? "Preview mode: perception and execution logic suspended."
+                  ? "Mode apercu: perception et execution suspendues."
                   : suspendDecisionLayer
                     ? "Feed canonique degrade: chart visible, mais perception et execution restent suspendues."
-                    : "Canonical feed required: perception and execution logic suspended."}
+                    : "Flux canonique requis: perception et execution suspendues."}
               </div>
             ) : null}
 
@@ -1026,7 +1033,7 @@ export default function TerminalChartV2(props: Props) {
             </div>
 
             {predictionV5.timing === "imminent" && (
-              <div className="perception-imminent">⚡ MOVE INCOMING</div>
+              <div className="perception-imminent">Mouvement possible</div>
             )}
 
             {/* trigger + invalidation */}
@@ -1057,7 +1064,7 @@ export default function TerminalChartV2(props: Props) {
 
             {/* focus mode */}
             {predictionV5.probability >= 70 && predictionV5.timing !== "weak" && (
-              <div className="perception-focus-badge">⚡ FOCUS MODE</div>
+              <div className="perception-focus-badge">Mode focus</div>
             )}
           </div>
           <div className="terminal-v2-card terminal-v2-card-ai">
@@ -1065,22 +1072,22 @@ export default function TerminalChartV2(props: Props) {
             <strong className={simulationTone}>{marketSimulation ? marketSimulation.stateLabel.replace(/_/g, " ") : "standby"}</strong>
             <span className="terminal-v2-meta">
               {marketSimulation
-                ? `${marketSimulation.decision.shouldExecute ? "execute" : "hold"} · conf ${(marketSimulation.confidence * 100).toFixed(0)}%`
-                : "awaiting market state"}
+                ? `${marketSimulation.decision.shouldExecute ? "executer" : "attendre"} · conf ${(marketSimulation.confidence * 100).toFixed(0)}%`
+                : "en attente du marche"}
             </span>
             <span className="terminal-v2-meta">
               {marketSimulation
                 ? `fill ${(marketSimulation.execution.fillProb * 100).toFixed(0)}% · slip ${marketSimulation.execution.slippage.toFixed(1)}bps · lat ${marketSimulation.execution.latency.toFixed(0)}ms`
-                : "no execution preview"}
+                : "pas d'apercu execution"}
             </span>
             {flowInsight ? (
               <div className={`terminal-v2-flow-chip ${flowInsight.dominantSide}`}>
-                <strong>Flow</strong>
+                <strong>Flux</strong>
                 <span>{flowInsight.label}</span>
                 <span>{(flowInsight.score * 100).toFixed(0)}% · bias {(Math.abs(flowInsight.liquidityBias) * 100).toFixed(0)}%</span>
               </div>
             ) : null}
-            {lowFlowEdgeBlocked ? <div className="terminal-v2-alert">LOW FLOW EDGE · execution blocked</div> : null}
+            {lowFlowEdgeBlocked ? <div className="terminal-v2-alert">Flux trop faible · execution bloquee</div> : null}
             <p className="terminal-v2-ai-copy">
               {marketSimulation
                 ? `100ms ${marketSimulation.t100ms.price.toFixed(2)} · 250ms ${marketSimulation.t250ms.price.toFixed(2)} · 500ms ${marketSimulation.t500ms.price.toFixed(2)} · cone ${marketSimulation.cone.best.toFixed(2)} / ${marketSimulation.cone.expected.toFixed(2)} / ${marketSimulation.cone.worst.toFixed(2)}`
@@ -1091,22 +1098,22 @@ export default function TerminalChartV2(props: Props) {
             <span className="terminal-v2-card-kicker">IA contextuelle</span>
             <strong>{aiHeadline}</strong>
             <span className="terminal-v2-meta">{smartDecisionHud.displayStateLabel} · {smartDecisionHud.confidenceBand} · {aiScenario}</span>
-            <span className="terminal-v2-meta">confidence {aiConfidencePct.toFixed(0)}% · regime {regimeSnapshot.state}</span>
+            <span className="terminal-v2-meta">confiance {aiConfidencePct.toFixed(0)}% · regime {regimeSnapshot.state}</span>
             {marketSyncGate ? <span className="terminal-v2-meta">{marketSyncGate.summaryLabel} · {marketSyncGate.attentionSummaryLabel} · {marketSyncGate.intentSummaryLabel} · {marketSyncGate.executionSummaryLabel}</span> : null}
             <p className="terminal-v2-ai-copy">{assistantContext}</p>
             <div className="terminal-v2-chat-row">
               <input
                 value={assistantInput}
                 onChange={(event) => setAssistantInput(event.target.value)}
-                placeholder="Ask AI about market context..."
+                placeholder="Demander a l'IA le contexte marche..."
                 onKeyDown={(event) => { if (event.key === "Enter") askAssistant(); }}
               />
-              <button type="button" className="chart-chip" onClick={askAssistant}>Send</button>
+              <button type="button" className="chart-chip" onClick={askAssistant}>Envoyer</button>
             </div>
             <div className="terminal-v2-chat-log">
               {assistantMessages.map((message, index) => (
                 <div key={`${message.role}-${index}`} className={`terminal-v2-chat-msg ${message.role}`}>
-                  <strong>{message.role === "assistant" ? "AI" : "You"}</strong>
+                  <strong>{message.role === "assistant" ? "IA" : "Toi"}</strong>
                   <span>{message.text}</span>
                 </div>
               ))}
@@ -1114,7 +1121,7 @@ export default function TerminalChartV2(props: Props) {
           </div>
 
           <div className="terminal-v2-card terminal-v2-card-anchors">
-            <span className="terminal-v2-card-kicker">Anchors</span>
+            <span className="terminal-v2-card-kicker">Reperes</span>
             <div className="terminal-v2-anchor-chips">
               {recentCandleAnchors.map((anchor) => (
                 <button key={`cand-${anchor.label}`} type="button" className="chart-chip" onClick={() => setAssistantAnchor(anchor)}>{anchor.label}</button>
@@ -1131,7 +1138,7 @@ export default function TerminalChartV2(props: Props) {
           </div>
 
           <div className="terminal-v2-card terminal-v2-card-sync">
-            <span className="terminal-v2-card-kicker">Link</span>
+            <span className="terminal-v2-card-kicker">Lien chart</span>
             <div className="terminal-v2-inline-actions">
               <button type="button" className={`chart-chip ${chartLinkSymbolEnabled ? "active" : ""}`} onClick={onToggleChartLinkSymbol}>Sym</button>
               <button type="button" className={`chart-chip ${chartLinkTimeframeEnabled ? "active" : ""}`} onClick={onToggleChartLinkTimeframe}>TF</button>
@@ -1144,7 +1151,7 @@ export default function TerminalChartV2(props: Props) {
       {/* ─── ROW 3: EXECUTION / DOM / ACTION ─── */}
       <div className="terminal-v2-execution-strip">
         <div className="terminal-v2-exec-card">
-          <span className="terminal-v2-card-kicker">Routing</span>
+          <span className="terminal-v2-card-kicker">Routage</span>
           <div className="terminal-v2-exec-head">
             <strong>{routeVenue || "--"}</strong>
             <div className="terminal-v2-meter"><div className="terminal-v2-meter-fill" style={{ width: `${effectiveRouteScore.toFixed(0)}%` }} /></div>
@@ -1162,23 +1169,23 @@ export default function TerminalChartV2(props: Props) {
         </div>
 
         <div className="terminal-v2-exec-card">
-          <span className="terminal-v2-card-kicker">Risk</span>
+          <span className="terminal-v2-card-kicker">Risque</span>
           <div className="terminal-v2-exec-head">
             <strong className={riskHardAlert ? "warn" : "good"}>{riskHardAlert ? "ALERT" : "OK"}</strong>
             <span className="terminal-v2-meta">miss {riskMissRatioPct.toFixed(1)}%</span>
           </div>
           <div className="terminal-v2-inline-actions">
-            <button type="button" className={`chart-chip ${riskGuardEnabled ? "active" : ""}`} onClick={onToggleRiskGuard}>Guard</button>
-            <label className="terminal-v2-input-chip">Loss<input type="number" value={maxLossUsd} onChange={(event) => onSetMaxLossUsd(Math.max(10, Number(event.target.value || 0)))} /></label>
+            <button type="button" className={`chart-chip ${riskGuardEnabled ? "active" : ""}`} onClick={onToggleRiskGuard}>Garde</button>
+            <label className="terminal-v2-input-chip">Perte<input type="number" value={maxLossUsd} onChange={(event) => onSetMaxLossUsd(Math.max(10, Number(event.target.value || 0)))} /></label>
             <label className="terminal-v2-input-chip">Target<input type="number" value={targetGainUsd} onChange={(event) => onSetTargetGainUsd(Math.max(10, Number(event.target.value || 0)))} /></label>
           </div>
           <div className="terminal-v2-inline-actions">
-            <button type="button" className="chart-chip" disabled={lowFlowEdgeBlocked} onClick={() => { onAutoReduce(); void appendRiskAction("auto-reduce", "Reduced by guardrail", { ratioMiss: riskMissRatioPct }); }}>Reduce</button>
-            <button type="button" className="chart-chip chart-sell-btn" disabled={lowFlowEdgeBlocked} onClick={() => { onAutoClose(); void appendRiskAction("auto-close", "Closed and armed kill-switch", { ratioMiss: riskMissRatioPct }); }}>Close</button>
+            <button type="button" className="chart-chip" disabled={lowFlowEdgeBlocked} onClick={() => { onAutoReduce(); void appendRiskAction("auto-reduce", "Reduction par garde-risque", { ratioMiss: riskMissRatioPct }); }}>Reduire</button>
+            <button type="button" className="chart-chip chart-sell-btn" disabled={lowFlowEdgeBlocked} onClick={() => { onAutoClose(); void appendRiskAction("auto-close", "Fermeture et kill-switch armes", { ratioMiss: riskMissRatioPct }); }}>Fermer</button>
           </div>
-          {lowFlowEdgeBlocked ? <span className="terminal-v2-alert">LOW FLOW EDGE</span> : null}
-          {riskLossExceeded ? <span className="terminal-v2-alert">Loss exceeded</span> : null}
-          {riskTargetMiss ? <span className="terminal-v2-alert">Target miss</span> : null}
+          {lowFlowEdgeBlocked ? <span className="terminal-v2-alert">Flux trop faible</span> : null}
+          {riskLossExceeded ? <span className="terminal-v2-alert">Perte depassee</span> : null}
+          {riskTargetMiss ? <span className="terminal-v2-alert">Objectif manque</span> : null}
         </div>
 
         <div className="terminal-v2-exec-card terminal-v2-exec-card-dom">
@@ -1232,18 +1239,18 @@ export default function TerminalChartV2(props: Props) {
               type="button"
               className={`chart-chip ${autoTraderV5.enabled ? "active" : ""}`}
               disabled={!analyticsReady}
-              title={analyticsReady ? "Toggle auto trader" : "Canonical feed required"}
+              title={analyticsReady ? "Activer ou couper l'auto-trading" : "Flux canonique requis"}
               onClick={() => updateAT(s => ({
                 ...s,
                 enabled: !s.enabled,
                 mode:    !s.enabled ? "watching" : "standby",
-                lastAction: !s.enabled ? "⏳ Scanning market…" : "Désactivé",
+                lastAction: !s.enabled ? "Scan du marche en cours..." : "Desactive",
               }))}
-            >{autoTraderV5.enabled ? "⚡ ACTIF" : "START"}</button>
+            >{autoTraderV5.enabled ? "ACTIF" : "DEMARRER"}</button>
             {autoTraderV5.mode === "paused" && (
               <button type="button" className="chart-chip"
-                onClick={() => updateAT(s => ({ ...s, mode: "watching", currentDrawdownPct: 0, lastAction: "Reset — watching" }))}
-              >RESET</button>
+                onClick={() => updateAT(s => ({ ...s, mode: "watching", currentDrawdownPct: 0, lastAction: "Reinitialise: surveillance" }))}
+              >REINITIALISER</button>
             )}
           </div>
         </div>
@@ -1285,7 +1292,7 @@ export default function TerminalChartV2(props: Props) {
             <span>@ {autoTraderV5.position.entryPrice.toFixed(2)}</span>
             <span>{autoTraderV5.position.size.toFixed(0)}$</span>
             <span>stop {autoTraderV5.position.trailingStop.toFixed(2)}</span>
-            {autoTraderV5.position.partialClosed && <span className="at-partial">½ closed</span>}
+            {autoTraderV5.position.partialClosed && <span className="at-partial">moitie fermee</span>}
           </div>
         )}
 

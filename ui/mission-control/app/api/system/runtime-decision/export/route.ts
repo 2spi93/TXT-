@@ -23,9 +23,11 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
 
   ensureRuntimeDecisionWriterStarted();
 
-  const symbol = request.nextUrl.searchParams.get("symbol") || "";
-  const timeframe = request.nextUrl.searchParams.get("timeframe") || "";
-  const strategy = request.nextUrl.searchParams.get("strategy") || "";
+  const requestedSymbol = request.nextUrl.searchParams.get("symbol") || "";
+  const deskScope = requestedSymbol.trim().toUpperCase() === "DESK";
+  const symbol = deskScope ? "" : requestedSymbol;
+  const timeframe = deskScope ? "" : request.nextUrl.searchParams.get("timeframe") || "";
+  const strategy = deskScope ? "" : request.nextUrl.searchParams.get("strategy") || "";
   const limit = Number(request.nextUrl.searchParams.get("limit") || 1200);
   const sinceDays = Number(request.nextUrl.searchParams.get("sinceDays") || 7);
   const samples = Number(request.nextUrl.searchParams.get("samples") || 3);

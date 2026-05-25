@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from fastapi import HTTPException
+
 from apps.control_plane import main as control_plane
 from apps.control_plane.protection_runtime import build_live_position_protection_status, build_position_protection_governor
 from apps.mt5_bridge import main as mt5_bridge
@@ -201,6 +203,196 @@ class Mt5BrokerTruthPreferenceTests(unittest.TestCase):
         self.assertEqual(metadata["broker_session"]["terminal"], "mt5-main")
         self.assertEqual(metadata["broker_session"]["snapshot_url"], "http://new/session")
         self.assertEqual(metadata["broker_session"]["payload_path"], "payload")
+
+    def test_filter_order_live_requires_execution_url(self) -> None:
+        request = mt5_bridge.Mt5OrderFilterRequest(
+            account_id="mt5-live-1",
+            symbol="BTCUSD",
+            side="buy",
+            lots=0.01,
+            estimated_notional_usd=5.0,
+            max_spread_bps=25,
+        )
+
+        with patch.object(
+            mt5_bridge,
+            "fetch_one",
+            return_value={"account_id": "mt5-live-1", "mode": "live", "status": "connected", "metadata": {}},
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                asyncio.run(mt5_bridge.filter_order(request))
+
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(ctx.exception.detail["status"], "mt5_live_execution_unconfigured")
+
+    def test_filter_order_live_uses_external_execution_and_persists_broker_state(self) -> None:
+        request = mt5_bridge.Mt5OrderFilterRequest(
+            account_id="mt5-live-1",
+            symbol="BTCUSD",
+            side="buy",
+            lots=0.01,
+            estimated_notional_usd=5.0,
+            max_spread_bps=25,
+            rationale="micro smoke",
+            risk_gate={"decision": "accept"},
+            chosen_route={"venue": "mt5", "last": 69000.0},
+        )
+        account_row = {
+            "account_id": "mt5-live-1",
+            "mode": "live",
+            "status": "connected",
+            "metadata": {
+                "broker_session": {
+                    "execution_url": "http://executor.local/orders",
+                    "truth_source": "mt5-external-session",
+                }
+            },
+        }
+        execute_calls: list[tuple[str, tuple | None]] = []
+
+        class FakeResponse:
+            status_code = 200
+
+            def json(self) -> dict:
+                return {
+                    "status": "filled",
+                    "broker_ticket": "ftmo-123",
+                    "realized_slippage_bps": 1.2,
+                    "latency_ms": 91,
+                    "broker_state": {
+                        "positions": [{"symbol": "BTCUSD", "quantity": 0.01, "side": "long", "mark_price": 69010.0, "avg_entry_price": 69000.0, "notional_usd": 690.1}],
+                        "balances": [{"asset_symbol": "USD", "equity_usd": 25000.0}],
+                    },
+                    "session": {"terminal": "ftmo-live", "connected": True},
+                }
+
+        class FakeAsyncClient:
+            requests: list[dict] = []
+
+            def __init__(self, *args, **kwargs) -> None:
+                del args, kwargs
+
+            async def __aenter__(self) -> "FakeAsyncClient":
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> bool:
+                del exc_type, exc, tb
+                return False
+
+            async def get(self, url: str, params: dict | None = None) -> FakeResponse:
+                self.requests.append({"method": "GET", "url": url, "params": params})
+                response = FakeResponse()
+                response.json = lambda: {"instrument": "BTCUSD", "session": "asia", "source": "market-data"}
+                return response
+
+            async def request(self, method: str, url: str, headers: dict | None = None, params: dict | None = None, json: dict | None = None) -> FakeResponse:
+                self.requests.append({"method": method, "url": url, "headers": headers, "params": params, "json": json})
+                return FakeResponse()
+
+        def record_execute(query: str, params: tuple | None = None) -> None:
+            execute_calls.append((query, params))
+
+        with patch.object(mt5_bridge, "fetch_one", return_value=account_row), \
+             patch.object(mt5_bridge.httpx, "AsyncClient", FakeAsyncClient), \
+             patch.object(mt5_bridge, "execute", side_effect=record_execute):
+            payload = asyncio.run(mt5_bridge.filter_order(request))
+
+        self.assertEqual(payload["status"], "filled")
+        self.assertEqual(payload["broker_ticket"], "ftmo-123")
+        self.assertEqual(payload["tradability"]["market_type"], "crypto")
+        update_sql = next(call for call in execute_calls if "UPDATE mt5_accounts" in call[0])
+        insert_sql = next(call for call in execute_calls if "INSERT INTO mt5_order_events" in call[0])
+        self.assertIn("ftmo-live", str(update_sql[1]))
+        self.assertIn("BTCUSD", str(insert_sql[1]))
+        self.assertIn("filled", str(insert_sql[1]))
+
+    def test_commands_mql_polls_persisted_order_commands(self) -> None:
+        now = datetime(2026, 5, 22, 12, 0, tzinfo=timezone.utc)
+        account_row = {"account_id": "541283177", "mode": "live", "status": "connected", "metadata": {}}
+        command_row = {
+            "command_id": "mt5cmd-1",
+            "account_id": "541283177",
+            "requested_account_id": "mt5-live-1",
+            "client_id": "ftmo-ld6-bridge",
+            "command_type": "place_order",
+            "status": "inflight",
+            "payload": {"symbol": "BTCUSD", "side": "buy", "lots": 0.01},
+            "created_at": now,
+            "expires_at": now + timedelta(minutes=2),
+        }
+        execute_calls: list[tuple[str, tuple | None]] = []
+
+        with patch.object(mt5_bridge, "_resolve_runtime_account", return_value=(account_row, "mt5-live-1")), \
+             patch.object(mt5_bridge, "fetch_all", return_value=[command_row]) as fetch_all_mock, \
+             patch.object(mt5_bridge, "execute", side_effect=lambda query, params=None: execute_calls.append((query, params))):
+            payload = asyncio.run(mt5_bridge.account_commands_mql("mt5-live-1", client_id="ftmo-ld6-bridge", limit=5))
+
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["account_id"], "541283177")
+        self.assertEqual(payload["requested_account_id"], "mt5-live-1")
+        self.assertEqual(payload["commands"][0]["command_id"], "mt5cmd-1")
+        self.assertEqual(payload["commands"][0]["payload"]["symbol"], "BTCUSD")
+        self.assertIn("UPDATE mt5_order_commands", fetch_all_mock.call_args[0][0])
+        self.assertTrue(any("status = 'expired'" in call[0] for call in execute_calls))
+
+    def test_live_execution_via_mql_queue_requires_real_broker_ticket(self) -> None:
+        request = mt5_bridge.Mt5OrderFilterRequest(
+            account_id="541283177",
+            symbol="BTCUSD",
+            side="buy",
+            lots=0.01,
+            estimated_notional_usd=5.0,
+            max_spread_bps=25,
+            chosen_route={"venue": "mt5"},
+        )
+        account_row = {
+            "account_id": "541283177",
+            "mode": "live",
+            "status": "connected",
+            "metadata": {
+                "broker_session": {"execution_mode": "mql_command_queue", "client_id": "ftmo-ld6-bridge", "execution_timeout_seconds": 3},
+                "broker_runtime_session": {"client_id": "ftmo-ld6-bridge", "connected": True},
+            },
+        }
+
+        async def fake_tradability(account: dict, symbol: str) -> dict:
+            del account, symbol
+            return {"tradable": True, "reason": "continuous_market", "market_type": "crypto"}
+
+        async def fake_wait(command_id: str, timeout_seconds: float) -> dict:
+            del command_id, timeout_seconds
+            return {"status": "executed", "result_payload": {"status": "executed"}, "broker_ticket": "", "error_message": ""}
+
+        with patch.object(mt5_bridge, "_evaluate_mt5_market_tradability", side_effect=fake_tradability), \
+             patch.object(mt5_bridge, "_enqueue_mt5_order_command", return_value="mt5cmd-2"), \
+             patch.object(mt5_bridge, "_wait_for_mt5_command_result", side_effect=fake_wait):
+            with self.assertRaises(HTTPException) as ctx:
+                asyncio.run(mt5_bridge._execute_live_order_via_mql_command_queue(account_row, request))
+
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(ctx.exception.detail["status"], "mt5_ea_execution_rejected")
+        self.assertEqual(ctx.exception.detail["command_id"], "mt5cmd-2")
+
+    def test_evaluate_mt5_market_tradability_blocks_eurusd_on_weekend_but_not_btc(self) -> None:
+        class SaturdayDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 5, 23, 0, 20, tzinfo=tz or timezone.utc)
+
+        account_row = {"account_id": "mt5-live-1", "mode": "live", "status": "connected", "metadata": {}}
+
+        async def fake_snapshot(symbol: str) -> dict:
+            return {"instrument": symbol, "session": "asia", "source": "market-data"}
+
+        with patch.object(mt5_bridge, "datetime", SaturdayDateTime), \
+             patch.object(mt5_bridge, "_resolve_market_session_snapshot", side_effect=fake_snapshot):
+            eurusd = asyncio.run(mt5_bridge._evaluate_mt5_market_tradability(account_row, "EURUSD"))
+            btcusd = asyncio.run(mt5_bridge._evaluate_mt5_market_tradability(account_row, "BTCUSD"))
+
+        self.assertFalse(eurusd["tradable"])
+        self.assertEqual(eurusd["reason"], "weekend_market_closed")
+        self.assertTrue(btcusd["tradable"])
+        self.assertEqual(btcusd["reason"], "continuous_market")
 
 
 class Mt5ExternalBrokerStateSourceTests(unittest.TestCase):

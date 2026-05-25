@@ -550,6 +550,7 @@ class KairosShadowRuntime:
                 "volume": instrument_data.get("volume"),
                 "trend_strength": instrument_data.get("trend_strength"),
                 "volatility": instrument_data.get("volatility"),
+                "renderable_rows": instrument_data.get("renderable_rows"),
             },
             "decision": decision_summary,
             "predictor": {
@@ -594,7 +595,7 @@ class KairosShadowRuntime:
 
     async def _fetch_market_snapshot(self) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=12.0) as client:
-            depth_response, micro_response, session_response = await asyncio.gather(
+            depth_response, micro_response, session_response, ohlcv_response = await asyncio.gather(
                 client.get(
                     f"{self.market_data_url}/v1/market/orderbook/depth",
                     params={"instrument": self.symbol, "venue": self.venue},
@@ -607,14 +608,20 @@ class KairosShadowRuntime:
                     f"{self.market_data_url}/v1/market/session-state",
                     params={"instrument": self.symbol},
                 ),
+                client.get(
+                    f"{self.market_data_url}/v1/market/ohlcv",
+                    params={"instrument": self.symbol, "venue": self.venue, "timeframe": "1m", "limit": 64},
+                ),
             )
         depth_response.raise_for_status()
         micro_response.raise_for_status()
         session_response.raise_for_status()
+        ohlcv_response.raise_for_status()
         return {
             "depth": depth_response.json(),
             "micro": micro_response.json(),
             "session": session_response.json(),
+            "ohlcv": ohlcv_response.json(),
         }
 
     async def _post_json(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -773,6 +780,24 @@ class KairosShadowRuntime:
         depth = snapshot.get("depth") if isinstance(snapshot.get("depth"), dict) else {}
         micro = snapshot.get("micro") if isinstance(snapshot.get("micro"), dict) else {}
         session = snapshot.get("session") if isinstance(snapshot.get("session"), dict) else {}
+        ohlcv_payload = snapshot.get("ohlcv")
+        ohlcv_rows = ohlcv_payload.get("rows") if isinstance(ohlcv_payload, dict) else ohlcv_payload
+        if isinstance(ohlcv_rows, list) and ohlcv_rows:
+            seeded_prices: list[float] = []
+            seeded_volumes: list[float] = []
+            for row in ohlcv_rows[-64:]:
+                if not isinstance(row, dict):
+                    continue
+                close = _safe_float(row.get("close", row.get("c")), 0.0)
+                volume = _safe_float(row.get("volume", row.get("v")), 0.0)
+                if close > 0:
+                    seeded_prices.append(close)
+                    seeded_volumes.append(max(0.0, volume))
+            if len(seeded_prices) >= 5:
+                self.price_history.clear()
+                self.price_history.extend(seeded_prices)
+                self.volume_history.clear()
+                self.volume_history.extend(seeded_volumes or [0.0 for _ in seeded_prices])
 
         best_bid = _safe_float(depth.get("best_bid"), 0.0)
         best_ask = _safe_float(depth.get("best_ask"), 0.0)
@@ -851,6 +876,7 @@ class KairosShadowRuntime:
             "market_session": str(session.get("session") or "off"),
             "depth_imbalance": depth_imbalance,
             "volume_imbalance": volume_imbalance,
+            "renderable_rows": len(prices),
         }
 
     def _build_predictor_payload(self, instrument_data: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -878,6 +904,7 @@ class KairosShadowRuntime:
             "available_depth_usd": round(available_depth_usd, 6),
             "depth_imbalance": instrument_data.get("depth_imbalance"),
             "volume_30s": instrument_data.get("volume"),
+            "renderable_rows": instrument_data.get("renderable_rows"),
             "volatility_bps": round(_safe_float(instrument_data.get("volatility"), 0.0) * 10000.0, 6),
             "fill_probability": round(fill_probability, 6),
             "backlog_pressure": 0.0,

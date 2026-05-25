@@ -13,7 +13,7 @@ type UseChartExecutionHudOptions = {
 export function useChartExecutionHud(
   { layoutScreenProfile, signalDisplayMode }: UseChartExecutionHudOptions,
 ) {
-  const [chartHudMinimized, setChartHudMinimized] = useState(false);
+  const [chartHudMinimized, setChartHudMinimized] = useState(true);
   const [chartHudPosition, setChartHudPosition] = useState({ x: 10, y: 10 });
   const [chartHudDragging, setChartHudDragging] = useState(false);
   const [chartHudBounds, setChartHudBounds] = useState<ChartHudBounds | null>(null);

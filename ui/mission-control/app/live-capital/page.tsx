@@ -484,12 +484,12 @@ function walletAuthMethodLabel(authMethod: string, hasCredentials: boolean): str
     return "custody / signer lié";
   }
   if (normalized === "walletconnect") {
-    return "wallet adapter";
+    return "adaptateur wallet";
   }
   if (normalized === "wallet_public_key") {
-    return "watch-only";
+    return "lecture seule";
   }
-  return hasCredentials ? "credential linked" : "watch-only";
+  return hasCredentials ? "identifiant relie" : "lecture seule";
 }
 
 function balanceRowUsdValue(row: JsonMap): number | null {
@@ -855,7 +855,7 @@ export default function LiveCapitalPage() {
   const [strategyName, setStrategyName] = useState("Agent Live Primary");
   const [strategyMarket, setStrategyMarket] = useState("fx");
   const [strategySetupType, setStrategySetupType] = useState("regime-execution");
-  const [strategyNotes, setStrategyNotes] = useState("Live allocation linked to a governed source with hard USD cap and explicit venue controls.");
+  const [strategyNotes, setStrategyNotes] = useState("Allocation live reliee a une source gouvernee, avec cap USD strict et controles explicites par plateforme.");
 
   function upsertConnectorAccount(nextAccount: ConnectorAccountRow): void {
     setConnectorAccounts((current) => {
@@ -938,7 +938,7 @@ export default function LiveCapitalPage() {
           platform: row.provider || row.label || row.account_id,
           connector_type: row.provider || sourceType,
           environment: environmentLabelForConnector(sourceType),
-          permission_label: row.mode === "trade" ? "trade enabled" : row.mode === "read" ? "read only" : row.mode || "linked",
+          permission_label: row.mode === "trade" ? "trading autorise" : row.mode === "read" ? "lecture seule" : row.mode || "relie",
           status: row.has_credentials ? "linked" : "credential-missing",
           display_name: row.label || row.account_id,
           latest_equity_usd: null,
@@ -1103,6 +1103,14 @@ export default function LiveCapitalPage() {
     }
     return null;
   }, [selectedCanonicalAccount, verification, verificationBalances, verificationCashVsEquivalent, verificationPocketSummaries]);
+  const selectedProviderKey = String(selectedSource?.connector_type || selectedSource?.platform || "").trim().toLowerCase();
+  const isBingxSelected = selectedProviderKey === "bingx" || String(selectedSource?.display_name || "").toLowerCase().includes("bingx");
+  const bingxVisibleCapitalUsd = isBingxSelected ? verificationTotalUsd : null;
+  const bingxMicroRecommendedUsd = 4.5;
+  const bingxHumanApprovalUsd = 5.0;
+  const bingxHardExampleUsd = 50;
+  const bingxAllocationPct = bingxVisibleCapitalUsd && bingxVisibleCapitalUsd > 0 ? (allocationCapUsd / bingxVisibleCapitalUsd) * 100 : null;
+  const bingxRecommendedPct = bingxVisibleCapitalUsd && bingxVisibleCapitalUsd > 0 ? (bingxMicroRecommendedUsd / bingxVisibleCapitalUsd) * 100 : null;
   const activePortfolioId = selectedPortfolioId || selectedCanonicalAccount?.portfolio_id || "";
   const verificationAsOf = useMemo(() => {
     if (typeof verificationNormalizedState?.as_of === "string" && verificationNormalizedState.as_of) {
@@ -1180,17 +1188,17 @@ export default function LiveCapitalPage() {
   ]), [leverageGlobal, riskAssetExposureUsd]);
   const capitalBadge = useMemo(() => {
     if (!verification) {
-      return { tone: "warn", label: "Capital Pending", detail: "Appeler ou synchroniser la source pour valider les poches." };
+      return { tone: "warn", label: "Capital en attente", detail: "Appeler ou synchroniser la source pour valider les poches." };
     }
     const mismatchUsd = verificationTotalUsd != null ? Math.abs(verificationTotalUsd - verificationTotalFromPockets) : 0;
     const mismatchThreshold = verificationTotalUsd != null ? Math.max(1, verificationTotalUsd * 0.02) : 1;
     if (verification.status === "ok" && verificationTotalUsd != null && verificationPocketSummaries.length > 0 && verificationWarnings.length === 0 && mismatchUsd <= mismatchThreshold) {
-      return { tone: "good", label: "Capital Verified", detail: "Toutes les poches remontent de façon cohérente." };
+      return { tone: "good", label: "Capital verifie", detail: "Toutes les poches remontent de façon coherente." };
     }
     if (verificationWarnings.length > 0 || verification.status === "partial" || mismatchUsd > mismatchThreshold) {
-      return { tone: mismatchUsd > mismatchThreshold ? "bad" : "warn", label: mismatchUsd > mismatchThreshold ? "Capital Mismatch" : "Capital Review", detail: verificationWarnings[0] || "Le desk a besoin d'une revue opérateur avant allocation." };
+      return { tone: mismatchUsd > mismatchThreshold ? "bad" : "warn", label: mismatchUsd > mismatchThreshold ? "Ecart capital" : "Revue capital", detail: verificationWarnings[0] || "Le desk a besoin d'une revue operateur avant allocation." };
     }
-    return { tone: "warn", label: "Capital Partial", detail: "La lecture existe, mais reste incomplète." };
+    return { tone: "warn", label: "Capital partiel", detail: "La lecture existe, mais reste incomplete." };
   }, [verification, verificationPocketSummaries.length, verificationTotalFromPockets, verificationTotalUsd, verificationWarnings]);
   const forensicNote = useMemo(() => {
     if (verificationNotes.length > 0) {
@@ -1217,7 +1225,7 @@ export default function LiveCapitalPage() {
       : [];
     const events: TimelineEvent[] = [];
     if (connectorAccount?.linked_at) {
-      events.push({ key: "linked", label: "Source linked", detail: `${String(connectorAccount.provider || selectedSource?.platform || "source")} rattaché au desk.`, timestamp: String(connectorAccount.linked_at), tone: "metric" });
+      events.push({ key: "linked", label: "Source reliee", detail: `${String(connectorAccount.provider || selectedSource?.platform || "source")} rattache au desk.`, timestamp: String(connectorAccount.linked_at), tone: "metric" });
     }
     if (verificationAsOf) {
       events.push({ key: "sync", label: "Latest sync", detail: verificationPocketHeadline || "synchronisation desk disponible", timestamp: verificationAsOf, tone: capitalBadge.tone === "bad" ? "bad" : "good" });
@@ -1421,10 +1429,14 @@ export default function LiveCapitalPage() {
     if (!selectedPortfolioId && selectedCanonicalAccount?.portfolio_id) {
       setSelectedPortfolioId(selectedCanonicalAccount.portfolio_id);
     }
-    if (!(allocationCapUsd > 0) && selectedSource.latest_equity_usd && selectedSource.latest_equity_usd > 0) {
+    if (isBingxSelected && (!(allocationCapUsd > 0) || allocationCapUsd > bingxHumanApprovalUsd)) {
+      setAllocationCapUsd(bingxMicroRecommendedUsd);
+      return;
+    }
+    if (!isBingxSelected && !(allocationCapUsd > 0) && selectedSource.latest_equity_usd && selectedSource.latest_equity_usd > 0) {
       setAllocationCapUsd(Math.max(1000, Math.round(selectedSource.latest_equity_usd * 0.25)));
     }
-  }, [allocationCapUsd, createPortfolioClientId, exchangeClientId, selectedCanonicalAccount, selectedPortfolioId, selectedSource, walletClientId]);
+  }, [allocationCapUsd, bingxHumanApprovalUsd, bingxMicroRecommendedUsd, createPortfolioClientId, exchangeClientId, isBingxSelected, selectedCanonicalAccount, selectedPortfolioId, selectedSource, walletClientId]);
 
   useEffect(() => {
     setCredentialUpdateApiKey("");
@@ -2002,6 +2014,23 @@ export default function LiveCapitalPage() {
             <strong>Avant d'allouer</strong>
             1. Identifie la nature de la source. 2. Verifie si elle est canonique et vraiment pilotable. 3. Controle les informations plateforme disponibles. 4. Seulement ensuite, attache un cap USD au portefeuille.
           </div>
+          <div className="txt-page-guide-note" style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <span className="terminal-onboarding-inline-pointer" aria-hidden="true">
+              <svg viewBox="0 0 48 48" role="presentation"><path d="M9 6L31 25H21L27 42L20 45L14 28L7 35Z" /></svg>
+            </span>
+            <strong>Besoin d'aide ?</strong>
+            Clique d'abord sur Appeler et verifier le compte, puis mets le cap micro a 4.5 USD pour BingX. Ops Copilot peut te dire exactement quoi cliquer.
+            <button
+              type="button"
+              className="btn"
+              onClick={() => openOpsCopilotPrompt({
+                message: "Guide-moi pas a pas sur Live Capital en francais simple: quoi verifier, ou cliquer, et pourquoi BingX doit rester a 4.5 USD au lieu de 50 USD avec environ 136.68 USDT.",
+                autoSend: true,
+              })}
+            >
+              Me guider avec Ops Copilot
+            </button>
+          </div>
           <p>
             <Link href="/terminal">Terminal</Link>
             {" | "}
@@ -2328,13 +2357,18 @@ export default function LiveCapitalPage() {
                 <option key={row.portfolio_id} value={row.portfolio_id}>{row.portfolio_id} · {row.client_id}</option>
               ))}
             </select>
-            <input type="number" step="0.1" value={allocationWeight} onChange={(event) => setAllocationWeight(Number(event.target.value || 0))} placeholder="allocation_weight" />
-            <input type="number" step="100" value={allocationCapUsd} onChange={(event) => setAllocationCapUsd(Number(event.target.value || 0))} placeholder="allocation_cap_usd" />
+            <input type="number" step="0.1" value={allocationWeight} onChange={(event) => setAllocationWeight(Number(event.target.value || 0))} placeholder="Poids allocation" aria-label="Poids allocation" />
+            <input type="number" step={isBingxSelected ? "0.5" : "100"} value={allocationCapUsd} onChange={(event) => setAllocationCapUsd(Number(event.target.value || 0))} placeholder="Cap maximum en USD" aria-label="Cap maximum en USD" />
             <select value={allocationStatus} onChange={(event) => setAllocationStatus(event.target.value)}>
-              <option value="active">active</option>
-              <option value="paused">paused</option>
+              <option value="active">actif</option>
+              <option value="paused">en pause</option>
             </select>
             <button type="button" onClick={() => attachAccountAllocation()} disabled={busy}>Allouer la source</button>
+            {isBingxSelected ? (
+              <button type="button" onClick={() => setAllocationCapUsd(bingxMicroRecommendedUsd)} disabled={busy}>
+                Utiliser le cap micro 4.5 USD
+              </button>
+            ) : null}
             {!selectedSource?.canonical ? (
               <button type="button" onClick={() => canonicalizeSelectedSource()} disabled={busy || !selectedSource}>
                 Canoniser pour allocation
@@ -2357,6 +2391,29 @@ export default function LiveCapitalPage() {
             <div className="row"><span>Cap USD</span><span>{formatUsd(allocationCapUsd)}</span></div>
             <div className="row"><span>Live readiness</span><span className={liveReady ? "good" : "warn"}>{liveReady ? "allocable pour agents live" : "vérifier source / portefeuille / statut"}</span></div>
           </div>
+          {isBingxSelected ? (
+            <div className="panel" style={{ marginTop: 12, borderRadius: 12, display: "grid", gap: 10 }}>
+              <div className="eyebrow">BingX en mots simples <HelpHint text="Ce bloc explique le montant que TXT peut utiliser sur BingX sans transformer un micro-test en vrai pari trop gros." examples={["Capital visible: environ 136.68 USDT si la verification remonte bien ce total.", "Cap micro conseille: 4.5 USD. Au-dessus de 5 USD, TXT doit demander une validation humaine."]} label="Pourquoi 4.5 USD ?" /></div>
+              <div className="row"><span>Capital visible</span><span>{bingxVisibleCapitalUsd != null ? formatUsd(bingxVisibleCapitalUsd) : "Clique Appeler et verifier le compte"}</span></div>
+              <div className="row"><span>Cap micro conseille</span><span className="good">{formatUsd(bingxMicroRecommendedUsd)}{bingxRecommendedPct != null ? ` · ${bingxRecommendedPct.toFixed(2)}% du compte` : ""}</span></div>
+              <div className="row"><span>Ton cap actuel</span><span className={allocationCapUsd <= bingxHumanApprovalUsd ? "good" : "warn"}>{formatUsd(allocationCapUsd)}{bingxAllocationPct != null ? ` · ${bingxAllocationPct.toFixed(2)}% du compte` : ""}</span></div>
+              <div className="row"><span>Validation humaine</span><span>{formatUsd(bingxHumanApprovalUsd)} et plus</span></div>
+              <p className="subtle" style={{ margin: 0 }}>
+                Avec environ 136.68 USDT, 50 USD utiliserait une grosse partie du compte ({bingxVisibleCapitalUsd && bingxVisibleCapitalUsd > 0 ? `${((bingxHardExampleUsd / bingxVisibleCapitalUsd) * 100).toFixed(1)}%` : "beaucoup trop"}).
+                4.5 USD reste un micro-test: assez petit pour verifier la chaine live, pas assez gros pour prendre un risque inutile.
+              </p>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => openOpsCopilotPrompt({
+                  message: `Explique-moi quoi faire sur BingX avec ${bingxVisibleCapitalUsd != null ? formatUsd(bingxVisibleCapitalUsd) : "le capital verifie"}: pourquoi le cap micro doit rester a 4.5 USD, pourquoi 50 USD est trop eleve, et quels boutons cliquer maintenant.`,
+                  autoSend: true,
+                })}
+              >
+                Demander l'explication BingX au Copilot
+              </button>
+            </div>
+          ) : null}
         </div>
       </section>
 

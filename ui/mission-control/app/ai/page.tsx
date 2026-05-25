@@ -89,6 +89,33 @@ function MetricCard({ title, value, detail, tone = "metric" }: { title: string; 
   );
 }
 
+const AI_TASK_OPTIONS = [
+  {
+    id: "strategy_creation",
+    label: "Creation de strategie",
+    description: "Demande une strategie ou une variante exploitable, avec hypotheses, garde-fous et limites de deploiement.",
+    example: "Exemple: strategie BTC faible turnover avec cap de perte journalier, conditions no-trade et taille max par signal.",
+  },
+  {
+    id: "risk_review",
+    label: "Revue risque",
+    description: "Fait relire une idee, une strategie ou une decision avant exposition live.",
+    example: "Exemple: verifier pourquoi une entree EURUSD doit rester bloquee hors horaires FTMO.",
+  },
+  {
+    id: "execution_diagnosis",
+    label: "Diagnostic execution",
+    description: "Analyse route, latence, slippage, fallback et cause probable d'un blocage ou d'une execution degradee.",
+    example: "Exemple: expliquer un routage score zero avec flux marche partiel et broker indisponible.",
+  },
+  {
+    id: "operator_brief",
+    label: "Brief operateur",
+    description: "Transforme des donnees techniques en decision courte: action, risque, raison, prochaine verification.",
+    example: "Exemple: resume Terminal maintenant avec DECISION, RISQUE, RAISON et OVERRIDE visible.",
+  },
+] as const;
+
 export default function AiPage() {
   const [task, setTask] = useState("strategy_creation");
   const [prompt, setPrompt] = useState("Design a low-turnover volatility-aware crypto strategy with hard risk caps and explicit execution safeguards.");
@@ -256,6 +283,7 @@ export default function AiPage() {
   const historyDegradedCount = history.filter((row) => String(row.status || "").toLowerCase() === "degraded").length;
   const memorySamples = toNumber((withVsWithout.samples as JsonMap | undefined)?.memory_on, 0) + toNumber((withVsWithout.samples as JsonMap | undefined)?.memory_off, 0);
   const routeBudgetUsd = providerRows.reduce((sum, row) => sum + toNumber(row.estimated_cost_usd, 0), 0);
+  const selectedTaskPreset = AI_TASK_OPTIONS.find((item) => item.id === task) || AI_TASK_OPTIONS[0];
   const liveBrokerSources = capitalSources.filter((row) => row.source_type === "broker" && row.environment === "live");
   const paperBrokerSources = capitalSources.filter((row) => row.source_type === "broker" && row.environment === "paper");
   const exchangeSources = capitalSources.filter((row) => row.source_type === "exchange");
@@ -596,8 +624,21 @@ export default function AiPage() {
         <div className="panel">
           <div className="eyebrow">Lancer une tache IA <HelpHint text="Zone de lancement contrôlée pour les tâches IA importantes, avec limite de coût et choix de route." examples={["Pour une tâche sensible, relis la route finale avant d'utiliser la réponse.", "Le mode local n'a de sens que si le service local répond bien."]} /></div>
           <form onSubmit={onExecute} className="form-grid" style={{ marginTop: 12 }}>
-            <input value={task} onChange={(event) => setTask(event.target.value)} placeholder="task" required />
-            <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={6} required />
+            <label className="field-stack">
+              <span>Type de tache IA</span>
+              <select value={task} onChange={(event) => setTask(event.target.value)} required>
+                {AI_TASK_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
+              </select>
+            </label>
+            <div className="panel" style={{ borderRadius: 10, padding: 12 }}>
+              <div className="row"><span>Ce que ca sert a faire</span><span>{selectedTaskPreset.description}</span></div>
+              <div className="row"><span>Prompt utile</span><span>{selectedTaskPreset.example}</span></div>
+              <div className="row"><span>Sortie attendue</span><span>Decision exploitable, limites, conditions de rejet et prochaine verification operateur.</span></div>
+            </div>
+            <label className="field-stack">
+              <span>Demande operateur</span>
+              <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={6} required />
+            </label>
             <div className="grid" style={{ gridTemplateColumns: "1fr 1fr", gap: 10 }}>
               <div className="form-grid">
                 <label className="subtle">Criticality</label>
@@ -663,11 +704,12 @@ export default function AiPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Lecture du contexte de marche <HelpHint text="Petit laboratoire pour lire le contexte du marché et savoir quel style d'action reste le plus adapté." examples={["Si le contexte semble clairement orienté, tu peux favoriser les outils qui suivent le mouvement.", "Si la confiance reste moyenne, prends le résultat comme une aide et non comme un ordre."]} /></div>
+          <div className="eyebrow">Lecture du contexte de marche <HelpHint text="Lit trois scores normalisés pour classer le contexte: tendance, volatilité réalisée et sentiment." examples={["trend_score vient d'un signal de tendance entre 0 et 1: 0.4 = modéré, 0.8 = fort.", "realized_volatility est la volatilité observée: 0.055 veut dire environ 5.5% sur la fenêtre du signal.", "sentiment_score va de -1 à 1 quand la source sentiment est disponible."]} /></div>
+          <p className="subtle" style={{ marginTop: 10 }}>Référence attendue: oracle marché, Terminal, rapport stratégie ou valeurs de test. Le résultat sert à ajuster prudence, pas à envoyer un ordre tout seul.</p>
           <div className="form-grid" style={{ marginTop: 12 }}>
-            <input type="number" step="0.01" value={trendScore} onChange={(event) => setTrendScore(Number(event.target.value || 0))} placeholder="trend_score" />
-            <input type="number" step="0.001" value={realizedVolatility} onChange={(event) => setRealizedVolatility(Number(event.target.value || 0))} placeholder="realized_volatility" />
-            <input type="number" step="0.01" value={sentimentScore} onChange={(event) => setSentimentScore(Number(event.target.value || 0))} placeholder="sentiment_score" />
+            <label className="field-stack"><span>Tendance 0-1</span><input type="number" step="0.01" value={trendScore} onChange={(event) => setTrendScore(Number(event.target.value || 0))} placeholder="0.42" /></label>
+            <label className="field-stack"><span>Volatilité réalisée</span><input type="number" step="0.001" value={realizedVolatility} onChange={(event) => setRealizedVolatility(Number(event.target.value || 0))} placeholder="0.055" /></label>
+            <label className="field-stack"><span>Sentiment -1 à 1</span><input type="number" step="0.01" value={sentimentScore} onChange={(event) => setSentimentScore(Number(event.target.value || 0))} placeholder="0.18" /></label>
             <button type="button" onClick={() => detectRegime()} disabled={regimeBusy}>{regimeBusy ? "Analyse..." : "Lire le contexte"}</button>
           </div>
           {regimeResult ? (
@@ -683,6 +725,7 @@ export default function AiPage() {
               ) : (
                 <p className="subtle" style={{ marginTop: 12 }}>Aucune recommandation retournee.</p>
               )}
+              <p className="subtle" style={{ marginTop: 12 }}>Lecture opérateur: confiance basse = information faible; chop/stress = réduire taille ou fréquence; trend avec confiance solide = contexte plus lisible, toujours sous contrôle risk gate.</p>
             </div>
           ) : null}
         </div>
@@ -690,12 +733,13 @@ export default function AiPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Test de scenario <HelpHint text="Ce bloc teste rapidement un scénario pour voir si le cadre d'action tient encore debout." examples={["Si le score de tenue baisse fortement, adopte une posture plus prudente.", "Ce test sert à cadrer la décision, pas à promettre l'avenir."]} /></div>
+          <div className="eyebrow">Stress-test de stratégie <HelpHint text="Teste une stratégie face à un scénario macro, géopolitique ou opérationnel avant promotion live." examples={["Fed emergency hike, exchange outage ou oil shock servent à voir si le cadre tient encore.", "Résilience haute = plus robuste; drawdown attendu haut = promotion live à retarder ou réduire."]} /></div>
+          <p className="subtle" style={{ marginTop: 10 }}>Ce résultat sert à décider garder, réduire, retarder ou retravailler une stratégie. Il ne remplace pas la validation risque ni la lecture du capital disponible.</p>
           <div className="form-grid" style={{ marginTop: 12 }}>
-            <input value={strategyName} onChange={(event) => setStrategyName(event.target.value)} placeholder="strategy_name" />
-            <input value={assetClass} onChange={(event) => setAssetClass(event.target.value)} placeholder="asset_class" />
-            <input value={scenario} onChange={(event) => setScenario(event.target.value)} placeholder="scenario" />
-            <input type="number" step="1" value={horizonDays} onChange={(event) => setHorizonDays(Number(event.target.value || 0))} placeholder="horizon_days" />
+            <label className="field-stack"><span>Stratégie</span><input value={strategyName} onChange={(event) => setStrategyName(event.target.value)} placeholder="institutional-ai-desk" /></label>
+            <label className="field-stack"><span>Classe d'actifs</span><input value={assetClass} onChange={(event) => setAssetClass(event.target.value)} placeholder="multi-asset" /></label>
+            <label className="field-stack"><span>Scénario</span><input value={scenario} onChange={(event) => setScenario(event.target.value)} placeholder="Fed emergency hike" /></label>
+            <label className="field-stack"><span>Horizon jours</span><input type="number" step="1" value={horizonDays} onChange={(event) => setHorizonDays(Number(event.target.value || 0))} placeholder="20" /></label>
             <button type="button" onClick={() => runBacktest()} disabled={backtestBusy}>{backtestBusy ? "Stress..." : "Lancer le test"}</button>
             <button type="button" onClick={() => openOpsCopilotPrompt({ message: `Propose en langage naturel si la stratégie ${strategyName} peut être promue vers un usage live, en tenant compte des sources de capital et du scénario ${scenario}.`, autoSend: true })}>
               Demander une proposition d'agent
@@ -715,6 +759,7 @@ export default function AiPage() {
               ) : (
                 <p className="subtle" style={{ marginTop: 12 }}>Aucune action retournee.</p>
               )}
+              <p className="subtle" style={{ marginTop: 12 }}>Lecture opérateur: promotion seulement si la résilience reste acceptable, le drawdown attendu reste compatible avec le mandat, et les actions retournées ne demandent pas de réduction préalable.</p>
             </div>
           ) : null}
         </div>

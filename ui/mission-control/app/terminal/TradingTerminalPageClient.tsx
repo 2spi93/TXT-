@@ -1171,11 +1171,11 @@ type BrowserLongTaskTelemetry = {
   pattern: "idle" | "wave" | "steady";
 };
 const TERMINAL_FOCUS_DECKS: Array<{ id: TerminalFocusDeckId; label: string }> = [
-  { id: "micro", label: "Micro" },
-  { id: "markets", label: "Markets" },
-  { id: "monitoring", label: "Ops" },
+  { id: "micro", label: "Flux marche" },
+  { id: "markets", label: "Marches" },
+  { id: "monitoring", label: "Lecture ops" },
   { id: "capital", label: "Capital" },
-  { id: "metaRisk", label: "Risk" },
+  { id: "metaRisk", label: "Meta-risque" },
   { id: "correlation", label: "Correlation" },
   { id: "calibration", label: "Calibration" },
 ];
@@ -5005,6 +5005,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
   const [terminalAdaptiveGuideValidatedSteps, setTerminalAdaptiveGuideValidatedSteps] = useState<string[]>([]);
   const [guidedCoachTargetId, setGuidedCoachTargetId] = useState<TerminalAdaptiveGuideTargetId | null>(null);
   const [coachOverlayVisible, setCoachOverlayVisible] = useState(false);
+  const [terminalAdvancedControlsOpen, setTerminalAdvancedControlsOpen] = useState(false);
   const [focusDecks, setFocusDecks] = useState<TerminalFocusDeckId[]>([]);
   const [layoutWorkspaceName, setLayoutWorkspaceName] = useState(DEFAULT_LAYOUT_WORKSPACE_NAME);
   const [terminalUiDebugVisible, setTerminalUiDebugVisible] = useState(false);
@@ -7671,6 +7672,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
   const monitoringRuntimeSectionMounted = showMonitoringDeck && diagnosticsSurfaceOpen && !adaptiveCommandMode && (layoutEditMode || monitoringRuntimeSectionOpen);
   const monitoringAlertsSectionMounted = showMonitoringDeck && diagnosticsSurfaceOpen && !adaptiveCommandMode && (layoutEditMode || monitoringAlertsSectionOpen);
   const monitoringGovernanceSectionMounted = showMonitoringDeck && diagnosticsSurfaceOpen && !adaptiveCommandMode && (layoutEditMode || monitoringGovernanceSectionOpen);
+  const monitoringGridHidden = !monitoringContextMounted && !diagnosticsSurfaceOpen;
   const chartSidecarMicroRealtimeEnabled = renderExtendedTerminalModules || focusDeckSet.has("micro");
   const sidecarProfileCards = CHART_SIDECAR_PROFILE_LAYOUTS[chartSidecarProfile].cards;
   const hasDomTapeSidecarConsumer = chartSidecarMicroRealtimeEnabled && sidecarProfileCards.includes("domTape");
@@ -24769,7 +24771,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
   const chartFlowConfidenceLabel = chartRuntimeOrderflowEnabled
     ? `Flow ${(chartFlowScore * 100).toFixed(0)}% · Frame ${(chartFrameSyncConfidence * 100).toFixed(0)}%`
     : `Frame ${(chartFrameSyncConfidence * 100).toFixed(0)}%`;
-  const chartSidecarVisible = layoutScreenProfile !== "sm" && !chartIsolationMode;
+  const chartSidecarVisible = layoutScreenProfile === "xl" && !chartIsolationMode;
   const chartSidecarDomRows = activeDomLevels.slice(0, 6);
   const chartSidecarTapeRows = activeTape.slice(0, 6);
   const chartSidecarFootprintRows = activeFootprintRows.slice(0, 5);
@@ -24798,6 +24800,11 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
       : dockedChartSidecarIds;
   const effectiveDetachedChartSidecars = detachedChartSidecars.filter((panel) => !effectiveDockedChartSidecarIds.includes(panel.id));
   const detachedChartSidecarFloatingIds = effectiveDetachedChartSidecars.map((panel) => panel.id);
+  const approveAllAndSendDisabledReason = finalDecisionExecutionOracle.blocks_execution
+    ? finalDecisionExecutionOracle.detail_label
+    : chartLowFlowEdgeBlocked
+      ? chartLowFlowEdgeMessage
+      : "";
 
   useEffect(() => {
     const allowed = new Set(CHART_SIDECAR_PROFILE_LAYOUTS[chartSidecarProfile].cards);
@@ -25028,6 +25035,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
         }}
         approveAllAndSendLabel={approveAllAndSendLabel}
         approveAllAndSendDisabled={finalDecisionExecutionOracle.blocks_execution || chartLowFlowEdgeBlocked}
+        approveAllAndSendDisabledReason={approveAllAndSendDisabledReason}
         showCriticalActions={marketDecisionV1.criticalConfirmed}
         previewOpen={chartOrderPreviewOpen}
         onTogglePreview={() => setChartOrderPreviewOpen((value) => !value)}
@@ -26137,29 +26145,78 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
           <a href="/connectors" data-testid="terminal-topbar-link-connectors">Connecteurs</a>
           <a href="/live-readiness" data-testid="terminal-topbar-link-readiness">Readiness</a>
           <a href="/incidents" data-testid="terminal-topbar-link-incidents">Incidents</a>
-          <div className="th-mode-toggle" role="group" aria-label="Layout controls">
-            <button type="button" className={`th-mode-btn${layoutEditMode ? " active" : ""}`} onClick={() => setLayoutEditMode((v) => !v)}>
-              Layout Edit <span className="th-hotkey">Alt+E</span>
-            </button>
+          <div className="th-mode-toggle" role="group" aria-label="Mode d'affichage Terminal">
             <button
               type="button"
               data-testid="terminal-density-focus-button"
               className={`th-mode-btn${terminalDensityMode === "focus" ? " active" : ""}`}
               onClick={() => requestTerminalDensityMode("focus", "toolbar")}
-              title="Principal chart only"
+              title="Vue quotidienne: chart, decision, risque et execution"
               disabled={terminalDensityTransitionLocked}
             >
-              Live Focus
+              Vue operateur
             </button>
             <button
               type="button"
               data-testid="terminal-density-full-button"
               className={`th-mode-btn${terminalDensityMode === "full" ? " active" : ""}`}
               onClick={() => requestTerminalDensityMode("full", "toolbar")}
-              title="All modules"
+              title="Affiche toutes les familles de panels"
               disabled={terminalDensityTransitionLocked}
             >
-              Full Surface
+              Surface complete
+            </button>
+            <button
+              type="button"
+              className="th-mode-btn"
+              onClick={terminalOnboardingExpanded ? collapseTerminalOnboarding : expandTerminalOnboarding}
+            >
+              {terminalOnboardingExpanded ? "Masquer guides" : "Guides"}
+            </button>
+            <button
+              type="button"
+              className={`th-mode-btn${terminalAdvancedControlsOpen ? " active" : ""}`}
+              onClick={() => setTerminalAdvancedControlsOpen((current) => !current)}
+              aria-expanded={terminalAdvancedControlsOpen}
+              aria-controls="terminal-advanced-controls"
+            >
+              Reglages avances
+            </button>
+          </div>
+          {terminalDensityMode === "focus" ? (
+            <div className="th-mode-toggle" role="group" aria-label="Focus panel controls">
+              {TERMINAL_FOCUS_DECKS.map((deck) => {
+                const toggleTestId = deck.id === "micro"
+                  ? "terminal-focus-toggle-micro"
+                  : deck.id === "markets"
+                    ? "terminal-focus-toggle-markets"
+                    : deck.id === "monitoring"
+                      ? "terminal-focus-toggle-ops"
+                      : undefined;
+                return (
+                  <button
+                    key={deck.id}
+                    type="button"
+                    data-testid={toggleTestId}
+                    className={`th-mode-btn${focusDeckSet.has(deck.id) ? " active" : ""}`}
+                    onClick={() => toggleFocusDeck(deck.id)}
+                    title="Afficher cette famille de panels dans la vue operateur"
+                  >
+                    {deck.label}
+                  </button>
+                );
+              })}
+            </div>
+          ) : null}
+          {terminalAdvancedControlsOpen ? (
+          <div id="terminal-advanced-controls" className="terminal-advanced-toolbar" data-testid="terminal-advanced-controls">
+          <div className="terminal-advanced-toolbar-head">
+            <span>Reglages avances</span>
+            <small>Layout, boot, presets et workspaces restent disponibles sans encombrer la vue operateur.</small>
+          </div>
+          <div className="th-mode-toggle" role="group" aria-label="Layout avance">
+            <button type="button" className={`th-mode-btn${layoutEditMode ? " active" : ""}`} onClick={() => setLayoutEditMode((v) => !v)}>
+              Layout Edit <span className="th-hotkey">Alt+E</span>
             </button>
             <button
               type="button"
@@ -26184,32 +26241,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
             <button type="button" className="th-mode-btn" onClick={restoreSavedLayout} title="Alt+R">Restore <span className="th-hotkey">R</span></button>
             <button type="button" data-testid="terminal-reset-floating-button" className="th-mode-btn" onClick={resetFloatingPanels} title="Alt+0" disabled={terminalFloatingTransitionLocked}>Reset Floating <span className="th-hotkey">0</span></button>
           </div>
-          {terminalDensityMode === "focus" ? (
-            <div className="th-mode-toggle" role="group" aria-label="Focus panel controls">
-              {TERMINAL_FOCUS_DECKS.map((deck) => {
-                const toggleTestId = deck.id === "micro"
-                  ? "terminal-focus-toggle-micro"
-                  : deck.id === "markets"
-                    ? "terminal-focus-toggle-markets"
-                    : deck.id === "monitoring"
-                      ? "terminal-focus-toggle-ops"
-                      : undefined;
-                return (
-                  <button
-                    key={deck.id}
-                    type="button"
-                    data-testid={toggleTestId}
-                    className={`th-mode-btn${focusDeckSet.has(deck.id) ? " active" : ""}`}
-                    onClick={() => toggleFocusDeck(deck.id)}
-                    title="Reactivate this panel family in focus mode"
-                  >
-                    {deck.label}
-                  </button>
-                );
-              })}
-            </div>
-          ) : null}
-          <div className="th-mode-toggle" role="group" aria-label="Workspace controls">
+          <div className="th-mode-toggle" role="group" aria-label="Workspaces avances">
             <button type="button" className="th-mode-btn" onClick={() => cycleWorkspace(-1)} title="Alt+Left">◀</button>
             <input
               value={layoutWorkspaceName}
@@ -26256,13 +26288,6 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
             <button type="button" className="th-mode-btn" onClick={exportLayoutsJson}>Export</button>
             <button type="button" className="th-mode-btn" onClick={() => layoutImportInputRef.current?.click()}>Import</button>
             <button type="button" className="th-mode-btn" onClick={() => cycleWorkspace(1)} title="Alt+Right">▶</button>
-            <button
-              type="button"
-              className="th-mode-btn"
-              onClick={terminalOnboardingExpanded ? collapseTerminalOnboarding : expandTerminalOnboarding}
-            >
-              {terminalOnboardingExpanded ? "Masquer guides" : "Guides"}
-            </button>
             {workspaceHintBadge ? <span className="layout-workspace-hint-badge">{workspaceHintBadge}</span> : null}
             <input
               ref={layoutImportInputRef}
@@ -26284,6 +26309,8 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
               }}
             />
           </div>
+          </div>
+          ) : null}
           <button type="button" onClick={() => void refreshTerminalData()} disabled={busy} className="chart-chip" style={{ fontSize: 11, padding: "4px 10px" }}>↻</button>
         </div>
       </header>
@@ -26935,6 +26962,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
                   {mode === "assisted" ? "Human" : mode === "semi-auto" ? "Hybrid" : "AI"}
                 </button>
               ))}
+              <span className="chart-advanced-controls" hidden={!terminalAdvancedControlsOpen} aria-hidden={!terminalAdvancedControlsOpen}>
               {(["auto", "balanced", "ultra"] as const).map((mode) => (
                 <button
                   key={mode}
@@ -27123,6 +27151,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
               <span className="chart-chip active" title="Desk-grade bar mode is forced by the resolved render mode">Bars:{effectiveChartBarConstructionMode.toUpperCase()}</span>
               {chartDeskModeLocked ? <span className="chart-chip active" title="System owns the render policy while AUTO is selected">AUTO LOCK</span> : null}
               {chartLowFlowEdgeBlocked ? <span className="chart-chip chart-chip-warn" title={chartLowFlowEdgeMessage}>LOW FLOW EDGE</span> : null}
+              </span>
               {CHART_TIMEFRAME_SELECTOR_VISIBLE.map((tf) => (
                 <button key={tf} type="button" className={`chart-chip ${chartTimeframe === tf ? "active" : ""}`} aria-pressed={chartTimeframe === tf} onClick={() => setActiveChartTimeframe(tf)}>{tf}</button>
               ))}
@@ -27139,10 +27168,10 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
                 <option value="">More TF</option>
                 {CHART_TIMEFRAME_SELECTOR_MORE.map((tf) => <option key={`tf-more-${tf}`} value={tf}>{tf}</option>)}
               </select>
-              <button type="button" className="chart-chip" onClick={() => setChartWindow((v) => Math.max(30, v - 20))}>+</button>
-              <button type="button" className="chart-chip" onClick={() => setChartWindow((v) => Math.min(500, v + 20))}>−</button>
+              {terminalAdvancedControlsOpen ? <button type="button" className="chart-chip" onClick={() => setChartWindow((v) => Math.max(30, v - 20))}>+</button> : null}
+              {terminalAdvancedControlsOpen ? <button type="button" className="chart-chip" onClick={() => setChartWindow((v) => Math.min(500, v + 20))}>−</button> : null}
               {/* ── Indicator active pills ── */}
-              {activeIndicators.map((ind) => (
+              {terminalAdvancedControlsOpen ? activeIndicators.map((ind) => (
                 <span key={`ind-pill-${ind.id}`} className="chart-chip chart-chip-indicator active">
                   {ind.id}
                   <button
@@ -27152,9 +27181,9 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
                     onClick={(e) => { e.stopPropagation(); toggleIndicator(ind.id); }}
                   >×</button>
                 </span>
-              ))}
+              )) : null}
               {/* ── Indicator picker button ── */}
-              <div className="chart-indicator-picker-wrap">
+              {terminalAdvancedControlsOpen ? <div className="chart-indicator-picker-wrap">
                 <button
                   type="button"
                   className={`chart-chip ${showIndicatorPanel ? "active" : ""}`}
@@ -27197,7 +27226,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
                     </button>
                   </div>
                 )}
-              </div>
+              </div> : null}
             </div>
           </div>
 
@@ -27205,11 +27234,11 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
             <span className="chart-overlay-chip chart-overlay-chip-emphasis">{selectedChartSymbol}</span>
             <span className={`chart-overlay-chip ${deskRenderProfile.resolvedViewMode === "flow" ? "chart-overlay-chip-good" : deskRenderProfile.resolvedViewMode === "candle" ? "chart-overlay-chip-warn" : ""}`}>{chartDeskModeLabel}</span>
             <span className={`chart-overlay-chip ${chartFlowConfidenceLow ? "chart-overlay-chip-warn" : chartRuntimeOrderflowEnabled ? "chart-overlay-chip-good" : ""}`}>{chartFlowConfidenceLabel}</span>
-            <span className={`chart-overlay-chip ${chartStabilityChipClass}`} title={chartStabilityChipTitle}>{chartStabilityChipLabel}</span>
-            <span className={`chart-overlay-chip ${chartCostChipClass}`} title={chartCostChipTitle}>{chartCostChipLabel}</span>
+            {terminalAdvancedControlsOpen ? <span className={`chart-overlay-chip ${chartStabilityChipClass}`} title={chartStabilityChipTitle}>{chartStabilityChipLabel}</span> : null}
+            {terminalAdvancedControlsOpen ? <span className={`chart-overlay-chip ${chartCostChipClass}`} title={chartCostChipTitle}>{chartCostChipLabel}</span> : null}
             {chartLowFlowEdgeBlocked ? <span className="chart-overlay-chip chart-overlay-chip-warn">LOW FLOW EDGE</span> : null}
-            <span className="chart-overlay-chip">Bars {effectiveChartBarConstructionMode.toUpperCase()}</span>
-            {deskRenderProfile.candlesContextOnly ? <span className="chart-overlay-chip">Candles = context only, not signal</span> : null}
+            {terminalAdvancedControlsOpen ? <span className="chart-overlay-chip">Bars {effectiveChartBarConstructionMode.toUpperCase()}</span> : null}
+            {terminalAdvancedControlsOpen && deskRenderProfile.candlesContextOnly ? <span className="chart-overlay-chip">Candles = context only, not signal</span> : null}
             <span className={`chart-overlay-chip ${localOhlcvAnalysis.signal === "OHLCV_RENDERABLE" ? "chart-overlay-chip-good" : "chart-overlay-chip-warn"}`}>Feed {selectedChartInstrument} @ {selectedChartVenue}</span>
             <span className={`chart-overlay-chip ${localOhlcvAnalysis.signal === "OHLCV_RENDERABLE" ? "chart-overlay-chip-good" : "chart-overlay-chip-warn"}`}>OHLCV {localOhlcvAnalysis.signal === "OHLCV_RENDERABLE" ? "RENDERABLE" : localOhlcvAnalysis.signal === "OHLCV_PARTIAL" ? "PARTIAL" : "UNUSABLE"}</span>
             <span className={`chart-overlay-chip chart-overlay-chip-signal chart-overlay-chip-signal-${marketSignalV1.dominantDirection}`}>{marketSignalV1.headline}</span>
@@ -27236,7 +27265,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
             <span className="chart-overlay-chip">Spread {chartHeaderSpread > 0 ? chartHeaderSpread.toFixed(2) : "–"}</span>
           </div>
 
-          <div className={`replay-control-strip ${replayState.enabled ? "active" : ""}`}>
+          {terminalAdvancedControlsOpen || replayState.enabled ? <div className={`replay-control-strip ${replayState.enabled ? "active" : ""}`}>
             <span className="replay-badge">{replayState.enabled ? "REPLAY MODE" : "LIVE"}</span>
             <span className="replay-time">{replayCurrentTimeLabel}</span>
             {activeExecutionFootprint ? (
@@ -27356,16 +27385,16 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
                 );
               })}
             </div>
-          </div>
+          </div> : null}
 
-          <div className="chart-symbol-chips">
+          {terminalAdvancedControlsOpen ? <div className="chart-symbol-chips">
             {uniqueFilteredQuotes.slice(0, 8).map((quote) => {
               const s = instrumentLabel(quote);
               return (
                 <button key={s} type="button" className={`chart-chip ${selectedChartSymbol === s ? "active" : ""}`} onClick={() => setActiveChartSymbol(s)}>{s}</button>
               );
             })}
-          </div>
+          </div> : null}
 
           <ModuleGuide
             mode={uiMode}
@@ -27374,7 +27403,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
             why="Il permet de confirmer rapidement si le signal reste cohérent avec la structure et le flux d'exécution."
             example="Si le prix reprend la VWAP, défend une zone de liquidité et garde un delta positif, le contexte reste plus favorable."
           />
-          <div className="chart-v2-flag-row">
+          {terminalAdvancedControlsOpen ? <div className="chart-v2-flag-row">
             <button type="button" className={`chart-chip ${terminalV2Enabled ? "active" : ""}`} onClick={toggleTerminalV2}>
               V2 Surface {terminalV2Enabled ? "ON" : "OFF"}
             </button>
@@ -27411,8 +27440,8 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
             </button>
             <span className="chart-overlay-chip">Feature flag: NEXT_PUBLIC_TERMINAL_V2 or ?v2=1</span>
             <span className="chart-overlay-chip">Engine flag: NEXT_PUBLIC_TERMINAL_ENGINE_V4 or ?engine=v4</span>
-          </div>
-          <div className="chart-v2-flag-row">
+          </div> : null}
+          {terminalAdvancedControlsOpen ? <div className="chart-v2-flag-row">
             <button type="button" className={`chart-chip ${chartHeatmapMode === "normal" ? "active" : ""}`} onClick={() => setChartHeatmapModeRuntime("normal")}>NORMAL</button>
             <button type="button" className={`chart-chip ${chartHeatmapMode === "bookmap" ? "active" : ""}`} onClick={() => setChartHeatmapModeRuntime("bookmap")}>BOOKMAP</button>
             <span className="chart-overlay-chip">Heat x{bookmapHeatIntensity.toFixed(2)}</span>
@@ -27440,7 +27469,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
             <button type="button" className={`chart-chip ${mlAbsorptionRuntimeMode === "live" ? "active" : ""}`} disabled={!TERMINAL_ML_ABSORPTION_LIVE_DEFAULT} title={TERMINAL_ML_ABSORPTION_LIVE_DEFAULT ? "ML live execution" : "ML live locked until validation/env unlock"} onClick={() => setMlAbsorptionRuntimeModePersisted("live")}>ML LIVE</button>
             <span className="chart-overlay-chip">DOM_GPU {terminalFeatureFlags.DOM_GPU ? "ON" : "OFF"}</span>
             <span className="chart-overlay-chip">REPLAY {terminalFeatureFlags.REPLAY_MODE ? "ON" : "OFF"}</span>
-          </div>
+          </div> : null}
 
           {!chartBootReady ? (
             <ChartSurfaceLoadingFallback />
@@ -27535,6 +27564,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
                   selectedVenue={selectedChartVenue}
                   availableVenues={Array.from(new Set(selectedQuoteRows.map((row) => String(row.venue || ""))).values()).filter(Boolean)}
                   onSelectVenue={(venue) => setChartVenueOverride(venue || null)}
+                  advancedControlsOpen={terminalAdvancedControlsOpen}
                   gpuViewportGrid={gpuViewportGrid}
                   chartTruth={chartTruthDesk}
                   aiHeadline={marketSignalV1.headline}
@@ -29690,9 +29720,9 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
         aria-busy={terminalOpsTransitionLocked}
       >
         <div className="term-monitoring-bar">
-          <span className="term-monitoring-title">Operator Monitoring</span>
+          <span className="term-monitoring-title">Lecture operateur</span>
           <div className="term-monitoring-actions">
-            <div className="th-mode-toggle" role="tablist" aria-label="Cockpit surface mode">
+            <div className="th-mode-toggle" role="tablist" aria-label="Mode de lecture operateur">
               <button
                 type="button"
                 data-testid="terminal-surface-context-button"
@@ -29701,7 +29731,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
                 aria-pressed={!diagnosticsSurfaceOpen}
                 disabled={terminalOpsTransitionLocked}
               >
-                Execution
+                Vue essentielle
               </button>
               <button
                 type="button"
@@ -29710,14 +29740,14 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
                 onClick={() => requestTerminalOpsSurfaceMode("diagnostic", "surface-button")}
                 aria-pressed={diagnosticsSurfaceOpen}
                 disabled={terminalOpsTransitionLocked}
-                title={adaptiveCommandMode ? "Command mode replie automatiquement le rail diagnostics" : undefined}
+                title={adaptiveCommandMode ? "La vue operateur replie automatiquement les diagnostics lourds sur ce profil" : undefined}
               >
-                Exceptions
+                Diagnostics avances
               </button>
             </div>
-            {adaptiveCommandMode ? <span className="term-monitoring-layout-note">Command mode garde seulement la lecture execution sur ce profil.</span> : null}
+            {adaptiveCommandMode ? <span className="term-monitoring-layout-note">Vue operateur: diagnostics lourds replies automatiquement.</span> : null}
             {layoutEditMode ? <span className="term-monitoring-layout-note">Layout Edit garde les familles visibles pour réagencer le poste.</span> : null}
-            {publicOpsRefreshPaused ? <span className="monitoring-state-badge paused">background paused</span> : <span className="monitoring-state-badge live">live refresh</span>}
+            {publicOpsRefreshPaused ? <span className="monitoring-state-badge paused">rafraich. pause</span> : <span className="monitoring-state-badge live">live</span>}
           </div>
         </div>
         <div
@@ -29725,8 +29755,8 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
           className={`monitoring-cols${layoutDropPreview?.zone === "monitoring" ? " is-drop-zone-active" : ""}`}
           data-surface-state={diagnosticsSurfaceOpen ? "diagnostic" : "context"}
           data-transition-phase={terminalOpsTransitionPhase}
-          hidden={!diagnosticsSurfaceOpen}
-          aria-hidden={!diagnosticsSurfaceOpen}
+          hidden={monitoringGridHidden}
+          aria-hidden={monitoringGridHidden}
           onDragOver={(event) => {
             if (layoutEditMode) {
               event.preventDefault();
@@ -29743,14 +29773,14 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
           {monitoringContextMounted ? TERMINAL_CONTEXT_PANEL_IDS.map((id) => renderMonitoringDeckCard(id)) : null}
           {diagnosticsSurfaceOpen ? (
             <div className="term-monitoring-section-switches" style={{ display: "grid", gap: 8, marginBottom: 8 }}>
-              <div className="subtle mini">Les exceptions ne montent plus tant qu'une famille n'est pas ouverte. La lecture execution reste permanente et legere.</div>
+              <div className="subtle mini">Les diagnostics avances restent fermes tant qu'une famille n'est pas ouverte. La vue essentielle garde seulement risque, marche, tradabilite, venues et readiness.</div>
               <div className="exec-lane-summary-actions">
                 <button
                   type="button"
                   className={`chart-chip ${monitoringRuntimeSectionMounted ? "active" : ""}`}
                   onClick={() => setMonitoringRuntimeSectionOpen((current) => !current)}
                 >
-                  {monitoringRuntimeSectionMounted ? "Masquer execution watch" : "Ouvrir execution watch"}
+                  {monitoringRuntimeSectionMounted ? "Masquer execution" : "Ouvrir execution"}
                 </button>
                 <button
                   type="button"
@@ -29764,7 +29794,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
                   className={`chart-chip ${monitoringGovernanceSectionMounted ? "active" : ""}`}
                   onClick={() => setMonitoringGovernanceSectionOpen((current) => !current)}
                 >
-                  {monitoringGovernanceSectionMounted ? "Masquer guardrails" : "Ouvrir guardrails"}
+                  {monitoringGovernanceSectionMounted ? "Masquer gouvernance" : "Ouvrir gouvernance"}
                 </button>
               </div>
             </div>
@@ -29773,7 +29803,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
           {monitoringAlertsSectionMounted ? TERMINAL_DIAGNOSTIC_ALERTS_PANEL_IDS.map((id) => renderMonitoringDeckCard(id)) : null}
           {monitoringGovernanceSectionMounted ? TERMINAL_DIAGNOSTIC_GOVERNANCE_PANEL_IDS.map((id) => renderMonitoringDeckCard(id)) : null}
         </div>
-        {!diagnosticsSurfaceOpen ? <div className="subtle mini">Diagnostics cachés par défaut.</div> : null}
+        {!diagnosticsSurfaceOpen ? <div className="subtle mini">Diagnostics avances replies par defaut. Ouvre-les seulement pour enqueter sur une anomalie.</div> : null}
         {diagnosticsSurfaceOpen ? (
           <div
             className="term-monitoring-empty"

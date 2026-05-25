@@ -202,7 +202,7 @@ services:
     environment:
       DATABASE_URL_FILE: /run/secrets/database_url
       MARKET_DATA_LIVENESS_PORT: 8010
-      MT5_BRIDGE_MODE: paper
+      MT5_BRIDGE_MODE: live
     env_file:
       - ./.env
     command: >

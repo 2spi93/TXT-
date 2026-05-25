@@ -89,9 +89,11 @@ export default function ConnectionsPage() {
   const [mt5Accounts, setMt5Accounts] = useState<JsonMap[]>([]);
   const [mt5BrokerSessionAccountId, setMt5BrokerSessionAccountId] = useState("");
   const [mt5SnapshotUrl, setMt5SnapshotUrl] = useState("");
+  const [mt5ExecutionUrl, setMt5ExecutionUrl] = useState("");
   const [mt5PayloadPath, setMt5PayloadPath] = useState("payload");
   const [mt5TruthSource, setMt5TruthSource] = useState("mt5-external-broker-session");
   const [mt5MinPollIntervalSeconds, setMt5MinPollIntervalSeconds] = useState("20");
+  const [mt5ExecutionTimeoutSeconds, setMt5ExecutionTimeoutSeconds] = useState("12");
   const [mt5BrokerSessionRefresh, setMt5BrokerSessionRefresh] = useState(true);
   const [mt5BrokerSessionBusy, setMt5BrokerSessionBusy] = useState(false);
   const [linkedAccounts, setLinkedAccounts] = useState<JsonMap[]>([]);
@@ -185,9 +187,11 @@ export default function ConnectionsPage() {
     const brokerSession = asMap(selectedMt5BrokerSessionAccount.metadata).broker_session;
     const brokerSessionConfig = asMap(brokerSession);
     setMt5SnapshotUrl(String(brokerSessionConfig.snapshot_url || brokerSessionConfig.state_url || brokerSessionConfig.url || ""));
+    setMt5ExecutionUrl(String(brokerSessionConfig.execution_url || brokerSessionConfig.place_order_url || brokerSessionConfig.order_url || ""));
     setMt5PayloadPath(String(brokerSessionConfig.payload_path || "payload"));
     setMt5TruthSource(String(brokerSessionConfig.truth_source || "mt5-external-broker-session"));
     setMt5MinPollIntervalSeconds(String(brokerSessionConfig.min_poll_interval_seconds || "20"));
+    setMt5ExecutionTimeoutSeconds(String(brokerSessionConfig.execution_timeout_seconds || "12"));
     setMt5BrokerSessionRefresh(true);
   }, [selectedMt5BrokerSessionAccount]);
 
@@ -234,9 +238,11 @@ export default function ConnectionsPage() {
     try {
       const brokerSession = clearSession ? {} : {
         snapshot_url: mt5SnapshotUrl.trim(),
+        execution_url: mt5ExecutionUrl.trim(),
         payload_path: mt5PayloadPath.trim() || "payload",
         truth_source: mt5TruthSource.trim() || "mt5-external-broker-session",
         min_poll_interval_seconds: Number.parseInt(mt5MinPollIntervalSeconds, 10) || 20,
+        execution_timeout_seconds: Number.parseInt(mt5ExecutionTimeoutSeconds, 10) || 12,
       };
       const response = await fetch(`/api/mt5/accounts/${encodeURIComponent(mt5BrokerSessionAccountId)}/broker-session`, {
         method: "PATCH",
@@ -254,9 +260,11 @@ export default function ConnectionsPage() {
       setResult((payload || null) as JsonMap | null);
       if (clearSession) {
         setMt5SnapshotUrl("");
+        setMt5ExecutionUrl("");
         setMt5PayloadPath("payload");
         setMt5TruthSource("mt5-external-broker-session");
         setMt5MinPollIntervalSeconds("20");
+        setMt5ExecutionTimeoutSeconds("12");
       }
       await loadConnectionsState();
     } catch (err) {
@@ -501,7 +509,7 @@ export default function ConnectionsPage() {
           ) : null}
           {mt5Accounts.length > 0 ? (
             <div className="panel" style={{ marginTop: 12, borderRadius: 12 }}>
-              <div className="eyebrow">Source broker_session MT5 <HelpHint text="Persiste ici la source externe du broker_state MT5 pour que le control-plane tire automatiquement l'etat broker sans push manuel." examples={["Snapshot URL + payload_path = TXT lit le JSON externe, puis l'injecte dans le bridge MT5 canonique.", "Effacer la source remet broker_session a vide pour couper l'ingestion automatique."]} /></div>
+              <div className="eyebrow">Source broker_session MT5 <HelpHint text="Persiste ici la source externe du broker_state MT5 et l'URL d'execution live reelle. Sans execution_url, le bridge MT5 live bloque maintenant l'ordre au lieu de simuler un accepted." examples={["Snapshot URL + payload_path = TXT lit le JSON externe, puis l'injecte dans le bridge MT5 canonique.", "Execution URL = TXT envoie le vrai ticket MT5 live a la session broker externe au lieu de simuler un ordre.", "Effacer la source remet broker_session a vide pour couper l'ingestion automatique et l'execution live externe."]} /></div>
               <div className="form-grid" style={{ marginTop: 12 }}>
                 <select value={mt5BrokerSessionAccountId} onChange={(e) => setMt5BrokerSessionAccountId(e.target.value)}>
                   {mt5Accounts.map((item) => (
@@ -509,9 +517,11 @@ export default function ConnectionsPage() {
                   ))}
                 </select>
                 <input value={mt5SnapshotUrl} onChange={(e) => setMt5SnapshotUrl(e.target.value)} placeholder="snapshot_url http://mt5-bridge:18086/state.json" />
+                <input value={mt5ExecutionUrl} onChange={(e) => setMt5ExecutionUrl(e.target.value)} placeholder="execution_url http://mt5-executor:18087/orders" />
                 <input value={mt5PayloadPath} onChange={(e) => setMt5PayloadPath(e.target.value)} placeholder="payload_path (ex: payload)" />
                 <input value={mt5TruthSource} onChange={(e) => setMt5TruthSource(e.target.value)} placeholder="truth_source" />
                 <input value={mt5MinPollIntervalSeconds} onChange={(e) => setMt5MinPollIntervalSeconds(e.target.value)} placeholder="min_poll_interval_seconds" />
+                <input value={mt5ExecutionTimeoutSeconds} onChange={(e) => setMt5ExecutionTimeoutSeconds(e.target.value)} placeholder="execution_timeout_seconds" />
                 <label className="subtle" style={{ display: "flex", alignItems: "center", gap: 8 }}>
                   <input type="checkbox" checked={mt5BrokerSessionRefresh} onChange={(e) => setMt5BrokerSessionRefresh(e.target.checked)} />
                   refresh immediat apres sauvegarde

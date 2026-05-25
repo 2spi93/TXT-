@@ -11,14 +11,14 @@ import type {
 const CHART_SIDECAR_FLOATING_GRID_SIZE = 16;
 
 export const CHART_SIDECAR_PROFILE_LAYOUTS: Record<ChartSidecarProfile, ChartSidecarProfileLayout> = {
-  scalping: { label: "Scalping", cards: ["execution", "localFeed", "forensic", "domTape", "footprintHeat", "policy"] },
-  intraday: { label: "Intraday", cards: ["execution", "localFeed", "forensic", "domTape", "footprintHeat", "policy"] },
-  swing: { label: "Swing", cards: ["execution", "localFeed", "forensic", "footprintHeat", "policy"] },
+  scalping: { label: "Scalping", cards: ["execution", "policy", "localFeed", "domTape", "footprintHeat", "forensic"] },
+  intraday: { label: "Intraday", cards: ["execution", "policy", "localFeed", "domTape", "footprintHeat", "forensic"] },
+  swing: { label: "Swing", cards: ["execution", "policy", "localFeed", "footprintHeat", "forensic"] },
 };
 
 export const CHART_SIDECAR_FLOATING_DEFAULTS: Record<ChartSidecarId, ChartSidecarFloatingDefault> = {
-  execution: { w: 328, h: 332 },
-  localFeed: { w: 320, h: 336 },
+  execution: { w: 304, h: 292 },
+  localFeed: { w: 296, h: 244 },
   forensic: { w: 352, h: 388 },
   policy: { w: 288, h: 276 },
   domTape: { w: 296, h: 360 },
@@ -42,14 +42,8 @@ export function defaultChartSidecarLayoutForPreset(preset: "scalp" | "swing" | "
   };
 }
 
-export function sidecarHybridIdsForProfile(profile: ChartSidecarProfile): ChartSidecarId[] {
-  if (profile === "swing") {
-    return ["execution", "localFeed"];
-  }
-  if (profile === "scalping") {
-    return ["execution", "localFeed"];
-  }
-  return ["execution", "localFeed"];
+export function sidecarHybridIdsForProfile(_profile: ChartSidecarProfile): ChartSidecarId[] {
+  return ["execution"];
 }
 
 export function clampDetachedChartSidecar(panel: DetachedChartSidecarState): DetachedChartSidecarState {
