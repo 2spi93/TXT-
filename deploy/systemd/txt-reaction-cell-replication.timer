@@ -1,0 +1,13 @@
+[Unit]
+Description=Check every minute for a targeted BTCUSDT cell replication event
+
+[Timer]
+OnBootSec=1min
+OnActiveSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Persistent=false
+Unit=txt-reaction-cell-replication.service
+
+[Install]
+WantedBy=timers.target

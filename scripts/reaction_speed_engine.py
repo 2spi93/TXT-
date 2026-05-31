@@ -82,6 +82,25 @@ def _read_db_url() -> str:
     raise SystemExit("ERROR: DATABASE_URL not set and secrets/database_url not found.")
 
 
+def _existing_output_keys(output_path: Path, *, venue: str, instrument: str) -> set[str]:
+    if not output_path.exists() or output_path == Path("/dev/null"):
+        return set()
+    keys: set[str] = set()
+    with output_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (
+                row.get("venue") == venue
+                and row.get("instrument") == instrument
+                and row.get("event_time")
+            ):
+                keys.add(str(row["event_time"]))
+    return keys
+
+
 def _parse_iso(value: str) -> datetime:
     if value.endswith("Z"):
         value = value[:-1] + "+00:00"
@@ -285,11 +304,16 @@ def run(
     summary["median_reaction_bps_by_class"] = {k: _median(per_class_bps[k]) for k in ("FAST", "MEDIUM", "SLOW")}
 
     if rows_to_write:
+        existing_keys = _existing_output_keys(output_path, venue=venue, instrument=instrument)
+        rows_to_write = [row for row in rows_to_write if str(row.get("event_time")) not in existing_keys]
+
+    if rows_to_write:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with output_path.open("a", encoding="utf-8") as fh:
             for row in rows_to_write:
                 fh.write(json.dumps(row, separators=(",", ":")) + "\n")
 
+    summary["written_rows"] = len(rows_to_write)
     return summary
 
 

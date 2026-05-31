@@ -1,5 +1,6 @@
 import { cpFetchJsonSafe, type ControlPlaneNetworkMeta } from "./controlPlane";
 import { getControlledCollectionSessionSummary } from "./controlledCollectionWatch";
+import { getRuntimeEdgeEvidenceState, type RuntimeEdgeEvidenceState } from "./edgeEvidenceState";
 import { getRuntimeDecisionAnalytics } from "./runtimeDecisionAnalytics";
 
 if (typeof window !== "undefined") {
@@ -45,6 +46,7 @@ type RuntimeTruthSnapshot = {
     mt5_health: unknown;
     runtime_decision: RuntimeDecisionSummary | null;
     controlled_collection: Awaited<ReturnType<typeof getControlledCollectionSessionSummary>>;
+    edge_evidence: RuntimeEdgeEvidenceState;
     network: Record<string, ControlPlaneNetworkMeta>;
   };
 };
@@ -63,6 +65,7 @@ runtimeTruthGlobal.__runtimeTruthInflight__ = runtimeTruthInflight;
 
 const RUNTIME_TRUTH_CP_TIMEOUT_MS = 8_000;
 const RUNTIME_TRUTH_ANALYTICS_TIMEOUT_MS = 8_000;
+const RUNTIME_TRUTH_EDGE_EVIDENCE_TIMEOUT_MS = 900;
 const RUNTIME_TRUTH_CACHE_MS = 2_000;
 
 function asRecord(value: unknown): JsonMap {
@@ -218,13 +221,28 @@ async function buildRuntimeTruthSnapshotUncached(input: Required<RuntimeTruthInp
         timeframe: input.timeframe,
         strategy: input.strategy,
       };
-  const [killSwitchResult, systemConfigResult, gateResult, marketSessionResult, mt5HealthResult, controlledCollection, runtimeDecision] = await Promise.all([
+  const edgeEvidenceFallback: RuntimeEdgeEvidenceState = {
+    available: false,
+    state: "UNAVAILABLE",
+    summary: "Edge evidence maturity snapshot timed out.",
+    filePath: "",
+    fileUpdatedAt: null,
+    matureThresholdEvents: 3,
+    cellCount: 0,
+    replicatedCells: 0,
+    matureCells: 0,
+    outcomesWithBoth: 0,
+    maxCellEventCount: 0,
+    topCells: [],
+  };
+  const [killSwitchResult, systemConfigResult, gateResult, marketSessionResult, mt5HealthResult, controlledCollection, edgeEvidence, runtimeDecision] = await Promise.all([
     cpFetchBounded("/v1/system/kill-switch"),
     cpFetchBounded("/v1/system/config"),
     cpFetchBounded("/v1/system/opportunity-gate"),
     cpFetchBounded(`/v1/market/session-state?instrument=${encodeURIComponent(input.marketInstrument)}`),
     cpFetchBounded("/v1/mt5/health"),
     getControlledCollectionSessionSummary().catch(() => null),
+    withTimeout(getRuntimeEdgeEvidenceState().catch(() => edgeEvidenceFallback), RUNTIME_TRUTH_EDGE_EVIDENCE_TIMEOUT_MS, edgeEvidenceFallback),
     withTimeout(
       getRuntimeDecisionAnalytics({
         ...runtimeDecisionScope,
@@ -373,6 +391,14 @@ async function buildRuntimeTruthSnapshotUncached(input: Required<RuntimeTruthInp
         kill_switch_source: controlled.killSwitchSource,
         fills_seen: controlled.fillsSeen,
         labels_seen: controlled.labelsSeen,
+        edge_evidence_state: edgeEvidence.state,
+        edge_evidence_available: edgeEvidence.available,
+        mature_cells: edgeEvidence.matureCells,
+        replicated_cells: edgeEvidence.replicatedCells,
+        cell_count: edgeEvidence.cellCount,
+        outcomes_with_both: edgeEvidence.outcomesWithBoth,
+        edge_evidence_summary: edgeEvidence.summary,
+        edge_evidence_top_cells: edgeEvidence.topCells,
       },
     },
     raw: {
@@ -383,6 +409,7 @@ async function buildRuntimeTruthSnapshotUncached(input: Required<RuntimeTruthInp
       mt5_health: mt5HealthResult.payload,
       runtime_decision: runtimeDecision,
       controlled_collection: controlled,
+      edge_evidence: edgeEvidence,
       network,
     },
   };

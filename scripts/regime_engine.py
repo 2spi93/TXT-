@@ -171,6 +171,26 @@ def _classify_window(*, vol_bps: float, autocorr: float, direction_ratio: float,
     return "RANGE", 0.5
 
 
+def _existing_output_keys(output_path: Path, *, venue: str, instrument: str, timeframe_sec: int) -> set[str]:
+    if not output_path.exists() or output_path == Path("/dev/null"):
+        return set()
+    keys: set[str] = set()
+    with output_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (
+                row.get("venue") == venue
+                and row.get("instrument") == instrument
+                and int(row.get("timeframe_sec") or 0) == timeframe_sec
+                and row.get("window_end")
+            ):
+                keys.add(str(row["window_end"]))
+    return keys
+
+
 def run(
     *,
     venue: str,
@@ -271,11 +291,21 @@ def run(
     summary["regime_pct"] = {k: round(100.0 * counts.get(k, 0) / total, 2) for k in ("TREND", "RANGE", "CHAOTIC", "HIGH_VOL", "LOW_LIQUIDITY")}
 
     if rows_to_write:
+        existing_keys = _existing_output_keys(
+            output_path,
+            venue=venue,
+            instrument=instrument,
+            timeframe_sec=timeframe_sec,
+        )
+        rows_to_write = [row for row in rows_to_write if str(row.get("window_end")) not in existing_keys]
+
+    if rows_to_write:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with output_path.open("a", encoding="utf-8") as fh:
             for row in rows_to_write:
                 fh.write(json.dumps(row, separators=(",", ":")) + "\n")
 
+    summary["written_rows"] = len(rows_to_write)
     return summary
 
 
