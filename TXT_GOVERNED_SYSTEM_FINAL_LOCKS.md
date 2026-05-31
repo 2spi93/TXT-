@@ -82,6 +82,8 @@ Active automation:
 - It only launches if `reaction_class in {FAST, SLOW}` and the current regime is
   `RANGE`.
 - Campaign prefix: `cellrep50`.
+- It can launch across multiple independent events, but deduplicates events it
+  has already processed.
 - This remains controlled simulated collection, not live MT5 execution.
 - `txt-edge-truth-phase-monitor.timer` refreshes the maturity and phase snapshots
   every five minutes.
@@ -89,13 +91,13 @@ Active automation:
 Current operator target:
 
 ```text
-EXPLORATORY -> EMERGING
+EMERGING -> EVIDENCED
 ```
 
 Required condition:
 
 ```text
-replicated_cells > 0
+mature_cells > 0
 ```
 
 The phase monitor publishes:

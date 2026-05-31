@@ -15,4 +15,5 @@ Environment=REACTION_GATED_VENUES=bybit-public
 Environment=REACTION_GATED_TARGET_CLASSES=FAST,SLOW
 Environment=REACTION_GATED_TARGET_REGIMES=RANGE
 Environment=REACTION_GATED_MATURITY_PREFIXES=rg10-,rg50-,cellrep50-
+Environment=REACTION_GATED_ALLOW_MULTIPLE=1
 ExecStart=/usr/bin/python3 /opt/txt/scripts/reaction_gated_campaign10.py

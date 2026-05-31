@@ -48,6 +48,8 @@ MATURITY_DECISION_PREFIXES = tuple(
     for item in os.getenv("REACTION_GATED_MATURITY_PREFIXES", "rg10-,rg50-,cellrep50-").split(",")
     if item.strip()
 )
+ALLOW_MULTIPLE_CAMPAIGNS = os.getenv("REACTION_GATED_ALLOW_MULTIPLE", "0").strip().lower() in {"1", "true", "yes", "on"}
+MAX_CAMPAIGN_HISTORY = int(os.getenv("REACTION_GATED_MAX_HISTORY", "50"))
 
 
 def utc_now() -> datetime:
@@ -95,6 +97,49 @@ def load_state() -> dict[str, Any]:
 def save_state(state: dict[str, Any]) -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def reaction_event_key(reaction: dict[str, Any] | None) -> str | None:
+    if not reaction:
+        return None
+    venue = str(reaction.get("venue") or "")
+    instrument = str(reaction.get("instrument") or INSTRUMENT)
+    event_time = str(reaction.get("event_time") or "")
+    reaction_class = str(reaction.get("reaction_class") or "")
+    if not venue or not event_time:
+        return None
+    return "|".join([venue, instrument, event_time, reaction_class])
+
+
+def processed_event_keys(state: dict[str, Any]) -> set[str]:
+    keys = {str(item) for item in state.get("processed_event_keys", []) if item}
+    previous_reaction = state.get("reaction") if isinstance(state.get("reaction"), dict) else None
+    previous_key = reaction_event_key(previous_reaction)
+    if state.get("launched") and previous_key:
+        keys.add(previous_key)
+    return keys
+
+
+def remember_campaign(state: dict[str, Any], *, event_key: str, campaign: dict[str, Any], reaction: dict[str, Any]) -> None:
+    keys = list(processed_event_keys(state))
+    if event_key not in keys:
+        keys.append(event_key)
+    state["processed_event_keys"] = keys[-MAX_CAMPAIGN_HISTORY:]
+
+    history = state.get("campaign_history") if isinstance(state.get("campaign_history"), list) else []
+    target_regime = reaction.get("target_regime") if isinstance(reaction.get("target_regime"), dict) else {}
+    history.append({
+        "campaign_id": campaign.get("campaign_id"),
+        "event_key": event_key,
+        "event_time": reaction.get("event_time"),
+        "reaction_class": reaction.get("reaction_class"),
+        "regime": target_regime.get("regime"),
+        "venue": reaction.get("venue"),
+        "success_count": len(campaign.get("successes") or []),
+        "failure_count": len(campaign.get("failures") or []),
+        "updated_at": iso_z(utc_now()),
+    })
+    state["campaign_history"] = history[-MAX_CAMPAIGN_HISTORY:]
 
 
 def refresh_reactions() -> None:
@@ -302,7 +347,7 @@ def schedule_label_edge(campaign_id: str) -> dict[str, str]:
 
 def main() -> int:
     state = load_state()
-    if state.get("launched"):
+    if state.get("launched") and not ALLOW_MULTIPLE_CAMPAIGNS:
         log(f"skip already_launched campaign_id={state.get('campaign_id')}")
         return 0
 
@@ -320,6 +365,10 @@ def main() -> int:
             f"reaction_class={reaction.get('reaction_class')} targets={','.join(TARGET_REACTION_CLASSES)} "
             f"event_time={reaction.get('event_time')} venue={reaction.get('venue')}"
         )
+        return 0
+    event_key = reaction_event_key(reaction)
+    if event_key and event_key in processed_event_keys(state):
+        log(f"skip already_processed_event event_key={event_key} campaign_id={state.get('campaign_id')}")
         return 0
     if state.get("blocked_event_time") == reaction.get("event_time"):
         log(f"skip blocked_event_time event_time={reaction.get('event_time')}")
@@ -350,9 +399,13 @@ def main() -> int:
         return 1
 
     deferred = schedule_label_edge(str(campaign["campaign_id"]))
+    if event_key:
+        remember_campaign(state, event_key=event_key, campaign=campaign, reaction=reaction)
     state.update({
         "launched": True,
         "complete": len(campaign["successes"]) >= ORDER_COUNT,
+        "min_success_met": len(campaign["successes"]) >= MIN_SUCCESS,
+        "allow_multiple": ALLOW_MULTIPLE_CAMPAIGNS,
         "success_count": len(campaign["successes"]),
         "failure_count": len(campaign["failures"]),
         "min_success": MIN_SUCCESS,
