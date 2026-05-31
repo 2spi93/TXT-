@@ -91,14 +91,17 @@ Active automation:
 Current operator target:
 
 ```text
-EMERGING -> EVIDENCED
+EVIDENCED -> STRUCTURAL
 ```
 
 Required condition:
 
 ```text
-mature_cells > 0
+multiple mature cells cohere by regime and pnl direction
 ```
+
+`EVIDENCED` does not unlock live MT5. The read-only MT5 / Reality Gap preflight
+requires `STRUCTURAL` before reporting the micro-trade gate as ready.
 
 The phase monitor publishes:
 

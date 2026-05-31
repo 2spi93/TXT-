@@ -52,8 +52,8 @@ print(json.dumps({"section": "edge_evidence", **edge}, sort_keys=True))
 print(json.dumps({"section": "mt5_health", **mt5_health}, sort_keys=True, default=str))
 
 gate_reasons = []
-if edge.get("state") not in {"EVIDENCED", "STRUCTURAL"}:
-    gate_reasons.append(f"edge_not_evidenced:{edge.get('state')}")
+if edge.get("state") != "STRUCTURAL":
+    gate_reasons.append(f"edge_not_structural:{edge.get('state')}")
 if not mt5_health.get("ok") and mt5_health.get("status") != 401:
     gate_reasons.append("mt5_health_unavailable")
 
@@ -61,6 +61,7 @@ print(json.dumps({
     "section": "micro_trade_gate",
     "ready": not gate_reasons,
     "reasons": gate_reasons,
+    "required_edge_state": "STRUCTURAL",
     "note": "read-only preflight; this script never submits live orders",
 }, sort_keys=True))
 PY
