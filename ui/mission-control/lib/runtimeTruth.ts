@@ -233,6 +233,13 @@ async function buildRuntimeTruthSnapshotUncached(input: Required<RuntimeTruthInp
     matureCells: 0,
     outcomesWithBoth: 0,
     maxCellEventCount: 0,
+    nextGate: {
+      name: "UNAVAILABLE",
+      targetState: "UNKNOWN",
+      condition: "edge evidence maturity snapshot available",
+      summary: "Edge evidence maturity snapshot timed out.",
+      candidateCells: [],
+    },
     topCells: [],
   };
   const [killSwitchResult, systemConfigResult, gateResult, marketSessionResult, mt5HealthResult, controlledCollection, edgeEvidence, runtimeDecision] = await Promise.all([
@@ -398,6 +405,7 @@ async function buildRuntimeTruthSnapshotUncached(input: Required<RuntimeTruthInp
         cell_count: edgeEvidence.cellCount,
         outcomes_with_both: edgeEvidence.outcomesWithBoth,
         edge_evidence_summary: edgeEvidence.summary,
+        edge_evidence_next_gate: edgeEvidence.nextGate,
         edge_evidence_top_cells: edgeEvidence.topCells,
       },
     },

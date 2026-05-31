@@ -28,6 +28,13 @@ export type RuntimeEdgeEvidenceState = {
   matureCells: number;
   outcomesWithBoth: number;
   maxCellEventCount: number;
+  nextGate: {
+    name: string;
+    targetState: string;
+    condition: string;
+    summary: string;
+    candidateCells: unknown[];
+  };
   topCells: RuntimeEdgeEvidenceCell[];
 };
 
@@ -72,6 +79,13 @@ function unavailable(filePath: string, summary: string): RuntimeEdgeEvidenceStat
     matureCells: 0,
     outcomesWithBoth: 0,
     maxCellEventCount: 0,
+    nextGate: {
+      name: "UNAVAILABLE",
+      targetState: "UNKNOWN",
+      condition: "edge evidence maturity snapshot available",
+      summary,
+      candidateCells: [],
+    },
     topCells: [],
   };
 }
@@ -84,6 +98,7 @@ export async function getRuntimeEdgeEvidenceState(): Promise<RuntimeEdgeEvidence
     const evidence = asRecord(payload.edge_evidence);
     const diagnostics = asRecord(payload.diagnostics);
     const params = asRecord(payload.params);
+    const nextGate = asRecord(evidence.next_gate);
     const state = String(evidence.state || diagnostics.edge_evidence_state || "UNAVAILABLE") as EdgeEvidenceState;
     const cells = asArray(payload.cells).slice(0, 8).map((cellRaw) => {
       const cell = asRecord(cellRaw);
@@ -112,6 +127,13 @@ export async function getRuntimeEdgeEvidenceState(): Promise<RuntimeEdgeEvidence
       matureCells: toNumber(evidence.mature_cells || diagnostics.mature_cells, 0),
       outcomesWithBoth: toNumber(diagnostics.outcomes_with_both, 0),
       maxCellEventCount: toNumber(evidence.max_cell_event_count, 0),
+      nextGate: {
+        name: String(nextGate.name || "UNKNOWN"),
+        targetState: String(nextGate.target_state || "UNKNOWN"),
+        condition: String(nextGate.condition || ""),
+        summary: String(nextGate.summary || ""),
+        candidateCells: asArray(nextGate.candidate_cells),
+      },
       topCells: cells,
     };
   } catch (error) {

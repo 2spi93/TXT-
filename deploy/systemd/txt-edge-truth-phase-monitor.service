@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh TXT Edge Truth phase status
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/txt
+ExecStart=/usr/bin/env bash -c 'python3 scripts/reaction_regime_cell_maturity.py --decision-prefix rg10- --decision-prefix rg50- --decision-prefix cellrep50- --format json >/dev/null && python3 scripts/edge_truth_phase_monitor.py --format json >/dev/null'

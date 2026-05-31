@@ -183,6 +183,69 @@ def _coherent_mature_groups(cells: list[dict[str, Any]], mature_threshold_events
     return coherent
 
 
+def _candidate_cells(cells: list[dict[str, Any]], *, min_events: int, max_events: int | None = None) -> list[dict[str, Any]]:
+    candidates = []
+    for cell in cells:
+        event_count = int(cell.get("event_count") or 0)
+        if event_count < min_events:
+            continue
+        if max_events is not None and event_count > max_events:
+            continue
+        candidates.append({
+            "cell": cell.get("cell"),
+            "event_count": event_count,
+            "sample_count": cell.get("sample_count"),
+            "dominant_venue": cell.get("dominant_venue"),
+            "mean_pnl_bps": cell.get("mean_pnl_bps"),
+            "stdev_pnl_bps": cell.get("stdev_pnl_bps"),
+            "next_required_event_count": event_count + 1,
+        })
+    candidates.sort(key=lambda cell: (-int(cell.get("event_count") or 0), -int(cell.get("sample_count") or 0), str(cell.get("cell") or "")))
+    return candidates
+
+
+def _next_gate_for_state(state: str, cells: list[dict[str, Any]], mature_threshold_events: int) -> dict[str, Any]:
+    if state == "NO_REPLICATED_CELLS":
+        return {
+            "name": "COMPLETE_FIRST_CELL",
+            "target_state": "EXPLORATORY",
+            "condition": "outcomes_with_both > 0 and cell_count > 0",
+            "summary": "Create the first complete Reaction + Regime + Outcome cell.",
+            "candidate_cells": [],
+        }
+    if state == "EXPLORATORY":
+        return {
+            "name": "FIRST_REPLICATION",
+            "target_state": "EMERGING",
+            "condition": "replicated_cells > 0",
+            "summary": "Repeat one existing cell on an independent event.",
+            "candidate_cells": _candidate_cells(cells, min_events=1, max_events=1),
+        }
+    if state == "EMERGING":
+        return {
+            "name": "FIRST_MATURE_CELL",
+            "target_state": "EVIDENCED",
+            "condition": f"mature_cells > 0 with event_count >= {mature_threshold_events}",
+            "summary": "Promote one replicated cell to mature causal evidence.",
+            "candidate_cells": _candidate_cells(cells, min_events=2, max_events=mature_threshold_events - 1),
+        }
+    if state == "EVIDENCED":
+        return {
+            "name": "STRUCTURAL_COHERENCE",
+            "target_state": "STRUCTURAL",
+            "condition": "multiple mature cells cohere by regime and pnl direction",
+            "summary": "Show that evidence is broader than one isolated mature cell.",
+            "candidate_cells": _candidate_cells(cells, min_events=mature_threshold_events),
+        }
+    return {
+        "name": "BROKER_REALITY",
+        "target_state": "REALITY_GAP_REAL",
+        "condition": "real broker fill audited and reality_gap_real_samples > 0",
+        "summary": "Move from structural simulated evidence to audited broker reality.",
+        "candidate_cells": _candidate_cells(cells, min_events=mature_threshold_events),
+    }
+
+
 def _edge_evidence_state(cells: list[dict[str, Any]], outcomes_with_both: int, mature_threshold_events: int) -> dict[str, Any]:
     replicated_cells = sum(1 for cell in cells if cell["event_count"] >= 2)
     mature_cells = sum(1 for cell in cells if cell["event_count"] >= mature_threshold_events)
@@ -211,6 +274,7 @@ def _edge_evidence_state(cells: list[dict[str, Any]], outcomes_with_both: int, m
         "mature_cells": mature_cells,
         "max_cell_event_count": max_event_count,
         "coherent_mature_groups": coherent_groups,
+        "next_gate": _next_gate_for_state(state, cells, mature_threshold_events),
     }
 
 

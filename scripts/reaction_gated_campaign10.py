@@ -292,6 +292,7 @@ def schedule_label_edge(campaign_id: str) -> dict[str, str]:
         f"LABELER_SINCE={since} LABELER_LIMIT=100 scripts/label_intent_outcomes_cron.sh >> {log_path} 2>&1; "
         f"python3 scripts/edge_map_engine.py --min-count 1 --pnl-field pnl_bps_5m >> {log_path} 2>&1; "
         f"python3 scripts/reaction_regime_cell_maturity.py {maturity_prefix_args} --format json >> {log_path} 2>&1; "
+        f"python3 scripts/edge_truth_phase_monitor.py --format json >> {log_path} 2>&1; "
         f"echo '[end] '$(date -u +%FT%TZ) >> {log_path}"
     )
     result = run(["systemd-run", "--on-active=65m", f"--unit={unit}", "/usr/bin/env", "bash", "-lc", command], check=False)

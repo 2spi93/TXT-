@@ -80,9 +80,28 @@ Active automation:
 - `txt-reaction-cell-replication.timer` is armed.
 - It checks every minute for a fresh bybit-public BTCUSDT reaction.
 - It only launches if `reaction_class in {FAST, SLOW}` and the current regime is
-	`RANGE`.
+  `RANGE`.
 - Campaign prefix: `cellrep50`.
 - This remains controlled simulated collection, not live MT5 execution.
+- `txt-edge-truth-phase-monitor.timer` refreshes the maturity and phase snapshots
+  every five minutes.
+
+Current operator target:
+
+```text
+EXPLORATORY -> EMERGING
+```
+
+Required condition:
+
+```text
+replicated_cells > 0
+```
+
+The phase monitor publishes:
+
+- `logs/edge_truth_phase_status.json`
+- `logs/edge_truth_phase_status.md`
 
 ### 2. First EVIDENCED Cell
 

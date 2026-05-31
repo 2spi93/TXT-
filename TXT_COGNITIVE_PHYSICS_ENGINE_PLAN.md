@@ -214,10 +214,11 @@ execution authorization by themselves.
 ## Implementation Order
 
 1. Keep `edge_evidence_state` in Runtime Truth.
-2. Add entropy on cell outcomes and route choices.
-3. Add decay-weighted evidence using half-life primitives.
-4. Add dispersion/stability metrics for replicated cells.
-5. Add novelty/compressibility once enough replay history exists.
+2. Keep `edge_truth_phase_status` refreshed from cell maturity.
+3. Add entropy on cell outcomes and route choices only after `EVIDENCED`.
+4. Add decay-weighted evidence using half-life primitives only after replication.
+5. Add dispersion/stability metrics for replicated cells.
+6. Add novelty/compressibility once enough replay history exists.
 
 ## Rule
 
