@@ -1,0 +1,9 @@
+[Unit]
+Description=Publish TXT Edge Truth market reopen watch snapshot
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/txt
+ExecStart=/usr/bin/python3 /opt/txt/scripts/edge_truth_reopen_watch.py --format json

@@ -87,6 +87,8 @@ Active automation:
 - This remains controlled simulated collection, not live MT5 execution.
 - `txt-edge-truth-phase-monitor.timer` refreshes the maturity and phase snapshots
   every five minutes.
+- `txt-edge-truth-reopen-watch.timer` publishes read-only reopen snapshots after
+  the 00:05 market reopen window.
 
 Current operator target:
 
@@ -107,6 +109,11 @@ The phase monitor publishes:
 
 - `logs/edge_truth_phase_status.json`
 - `logs/edge_truth_phase_status.md`
+
+The reopen watch publishes:
+
+- `logs/edge_truth_reopen_watch.json`
+- `logs/edge_truth_reopen_watch.md`
 
 ### 2. First EVIDENCED Cell
 
