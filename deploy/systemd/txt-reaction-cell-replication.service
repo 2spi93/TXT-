@@ -12,7 +12,7 @@ Environment=REACTION_GATED_CAMPAIGN_PREFIX=cellrep50
 Environment=REACTION_GATED_STATE_FILE=/opt/txt/logs/reaction_cell_replication_state.json
 Environment=REACTION_GATED_LOG=/opt/txt/logs/reaction_cell_replication.log
 Environment=REACTION_GATED_VENUES=bybit-public
-Environment=REACTION_GATED_TARGET_CLASSES=FAST,SLOW
+Environment=REACTION_GATED_TARGET_CLASSES=FAST,SLOW,MEDIUM
 Environment=REACTION_GATED_TARGET_REGIMES=RANGE
 Environment=REACTION_GATED_MATURITY_PREFIXES=rg10-,rg50-,cellrep50-
 Environment=REACTION_GATED_ALLOW_MULTIPLE=1

@@ -79,7 +79,7 @@ Active automation:
 
 - `txt-reaction-cell-replication.timer` is armed.
 - It checks every minute for a fresh bybit-public BTCUSDT reaction.
-- It only launches if `reaction_class in {FAST, SLOW}` and the current regime is
+- It only launches if `reaction_class in {FAST, SLOW, MEDIUM}` and the current regime is
   `RANGE`.
 - Campaign prefix: `cellrep50`.
 - It can launch across multiple independent events, but deduplicates events it
@@ -101,6 +101,11 @@ Required condition:
 ```text
 multiple mature cells cohere by regime and pnl direction
 ```
+
+While `EVIDENCED`, the structural candidates are RANGE cells that can become a
+second mature cell next to the current mature `SLOW + RANGE` anchor. This allows
+`FAST + RANGE` and `MEDIUM + RANGE` to progress without widening the regime or
+lookback windows.
 
 `EVIDENCED` does not unlock live MT5. The read-only MT5 / Reality Gap preflight
 requires `STRUCTURAL` before reporting the micro-trade gate as ready.

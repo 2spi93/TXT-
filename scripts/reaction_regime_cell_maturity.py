@@ -204,6 +204,44 @@ def _candidate_cells(cells: list[dict[str, Any]], *, min_events: int, max_events
     return candidates
 
 
+def _structural_candidate_cells(cells: list[dict[str, Any]], mature_threshold_events: int) -> list[dict[str, Any]]:
+    mature_cells = [cell for cell in cells if int(cell.get("event_count") or 0) >= mature_threshold_events]
+    mature_groups = {(str(cell.get("regime") or "UNKNOWN"), _pnl_direction(cell)) for cell in mature_cells}
+    mature_regimes = {regime for regime, _direction in mature_groups}
+    candidates = []
+    for cell in cells:
+        event_count = int(cell.get("event_count") or 0)
+        if event_count >= mature_threshold_events:
+            continue
+        regime = str(cell.get("regime") or "UNKNOWN")
+        pnl_direction = _pnl_direction(cell)
+        if (regime, pnl_direction) in mature_groups:
+            relation = "same_regime_pnl_direction"
+        elif regime in mature_regimes:
+            relation = "same_regime"
+        else:
+            continue
+        candidates.append({
+            "cell": cell.get("cell"),
+            "event_count": event_count,
+            "sample_count": cell.get("sample_count"),
+            "dominant_venue": cell.get("dominant_venue"),
+            "mean_pnl_bps": cell.get("mean_pnl_bps"),
+            "stdev_pnl_bps": cell.get("stdev_pnl_bps"),
+            "pnl_direction": pnl_direction,
+            "structural_relation": relation,
+            "next_required_event_count": mature_threshold_events,
+            "events_to_mature": max(mature_threshold_events - event_count, 0),
+        })
+    candidates.sort(key=lambda cell: (
+        0 if cell.get("structural_relation") == "same_regime_pnl_direction" else 1,
+        int(cell.get("events_to_mature") or mature_threshold_events),
+        -int(cell.get("sample_count") or 0),
+        str(cell.get("cell") or ""),
+    ))
+    return candidates
+
+
 def _next_gate_for_state(state: str, cells: list[dict[str, Any]], mature_threshold_events: int) -> dict[str, Any]:
     if state == "NO_REPLICATED_CELLS":
         return {
@@ -235,7 +273,7 @@ def _next_gate_for_state(state: str, cells: list[dict[str, Any]], mature_thresho
             "target_state": "STRUCTURAL",
             "condition": "multiple mature cells cohere by regime and pnl direction",
             "summary": "Show that evidence is broader than one isolated mature cell.",
-            "candidate_cells": _candidate_cells(cells, min_events=mature_threshold_events),
+            "candidate_cells": _structural_candidate_cells(cells, mature_threshold_events),
         }
     return {
         "name": "BROKER_REALITY",
