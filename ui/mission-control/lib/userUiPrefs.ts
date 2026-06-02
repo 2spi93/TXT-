@@ -38,19 +38,49 @@ export type SaveBackendUserUiPreferencesResult = {
   conflict: boolean;
 };
 
-const UI_MODE_STORAGE_KEY = "gtixt.ui.mode.v1";
-const CHART_MOTION_PRESET_STORAGE_KEY = "gtixt.chart.motion.preset.v1";
-const CHART_SNAP_ENABLED_STORAGE_KEY = "gtixt.chart.snap.enabled.v1";
-const CHART_SNAP_PRIORITY_STORAGE_KEY = "gtixt.chart.snap.priority.v1";
-const CHART_RELEASE_SEND_MODE_STORAGE_KEY = "gtixt.chart.release.send-mode.v1";
-const CHART_HAPTIC_MODE_STORAGE_KEY = "gtixt.chart.haptic.mode.v1";
-const TERMINAL_DESK_VIEW_MODE_STORAGE_KEY = "gtixt.terminal.desk-view-mode.v1";
-const TERMINAL_CHART_BAR_MODE_BY_SYMBOL_STORAGE_KEY = "gtixt.terminal.chart-bar-mode.by-symbol.v1";
-const USER_UI_PREFS_LOCAL_UPDATED_AT_KEY = "gtixt.ui.prefs.updated-at.v1";
+const UI_MODE_STORAGE_KEY = "txt.ui.mode.v1";
+const CHART_MOTION_PRESET_STORAGE_KEY = "txt.chart.motion.preset.v1";
+const CHART_SNAP_ENABLED_STORAGE_KEY = "txt.chart.snap.enabled.v1";
+const CHART_SNAP_PRIORITY_STORAGE_KEY = "txt.chart.snap.priority.v1";
+const CHART_RELEASE_SEND_MODE_STORAGE_KEY = "txt.chart.release.send-mode.v1";
+const CHART_HAPTIC_MODE_STORAGE_KEY = "txt.chart.haptic.mode.v1";
+const TERMINAL_DESK_VIEW_MODE_STORAGE_KEY = "txt.terminal.desk-view-mode.v1";
+const TERMINAL_CHART_BAR_MODE_BY_SYMBOL_STORAGE_KEY = "txt.terminal.chart-bar-mode.by-symbol.v1";
+const USER_UI_PREFS_LOCAL_UPDATED_AT_KEY = "txt.ui.prefs.updated-at.v1";
+const LEGACY_UI_STORAGE_KEYS: Record<string, string> = {
+  [UI_MODE_STORAGE_KEY]: "gtixt.ui.mode.v1",
+  [CHART_MOTION_PRESET_STORAGE_KEY]: "gtixt.chart.motion.preset.v1",
+  [CHART_SNAP_ENABLED_STORAGE_KEY]: "gtixt.chart.snap.enabled.v1",
+  [CHART_SNAP_PRIORITY_STORAGE_KEY]: "gtixt.chart.snap.priority.v1",
+  [CHART_RELEASE_SEND_MODE_STORAGE_KEY]: "gtixt.chart.release.send-mode.v1",
+  [CHART_HAPTIC_MODE_STORAGE_KEY]: "gtixt.chart.haptic.mode.v1",
+  [TERMINAL_DESK_VIEW_MODE_STORAGE_KEY]: "gtixt.terminal.desk-view-mode.v1",
+  [TERMINAL_CHART_BAR_MODE_BY_SYMBOL_STORAGE_KEY]: "gtixt.terminal.chart-bar-mode.by-symbol.v1",
+  [USER_UI_PREFS_LOCAL_UPDATED_AT_KEY]: "gtixt.ui.prefs.updated-at.v1",
+};
 const BACKEND_PREFS_FETCH_DEDUPE_MS = 2000;
 
 let backendPrefsInFlight: Promise<BackendUserUiPreferencesResponse | null> | null = null;
 let backendPrefsCache: { at: number; payload: BackendUserUiPreferencesResponse | null } | null = null;
+
+function readLocalStorageValue(key: string): string | null {
+  if (typeof window === "undefined") return null;
+  const current = window.localStorage.getItem(key);
+  if (current !== null) return current;
+  const legacyKey = LEGACY_UI_STORAGE_KEYS[key];
+  if (!legacyKey) return null;
+  const legacy = window.localStorage.getItem(legacyKey);
+  if (legacy !== null) {
+    window.localStorage.setItem(key, legacy);
+  }
+  return legacy;
+}
+
+function writeLocalStorageValue(key: string, value: string): void {
+  if (typeof window !== "undefined") {
+    window.localStorage.setItem(key, value);
+  }
+}
 
 function normalizeChartMotionPreset(preset: string | null | undefined): ChartMotionPreset {
   if (preset === "aggressive") return "scalping";
@@ -75,7 +105,7 @@ function normalizeTerminalChartBarModeSymbol(symbol: string | null | undefined):
 function readStoredTerminalChartBarModeMap(): Record<string, TerminalChartBarModePreference> {
   if (typeof window === "undefined") return {};
   try {
-    const raw = window.localStorage.getItem(TERMINAL_CHART_BAR_MODE_BY_SYMBOL_STORAGE_KEY);
+    const raw = readLocalStorageValue(TERMINAL_CHART_BAR_MODE_BY_SYMBOL_STORAGE_KEY);
     if (!raw) {
       return {};
     }
@@ -95,7 +125,7 @@ function readStoredTerminalChartBarModeMap(): Record<string, TerminalChartBarMod
 
 function setStoredTerminalChartBarModeMap(value: Record<string, TerminalChartBarModePreference>): void {
   if (typeof window !== "undefined") {
-    window.localStorage.setItem(TERMINAL_CHART_BAR_MODE_BY_SYMBOL_STORAGE_KEY, JSON.stringify(value));
+    writeLocalStorageValue(TERMINAL_CHART_BAR_MODE_BY_SYMBOL_STORAGE_KEY, JSON.stringify(value));
   }
   touchLocalPrefsUpdatedAt();
 }
@@ -107,24 +137,24 @@ function applyMode(mode: UiMode): void {
 
 function touchLocalPrefsUpdatedAt(): void {
   if (typeof window !== "undefined") {
-    window.localStorage.setItem(USER_UI_PREFS_LOCAL_UPDATED_AT_KEY, new Date().toISOString());
+    writeLocalStorageValue(USER_UI_PREFS_LOCAL_UPDATED_AT_KEY, new Date().toISOString());
   }
 }
 
 export function readLocalUserUiPreferencesUpdatedAt(): string | null {
   if (typeof window === "undefined") return null;
-  return window.localStorage.getItem(USER_UI_PREFS_LOCAL_UPDATED_AT_KEY);
+  return readLocalStorageValue(USER_UI_PREFS_LOCAL_UPDATED_AT_KEY);
 }
 
 export function setLocalUserUiPreferencesUpdatedAt(value: string): void {
   if (typeof window !== "undefined") {
-    window.localStorage.setItem(USER_UI_PREFS_LOCAL_UPDATED_AT_KEY, value);
+    writeLocalStorageValue(USER_UI_PREFS_LOCAL_UPDATED_AT_KEY, value);
   }
 }
 
 function setStoredUiMode(mode: UiMode): void {
   if (typeof window !== "undefined") {
-    window.localStorage.setItem(UI_MODE_STORAGE_KEY, mode);
+    writeLocalStorageValue(UI_MODE_STORAGE_KEY, mode);
   }
   applyMode(mode);
   touchLocalPrefsUpdatedAt();
@@ -132,53 +162,53 @@ function setStoredUiMode(mode: UiMode): void {
 
 function setStoredChartMotionPreset(preset: ChartMotionPreset): void {
   if (typeof window !== "undefined") {
-    window.localStorage.setItem(CHART_MOTION_PRESET_STORAGE_KEY, preset);
+    writeLocalStorageValue(CHART_MOTION_PRESET_STORAGE_KEY, preset);
   }
   touchLocalPrefsUpdatedAt();
 }
 
 export function readStoredChartSnapEnabled(): boolean {
   if (typeof window === "undefined") return true;
-  const raw = window.localStorage.getItem(CHART_SNAP_ENABLED_STORAGE_KEY);
+  const raw = readLocalStorageValue(CHART_SNAP_ENABLED_STORAGE_KEY);
   return raw !== "0";
 }
 
 function setStoredChartSnapEnabled(value: boolean): void {
   if (typeof window !== "undefined") {
-    window.localStorage.setItem(CHART_SNAP_ENABLED_STORAGE_KEY, value ? "1" : "0");
+    writeLocalStorageValue(CHART_SNAP_ENABLED_STORAGE_KEY, value ? "1" : "0");
   }
   touchLocalPrefsUpdatedAt();
 }
 
 function setStoredChartSnapPriority(value: ChartSnapPriority): void {
   if (typeof window !== "undefined") {
-    window.localStorage.setItem(CHART_SNAP_PRIORITY_STORAGE_KEY, value);
+    writeLocalStorageValue(CHART_SNAP_PRIORITY_STORAGE_KEY, value);
   }
   touchLocalPrefsUpdatedAt();
 }
 
 function setStoredChartReleaseSendMode(value: ChartReleaseSendMode): void {
   if (typeof window !== "undefined") {
-    window.localStorage.setItem(CHART_RELEASE_SEND_MODE_STORAGE_KEY, value);
+    writeLocalStorageValue(CHART_RELEASE_SEND_MODE_STORAGE_KEY, value);
   }
   touchLocalPrefsUpdatedAt();
 }
 
 function setStoredChartHapticMode(value: ChartHapticMode): void {
   if (typeof window !== "undefined") {
-    window.localStorage.setItem(CHART_HAPTIC_MODE_STORAGE_KEY, value);
+    writeLocalStorageValue(CHART_HAPTIC_MODE_STORAGE_KEY, value);
   }
   touchLocalPrefsUpdatedAt();
 }
 
 export function readStoredTerminalDeskViewMode(): TerminalDeskViewModePreference {
   if (typeof window === "undefined") return "auto";
-  return normalizeTerminalDeskViewMode(window.localStorage.getItem(TERMINAL_DESK_VIEW_MODE_STORAGE_KEY));
+  return normalizeTerminalDeskViewMode(readLocalStorageValue(TERMINAL_DESK_VIEW_MODE_STORAGE_KEY));
 }
 
 export function setStoredTerminalDeskViewMode(value: TerminalDeskViewModePreference): void {
   if (typeof window !== "undefined") {
-    window.localStorage.setItem(TERMINAL_DESK_VIEW_MODE_STORAGE_KEY, normalizeTerminalDeskViewMode(value));
+    writeLocalStorageValue(TERMINAL_DESK_VIEW_MODE_STORAGE_KEY, normalizeTerminalDeskViewMode(value));
   }
   touchLocalPrefsUpdatedAt();
 }
@@ -209,7 +239,7 @@ export function setStoredTerminalChartBarMode(symbol: string, mode: TerminalChar
 
 export function readStoredUiMode(): UiMode {
   if (typeof window === "undefined") return "expert";
-  const raw = window.localStorage.getItem(UI_MODE_STORAGE_KEY);
+  const raw = readLocalStorageValue(UI_MODE_STORAGE_KEY);
   return raw === "novice" ? "novice" : "expert";
 }
 
@@ -232,7 +262,7 @@ export function useUiMode(): [UiMode, (mode: UiMode) => void] {
 
 export function readStoredChartMotionPreset(): ChartMotionPreset {
   if (typeof window === "undefined") return "auto";
-  const raw = window.localStorage.getItem(CHART_MOTION_PRESET_STORAGE_KEY);
+  const raw = readLocalStorageValue(CHART_MOTION_PRESET_STORAGE_KEY);
   return normalizeChartMotionPreset(raw);
 }
 
@@ -268,7 +298,7 @@ export function useChartSnapEnabled(): [boolean, (value: boolean) => void] {
 
 export function readStoredChartSnapPriority(): ChartSnapPriority {
   if (typeof window === "undefined") return "execution";
-  const raw = window.localStorage.getItem(CHART_SNAP_PRIORITY_STORAGE_KEY);
+  const raw = readLocalStorageValue(CHART_SNAP_PRIORITY_STORAGE_KEY);
   if (raw === "vwap" || raw === "liquidity") {
     return raw;
   }
@@ -292,7 +322,7 @@ export function useChartSnapPriority(): [ChartSnapPriority, (value: ChartSnapPri
 
 export function readStoredChartReleaseSendMode(): ChartReleaseSendMode {
   if (typeof window === "undefined") return "confirm-required";
-  const raw = window.localStorage.getItem(CHART_RELEASE_SEND_MODE_STORAGE_KEY);
+  const raw = readLocalStorageValue(CHART_RELEASE_SEND_MODE_STORAGE_KEY);
   return raw === "one-click" ? "one-click" : "confirm-required";
 }
 
@@ -313,7 +343,7 @@ export function useChartReleaseSendMode(): [ChartReleaseSendMode, (value: ChartR
 
 export function readStoredChartHapticMode(): ChartHapticMode {
   if (typeof window === "undefined") return "light";
-  const raw = window.localStorage.getItem(CHART_HAPTIC_MODE_STORAGE_KEY);
+  const raw = readLocalStorageValue(CHART_HAPTIC_MODE_STORAGE_KEY);
   if (raw === "off" || raw === "medium") {
     return raw;
   }

@@ -16,6 +16,7 @@ import RuntimeStabilityDebugView from "../components/ui/RuntimeStabilityDebugVie
 import { readMissionControlBlueGreenStatus } from "../lib/blueGreenUiStatus";
 import { getRuntimeDecisionAnalytics } from "../lib/runtimeDecisionAnalytics";
 import { ensureRuntimeDecisionWriterStarted } from "../lib/runtimeDecisionWriter";
+import { UI_HELP_HINTS, UI_TERMS } from "../lib/uiLexicon";
 import { getRoleGroup, getRoleDisplayLabel, isClientRole } from "../lib/roleGroups";
 import { getServerRole } from "../lib/serverAuth";
 
@@ -395,7 +396,7 @@ export default async function DashboardPageContent() {
             {" | "}
             <Link href="/learn">TXT Learn</Link>
             {" | "}
-            <Link href="/advanced">TXT Advanced</Link>
+            <Link href="/advanced">TXT Diagnostics</Link>
             {" | "}
             <Link href="/settings">TXT Settings</Link>
             {" | "}
@@ -412,7 +413,7 @@ export default async function DashboardPageContent() {
           </div>
         </div>
         <div className="panel">
-          <div className="eyebrow">Security <HelpHint text="RBAC, rotation mot de passe, signatures et garde-fous d'execution." examples={["Avant un passage live, verifie que ton role est correct et que Paper only n'est pas incoherent.", "Si un ordre sensible doit sortir, assure-toi que la validation HMAC et les approvals sont disponibles."]} /></div>
+          <div className="eyebrow">Security <HelpHint text={UI_HELP_HINTS.dashboardSecurity.text} examples={UI_HELP_HINTS.dashboardSecurity.examples} /></div>
           <div className="metric good">RBAC + Signed Approvals</div>
           <p className="subtle">Les approbations passent par bearer token, role et signature HMAC.</p>
           <div className="row"><span>Policy version</span><span>{String(safeOverview.policy_version)}</span></div>
@@ -424,7 +425,7 @@ export default async function DashboardPageContent() {
         <div className="panel runtime-decision-dashboard-panel" data-testid="runtime-decision-dashboard-panel">
           <RuntimeDecisionOverviewCard summary={runtimeDecisionSummary} title="Runtime Decision Desk" exportHref={runtimeDecisionExportHref} />
           <p className="subtle" style={{ marginTop: 10 }}>
-            <Link href="/live-readiness/drift-alert-log">Ouvrir le drift alert log detaille</Link>
+            <Link href="/live-readiness/drift-alert-log">Ouvrir le {UI_TERMS.driftLog.toLowerCase()} detaille</Link>
           </p>
         </div>
         <MissionControlBlueGreenCard status={blueGreenStatus} compact />
@@ -432,7 +433,7 @@ export default async function DashboardPageContent() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1.1fr 0.9fr" }}>
         <div className="panel" data-testid="improvement-desk-panel">
-          <div className="eyebrow">Controlled Improvement Desk <HelpHint text="Lecture operateur des propositions, simulations et validations avant toute couche de deploiement." examples={["Un ACCEPT avec delta pnl positif mais drawdown en hausse doit encore etre juge par un humain.", "Si la simulation reste en heuristic_fallback, ne traite pas le resultat comme une preuve forte."]} /></div>
+          <div className="eyebrow">Controlled Improvement Desk <HelpHint text={UI_HELP_HINTS.dashboardImprovementDesk.text} examples={UI_HELP_HINTS.dashboardImprovementDesk.examples} /></div>
           {primaryImprovementScope?.scopeId ? (
             <>
               <div className="metric good">{String(improvementProposalsPayload?.proposal_count || 0)} proposals</div>
@@ -470,7 +471,7 @@ export default async function DashboardPageContent() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1.1fr 0.9fr" }}>
         <div className="panel" data-testid="deployment-desk-panel">
-          <div className="eyebrow">Controlled Deployment Desk <HelpHint text="Canary versionne, monitoring post-change et rollback prepare. Rien n'entre ici sans validation ACCEPT." examples={["Un canary CONFIRMED passe en full rollout logique sans perdre la trace de sa config versionnee.", "Si le monitoring voit slippage ou drawdown se degrader, le rollback devient immediatement recommandable."]} /></div>
+          <div className="eyebrow">Controlled Deployment Desk <HelpHint text={UI_HELP_HINTS.dashboardDeploymentDesk.text} examples={UI_HELP_HINTS.dashboardDeploymentDesk.examples} /></div>
           <div className={`metric ${Number(improvementDeploymentPayload?.active_count || 0) > 0 ? "good" : "subtle"}`}>{String(improvementDeploymentPayload?.active_count || 0)} active deployments</div>
           <p className="subtle">Canary scope versionne, branche uniquement sur ACCEPT, puis score de promotion, auto-confirmation et reduction adaptative d'exposition avant rollback complet.</p>
           {deploymentDeskRows.length === 0 ? <p className="subtle">Aucun canary actif pour le moment.</p> : null}
@@ -545,7 +546,7 @@ export default async function DashboardPageContent() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1.1fr 0.9fr" }}>
         <div className="panel">
-          <div className="eyebrow">Next Step Architecture <HelpHint text="Ordre de delivery valide niveau production: drift avant densite d'opportunite, puis dashboard, puis calibration lente." examples={["Ne calibre rien si la verite journal/runtime est encore confuse.", "Un dashboard sans drift engine observe juste des symptomes: il ne detecte pas les changements de comportement du systeme."]} /></div>
+          <div className="eyebrow">Next Step Architecture <HelpHint text={UI_HELP_HINTS.dashboardNextStepArchitecture.text} examples={UI_HELP_HINTS.dashboardNextStepArchitecture.examples} /></div>
           <div className="metric good">Drift → Opportunity → Dashboard → Calibration</div>
           <p className="subtle">Le systeme est maintenant explicable. La couche suivante doit detecter les glissements de comportement avant d'ajuster les seuils.</p>
           <div className="row"><span>Current dominant bucket</span><span>{runtimeDecisionSummary.dominant.bucket.label}</span></div>
@@ -566,7 +567,7 @@ export default async function DashboardPageContent() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1.1fr 0.9fr" }}>
         <div className="panel">
-          <div className="eyebrow">Venue Health <HelpHint text="Badge unifie backend pour savoir si l'execution est bloquee, reduite ou nominale." examples={["Si le badge passe en REDUCE SIZE, la taille live backend est deja rabotee.", "Si le badge passe en LIVE BLOCKED, ne cherche pas a forcer un smoke test: le control-plane coupe deja l'execution."]} /></div>
+          <div className="eyebrow">Venue Health <HelpHint text={UI_HELP_HINTS.dashboardVenueHealth.text} examples={UI_HELP_HINTS.dashboardVenueHealth.examples} /></div>
           {executionVenueRows.length === 0 ? <p className="subtle">Aucune venue d'execution live liee.</p> : null}
           {executionVenueRows.map((item) => {
             const badge = getConnectorHealthView(item);
@@ -582,7 +583,7 @@ export default async function DashboardPageContent() {
           })}
         </div>
         <div className="panel">
-          <div className="eyebrow">Data Mesh Health <HelpHint text="Supervision des venues de marche prioritaires pour la migration venue-aware." examples={["OKX, Binance et Bybit servent ici de thermometre data/market-health.", "Une venue peut etre bonne en data mais non prete en execution si aucun compte trade n'est lie."]} /></div>
+          <div className="eyebrow">Data Mesh Health <HelpHint text={UI_HELP_HINTS.dashboardDataMeshHealth.text} examples={UI_HELP_HINTS.dashboardDataMeshHealth.examples} /></div>
           {marketVenueRows.length === 0 ? <p className="subtle">Aucune venue de data prioritaire visible.</p> : null}
           {marketVenueRows.map((item) => {
             const badge = getConnectorHealthView(item);
@@ -602,7 +603,7 @@ export default async function DashboardPageContent() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Public Probe <HelpHint text="Reference probe du chart public. Ce bloc ne parle pas forcement de l'onglet terminal local en face de toi." examples={["Si ce probe est green mais le terminal local est rouge, le probleme est dans l'instance locale ou son feed choisi.", "Si failure reason=freshness, le chart public peut encore rendre des bougies mais avec retard."]} /></div>
+          <div className="eyebrow">Public Probe <HelpHint text={UI_HELP_HINTS.dashboardPublicProbe.text} examples={UI_HELP_HINTS.dashboardPublicProbe.examples} /></div>
           <div className={`metric ${String(publicChartVisibility?.state || publicChartVisibility?.public_chart_state || "unknown") === "healthy" ? "good" : "warn"}`}>{String(publicChartVisibility?.state || publicChartVisibility?.public_chart_state || "unavailable")}</div>
           <div className="row"><span>Failure reason</span><span>{String(publicChartVisibility?.failure_reason || "none")}</span></div>
           <div className="row"><span>Feed</span><span>{String(((publicChartVisibility?.ohlcv_contract as RecordItem | undefined)?.instrument) || "-")} @ {String(((publicChartVisibility?.ohlcv_contract as RecordItem | undefined)?.venue) || "-")}</span></div>
@@ -610,7 +611,7 @@ export default async function DashboardPageContent() {
           <div className="row"><span>Generated</span><span>{String(healthwatchDashboard?.generated_at || "-").slice(11, 19) || "-"}</span></div>
         </div>
         <div className="panel">
-          <div className="eyebrow">Local Terminal Capture <HelpHint text="Snapshot persiste de l'onglet terminal actif. C'est la source de verite pour verifier les pills exactes d'une instance locale." examples={["Si tu vois BUS OFFLINE dans l'onglet, ce bloc doit montrer la meme chose ici si cette instance publie encore ses captures.", "Le client id permet de distinguer plusieurs onglets ou postes de travail si necessaire."]} /></div>
+          <div className="eyebrow">Local Terminal Capture <HelpHint text={UI_HELP_HINTS.dashboardLocalTerminalCapture.text} examples={UI_HELP_HINTS.dashboardLocalTerminalCapture.examples} /></div>
           {latestLocalTerminalCapture ? (
             <>
               <div className={`metric ${latestLocalTerminalCapture.runtime.attention?.shouldBlockTrading || latestLocalTerminalCapture.runtime.noCandlesExpected ? "warn" : "good"}`}>{latestLocalTerminalCapture.runtime.attention?.shouldBlockTrading || latestLocalTerminalCapture.runtime.noCandlesExpected ? "Attention required" : "Flowing"}</div>
@@ -637,7 +638,7 @@ export default async function DashboardPageContent() {
 
       <section className="grid">
         <div className="panel">
-          <div className="eyebrow">Balances <HelpHint text="Liquidite par devise depuis le broker adapter." examples={["Si USDT libre baisse trop, reduis la taille des nouveaux ordres crypto.", "Si USD libre est a zero, n'envoie pas de ticket forex sans reallouer du cash."]} /></div>
+          <div className="eyebrow">Balances <HelpHint text={UI_HELP_HINTS.dashboardBalances.text} examples={UI_HELP_HINTS.dashboardBalances.examples} /></div>
           {balanceRows.map((item) => (
             <div className="row" key={String(item.currency)}>
               <span>{String(item.currency)}</span>
@@ -646,7 +647,7 @@ export default async function DashboardPageContent() {
           ))}
         </div>
         <div className="panel">
-          <div className="eyebrow">Positions <HelpHint text="Exposition nette en temps reel par instrument." examples={["Si BTCUSD est trop gros par rapport au reste, coupe ou hedge avant un news event.", "Si une ligne apparait ici alors qu'aucun bot ne devrait tourner, va verifier Connecteurs et Incidents."]} /></div>
+          <div className="eyebrow">Positions <HelpHint text={UI_HELP_HINTS.dashboardPositions.text} examples={UI_HELP_HINTS.dashboardPositions.examples} /></div>
           {safePositions.map((item) => (
             <div className="row" key={String(item.instrument)}>
               <span>{String(item.instrument)}</span>
@@ -655,7 +656,7 @@ export default async function DashboardPageContent() {
           ))}
         </div>
         <div className="panel">
-          <div className="eyebrow">Market Data <HelpHint text="Derniers ticks consolides pour supervision rapide." examples={["Utilise ce bloc pour voir en 2 secondes si le prix bouge encore normalement.", "Si le dernier prix semble fige, suspecte un connecteur de marche ou un broker en retard."]} /></div>
+          <div className="eyebrow">Market Data <HelpHint text={UI_HELP_HINTS.dashboardMarketData.text} examples={UI_HELP_HINTS.dashboardMarketData.examples} /></div>
           {safeQuotes.map((item) => (
             <div className="row" key={`${String(item.venue)}-${String(item.instrument)}`}>
               <span>{String(item.instrument)}</span>
@@ -664,7 +665,7 @@ export default async function DashboardPageContent() {
           ))}
         </div>
         <div className="panel">
-          <div className="eyebrow">Audit Trail <HelpHint text="Journal d'evenements pour non-repudiation et gouvernance." examples={["Si un operateur dit qu'il n'a rien fait, verifie ici la trace exacte.", "Si une approbation live est contestee, l'audit trail est la premiere preuve a lire."]} /></div>
+          <div className="eyebrow">Audit Trail <HelpHint text={UI_HELP_HINTS.dashboardAuditTrail.text} examples={UI_HELP_HINTS.dashboardAuditTrail.examples} /></div>
           {safeAudit.slice(0, 5).map((item, index) => (
             <div className="row" key={`${String(item.timestamp)}-${index}`}>
               <span>{String(item.category)}</span>
@@ -676,7 +677,7 @@ export default async function DashboardPageContent() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Pending Approvals <HelpHint text="Intentions acceptees par le risk gateway en attente de validation humaine." examples={["Exemple: une strategie propose un ordre, le risk gateway l'accepte, l'humain clique Approve ici.", "Si tu ne comprends pas le contexte d'un intent, n'approuve pas: ouvre IA ou Incidents pour investiguer."]} /></div>
+          <div className="eyebrow">Pending Approvals <HelpHint text={UI_HELP_HINTS.dashboardPendingApprovals.text} examples={UI_HELP_HINTS.dashboardPendingApprovals.examples} /></div>
           {pendingRows.length === 0 ? <p className="subtle">Aucune intention en attente.</p> : null}
           {pendingRows.map(([intentId, payload]) => (
             <div className="row" key={intentId}>
@@ -692,7 +693,7 @@ export default async function DashboardPageContent() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Strategy Registry <HelpHint text="Catalogue des strategies avec progression de niveau et promotions." examples={["Create Strategy: enregistre une nouvelle strategie avant de la tester ailleurs.", "Promote: passe L2 vers L3 seulement si sharpe, drawdown et rationale sont solides."]} /></div>
+          <div className="eyebrow">Strategy Registry <HelpHint text={UI_HELP_HINTS.dashboardStrategyRegistry.text} examples={UI_HELP_HINTS.dashboardStrategyRegistry.examples} /></div>
           <form action="/api/strategies" method="post" className="form-grid" style={{ marginBottom: 14 }}>
             <input name="strategy_id" placeholder="strategy_id" required />
             <input name="name" placeholder="name" required />

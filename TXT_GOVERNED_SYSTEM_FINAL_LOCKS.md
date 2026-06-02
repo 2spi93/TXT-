@@ -188,6 +188,32 @@ Mission Control should eventually expose one compact operator line:
 Runtime Truth | Observation Truth | Edge Truth | Capital Truth
 ```
 
+During BROKER_REALITY, Runtime Truth must also expose a broker-reality layer:
+
+```text
+broker_ack_rate
+fill_rate
+broker_latency_ms
+slippage_bps
+reality_gap_samples
+last_real_fill_age_minutes
+broker_reality_state
+```
+
+Recommended broker reality progression:
+
+```text
+UNTESTED
+  -> CONNECTED
+  -> ACK_VALIDATED
+  -> FILL_VALIDATED
+  -> REALITY_GAP_MEASURING
+  -> REALITY_GAP_STABLE
+```
+
+This avoids a false sense of readiness where Edge Truth is `STRUCTURAL` but
+the execution path to real broker truth is still unproven.
+
 Each truth layer should return one of:
 
 ```text

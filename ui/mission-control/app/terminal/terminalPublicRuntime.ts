@@ -6,7 +6,7 @@ export const PUBLIC_TERMINAL_BACKGROUND_REFRESH_MS = 180_000;
 export const PUBLIC_TERMINAL_GOVERNANCE_REFRESH_MS = 120_000;
 export const PUBLIC_TERMINAL_FALLBACK_POLL_MS = 8_000;
 
-export function isGtixPublicHost(hostname: string): boolean {
+export function isTxtPublicHost(hostname: string): boolean {
   const normalized = hostname.trim().toLowerCase();
   return normalized === "app.txt.gtixt.com"
     || normalized === "staging.txt.gtixt.com"
@@ -14,8 +14,8 @@ export function isGtixPublicHost(hostname: string): boolean {
     || normalized === "api.staging.txt.gtixt.com";
 }
 
-export function isGtixPublicBrowserHost(): boolean {
-  return typeof window !== "undefined" && isGtixPublicHost(window.location.hostname);
+export function isTxtPublicBrowserHost(): boolean {
+  return typeof window !== "undefined" && isTxtPublicHost(window.location.hostname);
 }
 
 export function isAutomationBrowser(): boolean {
@@ -40,7 +40,7 @@ export function shouldPausePublicOpsRefresh(): boolean {
   if (typeof document === "undefined") {
     return false;
   }
-  if (!isGtixPublicBrowserHost()) {
+  if (!isTxtPublicBrowserHost()) {
     return false;
   }
   if (isAutomationBrowser()) {

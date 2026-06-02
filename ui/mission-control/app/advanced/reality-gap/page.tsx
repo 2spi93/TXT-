@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 
 import HelpHint from "../../../components/HelpHint";
@@ -81,6 +82,7 @@ function JsonDetails({ title, value, defaultOpen = false }: { title: string; val
 }
 
 export default function RealityGapPage() {
+  const searchParams = useSearchParams();
   const [samples, setSamples] = useState<JsonMap[]>([]);
   const [profiles, setProfiles] = useState<JsonMap[]>([]);
   const [selectedDecisionId, setSelectedDecisionId] = useState<string | null>(null);
@@ -95,6 +97,7 @@ export default function RealityGapPage() {
   const [detailError, setDetailError] = useState<string | null>(null);
   const [memoryError, setMemoryError] = useState<string | null>(null);
   const [memoryDetailError, setMemoryDetailError] = useState<string | null>(null);
+  const deepLinkedDecisionId = String(searchParams?.get("decisionId") || "").trim();
 
   const loadDecisionDetail = useCallback(async (decisionId: string) => {
     setDetailBusy(true);
@@ -141,7 +144,7 @@ export default function RealityGapPage() {
         fetch("/api/predictor/memory-v2", { cache: "no-store" }),
       ]);
       if (!samplesResponse.ok || !profilesResponse.ok) {
-        throw new Error("Impossible de charger la vue Reality Gap");
+        throw new Error("Impossible de charger la vue Execution Gap");
       }
       const samplesPayload = asMap(await samplesResponse.json());
       const profilesPayload = asMap(await profilesResponse.json());
@@ -156,9 +159,11 @@ export default function RealityGapPage() {
         setMemorySummary(null);
         setMemoryError("Memory V2 summary indisponible");
       }
-      const activeDecisionId = selectedDecisionId && nextSamples.some((sample) => String(sample.decision_id || "") === selectedDecisionId)
+      const activeDecisionId = selectedDecisionId
         ? selectedDecisionId
-        : String(nextSamples[0]?.decision_id || "") || null;
+        : deepLinkedDecisionId
+          ? deepLinkedDecisionId
+          : String(nextSamples[0]?.decision_id || "") || null;
       setSelectedDecisionId(activeDecisionId);
       setDecisionQuery(activeDecisionId || "");
       if (activeDecisionId) {
@@ -191,6 +196,15 @@ export default function RealityGapPage() {
     };
   }, [loadData]);
 
+  useEffect(() => {
+    if (!deepLinkedDecisionId) {
+      return;
+    }
+    setSelectedDecisionId((current) => (current === deepLinkedDecisionId ? current : deepLinkedDecisionId));
+    setDecisionQuery((current) => (current === deepLinkedDecisionId ? current : deepLinkedDecisionId));
+    void loadDecisionDetail(deepLinkedDecisionId);
+  }, [deepLinkedDecisionId, loadDecisionDetail]);
+
   const latestSample = samples[0] || null;
   const latestProfile = profiles[0] || null;
   const predictedExecution = asMap(selectedSample?.predicted_execution);
@@ -198,6 +212,7 @@ export default function RealityGapPage() {
   const samplePayload = asMap(selectedSample?.payload);
   const replayTelemetry = asMap(selectedReplay?.telemetry);
   const replayPayload = asMap(replayTelemetry.payload);
+  const replayRoot = asMap(selectedReplay);
   const replayFills = asList(selectedReplay?.fills);
   const replayPreTradeMemoryGate = asMap(selectedReplay?.pre_trade_memory_gate || replayPayload.pre_trade_memory_gate);
   const replayKairosHarness = asMap(selectedReplay?.kairos_harness || replayPayload.kairos_harness);
@@ -217,6 +232,16 @@ export default function RealityGapPage() {
   const memoryCausalMatch = asMap(memoryContextLookup.causal_match);
   const memoryRecommendation = asMap(memoryContextLookup.recommendation);
   const memoryRelatedExperiences = asList(selectedMemoryPayload.related_experiences);
+  const selectedApprovalId = String(
+    selectedSample?.approval_id
+    || samplePayload.approval_id
+    || asMap(samplePayload.governance).approval_id
+    || replayRoot.approval_id
+    || asMap(replayRoot.order_payload).approval_id
+    || asMap(replayPayload.governance).approval_id
+    || replayPayload.approval_id
+    || "",
+  ).trim();
   const comparisonRows: Array<[string, unknown, unknown, unknown]> = [
     ["Slippage", predictedExecution.slippage_bps, realizedExecution.slippage_bps, selectedSample?.gap_slippage_bps],
     ["Fill probability", predictedExecution.fill_probability, realizedExecution.fill_probability, selectedSample?.gap_fill_probability],
@@ -230,11 +255,11 @@ export default function RealityGapPage() {
     <main className="shell txt-page-shell">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.2fr 0.9fr", gap: 14 }}>
         <div className="panel txt-page-hero">
-          <div className="eyebrow">Reality Gap</div>
+          <div className="eyebrow">Execution Gap</div>
           <h1 className="title" style={{ fontSize: 30, marginBottom: 8 }}>Recent Samples & Profiles</h1>
-          <p className="subtle" style={{ marginBottom: 12 }}>Vue ops dense pour suivre le flux reality-gap, verifier l'auto-ingestion post-trade et lire rapidement le diff predicted vs realized.</p>
+          <p className="subtle" style={{ marginBottom: 12 }}>Vue ops dense pour suivre le flux execution-gap, verifier l'auto-ingestion post-trade et lire rapidement le diff predicted vs realized.</p>
           <OperatorPanelGuide
-            title="Guide Reality Gap"
+            title="Guide Execution Gap"
             what="La différence entre l'exécution attendue et l'exécution réelle."
             why="Comprendre si le moteur lit bien le terrain ou s'il faut le rendre plus prudent."
             example="Si le délai et l'écart de prix montent ensemble, il faut traiter la plateforme comme plus difficile."
@@ -246,7 +271,7 @@ export default function RealityGapPage() {
             <StatChip label="Artifact" value={samplePayload.rust_reality_gap ? "native" : "replay-only"} tone={samplePayload.rust_reality_gap ? "good" : "subtle"} />
           </div>
           <p style={{ marginTop: 12, marginBottom: 0 }}>
-            <Link href="/advanced">Advanced</Link>
+            <Link href="/advanced">Diagnostics</Link>
             {" | "}
             <Link href="/advanced/predictor-calibration">Predictor Calibration</Link>
             {" | "}
@@ -280,29 +305,49 @@ export default function RealityGapPage() {
           </div>
           <div className="table-like" style={{ display: "grid", gap: 6, maxHeight: 430, overflow: "auto" }}>
             {samples.map((sample) => (
-              <button
-                key={String(sample.sample_id)}
-                type="button"
-                className="row"
-                onClick={() => {
-                  const nextDecisionId = String(sample.decision_id || "");
-                  setSelectedDecisionId(nextDecisionId);
-                  setDecisionQuery(nextDecisionId);
-                  void loadDecisionDetail(nextDecisionId);
-                }}
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "1.35fr 0.7fr 0.8fr 0.8fr 0.9fr 1fr",
-                  gap: 10,
-                  alignItems: "start",
-                  textAlign: "left",
-                  border: String(sample.decision_id || "") === selectedDecisionId ? "1px solid rgba(255,255,255,0.35)" : undefined,
-                  borderRadius: 12,
-                  padding: "8px 10px",
-                }}
-              >
+              (() => {
+                const sampleDecisionId = String(sample.decision_id || "");
+                const isSelectedDecision = sampleDecisionId === selectedDecisionId;
+                const isDeepLinkedDecision = Boolean(deepLinkedDecisionId) && sampleDecisionId === deepLinkedDecisionId;
+                return (
+                  <button
+                    key={String(sample.sample_id)}
+                    type="button"
+                    className="row"
+                    onClick={() => {
+                      const nextDecisionId = String(sample.decision_id || "");
+                      setSelectedDecisionId(nextDecisionId);
+                      setDecisionQuery(nextDecisionId);
+                      void loadDecisionDetail(nextDecisionId);
+                    }}
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "1.35fr 0.7fr 0.8fr 0.8fr 0.9fr 1fr",
+                      gap: 10,
+                      alignItems: "start",
+                      textAlign: "left",
+                      border: isDeepLinkedDecision
+                        ? "2px solid rgba(255,196,64,0.95)"
+                        : isSelectedDecision
+                          ? "1px solid rgba(255,255,255,0.35)"
+                          : "1px solid rgba(255,255,255,0.08)",
+                      background: isDeepLinkedDecision
+                        ? "linear-gradient(90deg, rgba(255,196,64,0.22), rgba(255,196,64,0.08))"
+                        : undefined,
+                      boxShadow: isDeepLinkedDecision
+                        ? "0 0 0 1px rgba(255,196,64,0.35), 0 0 18px rgba(255,196,64,0.22)"
+                        : undefined,
+                      borderRadius: 12,
+                      padding: "8px 10px",
+                    }}
+                  >
                 <div>
-                  <strong>{String(sample.decision_id || "-")}</strong>
+                      <strong>{String(sample.decision_id || "-")}</strong>
+                      {isDeepLinkedDecision ? (
+                        <span style={{ marginLeft: 8, fontSize: 10, fontWeight: 700, letterSpacing: 0.4, textTransform: "uppercase", color: "#ffd166" }}>
+                          deep-link
+                        </span>
+                      ) : null}
                   <div className="subtle">{String(sample.symbol || "-")} · {String(sample.venue || "-")}</div>
                 </div>
                 <span>{String(sample.regime || "-")}</span>
@@ -313,7 +358,9 @@ export default function RealityGapPage() {
                   <strong>{String(sample.calibration_action || "-")}</strong>
                   <div className="subtle">{formatTs(sample.created_at)}</div>
                 </div>
-              </button>
+                  </button>
+                );
+              })()
             ))}
             {samples.length === 0 ? <div className="subtle">Aucun sample reality-gap recent.</div> : null}
           </div>
@@ -344,6 +391,14 @@ export default function RealityGapPage() {
           <div className="row"><span>Symbol</span><span>{String(selectedSample?.symbol || "-")}</span></div>
           <div className="row"><span>Failure source</span><span>{String(selectedSample?.failure_source || "none")}</span></div>
           <div className="row"><span>Calibration</span><span>{String(selectedSample?.calibration_action || "-")}</span></div>
+          {selectedApprovalId ? (
+            <div className="row">
+              <span>Correlation</span>
+              <span>
+                <Link href={`/live-ops?audit_filter=${encodeURIComponent(selectedApprovalId)}`}>Audit trail filtre ({selectedApprovalId})</Link>
+              </span>
+            </div>
+          ) : null}
           {detailError ? <p className="warn">{detailError}</p> : null}
           <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
             <input

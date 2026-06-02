@@ -1,10 +1,12 @@
 "use client";
 
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 
 import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
 import { openOpsCopilotPrompt } from "../../lib/opsCopilot";
+import { UI_TERMS, formatReasonLabel } from "../../lib/uiLexicon";
 import { ControlRoomMonitoringPanel, ExecutionPnlTruthMonitoringPanel, OperatorActionSummary } from "../terminal/TerminalSecondaryPanels";
 
 type JsonMap = Record<string, unknown>;
@@ -103,6 +105,8 @@ function formatPlanDate(input: Date): string {
 }
 
 export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: LiveOpsPageClientProps) {
+  const searchParams = useSearchParams();
+  const auditFilter = String(searchParams?.get("audit_filter") || "").trim();
   const [liveOpsPayload, setLiveOpsPayload] = useState<JsonMap | null>(initialLiveOpsPayload);
   const [executionPnlAnalyzerPayload, setExecutionPnlAnalyzerPayload] = useState<JsonMap | null>(null);
   const [executionAiV6Payload, setExecutionAiV6Payload] = useState<JsonMap | null>(null);
@@ -157,8 +161,11 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
         }
       };
 
+      const liveOpsUrl = auditFilter
+        ? `/api/system/live-ops?audit_filter=${encodeURIComponent(auditFilter)}`
+        : "/api/system/live-ops";
       const [liveOpsResponse, pnlResponse, executionAiResponse] = await Promise.all([
-        fetchJsonWithTimeout("/api/system/live-ops", LIVE_OPS_PRIMARY_FETCH_TIMEOUT_MS),
+        fetchJsonWithTimeout(liveOpsUrl, LIVE_OPS_PRIMARY_FETCH_TIMEOUT_MS),
         fetchJsonWithTimeout("/api/execution/pnl-analyzer?scope_type=strategy&scope_id=mt5-live&limit=50", LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS),
         fetchJsonWithTimeout("/api/execution/ai/v6/state", LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS),
       ]);
@@ -271,7 +278,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
       window.clearTimeout(initialRefreshTimer);
       window.clearInterval(timer);
     };
-  }, [initialLiveOpsPayload]);
+  }, [auditFilter, initialLiveOpsPayload]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -312,6 +319,174 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
   const recovery = asRecord(snapshot.recovery);
   const memoryGap = asRecord(snapshot.memory_gap);
   const runtimeTruth = asRecord(asRecord(snapshot.raw).runtime_truth);
+  const runtimeTruthLayers = asRecord(runtimeTruth.layers);
+  const decisionReality = asRecord(runtimeTruthLayers.decision_reality);
+  const decisionRealityState = String(decisionReality.decision_reality_state || "UNKNOWN").toUpperCase();
+  const decisionRealityNextGate = String(decisionReality.next_gate || "-");
+  const decisionCoverageRaw = Number(decisionReality.decision_quote_coverage_pct);
+  const decisionCoveragePct = Number.isFinite(decisionCoverageRaw) ? decisionCoverageRaw : null;
+  const decisionCoveredRows = toNumber(decisionReality.decision_quote_covered_rows, 0);
+  const decisionUncoveredRows = toNumber(decisionReality.decision_quote_uncovered_rows, 0);
+  const decisionObservedIgnoredRows = toNumber(decisionReality.decision_quote_observed_ignored_rows, 0);
+  const decisionObservedIgnoredRateRaw = Number(decisionReality.decision_quote_observed_ignored_rate_pct);
+  const decisionObservedIgnoredRatePct = Number.isFinite(decisionObservedIgnoredRateRaw) ? decisionObservedIgnoredRateRaw : null;
+  const decisionIgnoredGateThresholdRaw = Number(decisionReality.decision_quote_ignored_gate_threshold_pct);
+  const decisionIgnoredGateThresholdPct = Number.isFinite(decisionIgnoredGateThresholdRaw) ? decisionIgnoredGateThresholdRaw : 5;
+  const decisionIgnoredGateAlert = Boolean(decisionReality.decision_quote_ignored_gate_alert);
+  const decisionCoverageTone = decisionCoveragePct === null
+    ? "subtle"
+    : decisionCoveragePct >= 100
+      ? "good"
+      : decisionCoveragePct >= 75
+        ? "subtle"
+        : "warn";
+  const decisionTopUncoveredReasons = Array.isArray(decisionReality.decision_quote_top_uncovered_reasons)
+    ? (decisionReality.decision_quote_top_uncovered_reasons as Array<Record<string, unknown>>)
+      .slice(0, 4)
+      .map((item) => ({
+        reason: formatReasonLabel(String(item.reason || "")),
+        count: toNumber(item.count, 0),
+      }))
+      .filter((item) => item.reason !== "n/a")
+    : [];
+  const decisionCoverageBreakdown = Array.isArray(decisionReality.decision_quote_coverage_breakdown)
+    ? (decisionReality.decision_quote_coverage_breakdown as Array<Record<string, unknown>>)
+      .slice(0, 8)
+      .map((item) => ({
+        label: String(item.label || "").trim() || formatReasonLabel(String(item.key || "")),
+        count: toNumber(item.count, 0),
+        sharePct: Number.isFinite(Number(item.share_pct)) ? Number(item.share_pct) : null,
+      }))
+      .filter((item) => item.label !== "n/a")
+    : [];
+  const decisionCoverageTrend = asRecord(decisionReality.decision_quote_coverage_breakdown_trend);
+  const decisionCoverageTrend24h = asRecord(decisionCoverageTrend.last_24h);
+  const decisionCoverageTrend7d = asRecord(decisionCoverageTrend.last_7d);
+  const decisionCoverageTrendRows = [
+    {
+      label: "24h",
+      sampleRows: toNumber(decisionCoverageTrend24h.sample_rows, 0),
+      observedUsedPct: (() => {
+        const breakdown = Array.isArray(decisionCoverageTrend24h.breakdown) ? decisionCoverageTrend24h.breakdown as Array<Record<string, unknown>> : [];
+        const found = breakdown.find((item) => String(item.key || "") === "quote_observed_and_used");
+        const pct = Number(found?.share_pct);
+        return Number.isFinite(pct) ? pct : null;
+      })(),
+      observedIgnoredPct: (() => {
+        const breakdown = Array.isArray(decisionCoverageTrend24h.breakdown) ? decisionCoverageTrend24h.breakdown as Array<Record<string, unknown>> : [];
+        const found = breakdown.find((item) => String(item.key || "") === "quote_observed_but_ignored");
+        const pct = Number(found?.share_pct);
+        return Number.isFinite(pct) ? pct : null;
+      })(),
+    },
+    {
+      label: "7j",
+      sampleRows: toNumber(decisionCoverageTrend7d.sample_rows, 0),
+      observedUsedPct: (() => {
+        const breakdown = Array.isArray(decisionCoverageTrend7d.breakdown) ? decisionCoverageTrend7d.breakdown as Array<Record<string, unknown>> : [];
+        const found = breakdown.find((item) => String(item.key || "") === "quote_observed_and_used");
+        const pct = Number(found?.share_pct);
+        return Number.isFinite(pct) ? pct : null;
+      })(),
+      observedIgnoredPct: (() => {
+        const breakdown = Array.isArray(decisionCoverageTrend7d.breakdown) ? decisionCoverageTrend7d.breakdown as Array<Record<string, unknown>> : [];
+        const found = breakdown.find((item) => String(item.key || "") === "quote_observed_but_ignored");
+        const pct = Number(found?.share_pct);
+        return Number.isFinite(pct) ? pct : null;
+      })(),
+    },
+  ];
+  const decisionIgnoredDrilldown = Array.isArray(decisionReality.decision_quote_ignored_drilldown)
+    ? (decisionReality.decision_quote_ignored_drilldown as Array<Record<string, unknown>>)
+      .slice(0, 8)
+      .map((item) => ({
+        path: String(item.decision_path || "").trim() || "unknown_path",
+        source: String(item.source || "").trim() || "unknown_source",
+        reason: formatReasonLabel(String(item.decision_reason || "").trim() || "n/a"),
+        count: toNumber(item.count, 0),
+        sharePct: Number.isFinite(Number(item.share_pct)) ? Number(item.share_pct) : null,
+        recentDecisionIds: Array.isArray(item.recent_decision_ids)
+          ? (item.recent_decision_ids as Array<unknown>).map((value) => String(value || "").trim()).filter(Boolean).slice(0, 3)
+          : [],
+      }))
+      .sort((a, b) => b.count - a.count)
+      .filter((item) => item.count > 0)
+    : [];
+  const decisionIgnoredReasonBreakdown = Array.isArray(decisionReality.decision_quote_ignored_reason_breakdown)
+    ? (decisionReality.decision_quote_ignored_reason_breakdown as Array<Record<string, unknown>>)
+      .slice(0, 8)
+      .map((item) => ({
+        reason: formatReasonLabel(String(item.reason || "").trim() || "n/a"),
+        count: toNumber(item.count, 0),
+        sharePct: Number.isFinite(Number(item.share_pct)) ? Number(item.share_pct) : null,
+      }))
+      .filter((item) => item.count > 0)
+    : [];
+  const decisionPathIgnoredThresholdRaw = Number(decisionReality.decision_quote_ignored_path_threshold_pct);
+  const decisionPathIgnoredThresholdPct = Number.isFinite(decisionPathIgnoredThresholdRaw) ? decisionPathIgnoredThresholdRaw : 10;
+  const decisionPathIgnoredAlerts = Array.isArray(decisionReality.decision_quote_ignored_path_alerts)
+    ? (decisionReality.decision_quote_ignored_path_alerts as Array<Record<string, unknown>>)
+      .slice(0, 8)
+      .map((item) => ({
+        path: String(item.decision_path || "").trim() || "unknown_path",
+        ignoredRatePct: Number.isFinite(Number(item.ignored_rate_pct)) ? Number(item.ignored_rate_pct) : null,
+        ignoredRows: toNumber(item.ignored_rows, 0),
+        totalRows: toNumber(item.total_rows, 0),
+        alert: Boolean(item.alert),
+      }))
+      .sort((a, b) => {
+        if (a.alert !== b.alert) {
+          return a.alert ? -1 : 1;
+        }
+        return (b.ignoredRatePct || 0) - (a.ignoredRatePct || 0);
+      })
+      .filter((item) => item.totalRows > 0)
+    : [];
+  const decisionPathReasonIgnoredThresholdRaw = Number(decisionReality.decision_quote_ignored_path_reason_threshold_pct);
+  const decisionPathReasonIgnoredThresholdPct = Number.isFinite(decisionPathReasonIgnoredThresholdRaw) ? decisionPathReasonIgnoredThresholdRaw : 10;
+  const decisionPathReasonImpactThresholdRaw = Number(decisionReality.decision_quote_ignored_path_reason_impact_threshold_pct_points);
+  const decisionPathReasonImpactThresholdPctPoints = Number.isFinite(decisionPathReasonImpactThresholdRaw) ? decisionPathReasonImpactThresholdRaw : 1;
+  const decisionPathReasonIgnoredAlerts = Array.isArray(decisionReality.decision_quote_ignored_path_reason_alerts)
+    ? (decisionReality.decision_quote_ignored_path_reason_alerts as Array<Record<string, unknown>>)
+      .slice(0, 8)
+      .map((item) => ({
+        path: String(item.decision_path || "").trim() || "unknown_path",
+        reason: formatReasonLabel(String(item.decision_reason || "").trim() || "n/a"),
+        ignoredRatePct: Number.isFinite(Number(item.ignored_rate_pct)) ? Number(item.ignored_rate_pct) : null,
+        volumeSharePct: Number.isFinite(Number(item.volume_share_pct)) ? Number(item.volume_share_pct) : null,
+        impactPctPoints: Number.isFinite(Number(item.impact_pct_points)) ? Number(item.impact_pct_points) : null,
+        ignoredRows: toNumber(item.ignored_rows, 0),
+        totalRows: toNumber(item.total_rows, 0),
+        ignoredRateAlert: Boolean(item.ignored_rate_alert),
+        impactAlert: Boolean(item.impact_alert),
+        alert: Boolean(item.alert),
+      }))
+      .sort((a, b) => {
+        if (a.alert !== b.alert) {
+          return a.alert ? -1 : 1;
+        }
+        return (b.impactPctPoints || 0) - (a.impactPctPoints || 0);
+      })
+      .filter((item) => item.totalRows > 0 && item.ignoredRows > 0)
+    : [];
+  const decisionTopRemediationCandidates = Array.isArray(decisionReality.decision_quote_top_remediation_candidates)
+    ? (decisionReality.decision_quote_top_remediation_candidates as Array<Record<string, unknown>>)
+      .slice(0, 3)
+      .map((item) => ({
+        path: String(item.decision_path || "").trim() || "unknown_path",
+        reason: formatReasonLabel(String(item.decision_reason || "").trim() || "n/a"),
+        ignoredRatePct: Number.isFinite(Number(item.ignored_rate_pct)) ? Number(item.ignored_rate_pct) : null,
+        volumeSharePct: Number.isFinite(Number(item.volume_share_pct)) ? Number(item.volume_share_pct) : null,
+        impactPctPoints: Number.isFinite(Number(item.impact_pct_points)) ? Number(item.impact_pct_points) : null,
+        ignoredRows: toNumber(item.ignored_rows, 0),
+        totalRows: toNumber(item.total_rows, 0),
+        ignoredRateAlert: Boolean(item.ignored_rate_alert),
+        impactAlert: Boolean(item.impact_alert),
+        alert: Boolean(item.alert),
+        suggestedAction: String(item.suggested_action || "").trim() || "Inspect routing condition.",
+      }))
+      .filter((item) => item.ignoredRows > 0)
+    : [];
   const controlledCollection = asRecord(snapshot.controlled_collection);
   const collectionLabelProgress = asRecord(controlledCollection.label_progress);
   const collectionEdgeConfidence = asRecord(controlledCollection.edge_confidence);
@@ -632,7 +807,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
             {" | "}
             <Link href="/terminal">Terminal</Link>
             {" | "}
-            <Link href="/live-readiness">Readiness</Link>
+            <Link href="/live-readiness">{UI_TERMS.readiness}</Link>
             {" | "}
             <Link href="/incidents">Incidents</Link>
           </p>
@@ -794,6 +969,132 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
           <p className="subtle" style={{ marginTop: 8 }}>{truthLine.detail}</p>
           <div className="row" style={{ marginTop: 8 }}><span>Expectancy live</span><span className={expectancyR >= 0 ? "good" : "warn"}>{expectancyR >= 0 ? "+" : ""}{expectancyR.toFixed(2)}R</span></div>
           <div className="row" style={{ marginTop: 6 }}><span>No-trade score</span><span className={noTradeScore > 0.7 ? "warn" : noTradeScore > 0.45 ? "subtle" : "good"}>{(noTradeScore * 100).toFixed(0)}%</span></div>
+          <div style={{ marginTop: 12, borderRadius: 12, border: "1px solid rgba(148, 163, 184, 0.18)", padding: 12, background: "rgba(2, 6, 23, 0.18)" }}>
+            <div className="row"><span>{UI_TERMS.decisionReality}</span><span className={decisionCoverageTone}>{decisionCoveragePct === null ? "n/a" : `${decisionCoveragePct.toFixed(2)}%`}</span></div>
+            <div className="row"><span>Etat</span><span>{decisionRealityState}</span></div>
+            <div className="row"><span>Couvertes</span><span>{decisionCoveredRows}</span></div>
+            <div className="row"><span>Non couvertes</span><span>{decisionUncoveredRows}</span></div>
+            <div className="row"><span>Observed but ignored</span><span>{decisionObservedIgnoredRows}{decisionObservedIgnoredRatePct === null ? "" : ` · ${decisionObservedIgnoredRatePct.toFixed(2)}%`}</span></div>
+            <div className="row"><span>Gate alert ({decisionIgnoredGateThresholdPct.toFixed(1)}%)</span><span className={decisionIgnoredGateAlert ? "warn" : "good"}>{decisionIgnoredGateAlert ? "ALERT" : "OK"}</span></div>
+            <div className="row"><span>Prochain gate</span><span>{decisionRealityNextGate}</span></div>
+            {decisionTopUncoveredReasons.length > 0 ? (
+              <div className="subtle mini" style={{ marginTop: 8 }}>
+                Raisons principales: {decisionTopUncoveredReasons.map((item) => `${item.reason} (${item.count})`).join(" · ")}
+              </div>
+            ) : (
+              <div className="subtle mini" style={{ marginTop: 8 }}>Raisons principales: n/a</div>
+            )}
+            {decisionCoverageBreakdown.length > 0 ? (
+              <div style={{ marginTop: 10 }}>
+                <div className="subtle mini" style={{ marginBottom: 6 }}>Decision Coverage Breakdown</div>
+                {decisionCoverageBreakdown.map((item) => (
+                  <div className="row" key={`${item.label}-${item.count}`} style={{ marginTop: 4 }}>
+                    <span>{item.label}</span>
+                    <span>{item.count}{item.sharePct === null ? "" : ` · ${item.sharePct.toFixed(2)}%`}</span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            <div style={{ marginTop: 10 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Trend couverture</div>
+              {decisionCoverageTrendRows.map((row) => (
+                <div className="row" key={row.label} style={{ marginTop: 4 }}>
+                  <span>{row.label}</span>
+                  <span>
+                    used {row.observedUsedPct === null ? "n/a" : `${row.observedUsedPct.toFixed(2)}%`} · ignored {row.observedIgnoredPct === null ? "n/a" : `${row.observedIgnoredPct.toFixed(2)}%`} · n={row.sampleRows}
+                  </span>
+                </div>
+              ))}
+            </div>
+            <div style={{ marginTop: 10 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Alertes par decision_path (seuil {decisionPathIgnoredThresholdPct.toFixed(1)}%)</div>
+              {decisionPathIgnoredAlerts.length > 0 ? decisionPathIgnoredAlerts.map((item) => (
+                <div className="row" key={`${item.path}-${item.totalRows}-${item.ignoredRows}`} style={{ marginTop: 4 }}>
+                  <span>{item.path}</span>
+                  <span className={item.alert ? "warn" : "good"}>
+                    ignored {item.ignoredRatePct === null ? "n/a" : `${item.ignoredRatePct.toFixed(2)}%`} · {item.ignoredRows}/{item.totalRows} · {item.alert ? "ALERT" : "OK"}
+                  </span>
+                </div>
+              )) : (
+                <div className="subtle mini">Aucune alerte par path sur la fenetre active.</div>
+              )}
+            </div>
+            <div style={{ marginTop: 10 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>
+                Alertes par path + reason (seuil ignored {decisionPathReasonIgnoredThresholdPct.toFixed(1)}% · seuil impact {decisionPathReasonImpactThresholdPctPoints.toFixed(2)} pts)
+              </div>
+              {decisionPathReasonIgnoredAlerts.length > 0 ? decisionPathReasonIgnoredAlerts.map((item) => (
+                <div className="row" key={`${item.path}-${item.reason}-${item.totalRows}-${item.ignoredRows}`} style={{ marginTop: 4 }}>
+                  <span>{item.path} · {item.reason}</span>
+                  <span className={item.alert ? "warn" : "good"}>
+                    ignored {item.ignoredRatePct === null ? "n/a" : `${item.ignoredRatePct.toFixed(2)}%`} · impact {item.impactPctPoints === null ? "n/a" : `${item.impactPctPoints.toFixed(2)} pts`} · vol {item.volumeSharePct === null ? "n/a" : `${item.volumeSharePct.toFixed(2)}%`} · {item.ignoredRows}/{item.totalRows} · {item.alert ? "ALERT" : "OK"}
+                    {item.ignoredRateAlert ? " · by-rate" : ""}
+                    {item.impactAlert ? " · by-impact" : ""}
+                  </span>
+                </div>
+              )) : (
+                <div className="subtle mini">Aucune alerte path+reason sur la fenetre active.</div>
+              )}
+            </div>
+            <div style={{ marginTop: 10 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Top 3 remediation candidates (impact = % ignored × volume)</div>
+              {decisionTopRemediationCandidates.length > 0 ? decisionTopRemediationCandidates.map((item, index) => (
+                <div key={`${item.path}-${item.reason}-${index}`} style={{ marginTop: 6, border: "1px solid rgba(148, 163, 184, 0.12)", borderRadius: 10, padding: "6px 8px" }}>
+                  <div className="row">
+                    <span>#{index + 1} {item.path} · {item.reason}</span>
+                    <span className={item.alert ? "warn" : "subtle"}>
+                      impact {item.impactPctPoints === null ? "n/a" : `${item.impactPctPoints.toFixed(2)} pts`}
+                      {item.ignoredRateAlert ? " · by-rate" : ""}
+                      {item.impactAlert ? " · by-impact" : ""}
+                    </span>
+                  </div>
+                  <div className="subtle mini" style={{ marginTop: 4 }}>
+                    ignored {item.ignoredRatePct === null ? "n/a" : `${item.ignoredRatePct.toFixed(2)}%`} · volume {item.volumeSharePct === null ? "n/a" : `${item.volumeSharePct.toFixed(2)}%`} · {item.ignoredRows}/{item.totalRows}
+                  </div>
+                  <div className="subtle mini" style={{ marginTop: 4 }}>
+                    action: {item.suggestedAction}
+                  </div>
+                </div>
+              )) : (
+                <div className="subtle mini">Aucune remediation candidate calculable sur la fenetre active.</div>
+              )}
+            </div>
+            <div style={{ marginTop: 10 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Breakdown reasons · Quote observed but ignored</div>
+              {decisionIgnoredReasonBreakdown.length > 0 ? decisionIgnoredReasonBreakdown.map((item) => (
+                <div className="row" key={`${item.reason}-${item.count}`} style={{ marginTop: 4 }}>
+                  <span>{item.reason}</span>
+                  <span>{item.count}{item.sharePct === null ? "" : ` · ${item.sharePct.toFixed(2)}%`}</span>
+                </div>
+              )) : (
+                <div className="subtle mini">Aucune raison instrumentee sur la fenetre active.</div>
+              )}
+            </div>
+            <div style={{ marginTop: 10 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Gate Cause Drilldown · Quote observed but ignored</div>
+              {decisionIgnoredDrilldown.length > 0 ? decisionIgnoredDrilldown.map((item) => (
+                <div key={`${item.path}-${item.source}-${item.reason}-${item.count}`} style={{ marginTop: 6, border: "1px solid rgba(148, 163, 184, 0.12)", borderRadius: 10, padding: "6px 8px" }}>
+                  <div className="row">
+                    <span>{item.path} · {item.source}</span>
+                    <span>{item.count}{item.sharePct === null ? "" : ` · ${item.sharePct.toFixed(2)}%`}</span>
+                  </div>
+                  <div className="subtle mini" style={{ marginTop: 4 }}>
+                    reason: {item.reason}
+                  </div>
+                  <div className="subtle mini" style={{ marginTop: 4 }}>
+                    decision_id recents: {item.recentDecisionIds.length > 0 ? item.recentDecisionIds.map((decisionId, index) => (
+                      <span key={`${item.path}-${item.source}-${item.reason}-${decisionId}`}>
+                        {index > 0 ? " · " : ""}
+                        <Link href={`/advanced/reality-gap?decisionId=${encodeURIComponent(decisionId)}`}>{decisionId}</Link>
+                      </span>
+                    )) : "n/a"}
+                  </div>
+                </div>
+              )) : (
+                <div className="subtle mini">Aucune decision quote_observed_but_ignored sur la fenetre active.</div>
+              )}
+            </div>
+          </div>
           <div style={{ display: "grid", gap: 10, marginTop: 12 }}>
             {planCards.map((card) => (
               <div key={card.title} style={{ border: "1px solid rgba(148, 163, 184, 0.18)", borderRadius: 12, padding: 12, background: "rgba(15, 23, 42, 0.2)" }}>

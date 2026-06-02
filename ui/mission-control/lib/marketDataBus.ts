@@ -234,7 +234,7 @@ function createKernelTelemetryDefaults(): MarketDataBusKernelTelemetry {
   };
 }
 
-function isGtixPublicHost(hostname: string): boolean {
+function isTxtPublicHost(hostname: string): boolean {
   const normalized = hostname.trim().toLowerCase();
   return normalized === "app.txt.gtixt.com"
     || normalized === "staging.txt.gtixt.com"
@@ -246,7 +246,7 @@ function buildMarketOhlcvWsUrl(instrument: string, venue: string, timeframe: str
   if (typeof window === "undefined") {
     return "";
   }
-  if (isGtixPublicHost(window.location.hostname)) {
+  if (isTxtPublicHost(window.location.hostname)) {
     return "";
   }
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
@@ -286,7 +286,7 @@ function buildMarketDepthWsUrl(instrument: string, venue: string): string {
   if (typeof window === "undefined") {
     return "";
   }
-  if (isGtixPublicHost(window.location.hostname)) {
+  if (isTxtPublicHost(window.location.hostname)) {
     return "";
   }
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
@@ -298,7 +298,7 @@ function buildMarketTradesWsUrl(instrument: string, venue: string, limit = 200):
   if (typeof window === "undefined") {
     return "";
   }
-  if (isGtixPublicHost(window.location.hostname)) {
+  if (isTxtPublicHost(window.location.hostname)) {
     return "";
   }
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
@@ -422,7 +422,7 @@ function barsToLiveCandles(bars: OhlcvBar[]): LiveChartCandle[] {
 }
 
 function resolveSideRefreshMs(): number {
-  if (typeof window !== "undefined" && isGtixPublicHost(window.location.hostname)) {
+  if (typeof window !== "undefined" && isTxtPublicHost(window.location.hostname)) {
     return PUBLIC_SIDE_REFRESH_MS;
   }
   return SIDE_REFRESH_MS;

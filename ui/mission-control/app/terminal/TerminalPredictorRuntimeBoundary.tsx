@@ -34,6 +34,7 @@ type TerminalPredictorRuntimeProviderProps = {
   onTrainingStatsChange: (stats: PredictorEngineV8TrainingStats) => void;
   onPersistenceLoaded: (loaded: boolean) => void;
   storageKey: string;
+  legacyStorageKey?: string;
   trainingFlushSize: number;
   trainingFlushIntervalMs: number;
 };
@@ -87,6 +88,7 @@ export function TerminalPredictorTrainingBoundary() {
     onTrainingStatsChange,
     onPersistenceLoaded,
     storageKey,
+    legacyStorageKey,
     trainingFlushSize,
     trainingFlushIntervalMs,
   } = useTerminalPredictorRuntimeContext();
@@ -97,7 +99,13 @@ export function TerminalPredictorTrainingBoundary() {
       return;
     }
 
-    const raw = window.localStorage.getItem(storageKey);
+    let raw = window.localStorage.getItem(storageKey);
+    if (!raw && legacyStorageKey) {
+      raw = window.localStorage.getItem(legacyStorageKey);
+      if (raw) {
+        window.localStorage.setItem(storageKey, raw);
+      }
+    }
     if (!raw) {
       onPersistenceLoaded(true);
       return;
@@ -110,10 +118,13 @@ export function TerminalPredictorTrainingBoundary() {
       }
     } catch {
       window.localStorage.removeItem(storageKey);
+      if (legacyStorageKey) {
+        window.localStorage.removeItem(legacyStorageKey);
+      }
     }
 
     onPersistenceLoaded(true);
-  }, [onPersistenceLoaded, onTrainingStatsChange, predictorEngineV8Ref, storageKey]);
+  }, [legacyStorageKey, onPersistenceLoaded, onTrainingStatsChange, predictorEngineV8Ref, storageKey]);
 
   useEffect(() => {
     if (!predictorTrainingSnapshot.v8PersistenceLoaded) {

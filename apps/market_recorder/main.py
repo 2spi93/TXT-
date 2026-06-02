@@ -23,6 +23,7 @@ POLL_SECONDS = max(1.0, float(os.getenv("MARKET_RECORDER_POLL_SECONDS", "5")))
 SYMBOLS = [item.strip().upper() for item in os.getenv("MARKET_RECORDER_SYMBOLS", "BTCUSDT").split(",") if item.strip()]
 VENUES = [item.strip() for item in os.getenv("MARKET_RECORDER_VENUES", "binance-public,bybit-public,okx-public,bingx-public").split(",") if item.strip()]
 TRADE_LIMIT = max(20, min(500, int(os.getenv("MARKET_RECORDER_TRADE_LIMIT", "120"))))
+QUOTE_MAX_AGE_SECONDS = max(0.0, float(os.getenv("MARKET_RECORDER_QUOTE_MAX_AGE_SECONDS", "120")))
 
 app = FastAPI(title="TXT Market Recorder", version="1.0.0")
 
@@ -60,6 +61,41 @@ def _event_time(payload: dict[str, Any]) -> str:
         if value:
             return str(value)
     return _now_iso()
+
+
+def _parse_event_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc)
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _normalized_symbol(value: Any) -> str:
+    return str(value or "").replace("-PERP", "").replace("/", "").replace("-", "").upper()
+
+
+def _quote_is_recordable(row: dict[str, Any]) -> bool:
+    venue = str(row.get("venue") or "").strip()
+    if venue not in set(VENUES):
+        return False
+    instrument = _normalized_symbol(row.get("instrument") or row.get("symbol") or row.get("market_instrument"))
+    if instrument not in {_normalized_symbol(symbol) for symbol in SYMBOLS}:
+        return False
+    if QUOTE_MAX_AGE_SECONDS > 0:
+        event_at = _parse_event_datetime(_event_time(row))
+        if event_at is not None:
+            age_seconds = (datetime.now(timezone.utc) - event_at).total_seconds()
+            if age_seconds > QUOTE_MAX_AGE_SECONDS:
+                return False
+    return True
 
 
 def _normalize_event(family: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -113,7 +149,7 @@ def _record_quotes() -> int:
     payload = _fetch_json("/v1/quotes", timeout=5.0)
     if not isinstance(payload, list):
         return 0
-    events = [_normalize_event("quotes", row) for row in payload if isinstance(row, dict)]
+    events = [_normalize_event("quotes", row) for row in payload if isinstance(row, dict) and _quote_is_recordable(row)]
     return int(_write_events(events).get("written") or 0)
 
 
@@ -191,6 +227,7 @@ async def health() -> dict[str, Any]:
         "storage_root": str(STORAGE_ROOT),
         "symbols": SYMBOLS,
         "venues": VENUES,
+        "quote_max_age_seconds": QUOTE_MAX_AGE_SECONDS,
         "counts": _counts,
         "started_at": _started_at,
         "last_write_at": _last_write_at,

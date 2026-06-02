@@ -6,6 +6,7 @@ import type {
   RuntimeDecisionMonitoringAlert,
   RuntimeDecisionNoTradeHeatmapRow,
 } from "../../lib/runtimeDecisionAnalytics";
+import { UI_HELP_HINTS } from "../../lib/uiLexicon";
 
 type Props = {
   summary: RuntimeDecisionAnalyticsSummary | null;
@@ -246,7 +247,7 @@ export default function RuntimeOperatorMonitoringCard({ summary, compact = false
         <div>
           <div className="eyebrow">
             {title}
-            {!compact ? <HelpHint text="Lecture operateur live: drift, opportunite, stale XCH, bus lag et clusters NO_TRADE sans reconstruire une seconde verite." examples={["Si XCH stale monte alors que bus/UI restent coherents, traite d'abord la fraicheur de la source de marche.", "Si missed opportunity est eleve cote runtime/policy, la heatmap aide a voir ou les blocages se concentrent vraiment."]} /> : null}
+            {!compact ? <HelpHint text={UI_HELP_HINTS.runtimeOperatorMonitoring.text} examples={UI_HELP_HINTS.runtimeOperatorMonitoring.examples} /> : null}
           </div>
           <div className="runtime-monitor-headline">{live.summary}</div>
         </div>

@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState, type FormEvent } from "react";
 import HelpHint from "../../components/HelpHint";
 import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
 import { openOpsCopilotPrompt } from "../../lib/opsCopilot";
+import { UI_HELP_HINTS } from "../../lib/uiLexicon";
 
 type JsonMap = Record<string, unknown>;
 
@@ -521,7 +522,7 @@ export default function AiPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1.15fr 0.85fr" }}>
         <div className="panel">
-          <div className="eyebrow">Routes IA disponibles <HelpHint text="Ce bloc montre quelles routes IA sont disponibles, combien elles coûtent et si une protection s'est déclenchée." examples={["Si une route importante manque, il faut le voir avant de lancer une tâche.", "Si une route tombe souvent en secours, le problème vient de l'infrastructure plus que du prompt."]} /></div>
+          <div className="eyebrow">Routes IA disponibles <HelpHint text={UI_HELP_HINTS.aiRoutesAvailable.text} examples={UI_HELP_HINTS.aiRoutesAvailable.examples} /></div>
           {providerRows.length === 0 ? <p className="subtle" style={{ marginTop: 12 }}>Aucun provider detecte.</p> : null}
           <div className="txt-scroll-shell compact">
             {providerRows.map((row) => (
@@ -547,7 +548,7 @@ export default function AiPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Capacite machine <HelpHint text="Ce bloc dit si la machine peut vraiment porter des tâches locales ou s'il vaut mieux s'appuyer sur le distant." examples={["Une machine sans GPU peut rester utile pour du léger mais pas pour du lourd.", "Si le local ne répond pas, il faut basculer vers les routes distantes prévues."]} /></div>
+          <div className="eyebrow">Capacite machine <HelpHint text={UI_HELP_HINTS.aiMachineCapacity.text} examples={UI_HELP_HINTS.aiMachineCapacity.examples} /></div>
           <div className="row"><span>CPU</span><span>{toNumber(cap.cpus, 0)}</span></div>
           <div className="row"><span>Memory</span><span>{toNumber(cap.memory_gb, 0).toFixed(2)} GiB</span></div>
           <div className="row"><span>GPU</span><span>{String(Boolean(cap.has_gpu))}</span></div>
@@ -560,7 +561,7 @@ export default function AiPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1.15fr 0.85fr" }}>
         <div className="panel">
-          <div className="eyebrow">Origine des fonds visibles <HelpHint text="Ce bloc rappelle d'où viennent les fonds visibles derrière le desk: test, réel, exchange ou wallet." examples={["Un montant visible en mode test n'est pas du capital réel.", "Un exchange ou un wallet peut être branché sans être encore prêt pour une vraie allocation."]} /></div>
+          <div className="eyebrow">Origine des fonds visibles <HelpHint text={UI_HELP_HINTS.aiVisibleFundsOrigin.text} examples={UI_HELP_HINTS.aiVisibleFundsOrigin.examples} /></div>
           <div className="term-report-body" style={{ marginTop: 12, marginBottom: 12 }}>
             <span>Broker live: <strong>{liveBrokerSources.length}</strong> · Broker paper: <strong>{paperBrokerSources.length}</strong>.</span>
             <span>Exchange: <strong>{exchangeSources.length}</strong> · Wallet: <strong>{walletSources.length}</strong>.</span>
@@ -622,7 +623,7 @@ export default function AiPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1.15fr 0.85fr" }}>
         <div className="panel">
-          <div className="eyebrow">Lancer une tache IA <HelpHint text="Zone de lancement contrôlée pour les tâches IA importantes, avec limite de coût et choix de route." examples={["Pour une tâche sensible, relis la route finale avant d'utiliser la réponse.", "Le mode local n'a de sens que si le service local répond bien."]} /></div>
+          <div className="eyebrow">Lancer une tache IA <HelpHint text={UI_HELP_HINTS.aiLaunchTask.text} examples={UI_HELP_HINTS.aiLaunchTask.examples} /></div>
           <form onSubmit={onExecute} className="form-grid" style={{ marginTop: 12 }}>
             <label className="field-stack">
               <span>Type de tache IA</span>
@@ -685,7 +686,7 @@ export default function AiPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Modeles locaux <HelpHint text="Ce bloc sert à voir si les modèles locaux répondent et à les préparer au début de la session." examples={["Lance le préchauffage si tu comptes utiliser le local aujourd'hui.", "Si les modèles restent hors ligne, traite-le comme un souci d'infrastructure."]} /></div>
+          <div className="eyebrow">Modeles locaux <HelpHint text={UI_HELP_HINTS.aiLocalModels.text} examples={UI_HELP_HINTS.aiLocalModels.examples} /></div>
           <div className="row"><span>Endpoint</span><span>{normalizeText(localHealth?.endpoint)}</span></div>
           <div className="row"><span>Reachable</span><span>{String(localReachable)}</span></div>
           <div style={{ display: "flex", gap: 10, marginTop: 12, marginBottom: 12 }}>
@@ -704,7 +705,7 @@ export default function AiPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Lecture du contexte de marche <HelpHint text="Lit trois scores normalisés pour classer le contexte: tendance, volatilité réalisée et sentiment." examples={["trend_score vient d'un signal de tendance entre 0 et 1: 0.4 = modéré, 0.8 = fort.", "realized_volatility est la volatilité observée: 0.055 veut dire environ 5.5% sur la fenêtre du signal.", "sentiment_score va de -1 à 1 quand la source sentiment est disponible."]} /></div>
+          <div className="eyebrow">Lecture du contexte de marche <HelpHint text={UI_HELP_HINTS.aiMarketContextRead.text} examples={UI_HELP_HINTS.aiMarketContextRead.examples} /></div>
           <p className="subtle" style={{ marginTop: 10 }}>Référence attendue: oracle marché, Terminal, rapport stratégie ou valeurs de test. Le résultat sert à ajuster prudence, pas à envoyer un ordre tout seul.</p>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <label className="field-stack"><span>Tendance 0-1</span><input type="number" step="0.01" value={trendScore} onChange={(event) => setTrendScore(Number(event.target.value || 0))} placeholder="0.42" /></label>
@@ -733,7 +734,7 @@ export default function AiPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Stress-test de stratégie <HelpHint text="Teste une stratégie face à un scénario macro, géopolitique ou opérationnel avant promotion live." examples={["Fed emergency hike, exchange outage ou oil shock servent à voir si le cadre tient encore.", "Résilience haute = plus robuste; drawdown attendu haut = promotion live à retarder ou réduire."]} /></div>
+          <div className="eyebrow">Stress-test de stratégie <HelpHint text={UI_HELP_HINTS.aiStrategyStressTest.text} examples={UI_HELP_HINTS.aiStrategyStressTest.examples} /></div>
           <p className="subtle" style={{ marginTop: 10 }}>Ce résultat sert à décider garder, réduire, retarder ou retravailler une stratégie. Il ne remplace pas la validation risque ni la lecture du capital disponible.</p>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <label className="field-stack"><span>Stratégie</span><input value={strategyName} onChange={(event) => setStrategyName(event.target.value)} placeholder="institutional-ai-desk" /></label>
@@ -765,7 +766,7 @@ export default function AiPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Memoire et calibration <HelpHint text="Ce bloc dit simplement si l'aide mémoire semble utile ou si le sujet reste encore ouvert." examples={["Sans assez d'exemples, il ne faut pas tirer de conclusion.", "Si l'écart reste faible ou flou, garde une lecture prudente."]} /></div>
+          <div className="eyebrow">Memoire et calibration <HelpHint text={UI_HELP_HINTS.aiMemoryCalibration.text} examples={UI_HELP_HINTS.aiMemoryCalibration.examples} /></div>
           <div className="row"><span>Winrate delta</span><span>{formatPct(toNumber(withVsWithout.winrate_delta, 0), 1)}</span></div>
           <div className="row"><span>p-value</span><span>{normalizeText(withVsWithout.p_value_two_sided, "n/a")}</span></div>
           <div className="row"><span>Significant @95%</span><span>{String(Boolean(withVsWithout.significant_95))}</span></div>
@@ -785,7 +786,7 @@ export default function AiPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Journal des taches IA <HelpHint text="Historique des tâches IA pour revoir ce qui a tourné, ce qui a échoué et ce qui mérite un tri." examples={["Si l'historique montre beaucoup de passages dégradés, il faut regarder la capacité ou les routes.", "Nettoyer l'historique sert à garder un journal lisible, pas à cacher un problème."]} /></div>
+          <div className="eyebrow">Journal des taches IA <HelpHint text={UI_HELP_HINTS.aiTasksJournal.text} examples={UI_HELP_HINTS.aiTasksJournal.examples} /></div>
           <div style={{ display: "flex", gap: 10, marginTop: 12, marginBottom: 12 }}>
             <button type="button" onClick={() => clearOldHistory()} disabled={clearingHistory}>{clearingHistory ? "Nettoyage..." : "Nettoyer l'historique"}</button>
             <button type="button" onClick={() => reloadDesk().catch((err) => setError(err instanceof Error ? err.message : "Reload impossible"))} disabled={loading || warming !== null || clearingHistory || regimeBusy || backtestBusy}>Rafraichir</button>

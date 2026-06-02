@@ -89,11 +89,151 @@ def _to_float(value: Any, fallback: float = 0.0) -> float:
     return numeric
 
 
+def _to_nullable_float(value: Any) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric != numeric:
+        return None
+    return numeric
+
+
 def _json_safe_row(row: dict[str, Any]) -> dict[str, Any]:
     normalized: dict[str, Any] = {}
     for key, value in row.items():
         normalized[key] = value.isoformat() if isinstance(value, datetime) else value
     return normalized
+
+
+def _find_nested_number(value: Any, keys: tuple[str, ...]) -> float | None:
+    if isinstance(value, dict):
+        for key in keys:
+            if key in value:
+                parsed = _to_nullable_float(value.get(key))
+                if parsed is not None:
+                    return parsed
+        for nested in value.values():
+            parsed = _find_nested_number(nested, keys)
+            if parsed is not None:
+                return parsed
+    elif isinstance(value, list):
+        for item in value:
+            parsed = _find_nested_number(item, keys)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _find_nested_string(value: Any, keys: tuple[str, ...]) -> str | None:
+    if isinstance(value, dict):
+        for key in keys:
+            if key in value:
+                text = str(value.get(key) or "").strip()
+                if text:
+                    return text
+        for nested in value.values():
+            parsed = _find_nested_string(nested, keys)
+            if parsed:
+                return parsed
+    elif isinstance(value, list):
+        for item in value:
+            parsed = _find_nested_string(item, keys)
+            if parsed:
+                return parsed
+    return None
+
+
+def _extract_symbol_quote_source(payload: Any, symbol: str) -> dict[str, Any]:
+    normalized = _normalize_symbol(symbol)
+    if not isinstance(payload, (dict, list)):
+        return {}
+
+    if isinstance(payload, dict):
+        symbol_entry = payload.get(normalized)
+        if isinstance(symbol_entry, dict):
+            return symbol_entry
+        for key in ("quotes", "symbol_quotes", "market_quotes", "ticks", "symbols"):
+            candidate = payload.get(key)
+            if isinstance(candidate, dict):
+                entry = candidate.get(normalized)
+                if isinstance(entry, dict):
+                    return entry
+            elif isinstance(candidate, list):
+                for item in candidate:
+                    if isinstance(item, dict) and _normalize_symbol(str(item.get("symbol") or item.get("instrument") or "")) == normalized:
+                        return item
+
+    if isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict) and _normalize_symbol(str(item.get("symbol") or item.get("instrument") or "")) == normalized:
+                return item
+
+    return payload if isinstance(payload, dict) else {}
+
+
+def _extract_quote_snapshot(account: dict[str, Any], symbol: str) -> dict[str, Any]:
+    metadata = account.get("metadata") if isinstance(account.get("metadata"), dict) else {}
+    runtime_session = metadata.get("broker_runtime_session") if isinstance(metadata.get("broker_runtime_session"), dict) else {}
+    symbol_payload = _extract_symbol_quote_source({**metadata, "runtime_session": runtime_session}, symbol)
+
+    bid = _find_nested_number(symbol_payload, ("bid", "best_bid", "bid_price", "bid1", "bid1Price"))
+    ask = _find_nested_number(symbol_payload, ("ask", "best_ask", "ask_price", "ask1", "ask1Price"))
+    spread_abs = _find_nested_number(symbol_payload, ("spread", "spread_absolute", "spreadAbs"))
+    midpoint = ((bid + ask) / 2.0) if bid is not None and ask is not None and bid > 0 and ask > 0 else None
+    spread_bps = _find_nested_number(symbol_payload, ("spread_bps", "spreadBps"))
+    if spread_abs is None and bid is not None and ask is not None:
+        spread_abs = ask - bid
+    if spread_bps is None and spread_abs is not None and midpoint and midpoint > 0:
+        spread_bps = spread_abs / midpoint * 10000.0
+
+    tick_time = (
+        _find_nested_string(symbol_payload, ("tick_time", "time", "timestamp", "as_of", "updated_at"))
+        or str(metadata.get("broker_state_updated_at") or "").strip()
+        or str(runtime_session.get("last_heartbeat_at") or "").strip()
+        or None
+    )
+    symbol_state = _find_nested_string(symbol_payload, ("symbol_state", "state", "status")) or "unknown"
+
+    return {
+        "symbol": _normalize_symbol(symbol),
+        "bid": round(bid, 8) if bid is not None else None,
+        "ask": round(ask, 8) if ask is not None else None,
+        "spread": round(spread_abs, 8) if spread_abs is not None else None,
+        "spread_bps": round(spread_bps, 6) if spread_bps is not None else None,
+        "tick_time": tick_time,
+        "symbol_state": symbol_state,
+        "source": "mt5-broker-state" if (bid is not None or ask is not None or spread_bps is not None) else "unavailable",
+    }
+
+
+def _listed_symbols_for_account(account: dict[str, Any]) -> list[str]:
+    metadata = account.get("metadata") if isinstance(account.get("metadata"), dict) else {}
+    symbols: set[str] = set()
+    for key in ("positions", "protective_orders"):
+        rows = metadata.get(key)
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                symbol = _normalize_symbol(str(row.get("symbol") or row.get("instrument") or ""))
+                if symbol:
+                    symbols.add(symbol)
+    for key in ("quotes", "symbol_quotes", "symbols", "market_quotes"):
+        payload = metadata.get(key)
+        if isinstance(payload, dict):
+            for raw in payload.keys():
+                symbol = _normalize_symbol(str(raw))
+                if symbol:
+                    symbols.add(symbol)
+        elif isinstance(payload, list):
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                symbol = _normalize_symbol(str(item.get("symbol") or item.get("instrument") or ""))
+                if symbol:
+                    symbols.add(symbol)
+    return sorted(symbols)
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -886,6 +1026,9 @@ def _merge_mt5_broker_state_metadata(existing_metadata: dict[str, Any] | None, p
     request_payload = payload if isinstance(payload, dict) else {}
     broker_state = request_payload.get("broker_state") if isinstance(request_payload.get("broker_state"), dict) else request_payload
 
+    if isinstance(broker_state, dict) and broker_state:
+        metadata["broker_state"] = dict(broker_state)
+
     positions = _sanitize_mt5_broker_state_rows(broker_state.get("positions"))
     if positions:
         metadata["positions"] = positions
@@ -895,6 +1038,13 @@ def _merge_mt5_broker_state_metadata(existing_metadata: dict[str, Any] | None, p
     balances = _sanitize_mt5_broker_state_rows(broker_state.get("balances"))
     if balances:
         metadata["balances"] = balances
+
+    quotes_dict = broker_state.get("quotes") if isinstance(broker_state.get("quotes"), dict) else None
+    quotes_rows = _sanitize_mt5_broker_state_rows(broker_state.get("quotes"))
+    if isinstance(quotes_dict, dict) and quotes_dict:
+        metadata["quotes"] = dict(quotes_dict)
+    elif quotes_rows:
+        metadata["quotes"] = quotes_rows
 
     broker_session = broker_state.get("session") if isinstance(broker_state.get("session"), dict) else request_payload.get("session") if isinstance(request_payload.get("session"), dict) else None
     if isinstance(broker_session, dict) and broker_session:
@@ -1037,6 +1187,81 @@ async def health() -> dict[str, Any]:
         "mode": os.getenv("MT5_BRIDGE_MODE", "paper"),
         "accounts": int(accounts["count"]),
         "ts": _now_iso(),
+    }
+
+
+@app.get("/status")
+async def status() -> dict[str, Any]:
+    rows = fetch_all(
+        """
+        SELECT account_id, mode, status, updated_at
+        FROM mt5_accounts
+        ORDER BY updated_at DESC
+        LIMIT 50
+        """
+    )
+    connected = sum(1 for row in rows if str(row.get("status") or "").strip().lower() == "connected")
+    return {
+        "status": "ok",
+        "service": "mt5-bridge",
+        "accounts_total": len(rows),
+        "accounts_connected": connected,
+        "accounts": [{
+            "account_id": str(row.get("account_id") or ""),
+            "mode": str(row.get("mode") or ""),
+            "status": str(row.get("status") or ""),
+            "updated_at": row.get("updated_at").isoformat() if isinstance(row.get("updated_at"), datetime) else row.get("updated_at"),
+        } for row in rows],
+    }
+
+
+@app.get("/symbols")
+async def symbols(account_id: str = "") -> dict[str, Any]:
+    if account_id.strip():
+        account, _ = _resolve_runtime_account(account_id.strip())
+    else:
+        account = fetch_one("SELECT * FROM mt5_accounts WHERE status = 'connected' ORDER BY updated_at DESC LIMIT 1")
+        if not account:
+            account = fetch_one("SELECT * FROM mt5_accounts ORDER BY updated_at DESC LIMIT 1")
+    if not account:
+        raise HTTPException(status_code=404, detail="MT5 account not found")
+    return {
+        "status": "ok",
+        "service": "mt5-bridge",
+        "account_id": str(account.get("account_id") or ""),
+        "symbols": _listed_symbols_for_account(account),
+    }
+
+
+@app.get("/quote/{symbol}")
+async def quote(symbol: str, account_id: str = "") -> dict[str, Any]:
+    if account_id.strip():
+        account, _ = _resolve_runtime_account(account_id.strip())
+    else:
+        account = fetch_one("SELECT * FROM mt5_accounts WHERE status = 'connected' ORDER BY updated_at DESC LIMIT 1")
+        if not account:
+            account = fetch_one("SELECT * FROM mt5_accounts ORDER BY updated_at DESC LIMIT 1")
+    if not account:
+        raise HTTPException(status_code=404, detail="MT5 account not found")
+    snapshot = _extract_quote_snapshot(account, symbol)
+    return {
+        "status": "ok",
+        "service": "mt5-bridge",
+        "account_id": str(account.get("account_id") or ""),
+        **snapshot,
+    }
+
+
+@app.get("/v1/accounts/{account_id}/quote/{symbol}")
+async def account_quote(account_id: str, symbol: str) -> dict[str, Any]:
+    account, requested_account_id = _resolve_runtime_account(account_id)
+    snapshot = _extract_quote_snapshot(account, symbol)
+    return {
+        "status": "ok",
+        "service": "mt5-bridge",
+        "requested_account_id": requested_account_id,
+        "account_id": str(account.get("account_id") or ""),
+        **snapshot,
     }
 
 

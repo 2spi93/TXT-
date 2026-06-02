@@ -446,7 +446,7 @@ export default function PredictorCalibrationClient() {
           terms={["confidence", "effective sample weight", "rolling window"]}
         />
         <p>
-          <Link href="/advanced">Advanced</Link>
+          <Link href="/advanced">Diagnostics</Link>
           {" | "}
           <Link href="/terminal">Trading Terminal</Link>
         </p>

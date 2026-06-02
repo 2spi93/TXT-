@@ -116,7 +116,7 @@ const INTERNAL_STEPS: WalkthroughStep[] = [
     pageLabel: "Incidents",
     title: "Traite les incidents sans perdre la trace",
     description: "Si quelque chose casse, ce bureau sert a assigner, suivre et cloturer proprement les problemes operateurs.",
-    validationLabel: "incident desk compris",
+    validationLabel: "incidents compris",
   },
   {
     key: "settings",

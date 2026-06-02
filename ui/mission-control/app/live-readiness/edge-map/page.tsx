@@ -205,11 +205,11 @@ export default async function EdgeMapPage() {
     <main className="shell txt-page-shell" data-testid="edge-map-page">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.4fr 1fr" }}>
         <div className="panel txt-page-hero">
-          <div className="eyebrow">Edge Map Observation</div>
+          <div className="eyebrow">Execution Edge Map</div>
           <h1 className="title" style={{ fontSize: 34 }}>Carte read-only de l’edge reaction × regime</h1>
           <p className="subtle txt-page-hero-copy">Cette vue ne pilote rien. Elle lit seulement les labels joins et montre ou le marche semble donner quelque chose, avec le niveau de confiance de l’observation.</p>
           <OperatorPanelGuide
-            title="Guide Edge Map"
+            title="Guide Execution Edge Map"
             what="Une carte simple des cellules reaction_class × regime, avec leurs deltas 24h et leur niveau de confiance observationnel."
             why="Voir si le contexte devient exploitable sans confondre lenteur du marche et edge reel."
             example="Si SLOW + RANGE reste proche de zero avec confiance basse, on observe encore. Si SLOW + TREND monte avec plus de labels, on documente avant toute decision policy."
@@ -221,11 +221,11 @@ export default async function EdgeMapPage() {
           <p>
             <Link href="/dashboard">Dashboard</Link>
             {" | "}
-            <Link href="/live-readiness">Live Readiness</Link>
+            <Link href="/live-readiness">Readiness</Link>
             {" | "}
             <Link href="/live-readiness/market-state-map">Market State Map</Link>
             {" | "}
-            <Link href="/live-readiness/drift-alert-log">Drift Alert Log</Link>
+            <Link href="/live-readiness/drift-alert-log">Drift Log</Link>
             {" | "}
             <Link href="/terminal">Trading Terminal</Link>
           </p>

@@ -1782,6 +1782,9 @@ function buildOperatorActionDecision(input: {
     value: runtimeTelemetryLead?.code || "n/a",
     tone: runtimeTelemetryLead?.tone || "subtle",
   };
+  const spreadLiveUsedMetric = runtimeProjectionOperator?.runtimeMetrics.spreadLiveUsed ?? { value: "n/a", tone: "subtle" as const };
+  const decisionQuoteCoverageMetric = runtimeProjectionOperator?.runtimeMetrics.decisionQuoteCoverage ?? { value: "n/a", tone: "subtle" as const };
+  const decisionQuoteDiagnosticMetric = runtimeProjectionOperator?.runtimeMetrics.decisionQuoteDiagnostic ?? { value: "n/a", tone: "subtle" as const };
   const dominanceReasons = aggregateDominanceReasons(trades).slice(0, 3).map((item) => `${item.label} x${item.count}`);
   const noTradeReasons = safeTextArray(executionContext.no_trade_reasons).slice(0, 3);
   const freezeReasons = safeTextArray(executionContext.freeze_learning_reasons).slice(0, 2);
@@ -1883,6 +1886,9 @@ function buildOperatorActionDecision(input: {
     { label: "Exchange", value: exchangeMetric.value, tone: exchangeMetric.tone },
     { label: "Execution", value: executionLockDescriptor.label, tone: executionLockDescriptor.tone },
     { label: "Telemetry", value: telemetryMetric.value, tone: telemetryMetric.tone },
+    { label: "Spread live used", value: spreadLiveUsedMetric.value, tone: spreadLiveUsedMetric.tone },
+    { label: "Decision quote coverage", value: decisionQuoteCoverageMetric.value, tone: decisionQuoteCoverageMetric.tone },
+    { label: "Decision quote diagnostic", value: decisionQuoteDiagnosticMetric.value, tone: decisionQuoteDiagnosticMetric.tone },
     { label: "No-trade", value: `${noTradeRatioPct.toFixed(0)}%`, tone: noTradeRatioPct >= 70 ? "warn" : noTradeRatioPct >= 35 ? "subtle" : "good" },
     { label: "Confidence", value: smartDecision?.confidenceBand || (confidencePct > 0 ? `${confidencePct.toFixed(0)}%` : "n/a"), tone: smartDecision ? (smartDecision.confidenceBand === "HIGH" ? "good" : smartDecision.confidenceBand === "MEDIUM" ? "subtle" : "warn") : confidencePct >= 60 ? "good" : confidencePct >= 40 ? "subtle" : "warn" },
     { label: "Latency", value: formatCompactMetricMs(avgLatencyMs), tone: avgLatencyMs > 120 ? "warn" : avgLatencyMs > 80 ? "subtle" : "good" },

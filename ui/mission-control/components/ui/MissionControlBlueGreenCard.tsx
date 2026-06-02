@@ -1,6 +1,7 @@
 import Link from "next/link";
 
 import type { MissionControlBlueGreenStatus } from "../../lib/blueGreenUiStatus";
+import { UI_TERMS } from "../../lib/uiLexicon";
 import OperatorCommandButton from "./OperatorCommandButton";
 
 function toneClass(statusLabel: "LIVE" | "STANDBY" | "DOWN"): string {
@@ -46,7 +47,7 @@ export default function MissionControlBlueGreenCard({
       <p className="txt-blue-green-card-links">
         <Link href="/live-readiness/ui-blue-green">Vue detaillee</Link>
         {" | "}
-        <Link href="/live-readiness/drift-alert-log">Drift Alert Log</Link>
+        <Link href="/live-readiness/drift-alert-log">{UI_TERMS.driftLog}</Link>
       </p>
       {showRollback ? (
         <div className="operator-command-shell">

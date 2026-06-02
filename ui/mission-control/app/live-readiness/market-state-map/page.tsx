@@ -92,11 +92,11 @@ export default function MarketStateMapPage() {
     <main className="shell txt-page-shell" data-testid="market-state-map-page">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.35fr 1fr" }}>
         <div className="panel txt-page-hero">
-          <div className="eyebrow">Market State Map</div>
+          <div className="eyebrow">Readiness State Map</div>
           <h1 className="title" style={{ fontSize: 34 }}>Carte dédiée des contextes admissibles et faux contextes exploitables</h1>
           <p className="subtle txt-page-hero-copy">Cette page lit la route canonique de state map et laisse l’opérateur filtrer symbole, venue, timeframe et fenêtre sans recalculer une autre vérité.</p>
           <OperatorPanelGuide
-            title="Guide State Map"
+            title="Guide Readiness State Map"
             what="Une vue dédiée des cellules de marché, des transitions et des zones inadmissibles construites depuis l’oracle, la mémoire marché et l’observation edge."
             why="Séparer clairement la lecture des régimes exploitables de la logique terminale et éviter qu’un faux contexte paraisse encore tradable."
             example="Si CHOP devient inadmissible sur une venue alors que TREND reste watch sur une autre, on documente la dégradation locale au lieu de généraliser le marché entier."
@@ -108,7 +108,7 @@ export default function MarketStateMapPage() {
           <p>
             <Link href="/dashboard">Dashboard</Link>
             {" | "}
-            <Link href="/live-readiness">Live Readiness</Link>
+            <Link href="/live-readiness">Readiness</Link>
             {" | "}
             <Link href="/live-readiness/edge-map">Edge Map</Link>
             {" | "}

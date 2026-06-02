@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 import HelpHint from "../../../components/HelpHint";
 import OperatorPanelGuide from "../../../components/ui/OperatorPanelGuide";
 import { openOpsCopilotPrompt } from "../../../lib/opsCopilot";
+import { UI_HELP_HINTS } from "../../../lib/uiLexicon";
 
 type JsonMap = Record<string, unknown>;
 
@@ -168,7 +169,7 @@ export default function KairosShadowClient() {
       ]);
 
       if (!statusResponse.ok) {
-        throw new Error(String(asMap(statusBody).detail || "Unable to load Kairos status"));
+        throw new Error(String(asMap(statusBody).detail || "Unable to load Market Regime status"));
       }
 
       setStatus(asMap(statusBody));
@@ -256,16 +257,16 @@ export default function KairosShadowClient() {
       <section className="panel" style={{ padding: 18, display: "grid", gap: 12 }}>
         <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "start", flexWrap: "wrap" }}>
           <div style={{ display: "grid", gap: 6 }}>
-            <span className="eyebrow">Moteur Kairos en observation</span>
+            <span className="eyebrow">Market Regime en observation</span>
             <h1 style={{ margin: 0 }}>Cycles shadow et recommandations mémoire</h1>
             <p className="subtle" style={{ margin: 0, maxWidth: 880 }}>
-              Cette page sert a regarder ce que Kairos ferait, sans envoyer d'ordre reel depuis cet ecran. Elle montre les analyses, les decisions proposees,
+              Cette page sert a regarder ce que le moteur Market Regime ferait, sans envoyer d'ordre reel depuis cet ecran. Elle montre les analyses, les decisions proposees,
               les raisons de blocage et les recommandations de memoire.
             </p>
             <OperatorPanelGuide
-              title="Guide Kairos"
-              what="Une lecture simple de ce que Kairos aurait fait en mode observation."
-              why="Avant de laisser Kairos agir automatiquement, tu dois voir s'il lit le marche proprement et s'il sait rester bloque quand le risque est mauvais."
+              title="Guide Market Regime"
+              what="Une lecture simple de ce que le moteur Market Regime aurait fait en mode observation."
+              why="Avant de laisser le moteur agir automatiquement, tu dois voir s'il lit le marche proprement et s'il sait rester bloque quand le risque est mauvais."
               example="Lis d'abord le statut, puis clique Lancer une fois pour faire une seule analyse. Si tout est clair, tu peux demarrer la boucle d'observation."
             />
           </div>
@@ -275,27 +276,27 @@ export default function KairosShadowClient() {
                 <svg viewBox="0 0 48 48" role="presentation"><path d="M9 6L31 25H21L27 42L20 45L14 28L7 35Z" /></svg>
               </span>
               <button type="button" className="btn" onClick={() => void runAction("/api/ai/kairos/shadow/start")} disabled={acting} title="Lance l'analyse automatique en continu, sans ordre reel depuis cette page.">
-                Demarrer la boucle
+                Demarrer l'observation
               </button>
-              <HelpHint text="Demarre une analyse automatique qui tourne en continu. Ici, Kairos observe et journalise ce qu'il ferait; ce bouton ne ferme pas et n'ouvre pas une position depuis cette page." examples={["A utiliser quand tu veux laisser Kairos surveiller le marche tout seul.", "Si tu veux juste tester maintenant, utilise plutot Lancer une fois."]} label="Demarrer la boucle" />
+              <HelpHint text={UI_HELP_HINTS.kairosShadowStartObservation.text} examples={UI_HELP_HINTS.kairosShadowStartObservation.examples} label="Demarrer l'observation" />
             </div>
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
               <button type="button" className="btn" onClick={() => void runAction("/api/ai/kairos/shadow/stop")} disabled={acting} title="Met l'analyse automatique en pause; ne ferme pas les positions existantes.">
                 Arreter la boucle
               </button>
-              <HelpHint text="Met la boucle Kairos en pause. Cela stoppe l'analyse automatique de cette couche, mais ne ferme pas une position deja ouverte ailleurs." examples={["A utiliser si tu ne veux plus que Kairos continue a analyser sans toi.", "Le bouton d'urgence execution reste separe du bouton pause Kairos."]} label="Arreter la boucle" />
+              <HelpHint text={UI_HELP_HINTS.kairosShadowStopLoop.text} examples={UI_HELP_HINTS.kairosShadowStopLoop.examples} label="Arreter la boucle" />
             </div>
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
               <button type="button" className="btn btn-primary" onClick={() => void runAction("/api/ai/kairos/shadow/run-once")} disabled={acting} title="Fait une seule analyse maintenant, sans lancer la boucle continue.">
                 Lancer une fois
               </button>
-              <HelpHint text="Fait une seule analyse maintenant, puis s'arrete. C'est le bouton le plus simple pour verifier ce que Kairos pense sans le laisser tourner en continu." examples={["Clique ici pour un test rapide.", "Lis ensuite les raisons dans le journal des cycles."]} label="Lancer une fois" />
+              <HelpHint text={UI_HELP_HINTS.kairosShadowRunOnce.text} examples={UI_HELP_HINTS.kairosShadowRunOnce.examples} label="Lancer une fois" />
             </div>
             <button
               type="button"
               className="btn"
               onClick={() => openOpsCopilotPrompt({
-                message: "Explique-moi en francais simple quoi cliquer sur Kairos Shadow: Demarrer la boucle, Arreter la boucle, Lancer une fois, et ce que cela change pour le live.",
+                message: "Explique-moi en francais simple quoi cliquer sur Market Regime Shadow: Demarrer l'observation, Arreter la boucle, Lancer une fois, et ce que cela change pour le live.",
                 autoSend: true,
               })}
             >
@@ -457,7 +458,7 @@ export default function KairosShadowClient() {
       <section className="panel" style={{ padding: 18, display: "grid", gap: 12 }}>
         <div>
           <span className="eyebrow">Decisions</span>
-          <h2 style={{ margin: "6px 0 0" }}>Journal SQL des décisions Kairos</h2>
+          <h2 style={{ margin: "6px 0 0" }}>Journal SQL des décisions Market Regime</h2>
         </div>
         <div style={{ overflowX: "auto" }}>
           <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 980 }}>

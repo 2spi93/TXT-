@@ -12,6 +12,7 @@ import {
   type ExchangeCapability,
 } from "../../lib/exchangeCapabilities";
 import { openOpsCopilotPrompt } from "../../lib/opsCopilot";
+import { UI_HELP_HINTS } from "../../lib/uiLexicon";
 
 type JsonMap = Record<string, unknown>;
 
@@ -2057,7 +2058,7 @@ export default function LiveCapitalPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Sources canoniques allocables <HelpHint text="Ces sources sont déjà prêtes dans le registre principal. Tu peux donc les vérifier, les rattacher à un portefeuille et les utiliser." examples={["Un compte réel déjà validé peut être alloué directement.", "Un exchange déjà préparé peut afficher ses montants avant allocation."]} /></div>
+          <div className="eyebrow">Sources canoniques allocables <HelpHint text={UI_HELP_HINTS.liveCanonicalAllocableSources.text} examples={UI_HELP_HINTS.liveCanonicalAllocableSources.examples} /></div>
           {capitalSources.filter((row) => row.canonical).length === 0 ? <p className="subtle">Aucune source canonique visible.</p> : null}
           <div className="txt-scroll-shell">
             {capitalSources.filter((row) => row.canonical).map((row) => (
@@ -2075,7 +2076,7 @@ export default function LiveCapitalPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Sources plateforme non encore canonisées <HelpHint text="Ces sources sont déjà branchées, mais pas encore prêtes pour une allocation officielle." examples={["Un exchange relié par clé API peut apparaître ici sans être encore utilisable.", "Un wallet en lecture seule peut être visible mais rester hors allocation."]} /></div>
+          <div className="eyebrow">Sources plateforme non encore canonisées <HelpHint text={UI_HELP_HINTS.livePlatformNonCanonicalSources.text} examples={UI_HELP_HINTS.livePlatformNonCanonicalSources.examples} /></div>
           {capitalSources.filter((row) => !row.canonical).length === 0 ? <p className="subtle">Tous les exchange/wallet visibles sont déjà canonisés ou aucune source connecteur additionnelle n'est présente.</p> : null}
           <div className="txt-scroll-shell">
             {capitalSources.filter((row) => !row.canonical).map((row) => (
@@ -2090,7 +2091,7 @@ export default function LiveCapitalPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Desk Structuring <HelpHint text="Ce bloc sert à décrire comment tu veux utiliser la source: type de compte, rôle du capital, lieu d'exécution et rythme de remise à niveau." examples={["Un compte principal peut servir au cœur de l'activité avec plusieurs plateformes.", "Une réserve peut rester séparée avec un usage plus prudent."]} /></div>
+          <div className="eyebrow">Desk Structuring <HelpHint text={UI_HELP_HINTS.liveDeskStructuring.text} examples={UI_HELP_HINTS.liveDeskStructuring.examples} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <div>
               <div className="subtle" style={{ marginBottom: 6 }}>Véhicule <HelpHint text={DESK_VEHICLE_HELP[deskVehicle].text} examples={DESK_VEHICLE_HELP[deskVehicle].examples} label={deskVehicle} /></div>
@@ -2158,7 +2159,7 @@ export default function LiveCapitalPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Venue Pockets & Prime Logic <HelpHint text="Montre où l'argent est rangé sur la source: comptant, dérivés, options, garde ou on-chain." examples={["Une plateforme peut avoir plusieurs poches, mais elles n'apparaissent que si la synchronisation les remonte bien.", "Un wallet de réserve sera plutôt vu comme garde ou réserve que comme compte d'exécution rapide."]} /></div>
+          <div className="eyebrow">Venue Pockets & Prime Logic <HelpHint text={UI_HELP_HINTS.liveVenuePocketsPrime.text} examples={UI_HELP_HINTS.liveVenuePocketsPrime.examples} /></div>
           <div className="row"><span>Source active</span><span>{selectedSource ? `${selectedSource.display_name} / ${selectedSource.platform}` : "-"}</span></div>
           <div className="row"><span>Coverage théorique</span><span>{selectedVenueSpec?.coverage || (selectedSource?.source_type === "broker" ? "broker margin / live or paper" : "-")}</span></div>
           <div className="row"><span>Poches desk</span><span>{venuePockets.join(", ")}</span></div>
@@ -2175,7 +2176,7 @@ export default function LiveCapitalPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Enregistrer un compte exchange avant allocation <HelpHint text="Renseigne ici les accès créés sur l'exchange. TXT vérifie maintenant la clé tout de suite pour éviter d'enregistrer un mauvais accès." examples={["Pour OKX, remplis la clé API, le secret API, la passphrase créée avec la clé et l'identifiant du compte ou du sous-compte.", "Choisis Lecture seule pour surveiller, ou Trading autorisé si la source doit vraiment exécuter."]} /></div>
+          <div className="eyebrow">Enregistrer un compte exchange avant allocation <HelpHint text={UI_HELP_HINTS.liveRegisterExchangeBeforeAllocation.text} examples={UI_HELP_HINTS.liveRegisterExchangeBeforeAllocation.examples} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <select value={exchangeProviderId} onChange={(event) => setExchangeProviderId(event.target.value)}>
               {EXCHANGE_CONNECTION_CATALOG.filter((item) => item.mode === "api-key").map((item) => (
@@ -2232,7 +2233,7 @@ export default function LiveCapitalPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Connecter un wallet / custody <HelpHint text="Ce bloc sert à brancher un wallet ou une solution de garde avant vérification puis allocation." examples={["Une adresse publique suffit pour suivre un wallet.", "La signature doit rester hors TXT, via un système externe prévu pour ça."]} /></div>
+          <div className="eyebrow">Connecter un wallet / custody <HelpHint text={UI_HELP_HINTS.liveConnectWalletCustody.text} examples={UI_HELP_HINTS.liveConnectWalletCustody.examples} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <select value={walletProviderId} onChange={(event) => setWalletProviderId(event.target.value)}>
               {WALLET_CONNECTION_CATALOG.map((item) => (
@@ -2273,7 +2274,7 @@ export default function LiveCapitalPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Mettre à jour les accès API d'une plateforme <HelpHint text="Cette section sert à remplacer la clé API, le secret ou la passphrase d'un exchange déjà lié sans recréer toute la source." examples={["Sélectionne d'abord la source exchange active, puis remplace ses accès API.", "Après mise à jour, TXT relance automatiquement une sync si le compte est déjà canonique."]} /></div>
+          <div className="eyebrow">Mettre à jour les accès API d'une plateforme <HelpHint text={UI_HELP_HINTS.liveUpdateVenueApiAccess.text} examples={UI_HELP_HINTS.liveUpdateVenueApiAccess.examples} /></div>
           {selectedExchangeConnectorAccount ? (
             <>
               <div className="panel" style={{ marginTop: 12, borderRadius: 12 }}>
@@ -2305,7 +2306,7 @@ export default function LiveCapitalPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Create Portfolio <HelpHint text="Le portefeuille sert à ranger la source dans le bon cadre, avec un poids et une limite en dollars." examples={["Crée d'abord le portefeuille du client, puis rattache la source.", "Une réserve peut vivre dans un portefeuille séparé du capital actif."]} /></div>
+          <div className="eyebrow">Create Portfolio <HelpHint text={UI_HELP_HINTS.liveCreatePortfolio.text} examples={UI_HELP_HINTS.liveCreatePortfolio.examples} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <input value={createPortfolioId} onChange={(event) => setCreatePortfolioId(event.target.value)} placeholder="portfolio_id" />
             <input value={createPortfolioClientId} onChange={(event) => setCreatePortfolioClientId(event.target.value)} placeholder="client_id" />
@@ -2343,7 +2344,7 @@ export default function LiveCapitalPage() {
         </div>
 
         <div className="panel" data-testid="live-capital-allocation-desk">
-          <div className="eyebrow">Allouer une source connectée <HelpHint text="C'est ici que la source passe d'un simple branchement à un capital vraiment encadré." examples={["Vérifie d'abord le montant réel, puis fixe une limite inférieure ou égale à ce qui a été confirmé.", "Pour une réserve, commence avec une limite prudente."]} /></div>
+          <div className="eyebrow">Allouer une source connectée <HelpHint text={UI_HELP_HINTS.liveAllocateConnectedSource.text} examples={UI_HELP_HINTS.liveAllocateConnectedSource.examples} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <select value={selectedSource?.key || ""} onChange={(event) => setSelectedSourceKey(event.target.value)}>
               <option value="">Choisir une source</option>
@@ -2389,11 +2390,11 @@ export default function LiveCapitalPage() {
             <div className="row"><span>Portefeuilles du client</span><span>{matchedPortfolios.length > 0 ? matchedPortfolios.map((row) => row.portfolio_id).slice(0, 2).join(", ") : "Créer ou choisir un portefeuille"}</span></div>
             <div className="row"><span>Total vérifié</span><span>{verificationTotalUsd != null ? formatUsd(verificationTotalUsd) : "Appeler le compte pour remonter le total"}</span></div>
             <div className="row"><span>Cap USD</span><span>{formatUsd(allocationCapUsd)}</span></div>
-            <div className="row"><span>Live readiness</span><span className={liveReady ? "good" : "warn"}>{liveReady ? "allocable pour agents live" : "vérifier source / portefeuille / statut"}</span></div>
+            <div className="row"><span>Readiness live</span><span className={liveReady ? "good" : "warn"}>{liveReady ? "allocable pour agents live" : "verifier source / portefeuille / statut"}</span></div>
           </div>
           {isBingxSelected ? (
             <div className="panel" style={{ marginTop: 12, borderRadius: 12, display: "grid", gap: 10 }}>
-              <div className="eyebrow">BingX en mots simples <HelpHint text="Ce bloc explique le montant que TXT peut utiliser sur BingX sans transformer un micro-test en vrai pari trop gros." examples={["Capital visible: environ 136.68 USDT si la verification remonte bien ce total.", "Cap micro conseille: 4.5 USD. Au-dessus de 5 USD, TXT doit demander une validation humaine."]} label="Pourquoi 4.5 USD ?" /></div>
+              <div className="eyebrow">BingX en mots simples <HelpHint text={UI_HELP_HINTS.liveBingxSimple.text} examples={UI_HELP_HINTS.liveBingxSimple.examples} label="Pourquoi 4.5 USD ?" /></div>
               <div className="row"><span>Capital visible</span><span>{bingxVisibleCapitalUsd != null ? formatUsd(bingxVisibleCapitalUsd) : "Clique Appeler et verifier le compte"}</span></div>
               <div className="row"><span>Cap micro conseille</span><span className="good">{formatUsd(bingxMicroRecommendedUsd)}{bingxRecommendedPct != null ? ` · ${bingxRecommendedPct.toFixed(2)}% du compte` : ""}</span></div>
               <div className="row"><span>Ton cap actuel</span><span className={allocationCapUsd <= bingxHumanApprovalUsd ? "good" : "warn"}>{formatUsd(allocationCapUsd)}{bingxAllocationPct != null ? ` · ${bingxAllocationPct.toFixed(2)}% du compte` : ""}</span></div>
@@ -2419,7 +2420,7 @@ export default function LiveCapitalPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Verification plateforme et fonds <HelpHint text="Ce bloc lit le compte pour afficher ce qui est vraiment visible: montants, positions et total confirmé." examples={["Avant d'allouer, commence toujours par cette vérification.", "Si aucun total ne remonte, la source est branchée mais pas encore bien lue par le système."]} /></div>
+          <div className="eyebrow">Verification plateforme et fonds <HelpHint text={UI_HELP_HINTS.livePlatformFundsVerification.text} examples={UI_HELP_HINTS.livePlatformFundsVerification.examples} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <button type="button" onClick={() => verifySelectedSource()} disabled={verifying || !selectedSource}>
               {verifying ? "Verification..." : "Appeler et vérifier le compte"}
@@ -2491,7 +2492,7 @@ export default function LiveCapitalPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Agent Strategy Readiness <HelpHint text="Une stratégie ne doit passer sur du vrai capital que si la source est claire, vérifiée et bien limitée." examples={["L'agent peut proposer, mais c'est à l'opérateur de valider le passage.", "Si le compte montre 10k USD, évite une limite plus haute que le montant confirmé."]} /></div>
+          <div className="eyebrow">Agent Strategy Readiness <HelpHint text={UI_HELP_HINTS.liveAgentStrategyReadiness.text} examples={UI_HELP_HINTS.liveAgentStrategyReadiness.examples} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <input value={strategyId} onChange={(event) => setStrategyId(event.target.value)} placeholder="strategy_id" />
             <input value={strategyName} onChange={(event) => setStrategyName(event.target.value)} placeholder="strategy name" />
@@ -2528,7 +2529,7 @@ export default function LiveCapitalPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Capital Verified <HelpHint text="Ce badge dit si la lecture du capital est fiable ou si un humain doit relire la situation." examples={["Vert si les différentes poches retombent bien sur le total attendu.", "Orange si quelque chose semble incomplet.", "Rouge si les montants se contredisent vraiment."]} /></div>
+          <div className="eyebrow">Capital Verified <HelpHint text={UI_HELP_HINTS.liveCapitalVerified.text} examples={UI_HELP_HINTS.liveCapitalVerified.examples} /></div>
           <div className={`live-capital-badge ${capitalBadge.tone}`}>{capitalBadge.label}</div>
           <div className="row" style={{ marginTop: 12 }}><span>Detail</span><span>{capitalBadge.detail}</span></div>
           <div className="row"><span>Valeur plateforme équivalente</span><span>{verificationCashVsEquivalent ? formatUsd(toNumber(verificationCashVsEquivalent.total_equivalent_usd, 0)) : verificationTotalUsd != null ? formatUsd(verificationTotalUsd) : "-"}</span></div>
@@ -2557,7 +2558,7 @@ export default function LiveCapitalPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Breakdown par actif <HelpHint text="Montre le détail de chaque poche avec les actifs, leur valeur et leur poids dans le total." examples={["Tu peux voir rapidement quels actifs dominent la source.", "La couleur aide à repérer ce qui monte ou baisse sur la période affichée."]} /></div>
+          <div className="eyebrow">Breakdown par actif <HelpHint text={UI_HELP_HINTS.liveAssetBreakdown.text} examples={UI_HELP_HINTS.liveAssetBreakdown.examples} /></div>
           {verificationPocketSummaries.length === 0 ? <p className="subtle">Aucune poche détaillée tant que la source n'a pas encore été vérifiée.</p> : null}
           {verificationPocketSummaries.map((pocket) => (
             <div key={`asset-pocket-${pocket.key}`} className="panel" style={{ marginTop: 12, borderRadius: 12 }}>
@@ -2620,7 +2621,7 @@ export default function LiveCapitalPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Risk Overlay Capital <HelpHint text="Ce bloc résume le niveau de risque pris par la source: taille globale, concentration et marge de sécurité restante." examples={["Un compte simple reste souvent peu levierisé.", "Si une poche grossit trop, elle fait monter le risque total."]} /></div>
+          <div className="eyebrow">Risk Overlay Capital <HelpHint text={UI_HELP_HINTS.liveRiskOverlayCapital.text} examples={UI_HELP_HINTS.liveRiskOverlayCapital.examples} /></div>
           <div className="live-capital-kpi-grid">
             <div className="live-capital-kpi"><span>Leverage global</span><strong>{leverageGlobal > 0 ? `${leverageGlobal.toFixed(2)}x` : "0.00x"}</strong></div>
             <div className="live-capital-kpi"><span>Gross exposure</span><strong>{formatUsd(grossExposureUsd)}</strong></div>
@@ -2654,7 +2655,7 @@ export default function LiveCapitalPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Capital Flow Engine <HelpHint text="Ici, tu vois les mouvements d'argent observés sur la source: entrées, sorties, transferts et résultat encaissé." examples={["Un déplacement entre deux poches apparaît comme un vrai mouvement suivi dans le temps.", "Les frais et le résultat réalisé sont regroupés ici pour raconter l'histoire du compte."]} /></div>
+          <div className="eyebrow">Capital Flow Engine <HelpHint text={UI_HELP_HINTS.liveCapitalFlowEngine.text} examples={UI_HELP_HINTS.liveCapitalFlowEngine.examples} /></div>
           <div className="row"><span>Entrées / sorties nettes</span><span>{verificationCapitalLedgerRows.length > 0 ? formatSignedUsd(verificationCapitalLedgerSummary.net_external_cashflow_usd) : netCapitalDeltaUsd != null ? formatSignedUsd(netCapitalDeltaUsd) : "ledger vide"}</span></div>
           <div className="row"><span>Transferts internes</span><span>{verificationCapitalLedgerRows.length > 0 ? formatUsd(verificationCapitalLedgerSummary.internal_transfer_usd) : "aucun transfert historisé"}</span></div>
           <div className="row"><span>Funding fees</span><span>{verificationCapitalLedgerRows.length > 0 ? formatSignedUsd(verificationCapitalLedgerSummary.funding_fee_usd) : fundingFeesAvailable ? formatSignedUsd(fundingFeesUsd) : "non remontées"}</span></div>
@@ -2696,7 +2697,7 @@ export default function LiveCapitalPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Portfolio Attribution <HelpHint text="Ce bloc aide à comprendre d'où vient le résultat: quelle source, quelle stratégie ou quel actif a le plus compté." examples={["Tu peux voir si le résultat vient surtout d'une plateforme précise.", "Tu peux aussi repérer quelle stratégie ou quel actif pèse le plus dans le bilan."]} /></div>
+          <div className="eyebrow">Portfolio Attribution <HelpHint text={UI_HELP_HINTS.livePortfolioAttribution.text} examples={UI_HELP_HINTS.livePortfolioAttribution.examples} /></div>
           <div className="row"><span>Sleeve courant</span><span>{capitalSleeve}</span></div>
           <div className="row"><span>Portefeuille</span><span>{activePortfolioId || "non sélectionné"}</span></div>
           {portfolioAttribution.length === 0 ? <p className="subtle" style={{ marginTop: 10 }}>Aucune ligne d'attribution disponible pour ce portefeuille sur la période courante.</p> : null}
@@ -2736,7 +2737,7 @@ export default function LiveCapitalPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Live Runbook <HelpHint text="C'est la checklist simple avant d'autoriser un agent à toucher du vrai capital." examples={["Branchement, vérification, préparation, allocation, puis seulement après passage en live.", "S'il manque une étape, considère la source comme non prête."]} /></div>
+          <div className="eyebrow">Live Runbook <HelpHint text={UI_HELP_HINTS.liveRunbook.text} examples={UI_HELP_HINTS.liveRunbook.examples} /></div>
           <div className="row"><span>1. Nature de la source</span><span>{selectedSource ? `${selectedSource.source_type} / ${selectedSource.environment}` : "Choisir une source"}</span></div>
           <div className="row"><span>2. Statut plateforme</span><span>{selectedSource?.status || "-"}</span></div>
           <div className="row"><span>3. Canonisation</span><span>{selectedSource?.canonical ? "faite" : "requise avant allocation"}</span></div>
@@ -2750,7 +2751,7 @@ export default function LiveCapitalPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Allocator Readiness Matrix <HelpHint text="Cette matrice résume ce qu'il manque encore avant d'utiliser la source dans de bonnes conditions." examples={["Un score complet veut dire que la source est claire et prête.", "Si la limite dépasse l'argent confirmé, la préparation n'est pas terminée."]} /></div>
+          <div className="eyebrow">Allocator Readiness Matrix <HelpHint text={UI_HELP_HINTS.liveAllocatorReadinessMatrix.text} examples={UI_HELP_HINTS.liveAllocatorReadinessMatrix.examples} /></div>
           <div className="row"><span>Score desk</span><span className={hedgeFundReadinessScore >= 5 ? "good" : hedgeFundReadinessScore >= 3 ? "warn" : "metric"}>{hedgeFundReadinessScore}/6</span></div>
           {hedgeFundChecks.map((item) => (
             <div key={item.label} className="row">
@@ -2761,7 +2762,7 @@ export default function LiveCapitalPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Strategies <HelpHint text="Rappel du niveau des stratégies pour éviter d'envoyer trop vite du vrai capital sur un setup encore fragile." examples={["Une stratégie encore en observation mérite une relecture avant tout passage réel.", "Regarde toujours son niveau actuel avant de la promouvoir."]} /></div>
+          <div className="eyebrow">Strategies <HelpHint text={UI_HELP_HINTS.liveStrategiesReminder.text} examples={UI_HELP_HINTS.liveStrategiesReminder.examples} /></div>
           {strategies.length === 0 ? <p className="subtle">Aucune stratégie disponible.</p> : null}
           {strategies.slice(0, 8).map((row) => (
             <div key={row.strategy_id} className="row">

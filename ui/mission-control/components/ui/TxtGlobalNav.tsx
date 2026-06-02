@@ -5,6 +5,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 
 import { useUiMode } from "../../lib/userUiPrefs";
+import { UI_TERMS } from "../../lib/uiLexicon";
 import type { RoleGroup } from "../../lib/roleGroups";
 
 /** Navigation visible to internal TXT staff only (admin · operator · viewer). */
@@ -14,14 +15,14 @@ const INTERNAL_NAV_ITEMS = [
   { href: "/live-capital", label: "Live Capital" },
   { href: "/live-ops", label: "Live Ops" },
   { href: "/terminal", label: "Terminal" },
-  { href: "/live-readiness", label: "Readiness" },
-  { href: "/advanced/reality-gap", label: "Reality Gap" },
-  { href: "/advanced/kairos-shadow", label: "Kairos" },
+  { href: "/live-readiness", label: UI_TERMS.readiness },
+  { href: "/advanced/reality-gap", label: UI_TERMS.executionGap },
+  { href: "/advanced/kairos-shadow", label: UI_TERMS.marketRegime },
   { href: "/incidents", label: "Incidents" },
   { href: "/connectors", label: "Connectors" },
   { href: "/ai", label: "AI" },
   { href: "/learn", label: "Learn" },
-  { href: "/advanced", label: "Advanced" },
+  { href: "/advanced", label: UI_TERMS.diagnostics },
   { href: "/settings", label: "Settings" },
 ];
 

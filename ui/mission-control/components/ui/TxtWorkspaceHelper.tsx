@@ -1,5 +1,7 @@
 import Link from "next/link";
 
+import { UI_TERMS } from "../../lib/uiLexicon";
+
 const WORKSPACE_CARDS = [
   {
     href: "/terminal",
@@ -33,7 +35,7 @@ const WORKSPACE_CARDS = [
   },
   {
     href: "/live-readiness",
-    title: "Readiness",
+    title: UI_TERMS.readiness,
     summary: "Pour verifier si une strategie ou un environnement est pret.",
     when: "Passe ici avant d'augmenter le risque ou de remettre une strategie en route.",
   },
@@ -63,7 +65,7 @@ const WORKSPACE_CARDS = [
   },
   {
     href: "/advanced",
-    title: "Advanced",
+    title: UI_TERMS.diagnostics,
     summary: "Pour les analyses plus poussees et les vues de debug.",
     when: "Ouvre cette zone seulement si tu es en phase de test, d'analyse ou de recherche plus fine.",
   },
@@ -72,7 +74,7 @@ const WORKSPACE_CARDS = [
 const QUICK_START = [
   "1. Commence par Dashboard pour voir si la machine est saine.",
   "2. Passe au Terminal pour lire le marche et agir.",
-  "3. Si quelque chose cloche, ouvre Live Ops, Readiness ou Incidents selon le type de probleme.",
+  `3. Si quelque chose cloche, ouvre Live Ops, ${UI_TERMS.readiness} ou ${UI_TERMS.incidents} selon le type de probleme.`,
 ];
 
 export default function TxtWorkspaceHelper() {

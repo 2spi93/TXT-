@@ -266,6 +266,22 @@ function buildAuditTrail(auditRows: JsonMap[], telemetryRows: JsonMap[], reality
     });
 }
 
+function filterAuditTrailRows(rows: JsonMap[], auditFilter: string): JsonMap[] {
+  const normalized = auditFilter.trim().toLowerCase();
+  if (!normalized) {
+    return rows;
+  }
+  return rows.filter((row) => {
+    const decisionId = String(row.decision_id || "").toLowerCase();
+    const decision = String(row.decision || "").toLowerCase();
+    const route = String(row.route || "").toLowerCase();
+    const execution = String(row.execution || "").toLowerCase();
+    const result = String(row.result || "").toLowerCase();
+    const compact = `${decisionId}|${decision}|${route}|${execution}|${result}`;
+    return compact.includes(normalized);
+  });
+}
+
 function computeDrawdownUsd(outcomes: JsonMap[]): number {
   let cumulative = 0;
   let peak = 0;
@@ -278,11 +294,13 @@ function computeDrawdownUsd(outcomes: JsonMap[]): number {
   return maxDrawdown;
 }
 
-export async function GET(): Promise<NextResponse> {
+export async function GET(request: Request): Promise<NextResponse> {
   const authError = await requireControlPlaneSession();
   if (authError) {
     return authError;
   }
+  const url = new URL(request.url);
+  const auditFilter = String(url.searchParams.get("audit_filter") || "").trim();
   const shadowSnapshot = getMetricsSnapshot();
   const networkSnapshot = getControlPlaneNetworkMetricsSnapshot();
   const [killSwitchResult, systemConfigResult, gateResult, telemetryResult, realityGapResult, auditResult, outcomesResult, dashboardResult, edgeObservationSummary, runtimeTruth] = await Promise.all([
@@ -464,6 +482,9 @@ export async function GET(): Promise<NextResponse> {
         ? "Paper-only remains active: keep observing until live permissions are restored."
         : "Run controlled collection only: BingX, BTCUSDT, micro-size 7-7.5 USD, no strategy tweak.";
 
+  const auditTrail = buildAuditTrail(auditRows, telemetryRows, realityGapRows);
+  const filteredAuditTrail = filterAuditTrailRows(auditTrail, auditFilter);
+
   return NextResponse.json({
     status: "ok",
     generated_at: new Date().toISOString(),
@@ -486,7 +507,10 @@ export async function GET(): Promise<NextResponse> {
       notional_proxy_usd: Number(sum(exposures.map((item) => item.notionalUsd)).toFixed(4)),
     },
     risk_timeline: buildRiskTimeline(outcomesRows, exposures),
-    audit_trail: buildAuditTrail(auditRows, telemetryRows, realityGapRows),
+    audit_filter: auditFilter || null,
+    audit_trail: filteredAuditTrail,
+    audit_trail_total_rows: auditTrail.length,
+    audit_trail_filtered_rows: filteredAuditTrail.length,
     memory_gap: {
       memory_decision: memoryDecision,
       reality_gap_score: Number(avgDriftScore.toFixed(4)),

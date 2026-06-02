@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import OperatorPanelGuide from "../../../components/ui/OperatorPanelGuide";
+import { UI_TERMS } from "../../../lib/uiLexicon";
 
 type Snapshot = {
   key: string;
@@ -438,11 +439,11 @@ export default function ChartAutoStabilityDebugPage() {
             terms={["hysteresis", "sparkline", "switches/h"]}
           />
           <p>
-            <Link href="/advanced">Advanced</Link>
+            <Link href="/advanced">Diagnostics</Link>
             {" | "}
             <Link href="/terminal">Trading Terminal</Link>
             {" | "}
-            <Link href="/live-readiness">Live Readiness</Link>
+            <Link href="/live-readiness">{UI_TERMS.readiness}</Link>
           </p>
           {error ? <p className="warn">{error}</p> : null}
         </div>

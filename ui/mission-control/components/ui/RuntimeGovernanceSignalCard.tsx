@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 
 import type { RuntimeDecisionAnalyticsSummary } from "../../lib/runtimeDecisionAnalytics";
+import { UI_TERMS } from "../../lib/uiLexicon";
 
 type JsonMap = Record<string, unknown>;
 
@@ -345,7 +346,7 @@ export default function RuntimeGovernanceSignalCard({
         </>
       ) : null}
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 12 }}>
-        <a href="/live-readiness">Ouvrir Live Readiness</a>
+        <a href="/live-readiness">Ouvrir {UI_TERMS.readiness}</a>
         <a href={regimeBrowserHref}>Ouvrir Regime Browser</a>
         {certifiedReplayHref ? <a href={certifiedReplayHref}>Ouvrir Certified Replay</a> : null}
       </div>

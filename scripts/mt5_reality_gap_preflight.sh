@@ -71,6 +71,21 @@ import json
 import urllib.error
 import urllib.request
 
+
+def fetch_json(url: str, timeout: int = 8) -> dict:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return {"ok": 200 <= response.status < 300, "status": response.status, "body": json.load(response)}
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            body = json.loads(raw)
+        except Exception:
+            body = {"raw": raw}
+        return {"ok": False, "status": exc.code, "body": body}
+    except Exception as exc:
+        return {"ok": False, "status": 0, "body": {"error": str(exc)}}
+
 try:
     with urllib.request.urlopen("http://mt5-bridge:8006/health", timeout=8) as response:
         body = json.load(response)
@@ -84,6 +99,47 @@ except urllib.error.HTTPError as exc:
     print(json.dumps({"section": "mt5_bridge_health", "ok": False, "status": exc.code, "body": body}, sort_keys=True, default=str))
 except Exception as exc:
     print(json.dumps({"section": "mt5_bridge_health", "ok": False, "status": 0, "body": {"error": str(exc)}}, sort_keys=True, default=str))
+
+target_account_id = "541283177"
+route_probe = fetch_json("http://execution-router:8002/v1/routes/score?symbol=BTCUSDT")
+bridge_probe = fetch_json("http://mt5-bridge:8006/health")
+account_probe = fetch_json(f"http://mt5-bridge:8006/v1/accounts/{target_account_id}")
+
+route_body = route_probe.get("body") if isinstance(route_probe.get("body"), dict) else {}
+route_best = route_body.get("best") if isinstance(route_body.get("best"), dict) else {}
+route_exists = bool(route_best)
+
+account_body = account_probe.get("body") if isinstance(account_probe.get("body"), dict) else {}
+account_data = account_body.get("account") if isinstance(account_body.get("account"), dict) else {}
+account_status = str(account_data.get("status") or "").strip().lower()
+account_id = str(account_data.get("account_id") or "").strip()
+
+bridge_health = bool(bridge_probe.get("ok"))
+executor_reachable = bool(account_probe.get("ok"))
+broker_session = account_status == "connected"
+account_ok = account_id == target_account_id and broker_session
+
+print(json.dumps({
+    "section": "mt5_continuity_phase1a",
+    "route_exists": route_exists,
+    "bridge_health": bridge_health,
+    "executor_reachable": executor_reachable,
+    "broker_session": broker_session,
+    "account_541283177": account_ok,
+    "target_account": target_account_id,
+    "route_probe": {
+        "ok": bool(route_probe.get("ok")),
+        "status": route_probe.get("status"),
+        "best_route_venue": route_best.get("venue") if isinstance(route_best, dict) else None,
+    },
+    "account_probe": {
+        "ok": bool(account_probe.get("ok")),
+        "status": account_probe.get("status"),
+        "account_id": account_id or None,
+        "status_text": account_status or None,
+    },
+    "note": "phase 1A continuity check only; no order submitted",
+}, sort_keys=True, default=str))
 PY
 
 docker exec -i control-plane python3 - <<'PY'

@@ -15,6 +15,7 @@ import PanelShell from "../../components/ui/PanelShell";
 import type RuntimeStabilityDebugViewType from "../../components/ui/RuntimeStabilityDebugView";
 import type IncidentCausalSummaryCardType from "../../components/ui/IncidentCausalSummaryCard";
 import { openOpsCopilotPrompt } from "../../lib/opsCopilot";
+import { UI_HELP_HINTS } from "../../lib/uiLexicon";
 import {
   applyLocalUserUiPreferences,
   fetchBackendUserUiPreferences,
@@ -128,8 +129,8 @@ import type {
 import { CHART_SIDECAR_PROFILE_IDS } from "./chartSidecarTypes";
 import {
   fetchTerminalAuthStatus,
-  isGtixPublicBrowserHost,
-  isGtixPublicHost,
+  isTxtPublicBrowserHost,
+  isTxtPublicHost,
   PUBLIC_AUTH_STATUS_CACHE_MS,
   PUBLIC_AUTH_STATUS_SYNC_MS,
   PUBLIC_TERMINAL_BACKGROUND_REFRESH_MS,
@@ -387,7 +388,8 @@ function buildTerminalMt5ReviewSignature(input: { accountId: string; symbol: str
   ].join("::");
 }
 
-const V8_PREDICTOR_STORAGE_KEY = "gtixt.terminal.v8.predictor.v1";
+const V8_PREDICTOR_STORAGE_KEY = "txt.terminal.v8.predictor.v1";
+const LEGACY_V8_PREDICTOR_STORAGE_KEY = "gtixt.terminal.v8.predictor.v1";
 const TERMINAL_DATA_MODE_QUERY_KEY = "dataMode";
 const TERMINAL_DATASET_PROFILE_QUERY_KEY = "datasetProfile";
 const TERMINAL_TRUTH_LOCK_QUERY_KEY = "truthLock";
@@ -6350,7 +6352,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
   };
 
   const refreshAuthSession = async (force = false): Promise<boolean> => {
-    const isPublicHost = isGtixPublicBrowserHost();
+    const isPublicHost = isTxtPublicBrowserHost();
     const wasAuthenticated = authStatusRef.current === "authenticated";
     if (!force && authStatusRequestRef.current) {
       return authStatusRequestRef.current;
@@ -6441,7 +6443,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
     if (typeof window === "undefined" || typeof document === "undefined") {
       return;
     }
-    if (!isGtixPublicBrowserHost()) {
+    if (!isTxtPublicBrowserHost()) {
       setPublicOpsRefreshPaused(false);
       return;
     }
@@ -6753,7 +6755,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
       setTelemetryStreamState("offline");
     };
     void syncAuthStatus(true);
-    const intervalMs = isGtixPublicBrowserHost() ? PUBLIC_AUTH_STATUS_SYNC_MS : 15_000;
+    const intervalMs = isTxtPublicBrowserHost() ? PUBLIC_AUTH_STATUS_SYNC_MS : 15_000;
     const timer = window.setInterval(() => {
       void syncAuthStatus(false);
     }, intervalMs);
@@ -8561,7 +8563,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
 
   useEffect(() => {
     loadShell(true).catch((err) => setError(err instanceof Error ? err.message : "Erreur inconnue"));
-    const intervalMs = isGtixPublicBrowserHost() ? PUBLIC_TERMINAL_BACKGROUND_REFRESH_MS : 60_000;
+    const intervalMs = isTxtPublicBrowserHost() ? PUBLIC_TERMINAL_BACKGROUND_REFRESH_MS : 60_000;
     const timer = window.setInterval(() => {
       void loadShell().catch((err) => setError(err instanceof Error ? err.message : "Erreur inconnue"));
     }, intervalMs);
@@ -8573,7 +8575,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
       return;
     }
     void loadDecks().catch((err) => setError(err instanceof Error ? err.message : "Erreur inconnue"));
-    const intervalMs = isGtixPublicBrowserHost() ? PUBLIC_TERMINAL_BACKGROUND_REFRESH_MS : 60_000;
+    const intervalMs = isTxtPublicBrowserHost() ? PUBLIC_TERMINAL_BACKGROUND_REFRESH_MS : 60_000;
     const timer = window.setInterval(() => {
       void loadDecks().catch((err) => setError(err instanceof Error ? err.message : "Erreur inconnue"));
     }, intervalMs);
@@ -8643,7 +8645,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
     }
 
     void refreshStabilitySignals();
-    const intervalMs = isGtixPublicBrowserHost() ? PUBLIC_TERMINAL_BACKGROUND_REFRESH_MS : 60_000;
+    const intervalMs = isTxtPublicBrowserHost() ? PUBLIC_TERMINAL_BACKGROUND_REFRESH_MS : 60_000;
     const timer = window.setInterval(() => {
       void refreshStabilitySignals();
     }, intervalMs);
@@ -8701,7 +8703,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
     };
 
     void refreshMt5Governance();
-    const intervalMs = isGtixPublicBrowserHost() ? PUBLIC_TERMINAL_BACKGROUND_REFRESH_MS : 60_000;
+    const intervalMs = isTxtPublicBrowserHost() ? PUBLIC_TERMINAL_BACKGROUND_REFRESH_MS : 60_000;
     const timer = window.setInterval(() => {
       void refreshMt5Governance();
     }, intervalMs);
@@ -8734,7 +8736,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
     };
 
     void refresh();
-    const intervalMs = isGtixPublicBrowserHost() ? PUBLIC_TERMINAL_GOVERNANCE_REFRESH_MS : 45_000;
+    const intervalMs = isTxtPublicBrowserHost() ? PUBLIC_TERMINAL_GOVERNANCE_REFRESH_MS : 45_000;
     const timer = window.setInterval(() => {
       void refresh();
     }, intervalMs);
@@ -8755,7 +8757,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
     let pollTimer: number | null = null;
     let closedByUnmount = false;
 
-    const usePollingFallback = typeof window !== "undefined" && isGtixPublicHost(window.location.hostname);
+    const usePollingFallback = typeof window !== "undefined" && isTxtPublicHost(window.location.hostname);
 
     const applyQuoteSnapshot = (nextQuotes: JsonMap[]) => {
       setQuotes(nextQuotes);
@@ -9354,7 +9356,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
     };
 
     void loadMetrics();
-    const intervalMs = isGtixPublicBrowserHost() ? PUBLIC_TERMINAL_GOVERNANCE_REFRESH_MS : 30_000;
+    const intervalMs = isTxtPublicBrowserHost() ? PUBLIC_TERMINAL_GOVERNANCE_REFRESH_MS : 30_000;
     const timer = window.setInterval(() => {
       void loadMetrics();
     }, intervalMs);
@@ -9378,7 +9380,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
     let pollTimer: number | null = null;
     let closedByUnmount = false;
 
-    const usePollingFallback = typeof window !== "undefined" && isGtixPublicHost(window.location.hostname);
+    const usePollingFallback = typeof window !== "undefined" && isTxtPublicHost(window.location.hostname);
 
     const schedulePoll = (delayMs: number) => {
       if (closedByUnmount) {
@@ -11520,7 +11522,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
   const driftItems = (drift.items as JsonMap[] | undefined) || [];
   const memorySummary = (((readiness?.memory_kpi as JsonMap | undefined)?.summary as JsonMap | undefined) || {});
   const balances = ((balance?.balances as JsonMap[] | undefined) || []).slice(0, 6);
-  const publicOpsPanelBadge = isGtixPublicBrowserHost() && publicOpsRefreshPaused
+  const publicOpsPanelBadge = isTxtPublicBrowserHost() && publicOpsRefreshPaused
     ? <span className="monitoring-panel-state-badge paused">bg</span>
     : null;
 
@@ -16611,7 +16613,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
       }
     };
     void loadScopes();
-    const intervalMs = isGtixPublicBrowserHost() ? PUBLIC_TERMINAL_GOVERNANCE_REFRESH_MS : 45000;
+    const intervalMs = isTxtPublicBrowserHost() ? PUBLIC_TERMINAL_GOVERNANCE_REFRESH_MS : 45000;
     const timer = window.setInterval(() => {
       void loadScopes();
     }, intervalMs);
@@ -21047,7 +21049,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
     if (!shouldPauseNonEssentialRefresh()) {
       void refreshRollbackGuardState();
     }
-    const intervalMs = isGtixPublicBrowserHost() ? PUBLIC_TERMINAL_BACKGROUND_REFRESH_MS : 60_000;
+    const intervalMs = isTxtPublicBrowserHost() ? PUBLIC_TERMINAL_BACKGROUND_REFRESH_MS : 60_000;
     const timer = window.setInterval(() => {
       if (shouldPauseNonEssentialRefresh()) {
         return;
@@ -21091,7 +21093,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
     };
 
     void pushObservation();
-    const intervalMs = isGtixPublicBrowserHost() ? PUBLIC_TERMINAL_BACKGROUND_REFRESH_MS : 60_000;
+    const intervalMs = isTxtPublicBrowserHost() ? PUBLIC_TERMINAL_BACKGROUND_REFRESH_MS : 60_000;
     const timer = window.setInterval(() => {
       void pushObservation();
     }, intervalMs);
@@ -21332,7 +21334,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
     renderableRows: localOhlcvAnalysis.renderableRows,
     chartMode: effectiveChartMode,
     chartVisualMode,
-    publicBrowserHost: isGtixPublicBrowserHost(),
+    publicBrowserHost: isTxtPublicBrowserHost(),
     attentionContext: contextualAttentionInput,
   });
   const routingInputDiagnostics = useMemo<LocalRoutingDiagnostics>(() => {
@@ -21589,7 +21591,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
         active: true,
         code: "live-readiness-degraded",
         summaryLabel: "READINESS DEGRADED · EXECUTION DISABLED",
-        detailLabel: `Live readiness ${formatControlPlaneStateLabel(readinessState)} (upstream ${readinessUpstreamStatus || "n/a"}, failure ${readinessFailureLabel}).`,
+        detailLabel: `Readiness ${formatControlPlaneStateLabel(readinessState)} (upstream ${readinessUpstreamStatus || "n/a"}, failure ${readinessFailureLabel}).`,
       };
     }
     if (hasMt5Payload && mt5Degraded) {
@@ -21626,7 +21628,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
     tone: systemRuntimeGuard.active ? "bad" : "good",
     detailLabel: systemRuntimeGuard.active
       ? systemRuntimeGuard.detailLabel
-      : "Runtime guard clear: Live Ops, readiness et bridge MT5 ne bloquent pas l'execution.",
+      : "Runtime guard clear: Live Ops, Readiness et bridge MT5 ne bloquent pas l'execution.",
   }), [systemRuntimeGuard]);
   const executionPolicyEngineMode = useMemo<"v3" | "v4">(() => {
     if (typeof window === "undefined" || !navigator.webdriver) {
@@ -25902,7 +25904,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
         style={{ order: lowerOrderById.blotter ?? 0, display: floatingPanels.some((fp) => fp.id === "blotter") ? "none" : undefined }}
       >
         <PanelShell className="panel term-blotter-panel gtix-panel-resizable-y">
-          <div className="eyebrow">Blotter d'exécution <HelpHint text="Journal des exécutions récentes." examples={["Si slippage monte brutalement, suspecte broker ou routeur dégradé."]} />
+          <div className="eyebrow">Blotter d'exécution <HelpHint text={UI_HELP_HINTS.terminalExecutionBlotter.text} examples={UI_HELP_HINTS.terminalExecutionBlotter.examples} />
             {layoutEditMode && <button type="button" className="panel-detach-btn" title="Detacher ce panneau" onClick={() => detachPanel("blotter", "lower")}>⤡</button>}
           </div>
           {filteredOutcomes.length === 0 ? <p className="subtle mini" style={{ marginTop: 8 }}>Aucune exécution.</p> : null}
@@ -26032,6 +26034,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
               onTrainingStatsChange={setV8TrainingStats}
               onPersistenceLoaded={setV8PersistenceLoaded}
               storageKey={V8_PREDICTOR_STORAGE_KEY}
+              legacyStorageKey={LEGACY_V8_PREDICTOR_STORAGE_KEY}
               trainingFlushSize={V8_BACKEND_TRAINING_FLUSH_SIZE}
               trainingFlushIntervalMs={V8_BACKEND_TRAINING_FLUSH_INTERVAL_MS}
             >
@@ -26758,7 +26761,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
             <article className={`term-performance-card tone-${performanceDeskTone}`}>
               <div className="term-performance-head">
                 <div>
-                  <span className="eyebrow">Performance Desk <HelpHint text="Le Performance Desk relie les chiffres de performance au type de capital sous-jacent: broker live, broker paper, exchange ou wallet." examples={["Avant de lire une bonne perf comme du vrai live, regarde la ligne source-capital juste en dessous.", "Si une source exchange n'est pas canonique, elle ne doit pas etre lue comme du capital pleinement gouverne."]} /></span>
+                  <span className="eyebrow">Performance Desk <HelpHint text={UI_HELP_HINTS.terminalPerformanceDesk.text} examples={UI_HELP_HINTS.terminalPerformanceDesk.examples} /></span>
                   <div className="term-performance-title">Attribution stratégie · symbole · venue</div>
                 </div>
                 <span className={`term-decision-badge tone-${performanceDeskTone}`}>{performanceSummary?.trade_count || 0} trades</span>
@@ -26810,7 +26813,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
             <article className={`term-performance-card tone-${latestInvestorReport ? "go" : "watch"}`}>
               <div className="term-performance-head">
                 <div>
-                  <span className="eyebrow">Investor Report <HelpHint text="Résumé du dernier reporting investisseur généré pour donner une lecture client ou comité du portefeuille." examples={["Si aucun rapport n'apparait, le desk reste lisible pour l'ops mais pas encore pour un reporting client propre.", "Le scope du rapport aide a comprendre quel portefeuille ou quelle strategie est couverte."]} /></span>
+                  <span className="eyebrow">Investor Report <HelpHint text={UI_HELP_HINTS.terminalInvestorReport.text} examples={UI_HELP_HINTS.terminalInvestorReport.examples} /></span>
                   <div className="term-performance-title">Dernier rapport généré</div>
                 </div>
                 <span className={`term-decision-badge tone-${latestInvestorReport ? "go" : "watch"}`}>{latestInvestorReport?.status || "none"}</span>
@@ -28310,7 +28313,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
 
         {/* ── EXECUTION LANE ── */}
         <PanelShell className="panel term-exec-panel gtix-panel-resizable-y">
-          <div className="exec-lane-header"><span className="eyebrow">Execution Lane</span><span className={`status-chip ${avgLatency > 200 ? "alert-chip" : ""}`}>live {avgLatency.toFixed(0)} ms</span><HelpHint text="Route préférée, surveillance slippage/latence, replay et ticket d'ordre gouverné." examples={["Route préférée = venue avec le plus petit spread.", "Replay = dernier fill series avec timeline et histogramme slippage."]} /></div>
+          <div className="exec-lane-header"><span className="eyebrow">Execution Lane</span><span className={`status-chip ${avgLatency > 200 ? "alert-chip" : ""}`}>live {avgLatency.toFixed(0)} ms</span><HelpHint text={UI_HELP_HINTS.terminalExecutionLane.text} examples={UI_HELP_HINTS.terminalExecutionLane.examples} /></div>
           {showExecOverlay && (
             <div className="exec-overlay-strip">
               <div className="eov-block">
@@ -29773,7 +29776,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
           {monitoringContextMounted ? TERMINAL_CONTEXT_PANEL_IDS.map((id) => renderMonitoringDeckCard(id)) : null}
           {diagnosticsSurfaceOpen ? (
             <div className="term-monitoring-section-switches" style={{ display: "grid", gap: 8, marginBottom: 8 }}>
-              <div className="subtle mini">Les diagnostics avances restent fermes tant qu'une famille n'est pas ouverte. La vue essentielle garde seulement risque, marche, tradabilite, venues et readiness.</div>
+              <div className="subtle mini">Les diagnostics avances restent fermes tant qu'une famille n'est pas ouverte. La vue essentielle garde seulement risque, marche, tradabilite, venues et Readiness.</div>
               <div className="exec-lane-summary-actions">
                 <button
                   type="button"

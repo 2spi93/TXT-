@@ -102,6 +102,9 @@ export type RuntimeReadonlyProjectionSnapshot = {
       chartFeed: { value: string; tone: ProjectionTone };
       exchange: { value: string; tone: ProjectionTone };
       telemetry: { value: string; tone: ProjectionTone };
+      spreadLiveUsed: { value: string; tone: ProjectionTone };
+      decisionQuoteCoverage: { value: string; tone: ProjectionTone };
+      decisionQuoteDiagnostic: { value: string; tone: ProjectionTone };
     };
   };
 };
@@ -766,6 +769,50 @@ export function buildRuntimeReadonlyProjection(input: {
     runtimeDecisionSummary,
   });
   const runtimeLive = runtimeDecisionSummary?.monitoring?.live || null;
+  const runtimeOpsRecord = safeRecord(input.runtimeOpsPayload);
+  const runtimeTruthPrimary = safeRecord(runtimeOpsRecord.runtime_truth);
+  const runtimeTruthRaw = safeRecord(safeRecord(runtimeOpsRecord.raw).runtime_truth);
+  const runtimeTruth = Object.keys(runtimeTruthPrimary).length > 0 ? runtimeTruthPrimary : runtimeTruthRaw;
+  const runtimeTruthLayers = safeRecord(runtimeTruth.layers);
+  const decisionReality = safeRecord(runtimeTruthLayers.decision_reality);
+  const spreadLiveUsedRateRaw = Number(decisionReality.spread_live_used_rate_pct);
+  const spreadLiveUsedRatePct = Number.isFinite(spreadLiveUsedRateRaw) ? spreadLiveUsedRateRaw : null;
+  const decisionQuoteCoverageRateRaw = Number(decisionReality.decision_quote_coverage_pct);
+  const decisionQuoteCoverageRatePct = Number.isFinite(decisionQuoteCoverageRateRaw) ? decisionQuoteCoverageRateRaw : null;
+  const decisionQuoteCoveredRows = Number(decisionReality.decision_quote_covered_rows);
+  const decisionQuoteUncoveredRows = Number(decisionReality.decision_quote_uncovered_rows);
+  const decisionQuoteCoverageBreakdown = Array.isArray(decisionReality.decision_quote_coverage_breakdown)
+    ? decisionReality.decision_quote_coverage_breakdown
+        .map((item) => {
+          const label = String((item as { label?: unknown })?.label || (item as { key?: unknown })?.key || "").trim();
+          const countRaw = Number((item as { count?: unknown })?.count);
+          return label && Number.isFinite(countRaw) ? `${label} x${countRaw}` : null;
+        })
+        .filter((item): item is string => Boolean(item))
+    : [];
+  const decisionQuoteTopUncoveredReasons = Array.isArray(decisionReality.decision_quote_top_uncovered_reasons)
+    ? decisionReality.decision_quote_top_uncovered_reasons
+        .map((item) => {
+          const reason = String((item as { reason?: unknown })?.reason || "").trim();
+          const countRaw = Number((item as { count?: unknown })?.count);
+          return reason && Number.isFinite(countRaw) ? `${reason} x${countRaw}` : null;
+        })
+        .filter((item): item is string => Boolean(item))
+    : [];
+  const spreadLiveUsedMetric = {
+    value: spreadLiveUsedRatePct === null ? "n/a" : `${spreadLiveUsedRatePct.toFixed(1)}%`,
+    tone: spreadLiveUsedRatePct === null ? "subtle" as const : spreadLiveUsedRatePct > 0 ? "good" as const : "warn" as const,
+  };
+  const decisionQuoteCoverageMetric = {
+    value: decisionQuoteCoverageRatePct === null ? "n/a" : `${decisionQuoteCoverageRatePct.toFixed(1)}%`,
+    tone: decisionQuoteCoverageRatePct === null ? "subtle" as const : decisionQuoteCoverageRatePct >= 100 ? "good" as const : decisionQuoteCoverageRatePct > 0 ? "subtle" as const : "warn" as const,
+  };
+  const decisionQuoteDiagnosticMetric = {
+    value: decisionQuoteCoverageRatePct === null
+      ? "n/a"
+      : `${decisionQuoteCoveredRows}/${decisionQuoteCoveredRows + decisionQuoteUncoveredRows || 0} covered${decisionQuoteCoverageBreakdown.length > 0 ? ` · ${decisionQuoteCoverageBreakdown.slice(0, 2).join(", ")}` : decisionQuoteTopUncoveredReasons.length > 0 ? ` · ${decisionQuoteTopUncoveredReasons.slice(0, 3).join(", ")}` : ""}`,
+    tone: decisionQuoteCoverageRatePct === null ? "subtle" as const : decisionQuoteCoverageRatePct >= 100 ? "good" as const : decisionQuoteCoverageRatePct > 0 ? "subtle" as const : "warn" as const,
+  };
   const runtimeDecisionHeader = runtimeDecisionSummary
     ? (isRuntimeTelemetryIssueState(runtimeDecisionSummary.opportunity.liveState)
       ? { label: runtimeDecisionSummary.opportunity.liveState, tone: runtimeTelemetryStateTone(runtimeDecisionSummary.opportunity.liveState) }
@@ -808,6 +855,9 @@ export function buildRuntimeReadonlyProjection(input: {
           value: runtimeTelemetryGuard?.label ? `${runtimeTelemetryGuard.label}${runtimeTelemetryLead ? ` / ${runtimeTelemetryLead.code}` : ""}` : (runtimeTelemetryLead?.code || "n/a"),
           tone: runtimeTelemetryGuard?.tone || runtimeTelemetryLead?.tone || "subtle",
         },
+        spreadLiveUsed: spreadLiveUsedMetric,
+        decisionQuoteCoverage: decisionQuoteCoverageMetric,
+        decisionQuoteDiagnostic: decisionQuoteDiagnosticMetric,
       },
     },
   };

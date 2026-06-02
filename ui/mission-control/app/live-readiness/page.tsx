@@ -151,7 +151,7 @@ export default function LiveReadinessPage() {
       fetch("/api/market-state-map?symbol=DESK&timeframe=live&strategy=live-ops&sinceDays=14&limit=1200&windowHours=24", { cache: "no-store" }),
     ]);
     if (!readinessRes.ok || !thresholdRes.ok) {
-      throw new Error("Impossible de charger la vue Live Readiness");
+      throw new Error("Impossible de charger la vue Readiness");
     }
     setOverview(await readinessRes.json());
     const thresholdsPayload = await thresholdRes.json();
@@ -328,7 +328,7 @@ export default function LiveReadinessPage() {
     <main className="shell txt-page-shell">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.4fr 1fr" }}>
         <div id="global-guide-readiness-hero" className="panel txt-page-hero">
-          <div className="eyebrow">Live Readiness Center</div>
+          <div className="eyebrow">Readiness Center</div>
           <h1 className="title" style={{ fontSize: 34 }}>Pret pour le live, derive et test memoire</h1>
           <p className="subtle txt-page-hero-copy">Cette page dit si les strategies restent assez propres pour continuer le live ou s'il faut freiner, suspendre et revalider.</p>
           <OperatorPanelGuide
@@ -344,7 +344,7 @@ export default function LiveReadinessPage() {
           <p>
             <Link href="/dashboard">Dashboard</Link>
             {" | "}
-            <Link href="/live-readiness/drift-alert-log">Drift Alert Log</Link>
+            <Link href="/live-readiness/drift-alert-log">Drift Log</Link>
             {" | "}
             <Link href="/live-readiness/edge-map">Edge Map</Link>
             {" | "}

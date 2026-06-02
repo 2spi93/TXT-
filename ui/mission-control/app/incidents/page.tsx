@@ -135,7 +135,7 @@ export default function IncidentsPage() {
     <main className="shell txt-page-shell">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.4fr 1fr" }}>
         <div id="global-guide-incidents-hero" className="panel txt-page-hero">
-          <div className="eyebrow">Incident Desk</div>
+          <div className="eyebrow">Incident Operations</div>
           <h1 className="title" style={{ fontSize: 34 }}>Incidents Operations</h1>
           <p className="subtle">Pilote les incidents ouverts par le chatbot et les operateurs.</p>
           <OperatorPanelGuide
@@ -149,7 +149,7 @@ export default function IncidentsPage() {
             {" | "}
             <Link href="/terminal">Trading Terminal</Link>
             {" | "}
-            <Link href="/live-readiness">Live Readiness</Link>
+            <Link href="/live-readiness">Readiness</Link>
             {" | "}
             <Link href="/ai">IA</Link>
           </p>

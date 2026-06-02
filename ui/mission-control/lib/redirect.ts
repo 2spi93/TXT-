@@ -7,7 +7,12 @@ function normalizeForwardedProto(value: string | null): string {
 
 function isPublicHttpsHost(host: string): boolean {
   const normalized = host.split(":")[0].toLowerCase();
-  return normalized === "app.txt.gtixt.com" || normalized.endsWith(".gtixt.com");
+  return normalized === "app.txt.gtixt.com"
+    || normalized === "txt.gtixt.com"
+    || normalized === "api.txt.gtixt.com"
+    || normalized === "staging.txt.gtixt.com"
+    || normalized === "api.staging.txt.gtixt.com"
+    || normalized === "bridge.txt.gtixt.com";
 }
 
 export function isHttpsRequest(request: Request): boolean {

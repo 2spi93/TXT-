@@ -356,7 +356,7 @@ function buildOverfitShield(input: {
     drawdownPct >= 3 ? `drawdown ${drawdownPct.toFixed(2)}% triggers learning freeze` : null,
     negativeStreakEstimate >= 5 ? `negative streak proxy ${negativeStreakEstimate.toFixed(0)} trades` : null,
     override24h > 0 ? `${override24h.toFixed(0)} visible override(s) over 24h` : null,
-    realityGapScore > 0.2 ? `reality gap ${realityGapScore.toFixed(2)} is elevated` : null,
+    realityGapScore > 0.2 ? `execution gap ${realityGapScore.toFixed(2)} is elevated` : null,
   ].filter((value): value is string => Boolean(value));
 
   return {

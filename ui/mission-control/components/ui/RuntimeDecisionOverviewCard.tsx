@@ -5,6 +5,7 @@ import type {
   RuntimeDecisionFalseContextMotif,
   RuntimeDecisionOpportunityBreakdownItem,
 } from "../../lib/runtimeDecisionAnalytics";
+import { UI_HELP_HINTS } from "../../lib/uiLexicon";
 
 type Props = {
   summary: RuntimeDecisionAnalyticsSummary | null;
@@ -267,7 +268,7 @@ export default function RuntimeDecisionOverviewCard({ summary, compact = false, 
         <div>
           <div className="eyebrow">
             {title}
-            {!compact ? <HelpHint text="Lecture compacte des refus d'execution: bucket dominant, codes majeurs, hygiene de journal et contexte de marche." examples={["Si market domine, traite d'abord la rarete d'edge et le routing score.", "Si runtime domine, va verifier readiness, recovery, fallback et bridge avant toute calibration."]} /> : null}
+            {!compact ? <HelpHint text={UI_HELP_HINTS.runtimeDecisionOverview.text} examples={UI_HELP_HINTS.runtimeDecisionOverview.examples} /> : null}
           </div>
           <div className={`runtime-decision-headline ${toneClass(summary.deskRead.tone)}`}>{summary.deskRead.headline}</div>
           <p className="runtime-decision-summary">{summary.deskRead.summary}</p>

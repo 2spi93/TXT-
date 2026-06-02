@@ -497,7 +497,7 @@ export default function ChartHudSignalDecisionPanel({
                   {stateKey}
                 </button>
               ))}
-              <input type="text" className="chart-auto-exec-reason-search" placeholder="reason search" value={autoExecutionAuditReasonSearch} onChange={(event) => onSetAutoExecutionAuditReasonSearch(event.target.value)} />
+              <input type="text" className="chart-auto-exec-reason-search" placeholder="recherche raison" value={autoExecutionAuditReasonSearch} onChange={(event) => onSetAutoExecutionAuditReasonSearch(event.target.value)} />
               <button type="button" className="chart-chip" onClick={onExportAutoExecutionAuditJson}>Export JSON</button>
               <button type="button" className="chart-chip" onClick={onExportAutoExecutionAuditCsv}>Export CSV</button>
               <button type="button" className="chart-chip" onClick={onClearAutoExecutionAuditTrail}>Clear</button>

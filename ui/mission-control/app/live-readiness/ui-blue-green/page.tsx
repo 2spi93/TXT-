@@ -25,7 +25,7 @@ export default async function UiBlueGreenPage() {
           <h1 className="title" style={{ fontSize: 34 }}>Etat operateur des slots Mission Control UI</h1>
           <p className="subtle txt-page-hero-copy">Cette page montre quel slot UI sert le trafic, quel slot est en standby, et si les deux environnements repondent reellement sur le reseau compose.</p>
           <OperatorPanelGuide
-            title="Guide Blue Green"
+            title="Guide Blue/Green"
             what="Le slot actif, le standby, les build IDs et la joignabilite des deux UIs."
             why="Verifier la capacite de promotion et rollback sans couper le terminal live."
             example="Si le slot standby repond avec un build ID recent, tu peux le promouvoir; s'il est DOWN, tu ne flips pas."
@@ -37,9 +37,9 @@ export default async function UiBlueGreenPage() {
           <p>
             <Link href="/dashboard">Dashboard</Link>
             {" | "}
-            <Link href="/live-readiness">Live Readiness</Link>
+            <Link href="/live-readiness">Readiness</Link>
             {" | "}
-            <Link href="/live-readiness/drift-alert-log">Drift Alert Log</Link>
+            <Link href="/live-readiness/drift-alert-log">Drift Log</Link>
             {" | "}
             <Link href="/terminal">Trading Terminal</Link>
           </p>

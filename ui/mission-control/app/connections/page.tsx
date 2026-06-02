@@ -17,6 +17,7 @@ import {
   suggestedExchangeVenue,
   type ExchangeCapability,
 } from "../../lib/exchangeCapabilities";
+import { UI_HELP_HINTS } from "../../lib/uiLexicon";
 
 type JsonMap = Record<string, unknown>;
 
@@ -126,7 +127,7 @@ export default function ConnectionsPage() {
   const [walletAccessMode, setWalletAccessMode] = useState("read");
   const [exchangeCapabilities, setExchangeCapabilities] = useState<Record<string, ExchangeCapability>>({});
   const [integrationRoutes, setIntegrationRoutes] = useState<JsonMap[]>([]);
-  const [integrationSource, setIntegrationSource] = useState("kairos");
+  const [integrationSource, setIntegrationSource] = useState("market-regime");
   const [integrationRouteKey, setIntegrationRouteKey] = useState("default");
   const [integrationAccountId, setIntegrationAccountId] = useState("");
   const [integrationPreferredVenue, setIntegrationPreferredVenue] = useState("bingx");
@@ -478,12 +479,12 @@ export default function ConnectionsPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Connexion MT5 directe <HelpHint text="Point d'entree client pour rattacher un compte MetaTrader 5 paper ou live a TXT, y compris FTMO via MT5." examples={["Pour FTMO, branche le compte en mode live, puis utilise ensuite la route live plus bas pour l'activer cote agent.", "Commencez par paper pour tester le pipeline complet sans risque reel."]} /></div>
+          <div className="eyebrow">Connexion MT5 directe <HelpHint text={UI_HELP_HINTS.connectionsDirectMt5.text} examples={UI_HELP_HINTS.connectionsDirectMt5.examples} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
-            <input value={accountId} onChange={(e) => setAccountId(e.target.value)} placeholder="account_id" />
-            <input value={broker} onChange={(e) => setBroker(e.target.value)} placeholder="broker" />
-            <input value={server} onChange={(e) => setServer(e.target.value)} placeholder="server" />
-            <input value={login} onChange={(e) => setLogin(e.target.value)} placeholder="login" />
+            <input value={accountId} onChange={(e) => setAccountId(e.target.value)} placeholder="ID compte" />
+            <input value={broker} onChange={(e) => setBroker(e.target.value)} placeholder="Broker (ex: FTMO)" />
+            <input value={server} onChange={(e) => setServer(e.target.value)} placeholder="Serveur MT5" />
+            <input value={login} onChange={(e) => setLogin(e.target.value)} placeholder="Login MT5" />
             <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="mot de passe MT5" />
             <select value={mode} onChange={(e) => setMode(e.target.value)}>
               <option value="paper">paper</option>
@@ -509,7 +510,7 @@ export default function ConnectionsPage() {
           ) : null}
           {mt5Accounts.length > 0 ? (
             <div className="panel" style={{ marginTop: 12, borderRadius: 12 }}>
-              <div className="eyebrow">Source broker_session MT5 <HelpHint text="Persiste ici la source externe du broker_state MT5 et l'URL d'execution live reelle. Sans execution_url, le bridge MT5 live bloque maintenant l'ordre au lieu de simuler un accepted." examples={["Snapshot URL + payload_path = TXT lit le JSON externe, puis l'injecte dans le bridge MT5 canonique.", "Execution URL = TXT envoie le vrai ticket MT5 live a la session broker externe au lieu de simuler un ordre.", "Effacer la source remet broker_session a vide pour couper l'ingestion automatique et l'execution live externe."]} /></div>
+              <div className="eyebrow">Source broker_session MT5 <HelpHint text={UI_HELP_HINTS.connectionsMt5BrokerSessionSource.text} examples={UI_HELP_HINTS.connectionsMt5BrokerSessionSource.examples} /></div>
               <div className="form-grid" style={{ marginTop: 12 }}>
                 <select value={mt5BrokerSessionAccountId} onChange={(e) => setMt5BrokerSessionAccountId(e.target.value)}>
                   {mt5Accounts.map((item) => (
@@ -542,7 +543,7 @@ export default function ConnectionsPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Enregistrer un compte exchange <HelpHint text="Renseigne ici les accès créés sur l'exchange. TXT vérifie maintenant la clé tout de suite pour éviter d'enregistrer un mauvais accès." examples={["Pour OKX, remplis la clé API, le secret API, la passphrase créée avec la clé et l'identifiant du compte ou du sous-compte.", "Choisis Lecture seule pour voir le compte sans autoriser d'ordre."]} /></div>
+          <div className="eyebrow">Enregistrer un compte exchange <HelpHint text={UI_HELP_HINTS.connectionsRegisterExchange.text} examples={UI_HELP_HINTS.connectionsRegisterExchange.examples} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <select value={exchangeProviderId} onChange={(e) => setExchangeProviderId(e.target.value)}>
               {EXCHANGE_CONNECTION_CATALOG.filter((item) => item.mode === "api-key").map((item) => (
@@ -581,10 +582,10 @@ export default function ConnectionsPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Route d'integration live <HelpHint text="Expose la creation de route pour un signal autonome vers un compte lie, exchange ou broker MT5/FTMO." examples={["Source kairos + route default + live enabled = le moteur peut demander du vrai live gouverne vers BingX ou un compte MT5 FTMO.", "Si tu veux rester sans risque, desactive live_enabled ou garde un venue paper."]} /></div>
+          <div className="eyebrow">Route d'integration live <HelpHint text={UI_HELP_HINTS.connectionsLiveIntegrationRoute.text} examples={UI_HELP_HINTS.connectionsLiveIntegrationRoute.examples} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
-            <input value={integrationSource} onChange={(e) => setIntegrationSource(e.target.value)} placeholder="source (ex: kairos)" />
-            <input value={integrationRouteKey} onChange={(e) => setIntegrationRouteKey(e.target.value)} placeholder="route_key" />
+            <input value={integrationSource} onChange={(e) => setIntegrationSource(e.target.value)} placeholder="Source (ex: market-regime)" />
+            <input value={integrationRouteKey} onChange={(e) => setIntegrationRouteKey(e.target.value)} placeholder="Cle route (default)" />
             <select value={integrationAccountId} onChange={(e) => setIntegrationAccountId(e.target.value)}>
               <option value="">compte lie pour execution</option>
               {linkedExecutionAccounts.map((item) => (
@@ -593,8 +594,8 @@ export default function ConnectionsPage() {
                 </option>
               ))}
             </select>
-            <input value={integrationPreferredVenue} onChange={(e) => setIntegrationPreferredVenue(e.target.value)} placeholder="preferred_venue" />
-            <input type="number" step="0.1" value={integrationNotionalUsd} onChange={(e) => setIntegrationNotionalUsd(Number(e.target.value || 0))} placeholder="notional_usd" />
+            <input value={integrationPreferredVenue} onChange={(e) => setIntegrationPreferredVenue(e.target.value)} placeholder="Venue preferee" />
+            <input type="number" step="0.1" value={integrationNotionalUsd} onChange={(e) => setIntegrationNotionalUsd(Number(e.target.value || 0))} placeholder="Notional USD" />
             <label className="row" style={{ gap: 8 }}>
               <span>Live enabled</span>
               <input type="checkbox" checked={integrationLiveEnabled} onChange={(e) => setIntegrationLiveEnabled(e.target.checked)} />
@@ -626,7 +627,7 @@ export default function ConnectionsPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Connexion wallet / adresse on-chain <HelpHint text="Liez ici une adresse publique ou une référence custody. TXT ne doit jamais recevoir la clé privée du wallet." examples={["Solana: renseignez l'adresse publique et un label clair.", "Pour du trade on-chain agentique, utilisez Fireblocks, Safe ou un wallet adapter compatible."]} /></div>
+          <div className="eyebrow">Connexion wallet / adresse on-chain <HelpHint text={UI_HELP_HINTS.connectionsWalletOnchain.text} examples={UI_HELP_HINTS.connectionsWalletOnchain.examples} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <select value={walletProviderId} onChange={(e) => setWalletProviderId(e.target.value)}>
               {WALLET_CONNECTION_CATALOG.map((item) => (
@@ -666,7 +667,7 @@ export default function ConnectionsPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Onboarding broker / exchange / wallet non standard <HelpHint text="Demande client pour les connexions hors parcours directs deja supportes." examples={["Choisissez prop firm si votre venue utilise une plateforme proprietaire.", "Utilisez ce bloc quand l'integration demande FIX, OAuth specifique ou un adaptateur dedie."]} /></div>
+          <div className="eyebrow">Onboarding broker / exchange / wallet non standard <HelpHint text={UI_HELP_HINTS.connectionsNonStandardOnboarding.text} examples={UI_HELP_HINTS.connectionsNonStandardOnboarding.examples} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <select value={connectionProviderType} onChange={(e) => setConnectionProviderType(e.target.value as ConnectionProviderType)}>
               <option value="broker">broker</option>

@@ -9559,6 +9559,8 @@ def _evaluate_go_live_hardening(
         "approval_mode": "",
         "override": False,
     }
+    governance_mode = str(governance_view.get("approval_mode") or "").strip().lower()
+    is_second_governance_approval = bool(governance_view.get("approved")) and governance_mode == "mt5_double_approval"
     normalized_symbol = _normalize_symbol(symbol)
     normalized_side = str(side or "buy").strip().lower() or "buy"
     status = "approved"
@@ -9583,6 +9585,11 @@ def _evaluate_go_live_hardening(
     drawdown_threshold = max(_kill_switch_thresholds().get("max_drawdown_intraday", 1.0), 1.0)
     drawdown_intraday_usd = _to_float(((kill_state.get("stats") or {}) if isinstance(kill_state.get("stats"), dict) else {}).get("drawdown_intraday_usd"), 0.0)
     pending_live_approvals = _recent_pending_live_approval_count(account_id)
+    # During second approval, count the current pending request as in-flight so
+    # backlog checks do not deadlock the queue at the threshold.
+    governance_approval_id = str(governance_view.get("approval_id") or "").strip()
+    if active and governance_view.get("approved") and governance_approval_id and governance_mode == "mt5_double_approval":
+        pending_live_approvals = max(0, pending_live_approvals - 1)
 
     if active and kill_state.get("active"):
         reasons.append("kill_switch_active")
@@ -9621,10 +9628,10 @@ def _evaluate_go_live_hardening(
     degraded_confidence_multiplier = _clamp(_to_float(anti_loop_policy.get("degraded_confidence_multiplier"), 0.6), 0.1, 1.0)
     anti_loop_degraded = anti_loop.get("repeat_count", 0) >= same_signal_limit
     anti_loop_blocked = anti_loop.get("repeat_count", 0) >= block_after_repeats
-    if active and anti_loop_degraded:
+    if active and anti_loop_degraded and not is_second_governance_approval:
         effective_confidence = _clamp(effective_confidence * degraded_confidence_multiplier, 0.0, 1.0)
         reasons.append("anti_loop_confidence_degraded")
-    if active and anti_loop_blocked:
+    if active and anti_loop_blocked and not is_second_governance_approval:
         reasons.append("anti_loop_repetition_blocked")
         status = _promote_go_live_status(status, "blocked")
 
@@ -9662,7 +9669,7 @@ def _evaluate_go_live_hardening(
         status = _promote_go_live_status(status, "require_human")
 
     min_live_confidence = _to_float(policy.get("min_live_confidence"), 0.7)
-    if active and min_live_confidence > 0 and effective_confidence < min_live_confidence:
+    if active and min_live_confidence > 0 and effective_confidence < min_live_confidence and not is_second_governance_approval:
         reasons.append("confidence_below_governance_threshold")
         status = _promote_go_live_status(status, "blocked")
 
@@ -19567,6 +19574,19 @@ async def proxy_mt5_accounts(auth: AuthContext = Depends(viewer_auth)) -> list[d
     return enriched
 
 
+@app.get("/v1/mt5/accounts/{account_id}/quote/{symbol}")
+async def proxy_mt5_account_quote(account_id: str, symbol: str) -> dict:
+    safe_account_id = str(account_id or "").strip()
+    safe_symbol = str(symbol or "").strip().upper()
+    if not safe_account_id or not safe_symbol:
+        raise HTTPException(status_code=400, detail="account_id and symbol are required")
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        response = await client.get(f"{MT5_BRIDGE_URL}/v1/accounts/{safe_account_id}/quote/{safe_symbol}")
+        if response.status_code >= 400:
+            raise HTTPException(status_code=502, detail="MT5 bridge unavailable")
+        return response.json()
+
+
 @app.post("/v1/mt5/accounts")
 async def proxy_mt5_connect_account(payload: dict, auth: AuthContext = Depends(connector_manage_auth)) -> dict:
     account_id = _normalize_account_id(payload.get("account_id"))
@@ -20851,6 +20871,618 @@ async def mt5_orders_risk_history_export(
     return PlainTextResponse(content=output.getvalue(), media_type="text/csv")
 
 
+@app.get("/v1/mt5/orders/spread-decision-trace/summary")
+async def mt5_spread_decision_trace_summary(
+    lookback_hours: float = 72.0,
+    limit: int = 800,
+    auth: AuthContext = Depends(viewer_auth),
+) -> dict:
+    del auth
+    safe_limit = max(1, min(limit, 5000))
+    safe_lookback_hours = max(1.0, min(lookback_hours, 24.0 * 30.0))
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=safe_lookback_hours)
+
+    rows = fetch_all(
+        """
+        SELECT created_at, category, payload
+        FROM audit_events
+        WHERE created_at >= %s
+          AND category IN ('mt5_order_rejected', 'mt5_order_accepted', 'mt5_live_order_pending_second_approval')
+        ORDER BY id DESC
+        LIMIT %s
+        """,
+        (cutoff, safe_limit),
+    )
+
+    policy_row = fetch_one(
+        """
+        SELECT policy_version, policy
+        FROM risk_policies
+        WHERE is_active = TRUE
+        ORDER BY created_at DESC
+        LIMIT 1
+        """
+    )
+    policy_payload = policy_row.get("policy") if isinstance(policy_row, dict) and isinstance(policy_row.get("policy"), dict) else {}
+    policy_max_slippage_bps = _to_float(policy_payload.get("max_slippage_bps"), None)
+    policy_version = str((policy_row or {}).get("policy_version") or "") or str(policy_payload.get("policy_version") or "")
+
+    spread_too_wide_rows = 0
+    policy_only_rows = 0
+    spread_live_used_rows = 0
+    decision_quote_covered_rows = 0
+    decision_quote_uncovered_rows = 0
+    decision_quote_observed_ignored_rows = 0
+    decision_quote_ignored_gate_threshold_pct = 5.0
+    uncovered_reason_counts: dict[str, int] = {}
+    coverage_breakdown_counts: dict[str, int] = {
+        "quote_observed_and_used": 0,
+        "quote_observed_but_ignored": 0,
+        "quote_timeout": 0,
+        "quote_unavailable": 0,
+        "fallback_path_used": 0,
+        "legacy_path_used": 0,
+    }
+    classified_rows: list[dict[str, Any]] = []
+    observed_ignored_path_source_counts: dict[tuple[str, str], int] = {}
+    observed_ignored_path_source_recent_ids: dict[tuple[str, str], list[tuple[datetime, str]]] = {}
+    observed_ignored_path_source_reason_counts: dict[tuple[str, str, str], int] = {}
+    observed_ignored_path_source_reason_recent_ids: dict[tuple[str, str, str], list[tuple[datetime, str]]] = {}
+    observed_ignored_reason_counts: dict[str, int] = {}
+    decision_path_total_counts: dict[str, int] = {}
+    decision_path_ignored_counts: dict[str, int] = {}
+    decision_path_ignored_gate_threshold_pct = 10.0
+    decision_path_reason_total_counts: dict[tuple[str, str], int] = {}
+    decision_path_reason_ignored_counts: dict[tuple[str, str], int] = {}
+    decision_path_reason_source_ignored_counts: dict[tuple[str, str, str], int] = {}
+    decision_path_reason_ignored_gate_threshold_pct = 10.0
+    decision_path_reason_impact_gate_threshold_pct_points = max(
+        0.05,
+        _to_float(os.getenv("SPREAD_DECISION_PATH_REASON_IMPACT_ALERT_THRESHOLD_PCT_POINTS"), 1.0),
+    )
+    last_spread_reject_at: str | None = None
+    trace_preview: list[dict[str, Any]] = []
+
+    for row in rows:
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        risk = payload.get("risk") if isinstance(payload.get("risk"), dict) else {}
+        reasons = risk.get("reasons") if isinstance(risk.get("reasons"), list) else []
+        reasons_text = [str(item) for item in reasons]
+        if "spread_too_wide" not in reasons_text:
+            continue
+
+        spread_too_wide_rows += 1
+        created_at = row.get("created_at")
+        created_iso = created_at.isoformat() if isinstance(created_at, datetime) else None
+        if last_spread_reject_at is None:
+            last_spread_reject_at = created_iso
+
+        risk_context = payload.get("risk_context") if isinstance(payload.get("risk_context"), dict) else {}
+        spread_live_used = _to_float(
+            payload.get("spread_live_used")
+            if payload.get("spread_live_used") is not None
+            else risk_context.get("spread_bps"),
+            None,
+        )
+        spread_source = str(
+            payload.get("spread_source")
+            if payload.get("spread_source") is not None
+            else risk_context.get("spread_source")
+            if isinstance(risk_context.get("spread_source"), str)
+            else ""
+        ).strip()
+        broker_bid = _to_float(payload.get("broker_bid"), None)
+        broker_ask = _to_float(payload.get("broker_ask"), None)
+        broker_spread_bps = _to_float(payload.get("broker_spread_bps"), None)
+        quote_timestamp = str(
+            payload.get("broker_quote_observed_at")
+            or risk_context.get("quote_timestamp")
+            or created_iso
+            or ""
+        ).strip() or None
+        spread_source_norm = spread_source.lower()
+        has_quote_values = broker_bid is not None or broker_ask is not None or broker_spread_bps is not None
+        decision_path = str(
+            payload.get("decision_path")
+            or payload.get("path")
+            or payload.get("route_path")
+            or payload.get("route_key")
+            or risk_context.get("decision_path")
+            or risk_context.get("path")
+            or ""
+        ).strip() or str(row.get("category") or "unknown_path").strip() or "unknown_path"
+        decision_source = spread_source or "unknown_source"
+        decision_id = str(payload.get("decision_id") or risk_context.get("decision_id") or "").strip() or None
+        approval_id = str(payload.get("approval_id") or "").strip() or None
+        decision_identifier = decision_id or approval_id or (
+            f"evt:{created_iso}|{str(payload.get('account_id') or '').strip() or 'na'}|{str(payload.get('symbol') or '').strip() or 'na'}"
+            if created_iso
+            else "evt:unknown"
+        )
+        decision_path_total_counts[decision_path] = decision_path_total_counts.get(decision_path, 0) + 1
+
+        decision_quote_covered = (
+            broker_bid is not None
+            and broker_ask is not None
+            and broker_spread_bps is not None
+            and bool(spread_source)
+            and quote_timestamp is not None
+        )
+        uncovered_reason: str | None = None
+        if not decision_quote_covered:
+            decision_quote_uncovered_rows += 1
+            if broker_bid is None and broker_ask is None and broker_spread_bps is None:
+                uncovered_reason = "quote_missing"
+            elif spread_source == "policy_only":
+                uncovered_reason = "fallback_policy_only"
+            elif spread_source in {"unavailable", "timeout", "fetch_timeout"}:
+                uncovered_reason = "quote_fetch_timeout"
+            elif not spread_source:
+                uncovered_reason = "spread_source_missing"
+            elif quote_timestamp is None:
+                uncovered_reason = "quote_timestamp_missing"
+            else:
+                uncovered_reason = "partial_quote_metadata"
+            uncovered_reason_counts[uncovered_reason] = uncovered_reason_counts.get(uncovered_reason, 0) + 1
+
+        decision_reason_raw = str(
+            payload.get("decision_reason")
+            or payload.get("route_reason")
+            or payload.get("reason")
+            or payload.get("decision_cause")
+            or risk.get("decision_reason")
+            or risk.get("route_reason")
+            or risk_context.get("decision_reason")
+            or risk_context.get("reason")
+            or ""
+        ).strip()
+
+        coverage_category = "legacy_path_used"
+        if decision_quote_covered:
+            coverage_breakdown_counts["quote_observed_and_used"] += 1
+            coverage_category = "quote_observed_and_used"
+        elif spread_source_norm in {"timeout", "fetch_timeout", "quote_timeout", "quote_fetch_timeout"}:
+            coverage_breakdown_counts["quote_timeout"] += 1
+            coverage_category = "quote_timeout"
+        elif has_quote_values:
+            coverage_breakdown_counts["quote_observed_but_ignored"] += 1
+            coverage_category = "quote_observed_but_ignored"
+        elif spread_source_norm in {"policy_only", "fallback_policy_only", "policy_fallback", "fallback"}:
+            coverage_breakdown_counts["fallback_path_used"] += 1
+            coverage_category = "fallback_path_used"
+        elif spread_source_norm in {"", "legacy", "legacy_path", "spread_source_missing", "unknown", "payload_trace"}:
+            coverage_breakdown_counts["legacy_path_used"] += 1
+            coverage_category = "legacy_path_used"
+        elif spread_source_norm in {"unavailable", "quote_unavailable", "no_quote"} or not has_quote_values:
+            coverage_breakdown_counts["quote_unavailable"] += 1
+            coverage_category = "quote_unavailable"
+        else:
+            coverage_breakdown_counts["legacy_path_used"] += 1
+            coverage_category = "legacy_path_used"
+
+        decision_reason = decision_reason_raw
+        if not decision_reason:
+            if coverage_category == "quote_observed_but_ignored":
+                if uncovered_reason == "quote_fetch_timeout" or spread_source_norm in {"timeout", "fetch_timeout", "quote_timeout", "quote_fetch_timeout"}:
+                    decision_reason = "quote_timeout"
+                elif uncovered_reason == "fallback_policy_only" or spread_source_norm in {"policy_only", "fallback_policy_only", "policy_fallback", "fallback"}:
+                    decision_reason = "fallback_path_used"
+                elif uncovered_reason == "spread_source_missing" or spread_source_norm in {"", "legacy", "legacy_path", "spread_source_missing", "unknown", "payload_trace"}:
+                    decision_reason = "legacy_path_used"
+                elif uncovered_reason == "quote_missing" or spread_source_norm in {"unavailable", "quote_unavailable", "no_quote"}:
+                    decision_reason = "quote_unavailable"
+                elif uncovered_reason:
+                    decision_reason = uncovered_reason
+                else:
+                    decision_reason = "quote_observed_but_ignored"
+            elif uncovered_reason:
+                decision_reason = uncovered_reason
+        decision_reason = decision_reason or "n/a"
+        path_reason_key = (decision_path, decision_reason)
+        decision_path_reason_total_counts[path_reason_key] = decision_path_reason_total_counts.get(path_reason_key, 0) + 1
+
+        if coverage_category == "quote_observed_but_ignored":
+            decision_quote_observed_ignored_rows += 1
+            key = (decision_path, decision_source)
+            observed_ignored_path_source_counts[key] = observed_ignored_path_source_counts.get(key, 0) + 1
+            reason_key = (decision_path, decision_source, decision_reason)
+            observed_ignored_path_source_reason_counts[reason_key] = observed_ignored_path_source_reason_counts.get(reason_key, 0) + 1
+            observed_ignored_reason_counts[decision_reason] = observed_ignored_reason_counts.get(decision_reason, 0) + 1
+            decision_path_ignored_counts[decision_path] = decision_path_ignored_counts.get(decision_path, 0) + 1
+            decision_path_reason_ignored_counts[path_reason_key] = decision_path_reason_ignored_counts.get(path_reason_key, 0) + 1
+            source_key = (decision_path, decision_reason, decision_source)
+            decision_path_reason_source_ignored_counts[source_key] = decision_path_reason_source_ignored_counts.get(source_key, 0) + 1
+            if isinstance(created_at, datetime):
+                observed_ignored_path_source_recent_ids.setdefault(key, []).append((created_at, decision_identifier))
+                observed_ignored_path_source_reason_recent_ids.setdefault(reason_key, []).append((created_at, decision_identifier))
+        if isinstance(created_at, datetime):
+            classified_rows.append({"created_at": created_at, "coverage_category": coverage_category})
+
+        if spread_live_used is not None:
+            spread_live_used_rows += 1
+        if decision_quote_covered:
+            decision_quote_covered_rows += 1
+        if spread_live_used is None and not spread_source:
+            policy_only_rows += 1
+            spread_source = "policy_only"
+
+        if len(trace_preview) < 25:
+            trace_preview.append(
+                {
+                    "event_at": created_iso,
+                    "category": row.get("category"),
+                    "decision": str(risk.get("decision") or "").strip() or None,
+                    "reject_reason": reasons_text,
+                    "request_max_spread_bps": _to_float(payload.get("max_spread_bps"), None),
+                    "policy_max_slippage_bps": policy_max_slippage_bps,
+                    "broker_bid": broker_bid,
+                    "broker_ask": broker_ask,
+                    "broker_spread_bps": broker_spread_bps,
+                    "quote_timestamp": quote_timestamp,
+                    "spread_live_used": spread_live_used,
+                    "spread_source": spread_source or None,
+                    "decision_quote_covered": decision_quote_covered,
+                    "decision_quote_coverage_category": coverage_category,
+                    "decision_path": decision_path,
+                    "decision_source": decision_source,
+                    "decision_reason": decision_reason,
+                    "decision_id": decision_id,
+                    "symbol": str(payload.get("symbol") or "").strip() or None,
+                    "account_id": str(payload.get("account_id") or "").strip() or None,
+                    "approval_id": approval_id,
+                }
+            )
+
+    policy_only_rate_pct = (policy_only_rows / spread_too_wide_rows * 100.0) if spread_too_wide_rows > 0 else None
+    spread_live_used_rate_pct = (spread_live_used_rows / spread_too_wide_rows * 100.0) if spread_too_wide_rows > 0 else None
+    decision_quote_coverage_pct = (decision_quote_covered_rows / spread_too_wide_rows * 100.0) if spread_too_wide_rows > 0 else None
+    decision_quote_observed_ignored_rate_pct = (decision_quote_observed_ignored_rows / spread_too_wide_rows * 100.0) if spread_too_wide_rows > 0 else None
+    decision_quote_ignored_gate_alert = bool(
+        decision_quote_observed_ignored_rate_pct is not None
+        and decision_quote_observed_ignored_rate_pct > decision_quote_ignored_gate_threshold_pct
+    )
+    uncovered_reason_ordered = sorted(uncovered_reason_counts.items(), key=lambda item: (-item[1], item[0]))
+    decision_quote_top_uncovered_reasons = [
+        {"reason": reason, "count": count, "share_pct": round((count / decision_quote_uncovered_rows * 100.0), 6) if decision_quote_uncovered_rows > 0 else None}
+        for reason, count in uncovered_reason_ordered[:5]
+    ]
+    decision_quote_coverage_breakdown = [
+        {
+            "key": key,
+            "label": label,
+            "count": count,
+            "share_pct": round((count / spread_too_wide_rows * 100.0), 6) if spread_too_wide_rows > 0 else None,
+        }
+        for key, label, count in [
+            ("quote_observed_and_used", "Quote observed and used", coverage_breakdown_counts["quote_observed_and_used"]),
+            ("quote_observed_but_ignored", "Quote observed but ignored", coverage_breakdown_counts["quote_observed_but_ignored"]),
+            ("quote_timeout", "Quote timeout", coverage_breakdown_counts["quote_timeout"]),
+            ("quote_unavailable", "Quote unavailable", coverage_breakdown_counts["quote_unavailable"]),
+            ("fallback_path_used", "Fallback path used", coverage_breakdown_counts["fallback_path_used"]),
+            ("legacy_path_used", "Legacy path used", coverage_breakdown_counts["legacy_path_used"]),
+        ]
+    ]
+    observed_ignored_path_source_reason_ordered = sorted(
+        observed_ignored_path_source_reason_counts.items(),
+        key=lambda item: (-item[1], item[0][0], item[0][1], item[0][2]),
+    )
+    decision_quote_ignored_drilldown = [
+        {
+            "decision_path": decision_path,
+            "source": source,
+            "decision_reason": decision_reason,
+            "count": count,
+            "share_pct": round((count / decision_quote_observed_ignored_rows * 100.0), 6) if decision_quote_observed_ignored_rows > 0 else None,
+            "share_total_pct": round((count / spread_too_wide_rows * 100.0), 6) if spread_too_wide_rows > 0 else None,
+            "recent_decision_ids": [
+                value[1]
+                for value in sorted(observed_ignored_path_source_reason_recent_ids.get((decision_path, source, decision_reason), []), key=lambda item: item[0], reverse=True)[:5]
+            ],
+        }
+        for (decision_path, source, decision_reason), count in observed_ignored_path_source_reason_ordered[:30]
+    ]
+    decision_quote_ignored_reason_breakdown = [
+        {
+            "reason": reason,
+            "count": count,
+            "share_pct": round((count / decision_quote_observed_ignored_rows * 100.0), 6) if decision_quote_observed_ignored_rows > 0 else None,
+        }
+        for reason, count in sorted(observed_ignored_reason_counts.items(), key=lambda item: (-item[1], item[0]))[:12]
+    ]
+    decision_quote_ignored_path_alerts = [
+        {
+            "decision_path": path_key,
+            "total_rows": total_rows,
+            "ignored_rows": ignored_rows,
+            "ignored_rate_pct": round((ignored_rows / total_rows * 100.0), 6) if total_rows > 0 else None,
+            "threshold_pct": decision_path_ignored_gate_threshold_pct,
+            "alert": bool(total_rows > 0 and (ignored_rows / total_rows * 100.0) > decision_path_ignored_gate_threshold_pct),
+        }
+        for path_key, total_rows in decision_path_total_counts.items()
+        for ignored_rows in [decision_path_ignored_counts.get(path_key, 0)]
+    ]
+    decision_quote_ignored_path_alerts.sort(
+        key=lambda item: (
+            0 if item.get("alert") else 1,
+            -(item.get("ignored_rate_pct") or 0),
+            -int(item.get("ignored_rows") or 0),
+            str(item.get("decision_path") or ""),
+        )
+    )
+    decision_quote_ignored_path_reason_alerts = [
+        {
+            "decision_path": path_key,
+            "decision_reason": reason_key,
+            "total_rows": total_rows,
+            "ignored_rows": ignored_rows,
+            "ignored_rate_pct": round((ignored_rows / total_rows * 100.0), 6) if total_rows > 0 else None,
+            "volume_share_pct": round((total_rows / spread_too_wide_rows * 100.0), 6) if spread_too_wide_rows > 0 else None,
+            "impact_pct_points": round((ignored_rows / spread_too_wide_rows * 100.0), 6) if spread_too_wide_rows > 0 else None,
+            "threshold_pct": decision_path_reason_ignored_gate_threshold_pct,
+            "impact_threshold_pct_points": decision_path_reason_impact_gate_threshold_pct_points,
+            "ignored_rate_alert": bool(total_rows > 0 and (ignored_rows / total_rows * 100.0) > decision_path_reason_ignored_gate_threshold_pct),
+            "impact_alert": bool(spread_too_wide_rows > 0 and (ignored_rows / spread_too_wide_rows * 100.0) > decision_path_reason_impact_gate_threshold_pct_points),
+            "alert": bool(
+                (total_rows > 0 and (ignored_rows / total_rows * 100.0) > decision_path_reason_ignored_gate_threshold_pct)
+                or (spread_too_wide_rows > 0 and (ignored_rows / spread_too_wide_rows * 100.0) > decision_path_reason_impact_gate_threshold_pct_points)
+            ),
+        }
+        for (path_key, reason_key), total_rows in decision_path_reason_total_counts.items()
+        for ignored_rows in [decision_path_reason_ignored_counts.get((path_key, reason_key), 0)]
+        if ignored_rows > 0
+    ]
+    decision_quote_ignored_path_reason_alerts.sort(
+        key=lambda item: (
+            0 if item.get("alert") else 1,
+            -(item.get("impact_pct_points") or 0),
+            -(item.get("ignored_rate_pct") or 0),
+            -int(item.get("ignored_rows") or 0),
+            str(item.get("decision_path") or ""),
+            str(item.get("decision_reason") or ""),
+        )
+    )
+    remediation_reason_to_action = {
+        "quote_timeout": "Augmenter la resilience quote fetch (timeout/retry) sur ce path.",
+        "quote_fetch_timeout": "Raccourcir le chemin de fallback et renforcer retry budget quote.",
+        "fallback_path_used": "Verifier la condition de fallback et re-prioriser quote broker sur ce path.",
+        "legacy_path_used": "Migrer le path legacy vers route quote-aware v2.",
+        "quote_unavailable": "Verifier la disponibilite quote broker et la qualite des snapshots.",
+        "partial_quote_metadata": "Completer les metadonnees quote (bid/ask/spread/timestamp/source).",
+        "spread_source_missing": "Instrumenter spread_source pour supprimer les contournements implicites.",
+        "quote_timestamp_missing": "Forcer l'horodatage quote avant arbitrage de spread.",
+        "quote_missing": "Traiter la source quote manquante avant decision routing.",
+    }
+    decision_quote_top_remediation_candidates = []
+    for item in decision_quote_ignored_path_reason_alerts[:12]:
+        path_key = str(item.get("decision_path") or "unknown_path")
+        reason_key = str(item.get("decision_reason") or "n/a")
+        ignored_rows = int(item.get("ignored_rows") or 0)
+        source_counts = [
+            (source_key, count)
+            for (path_value, reason_value, source_key), count in decision_path_reason_source_ignored_counts.items()
+            if path_value == path_key and reason_value == reason_key
+        ]
+        source_counts.sort(key=lambda pair: (-pair[1], pair[0]))
+        top_sources = [
+            {
+                "source": source_name,
+                "count": source_count,
+                "share_pct": round((source_count / ignored_rows * 100.0), 6) if ignored_rows > 0 else None,
+            }
+            for source_name, source_count in source_counts[:3]
+        ]
+        decision_quote_top_remediation_candidates.append(
+            {
+                "decision_path": path_key,
+                "decision_reason": reason_key,
+                "ignored_rows": ignored_rows,
+                "total_rows": int(item.get("total_rows") or 0),
+                "ignored_rate_pct": item.get("ignored_rate_pct"),
+                "volume_share_pct": item.get("volume_share_pct"),
+                "impact_pct_points": item.get("impact_pct_points"),
+                "threshold_pct": item.get("threshold_pct"),
+                "impact_threshold_pct_points": item.get("impact_threshold_pct_points"),
+                "ignored_rate_alert": bool(item.get("ignored_rate_alert")),
+                "impact_alert": bool(item.get("impact_alert")),
+                "alert": bool(item.get("alert")),
+                "top_sources": top_sources,
+                "suggested_action": remediation_reason_to_action.get(reason_key, "Inspecter la condition de routage et supprimer le contournement quote."),
+            }
+        )
+    decision_quote_top_remediation_candidates.sort(
+        key=lambda item: (
+            0 if item.get("alert") else 1,
+            -(item.get("impact_pct_points") or 0),
+            -(item.get("ignored_rate_pct") or 0),
+            -int(item.get("ignored_rows") or 0),
+        )
+    )
+    decision_quote_top_remediation_candidates = decision_quote_top_remediation_candidates[:3]
+    window_hours_map = {"last_24h": 24.0, "last_7d": 24.0 * 7.0}
+    now_utc = datetime.now(timezone.utc)
+    decision_quote_coverage_breakdown_trend: dict[str, Any] = {}
+    for window_key, window_hours in window_hours_map.items():
+        cutoff_window = now_utc - timedelta(hours=window_hours)
+        bucket_counts = {key: 0 for key in coverage_breakdown_counts.keys()}
+        total_window_rows = 0
+        for item in classified_rows:
+            item_created_at = item.get("created_at")
+            item_category = str(item.get("coverage_category") or "legacy_path_used")
+            if not isinstance(item_created_at, datetime):
+                continue
+            if item_created_at < cutoff_window:
+                continue
+            total_window_rows += 1
+            if item_category in bucket_counts:
+                bucket_counts[item_category] += 1
+            else:
+                bucket_counts["legacy_path_used"] += 1
+        decision_quote_coverage_breakdown_trend[window_key] = {
+            "window_hours": window_hours,
+            "sample_rows": total_window_rows,
+            "breakdown": [
+                {
+                    "key": key,
+                    "label": label,
+                    "count": bucket_counts[key],
+                    "share_pct": round((bucket_counts[key] / total_window_rows * 100.0), 6) if total_window_rows > 0 else None,
+                }
+                for key, label in [
+                    ("quote_observed_and_used", "Quote observed and used"),
+                    ("quote_observed_but_ignored", "Quote observed but ignored"),
+                    ("quote_timeout", "Quote timeout"),
+                    ("quote_unavailable", "Quote unavailable"),
+                    ("fallback_path_used", "Fallback path used"),
+                    ("legacy_path_used", "Legacy path used"),
+                ]
+            ],
+        }
+    if spread_too_wide_rows == 0:
+        decision_reality_state = "UNKNOWN"
+    elif spread_live_used_rows > 0:
+        decision_reality_state = "OBSERVED"
+    else:
+        decision_reality_state = "POLICY_ONLY"
+
+    return {
+        "sample_count": len(rows),
+        "lookback_hours": safe_lookback_hours,
+        "spread_too_wide_rows": spread_too_wide_rows,
+        "policy_only_rows": policy_only_rows,
+        "spread_live_used_rows": spread_live_used_rows,
+        "decision_quote_covered_rows": decision_quote_covered_rows,
+        "decision_quote_uncovered_rows": decision_quote_uncovered_rows,
+        "policy_only_rate_pct": policy_only_rate_pct,
+        "spread_live_used_rate_pct": spread_live_used_rate_pct,
+        "decision_quote_coverage_pct": decision_quote_coverage_pct,
+        "decision_quote_observed_ignored_rows": decision_quote_observed_ignored_rows,
+        "decision_quote_observed_ignored_rate_pct": decision_quote_observed_ignored_rate_pct,
+        "decision_quote_ignored_gate_threshold_pct": decision_quote_ignored_gate_threshold_pct,
+        "decision_quote_ignored_gate_alert": decision_quote_ignored_gate_alert,
+        "decision_quote_ignored_path_threshold_pct": decision_path_ignored_gate_threshold_pct,
+        "decision_quote_ignored_path_alerts": decision_quote_ignored_path_alerts,
+        "decision_quote_ignored_path_reason_threshold_pct": decision_path_reason_ignored_gate_threshold_pct,
+        "decision_quote_ignored_path_reason_impact_threshold_pct_points": decision_path_reason_impact_gate_threshold_pct_points,
+        "decision_quote_ignored_path_reason_alerts": decision_quote_ignored_path_reason_alerts,
+        "decision_quote_top_remediation_candidates": decision_quote_top_remediation_candidates,
+        "decision_quote_coverage_breakdown": decision_quote_coverage_breakdown,
+        "decision_quote_ignored_drilldown": decision_quote_ignored_drilldown,
+        "decision_quote_ignored_reason_breakdown": decision_quote_ignored_reason_breakdown,
+        "decision_quote_coverage_breakdown_trend": decision_quote_coverage_breakdown_trend,
+        "decision_quote_top_uncovered_reasons": decision_quote_top_uncovered_reasons,
+        "decision_reality_state": decision_reality_state,
+        "policy_version": policy_version or None,
+        "policy_max_slippage_bps": policy_max_slippage_bps,
+        "last_audit": datetime.now(timezone.utc).isoformat(),
+        "last_spread_reject_at": last_spread_reject_at,
+        "trace_preview": trace_preview,
+    }
+
+
+def _spread_decision_remediation_snapshot(summary: dict[str, Any], top_n: int = 3) -> dict[str, Any]:
+    safe_top_n = max(1, min(top_n, 20))
+    candidates_raw = summary.get("decision_quote_top_remediation_candidates")
+    candidates = candidates_raw if isinstance(candidates_raw, list) else []
+    ranked = [item for item in candidates if isinstance(item, dict)]
+    ranked.sort(
+        key=lambda item: (
+            0 if item.get("alert") else 1,
+            -(item.get("impact_pct_points") or 0),
+            -(item.get("ignored_rate_pct") or 0),
+            -int(item.get("ignored_rows") or 0),
+        )
+    )
+    top_candidates = ranked[:safe_top_n]
+    alerts_raw = summary.get("decision_quote_ignored_path_reason_alerts")
+    alerts = [item for item in (alerts_raw if isinstance(alerts_raw, list) else []) if isinstance(item, dict)]
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "lookback_hours": _to_float(summary.get("lookback_hours"), None),
+        "sample_count": int(summary.get("sample_count") or 0),
+        "spread_too_wide_rows": int(summary.get("spread_too_wide_rows") or 0),
+        "decision_quote_observed_ignored_rows": int(summary.get("decision_quote_observed_ignored_rows") or 0),
+        "decision_quote_observed_ignored_rate_pct": _to_float(summary.get("decision_quote_observed_ignored_rate_pct"), None),
+        "decision_quote_ignored_path_reason_threshold_pct": _to_float(summary.get("decision_quote_ignored_path_reason_threshold_pct"), None),
+        "decision_quote_ignored_path_reason_impact_threshold_pct_points": _to_float(
+            summary.get("decision_quote_ignored_path_reason_impact_threshold_pct_points"),
+            None,
+        ),
+        "path_reason_alerts_count": len(alerts),
+        "path_reason_alerts_triggered": len([item for item in alerts if bool(item.get("alert"))]),
+        "top_n": safe_top_n,
+        "top_candidates": top_candidates,
+    }
+
+
+@app.get("/v1/mt5/orders/spread-decision-trace/remediation-snapshot")
+async def mt5_spread_decision_trace_remediation_snapshot(
+    lookback_hours: float = 24.0,
+    limit: int = 2500,
+    top_n: int = 3,
+    format: str = "json",
+    auth: AuthContext = Depends(viewer_auth),
+) -> dict | PlainTextResponse:
+    summary = await mt5_spread_decision_trace_summary(
+        lookback_hours=lookback_hours,
+        limit=limit,
+        auth=auth,
+    )
+    snapshot = _spread_decision_remediation_snapshot(summary, top_n=top_n)
+    if str(format or "json").strip().lower() != "csv":
+        return snapshot
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "generated_at",
+            "lookback_hours",
+            "sample_count",
+            "spread_too_wide_rows",
+            "decision_quote_observed_ignored_rows",
+            "decision_quote_observed_ignored_rate_pct",
+            "decision_path",
+            "decision_reason",
+            "impact_pct_points",
+            "ignored_rate_pct",
+            "volume_share_pct",
+            "ignored_rows",
+            "total_rows",
+            "ignored_rate_alert",
+            "impact_alert",
+            "alert",
+            "suggested_action",
+            "top_sources",
+        ]
+    )
+    for item in snapshot.get("top_candidates") or []:
+        row = item if isinstance(item, dict) else {}
+        top_sources = row.get("top_sources") if isinstance(row.get("top_sources"), list) else []
+        writer.writerow(
+            [
+                snapshot.get("generated_at") or "",
+                snapshot.get("lookback_hours") or "",
+                snapshot.get("sample_count") or 0,
+                snapshot.get("spread_too_wide_rows") or 0,
+                snapshot.get("decision_quote_observed_ignored_rows") or 0,
+                snapshot.get("decision_quote_observed_ignored_rate_pct") or "",
+                str(row.get("decision_path") or ""),
+                str(row.get("decision_reason") or ""),
+                row.get("impact_pct_points") if row.get("impact_pct_points") is not None else "",
+                row.get("ignored_rate_pct") if row.get("ignored_rate_pct") is not None else "",
+                row.get("volume_share_pct") if row.get("volume_share_pct") is not None else "",
+                int(row.get("ignored_rows") or 0),
+                int(row.get("total_rows") or 0),
+                bool(row.get("ignored_rate_alert")),
+                bool(row.get("impact_alert")),
+                bool(row.get("alert")),
+                str(row.get("suggested_action") or ""),
+                json.dumps(top_sources, ensure_ascii=True),
+            ]
+        )
+    return PlainTextResponse(content=output.getvalue(), media_type="text/csv")
+
+
 @app.post("/v1/mt5/orders/live-approve/{approval_id}")
 async def mt5_live_second_approve(approval_id: str, auth: AuthContext = Depends(operator_auth)) -> dict:
     approval = fetch_one(
@@ -20914,6 +21546,58 @@ async def _risk_check_mt5_order(payload: dict) -> dict:
     async with httpx.AsyncClient(timeout=12.0) as client:
         response = await client.post(f"{RISK_GATEWAY_URL}/v1/checks/mt5-order", json=risk_payload)
         return response.json()
+
+
+async def _fetch_mt5_quote_evidence(account_id: str, symbol: str) -> dict[str, Any] | None:
+    safe_account_id = _normalize_account_id(account_id)
+    safe_symbol = _normalize_symbol(symbol)
+    if not safe_symbol:
+        return None
+
+    payload: dict[str, Any] | None = None
+
+    def _has_usable_quote(candidate: dict[str, Any]) -> bool:
+        bid_value = _to_float(candidate.get("bid"), None)
+        ask_value = _to_float(candidate.get("ask"), None)
+        spread_value = _to_float(candidate.get("spread_bps"), None)
+        return bid_value is not None or ask_value is not None or spread_value is not None
+
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            if safe_account_id:
+                response = await client.get(f"{MT5_BRIDGE_URL}/v1/accounts/{safe_account_id}/quote/{safe_symbol}")
+                if response.status_code < 400 and isinstance(response.json(), dict):
+                    account_payload = response.json()
+                    if _has_usable_quote(account_payload):
+                        payload = account_payload
+            if payload is None:
+                fallback_response = await client.get(f"{MT5_BRIDGE_URL}/quote/{safe_symbol}")
+                if fallback_response.status_code < 400 and isinstance(fallback_response.json(), dict):
+                    fallback_payload = fallback_response.json()
+                    if _has_usable_quote(fallback_payload):
+                        payload = fallback_payload
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    bid = _to_float(payload.get("bid"), None)
+    ask = _to_float(payload.get("ask"), None)
+    spread_bps = _to_float(payload.get("spread_bps"), None)
+    if spread_bps is None and bid is not None and ask is not None and bid > 0:
+        spread_bps = abs(ask - bid) / bid * 10000.0
+
+    return {
+        "account_id": safe_account_id,
+        "symbol": safe_symbol,
+        "bid": bid,
+        "ask": ask,
+        "spread_bps": spread_bps,
+        "observed_at": str(payload.get("observed_at") or payload.get("timestamp") or "").strip() or None,
+        "source": str(payload.get("source") or "mt5-broker-state").strip() or "mt5-broker-state",
+        "broker": str(payload.get("broker") or "metaquotes").strip() or "metaquotes",
+    }
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -21083,9 +21767,31 @@ async def _execute_mt5_filtered_order(payload: dict) -> dict:
                 },
             )
 
+    quote_evidence = await _fetch_mt5_quote_evidence(
+        str(payload.get("account_id") or ""),
+        str(payload.get("symbol") or ""),
+    )
     risk_body = await _risk_check_mt5_order(payload)
     if risk_body.get("decision") != "accept":
-        append_audit("mt5_order_rejected", {"risk": risk_body})
+        spread_live_used = _to_float((quote_evidence or {}).get("spread_bps"), None)
+        spread_source = str((quote_evidence or {}).get("source") or "").strip() or "policy_only"
+        append_audit(
+            "mt5_order_rejected",
+            {
+                "risk": risk_body,
+                "account_id": payload.get("account_id", ""),
+                "symbol": payload.get("symbol", ""),
+                "side": payload.get("side", "buy"),
+                "max_spread_bps": _to_float(payload.get("max_spread_bps"), None),
+                "broker_bid": _to_float((quote_evidence or {}).get("bid"), None),
+                "broker_ask": _to_float((quote_evidence or {}).get("ask"), None),
+                "broker_spread_bps": spread_live_used,
+                "broker_quote_observed_at": (quote_evidence or {}).get("observed_at"),
+                "spread_live_used": spread_live_used,
+                "spread_source": spread_source,
+                "quote": quote_evidence,
+            },
+        )
         raise HTTPException(status_code=400, detail=risk_body)
 
     routing = await _compute_route_plan(str(payload.get("symbol", "")), _predictor_context(payload))

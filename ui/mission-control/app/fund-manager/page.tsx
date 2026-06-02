@@ -5,6 +5,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import HelpHint from "../../components/HelpHint";
 import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
+import { UI_HELP_HINTS } from "../../lib/uiLexicon";
 import {
   BROKER_CONNECTION_CATALOG,
   EXCHANGE_CONNECTION_CATALOG,
@@ -55,7 +56,8 @@ type SparklineCardProps = {
   tone: string;
 };
 
-const NOTES_STORAGE_KEY = "gtixt.fund-manager.notes.v2";
+const NOTES_STORAGE_KEY = "txt.fund-manager.notes.v2";
+const LEGACY_NOTES_STORAGE_KEY = "gtixt.fund-manager.notes.v2";
 
 const DEFAULT_NOTES: NotesState = {
   investmentThesis: "Hypothese centrale, catalyseurs, invalidation, sizing et plan de sortie par sleeve.",
@@ -306,6 +308,21 @@ function coerceNotes(parsed: Partial<NotesState>): NotesState {
   }, {} as NotesState);
 }
 
+function readStoredNotesValue(): string | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  const current = window.localStorage.getItem(NOTES_STORAGE_KEY);
+  if (current !== null) {
+    return current;
+  }
+  const legacy = window.localStorage.getItem(LEGACY_NOTES_STORAGE_KEY);
+  if (legacy !== null) {
+    window.localStorage.setItem(NOTES_STORAGE_KEY, legacy);
+  }
+  return legacy;
+}
+
 function useStoredNotes(): [NotesState, (key: keyof NotesState, value: string) => void] {
   const [notes, setNotes] = useState<NotesState>(DEFAULT_NOTES);
 
@@ -314,7 +331,7 @@ function useStoredNotes(): [NotesState, (key: keyof NotesState, value: string) =
       return;
     }
     try {
-      const raw = window.localStorage.getItem(NOTES_STORAGE_KEY);
+      const raw = readStoredNotesValue();
       if (!raw) {
         return;
       }
@@ -1123,7 +1140,7 @@ export default function FundManagerPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1.15fr 0.85fr" }}>
         <div className="panel">
-          <div className="eyebrow">Capital Integration <HelpHint text="Montre combien d'argent réel est placé dans chaque poche et si on s'éloigne du plan prévu." examples={["Une poche peut sembler bonne sur le papier mais manquer de capital réel.", "Sépare toujours l'argent disponible et la valeur totale du compte pour éviter les malentendus."]} /></div>
+          <div className="eyebrow">Capital Integration <HelpHint text={UI_HELP_HINTS.fundCapitalIntegration.text} examples={UI_HELP_HINTS.fundCapitalIntegration.examples} /></div>
           {capitalIntegrationSleeves.length === 0 ? <p className="subtle" style={{ marginTop: 10 }}>Aucune intégration Live Capital active sur ce portefeuille. Attache des comptes canonisés avec `capital_sleeve` pour voir le capital réel par sleeve.</p> : null}
           <div className="txt-scroll-shell">
             {capitalIntegrationSleeves.slice(0, 5).map((row) => (
@@ -1173,7 +1190,7 @@ export default function FundManagerPage() {
         <>
           <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1.15fr 0.85fr" }}>
             <div className="panel">
-              <div className="eyebrow">Fund Mandate & Discipline <HelpHint text="C'est ici que tu poses les règles du fonds: but, limites et façon de prendre le risque." examples={["Si l'objectif ou les limites ne sont pas clairs, le reste de la page devient difficile à lire.", "Avant de monter le risque, vérifie que la décision reste dans le cadre prévu."]} /></div>
+              <div className="eyebrow">Fund Mandate & Discipline <HelpHint text={UI_HELP_HINTS.fundMandateDiscipline.text} examples={UI_HELP_HINTS.fundMandateDiscipline.examples} /></div>
               <div className="grid" style={{ marginTop: 12, gridTemplateColumns: "1fr 1fr", gap: 12 }}>
                 <div>
                   <div className="subtle" style={{ marginBottom: 6 }}>Objectif du fonds</div>
@@ -1222,7 +1239,7 @@ export default function FundManagerPage() {
 
           <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
             <div className="panel">
-              <div className="eyebrow">Regime Policy by Horizon <HelpHint text="Ce bloc aide à décider quel style de prise de position convient au contexte du moment." examples={["Quand le marché devient instable, réduis les prises rapides et garde des tailles plus modestes.", "Quand le contexte est plus lisible, tu peux laisser respirer des positions plus longues."]} /></div>
+              <div className="eyebrow">Regime Policy by Horizon <HelpHint text={UI_HELP_HINTS.fundRegimePolicyByHorizon.text} examples={UI_HELP_HINTS.fundRegimePolicyByHorizon.examples} /></div>
               <p className="subtle" style={{ marginTop: 10 }}>Référence chiffres: Terminal/oracle marché pour la tendance, analytics volatilité réalisée pour la vol, note desk/news pour le sentiment. Garde les valeurs manuelles uniquement pour un test.</p>
               <div className="form-grid" style={{ marginTop: 12 }}>
                 <label className="field-stack"><span>Tendance 0-1</span><input type="number" step="0.01" value={trendScore} onChange={(event) => setTrendScore(Number(event.target.value || 0))} placeholder="trend_score" /></label>
@@ -1265,7 +1282,7 @@ export default function FundManagerPage() {
 
       {showSleeves ? (
         <section className="panel" style={{ marginTop: 16 }}>
-          <div className="eyebrow">Sleeves Architecture <HelpHint text="Les poches servent à séparer les approches, renforcer celles qui tiennent et réduire celles qui pèsent trop." examples={["Si une poche gagne mais prend trop de risque, baisse sa taille plutôt que de l'ignorer.", "Si une autre reste stable et utile, tu peux lui donner un peu plus de place."]} /></div>
+          <div className="eyebrow">Sleeves Architecture <HelpHint text={UI_HELP_HINTS.fundSleevesArchitecture.text} examples={UI_HELP_HINTS.fundSleevesArchitecture.examples} /></div>
           <div className="grid" style={{ marginTop: 12, gridTemplateColumns: "repeat(2, minmax(0, 1fr))" }}>
             {sleeveIntelligence.map((sleeve) => (
               <div className="panel" key={sleeve.name} style={{ borderRadius: 16 }}>
@@ -1325,7 +1342,7 @@ export default function FundManagerPage() {
 
       {showIcNotes ? (
         <section className="panel" style={{ marginTop: 16 }}>
-          <div className="eyebrow">IC Notes / Investment Committee <HelpHint text="Cette zone garde la mémoire des décisions: ce qu'on pensait, ce qu'on a vu et ce qu'on change." examples={["Après la revue de semaine, note ce qui a aidé, ce qui a échoué et l'action retenue.", "Si une limite change, écris-la ici avant de toucher aux tailles ou au capital."]} /></div>
+          <div className="eyebrow">IC Notes / Investment Committee <HelpHint text={UI_HELP_HINTS.fundIcNotes.text} examples={UI_HELP_HINTS.fundIcNotes.examples} /></div>
           <div className="grid" style={{ marginTop: 12, gridTemplateColumns: "repeat(2, minmax(0, 1fr))" }}>
             <div>
               <div className="subtle" style={{ marginBottom: 6 }}>Structured notes</div>
@@ -1388,7 +1405,7 @@ export default function FundManagerPage() {
 
       {showAllocator ? (
         <section className="panel" style={{ marginTop: 16 }}>
-          <div className="eyebrow">Allocator Reporting Blocks <HelpHint text="Ce bloc résume le fonds de façon lisible: résultat, baisse, exposition et origine principale de la performance." examples={["Avant un échange avec un investisseur, vérifie d'abord le résultat récent, la pire baisse et l'exposition actuelle.", "Si une seule poche explique presque tout, il faut pouvoir le dire simplement."]} /></div>
+          <div className="eyebrow">Allocator Reporting Blocks <HelpHint text={UI_HELP_HINTS.fundAllocatorReporting.text} examples={UI_HELP_HINTS.fundAllocatorReporting.examples} /></div>
           <div className="grid" style={{ marginTop: 12, gridTemplateColumns: "repeat(4, minmax(0, 1fr))" }}>
             {allocatorReturnCards.map((metric) => (
               <div className="panel" key={metric.label} style={{ borderRadius: 14, minHeight: 110 }}>
@@ -1482,7 +1499,7 @@ export default function FundManagerPage() {
 
       {showRisk ? (
         <section className="panel" style={{ marginTop: 16 }}>
-          <div className="eyebrow">Live Risk Overlay <HelpHint text="Ici, tu dois voir tout de suite si le fonds reste sous contrôle ou s'il faut calmer le jeu." examples={["Si une poche prend trop de place et que la baisse s'aggrave, réduis-la vite.", "Si tout se met à bouger dans le même sens, considère que la diversification protège moins qu'avant."]} /></div>
+          <div className="eyebrow">Live Risk Overlay <HelpHint text={UI_HELP_HINTS.fundLiveRiskOverlay.text} examples={UI_HELP_HINTS.fundLiveRiskOverlay.examples} /></div>
           <div className="grid" style={{ marginTop: 12, gridTemplateColumns: "repeat(3, minmax(0, 1fr))" }}>
             {liveRiskCards.map((card) => (
               <div className="panel" key={card.label} style={{ borderRadius: 14, minHeight: 112 }}>

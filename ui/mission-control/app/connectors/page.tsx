@@ -12,6 +12,7 @@ import {
   type ConnectionProviderType,
 } from "../../lib/connectionCatalog";
 import { getConnectorHealthView } from "../../lib/connectorHealth";
+import { UI_HELP_HINTS, UI_TERMS } from "../../lib/uiLexicon";
 
 type JsonMap = Record<string, unknown>;
 
@@ -681,7 +682,7 @@ export default function ConnectorsPage() {
             {" | "}
             <Link href="/connections">Parcours client Connections</Link>
             {" | "}
-            <Link href="/live-readiness">Live Readiness</Link>
+            <Link href="/live-readiness">{UI_TERMS.readiness}</Link>
             {" | "}
             <Link href="/incidents">Incidents</Link>
           </p>
@@ -689,7 +690,7 @@ export default function ConnectorsPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">MT5 Bridge <HelpHint text="Sante bridge MT5 et compteur des validations live en attente." examples={["Si Pending live approvals monte, un second validateur doit venir ici ou sur le terminal.", "Si status n'est pas healthy, n'envoie pas de nouvel ordre live."]} /></div>
+          <div className="eyebrow">MT5 Bridge <HelpHint text={UI_HELP_HINTS.connectorsMt5Bridge.text} examples={UI_HELP_HINTS.connectorsMt5Bridge.examples} /></div>
           <div className="row"><span>Status</span><span>{String(mt5Health?.status || "-")}</span></div>
           <div className="row"><span>Mode</span><span>{String(mt5Health?.mode || "-")}</span></div>
           <div className="row"><span>Accounts</span><span>{String(mt5Health?.accounts || 0)}</span></div>
@@ -711,7 +712,7 @@ export default function ConnectorsPage() {
 
       <section className="grid" style={{ gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Connecteurs Live <HelpHint text="Disponibilite instantanee des integrations critiques." examples={["Chaque ligne doit etre healthy=true avant une vraie session de trading.", "Si un connecteur devient false, considere l'environnement comme degrade jusqu'a verification."]} /></div>
+          <div className="eyebrow">Connecteurs Live <HelpHint text={UI_HELP_HINTS.connectorsLiveConnectors.text} examples={UI_HELP_HINTS.connectorsLiveConnectors.examples} /></div>
           <div className="txt-scroll-shell">
             {connectors.map((item) => {
               const badge = getConnectorHealthView(item);
@@ -729,7 +730,7 @@ export default function ConnectorsPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Comptes MT5 <HelpHint text="Inventaire des comptes raccordes et leur mode paper/live." examples={["Cherche ici ton compte demo pour verifier qu'il est bien en paper avant un test.", "Ne bascule pas en live sans voir clairement le mode et le status attendus."]} /></div>
+          <div className="eyebrow">Comptes MT5 <HelpHint text={UI_HELP_HINTS.connectorsMt5Accounts.text} examples={UI_HELP_HINTS.connectorsMt5Accounts.examples} /></div>
           {mt5Accounts.length === 0 ? <p className="subtle">Aucun compte connecte.</p> : null}
           <div className="txt-scroll-shell">
             {mt5Accounts.map((item) => (
@@ -749,7 +750,7 @@ export default function ConnectorsPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Gouvernance FTMO MT5 <HelpHint text="Lecture directe de la phase active FTMO, des seuils de hardening et des caps de sizing par bucket." examples={["Phase micro_risk: seuls les tickets les plus petits doivent passer et tout drift regime doit compresser le sizing.", "Si Oracle Stability descend sous le seuil blocant, le desk doit rester NO TRADE meme si la confiance brute reste elevee."]} /></div>
+          <div className="eyebrow">Gouvernance FTMO MT5 <HelpHint text={UI_HELP_HINTS.connectorsFtmoGovernance.text} examples={UI_HELP_HINTS.connectorsFtmoGovernance.examples} /></div>
           <div className="row"><span>Phase active</span><span>{String(mt5MicroLive.current_stage || "n/a")}</span></div>
           <div className="row"><span>Balance nominale</span><span>{formatUsd(mt5FtmoChallenge.nominal_balance_usd)}</span></div>
           <div className="row"><span>Profit target</span><span>{formatUsd(mt5FtmoChallenge.profit_target_usd)}</span></div>
@@ -783,7 +784,7 @@ export default function ConnectorsPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Preview sizing MT5 <HelpHint text="Simulation operateur du bucket choisi et du decay de regime reellement injectes dans la policy live." examples={["Monte la confiance a 0.92 pour verifier le passage standard -> premium si le cap FTMO le permet.", "Si le decay regime tombe a 0.72, la taille doit se compresser automatiquement avant execution."]} /></div>
+          <div className="eyebrow">Preview sizing MT5 <HelpHint text={UI_HELP_HINTS.connectorsMt5SizingPreview.text} examples={UI_HELP_HINTS.connectorsMt5SizingPreview.examples} /></div>
           <div className="row" style={{ gap: 10, alignItems: "center", flexWrap: "wrap" }}>
             <span>Compte</span>
             <select value={mt5PreviewAccountId} onChange={(event) => setMt5PreviewAccountId(event.target.value)} style={{ minWidth: 180 }}>
@@ -833,7 +834,7 @@ export default function ConnectorsPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "0.85fr 1.15fr" }}>
         <div className="panel">
-          <div className="eyebrow">Capacites d'execution par compte <HelpHint text="Vue operateur dediee pour voir quel compte peut vraiment executer un cancel/replace natif et quel compte reste en reslice." examples={["Si un compte affiche CANCEL REPLACE=true et MODIFY=false, le scheduler doit rester sur cancel_replace et non sur amend natif.", "Si un compte est trade=false, traite ses capacites comme purement informatives tant qu'il n'est pas habilite execution."]} /></div>
+          <div className="eyebrow">Capacites d'execution par compte <HelpHint text={UI_HELP_HINTS.connectorsExecutionCapabilitiesByAccount.text} examples={UI_HELP_HINTS.connectorsExecutionCapabilitiesByAccount.examples} /></div>
           <div className="row"><span>Comptes lies</span><span>{String(brokerCapabilitySummary.totalAccounts)}</span></div>
           <div className="row"><span>Comptes trade enabled</span><span>{String(brokerCapabilitySummary.tradableAccounts)}</span></div>
           <div className="row"><span>Cancel/replace natif</span><span className={brokerCapabilitySummary.cancelReplaceAccounts > 0 ? "good" : "subtle"}>{String(brokerCapabilitySummary.cancelReplaceAccounts)}</span></div>
@@ -846,7 +847,7 @@ export default function ConnectorsPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Chemin de modification par compte <HelpHint text="Lecture directe du chemin de remplacement expose par le control-plane pour chaque compte lie." examples={["Un compte BingX doit aujourd'hui montrer replace strategy = CANCEL REPLACE et modify = false.", "Si un futur broker confirme amend natif, cette matrice devra montrer MODIFY avant tout basculement du scheduler."]} /></div>
+          <div className="eyebrow">Chemin de modification par compte <HelpHint text={UI_HELP_HINTS.connectorsReplacePathByAccount.text} examples={UI_HELP_HINTS.connectorsReplacePathByAccount.examples} /></div>
           {brokerCapabilityRows.length === 0 ? <p className="subtle">Aucun compte lie avec broker_capabilities.</p> : null}
           <div className="txt-scroll-shell">
             {brokerCapabilityRows.map((item) => (
@@ -900,7 +901,7 @@ export default function ConnectorsPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1.1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Droits par connecteur <HelpHint text="Granularite des droits, scopes et contraintes de signature par compte lie." examples={["Vrifie qu'un compte exchange n'a pas withdraw=true si son role est uniquement execution.", "Pour les wallets, la policy doit montrer hardware, MPC ou signer externe, jamais une cle privee en clair."]} /></div>
+          <div className="eyebrow">Droits par connecteur <HelpHint text={UI_HELP_HINTS.connectorsRightsByConnector.text} examples={UI_HELP_HINTS.connectorsRightsByConnector.examples} /></div>
           {linkedConnectorAccounts.length === 0 ? <p className="subtle">Aucun compte lie.</p> : null}
           <div className="txt-scroll-shell">
             {linkedConnectorAccounts.map((account) => {
@@ -923,7 +924,7 @@ export default function ConnectorsPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Plan de secours par connecteur <HelpHint text="Diagnostic et plan d'auto-downgrade par venue." examples={["Si WS drop ou feed degraded, la chaine doit montrer WS -> REST -> stale cache.", "Si l'etat devient critical, le live doit passer read-only et proposer un reroute venue."]} /></div>
+          <div className="eyebrow">Plan de secours par connecteur <HelpHint text={UI_HELP_HINTS.connectorsFallbackPlanByConnector.text} examples={UI_HELP_HINTS.connectorsFallbackPlanByConnector.examples} /></div>
           {connectorIncidentRows.length === 0 ? <p className="subtle">Aucune degradation active.</p> : null}
           <div className="txt-scroll-shell">
             {connectorIncidentRows.map((item) => {
@@ -956,7 +957,7 @@ export default function ConnectorsPage() {
           const topRisks = asList(capital.top_risks);
           return (
             <div className="panel" key={`capital-${String(item.name)}`}>
-              <div className="eyebrow">Capital Integration | {String(item.name)} <HelpHint text="Vision capital et risque par venue/connecteur raccorde au Fund Manager." examples={["Compare valeur plateforme et cash brut pour savoir si la venue est sur-inventorisee ou vraiment liquide.", "Regarde le drift vs Fund Manager avant de laisser l'OMS router plus de risque sur cette venue."]} /></div>
+              <div className="eyebrow">Capital Integration | {String(item.name)} <HelpHint text={UI_HELP_HINTS.connectorsCapitalIntegrationByVenue.text} examples={UI_HELP_HINTS.connectorsCapitalIntegrationByVenue.examples} /></div>
               <div className="row"><span>Valeur plateforme</span><span>{formatUsd(capital.actual_equivalent_usd)}</span></div>
               <div className="row"><span>Cash brut</span><span>{formatUsd(capital.actual_raw_cash_usd)}</span></div>
               <div className="row"><span>Inventaire</span><span>{formatUsd(capital.inventory_usd)}</span></div>
@@ -977,7 +978,7 @@ export default function ConnectorsPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Vue Client / Portfolio <HelpHint text="Agrgat interne client par client pour verifier la repartition des comptes et l'exposition canonique." examples={["Un client peut porter plusieurs comptes mais un seul portfolio ops principal.", "Cette vue aide a repérer un compte MT5 rattache au mauvais client ou au mauvais portfolio."]} /></div>
+          <div className="eyebrow">Vue Client / Portfolio <HelpHint text={UI_HELP_HINTS.connectorsClientPortfolioView.text} examples={UI_HELP_HINTS.connectorsClientPortfolioView.examples} /></div>
           {clientPortfolioSummaries.length === 0 ? <p className="subtle">Aucun portfolio canonique disponible.</p> : null}
           {clientPortfolioSummaries.map((item) => (
             <div className="row" key={`${item.client_id}-${item.portfolio_id}`}>
@@ -990,7 +991,7 @@ export default function ConnectorsPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Alertes Temps Reel <HelpHint text="Alertes websocket: kill-switch, validations live, incidents." examples={["Si une alerte kill-switch apparait, stoppe les actions execution et va d'abord sur Incidents.", "Si une alerte live approval arrive, ouvre le bloc de double validation juste en dessous."]} /></div>
+          <div className="eyebrow">Alertes Temps Reel <HelpHint text={UI_HELP_HINTS.connectorsRealtimeAlerts.text} examples={UI_HELP_HINTS.connectorsRealtimeAlerts.examples} /></div>
           {alerts.length === 0 ? <p className="subtle">Aucune alerte active.</p> : null}
           {alerts.map((item, idx) => (
             <div className="row" key={`${String(item.type)}-${idx}`}>
@@ -1001,7 +1002,7 @@ export default function ConnectorsPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Historique Validations Live <HelpHint text="Traite la preuve de double approbation des ordres live." examples={["Apres un ordre live, verifie ici qui a fait la seconde approbation.", "Si une validation manque, ne considere pas l'execution comme completement gouvernee."]} /></div>
+          <div className="eyebrow">Historique Validations Live <HelpHint text={UI_HELP_HINTS.connectorsLiveApprovalHistory.text} examples={UI_HELP_HINTS.connectorsLiveApprovalHistory.examples} /></div>
           {recentApprovals.length === 0 ? <p className="subtle">Aucune validation live recente.</p> : null}
           {recentApprovals.map((item) => (
             <div className="row" key={String(item.approval_id)}>
@@ -1014,7 +1015,7 @@ export default function ConnectorsPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel" style={{ gridColumn: "1 / -1" }}>
-          <div className="eyebrow">FTMO Live Workflow <HelpHint text="Vue opérateur simplifiée: où raccorder FTMO, où créer une demande live, et où faire la seconde approbation." examples={["1. Connections: brancher le compte FTMO et la vraie broker session.", "2. Terminal ou Connectors: créer la demande d'ordre live.", "3. Connectors ou Live Capital: un autre opérateur valide en second."]} /></div>
+          <div className="eyebrow">FTMO Live Workflow <HelpHint text={UI_HELP_HINTS.connectorsFtmoWorkflow.text} examples={UI_HELP_HINTS.connectorsFtmoWorkflow.examples} /></div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 12, marginTop: 12 }}>
             <div className="panel" style={{ borderRadius: 12 }}>
               <div className="row"><span>1. Raccorder FTMO</span><span>{mt5Accounts.length > 0 ? `${mt5Accounts.length} compte(s) MT5 visible(s)` : "aucun compte visible"}</span></div>
@@ -1043,7 +1044,7 @@ export default function ConnectorsPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Connexion MT5 <HelpHint text="Formulaire de raccordement compte MT5 au bridge." examples={["Exemple: entre mt5-demo-01, serveur demo, login demo, puis clique Connecter le compte.", "Utilise paper pour tester le pipeline sans risque reel."]} /></div>
+          <div className="eyebrow">Connexion MT5 <HelpHint text={UI_HELP_HINTS.connectorsMt5ConnectionForm.text} examples={UI_HELP_HINTS.connectorsMt5ConnectionForm.examples} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <input value={accountId} onChange={(e) => setAccountId(e.target.value)} placeholder="account_id" />
             <input value={broker} onChange={(e) => setBroker(e.target.value)} placeholder="broker" />
@@ -1062,7 +1063,7 @@ export default function ConnectorsPage() {
         </div>
 
         <div className="panel" id="mt5-order-filter">
-          <div className="eyebrow">Demande ordre MT5 avec contrôle risque <HelpHint text="Prépare une demande d'ordre MT5 et la fait passer par les contrôles risque, spread, slippage et double validation live." examples={["EURUSD, buy, 0.10 lot, notional prudent et raison courte: le système répond approval si le live demande une seconde validation.", "Si le spread est trop large ou le marché est fermé, l'ordre doit rester bloqué plutôt que simuler un vrai broker."]} /></div>
+          <div className="eyebrow">Demande ordre MT5 avec contrôle risque <HelpHint text={UI_HELP_HINTS.connectorsMt5OrderRequestRisk.text} examples={UI_HELP_HINTS.connectorsMt5OrderRequestRisk.examples} /></div>
           <p className="subtle" style={{ marginTop: 10 }}>Ce bloc crée une demande gouvernée, pas une exécution directe aveugle. En live, TXT attend ensuite la seconde validation dans Approvals Live MT5.</p>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <label className="field-stack"><span>Symbole broker</span><input value={orderSymbol} onChange={(e) => setOrderSymbol(e.target.value)} placeholder="EURUSD ou BTCUSD" /></label>
@@ -1081,7 +1082,7 @@ export default function ConnectorsPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr" }}>
         <div className="panel" id="mt5-live-approvals">
-          <div className="eyebrow">Approvals Live MT5 <HelpHint text="Second validateur requis pour execution compte live." examples={["Quand une demande arrive ici, un autre operateur doit cliquer Valider en second.", "Si rien n'apparait ici, l'ordre est soit en paper, soit pas encore eligibile au live."]} /></div>
+          <div className="eyebrow">Approvals Live MT5 <HelpHint text={UI_HELP_HINTS.connectorsMt5LiveApprovals.text} examples={UI_HELP_HINTS.connectorsMt5LiveApprovals.examples} /></div>
           <div className="row" style={{ marginTop: 10 }}>
             <span>{pendingLive.length > 0 ? `${pendingLive.length} demande(s) live en attente` : "Aucune demande live en attente"}</span>
             <span>{pendingLive.length > 0 ? "second opérateur requis" : "pipeline idle"}</span>
@@ -1102,7 +1103,7 @@ export default function ConnectorsPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Lecture régime marché <HelpHint text="Lit trois scores normalisés pour classer le contexte: tendance, volatilité réalisée et sentiment." examples={["trend_score vient d'un signal de tendance normalisé entre 0 et 1: 0.4 = modéré, 0.8 = fort.", "realized_volatility est la volatilité observée: 0.05 veut dire environ 5% sur la fenêtre utilisée par le signal.", "sentiment_score est l'impulsion news/social/desk entre -1 et 1 quand la source le permet."]} /></div>
+          <div className="eyebrow">Lecture régime marché <HelpHint text={UI_HELP_HINTS.aiMarketContextRead.text} examples={UI_HELP_HINTS.aiMarketContextRead.examples} /></div>
           <p className="subtle" style={{ marginTop: 10 }}>Utilise ce bloc comme lecture de contexte. Les chiffres doivent venir du Terminal, de l'oracle marché, d'un rapport stratégie, ou rester aux valeurs d'exemple pour un simple test.</p>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <label className="field-stack"><span>Tendance 0-1</span><input type="number" step="0.01" value={trendScore} onChange={(e) => setTrendScore(Number(e.target.value || 0))} placeholder="0.40" /></label>
@@ -1121,7 +1122,7 @@ export default function ConnectorsPage() {
         </div>
 
         <div className="panel">
-          <div className="eyebrow">Stress-test IA géopolitique <HelpHint text="Teste un scénario macro ou géopolitique pour voir si une stratégie reste acceptable avant promotion ou live." examples={["Exemple: Fed emergency hike, oil shock, exchange outage, weekend liquidity shock.", "Resilience élevée = cadre plus robuste; expected max drawdown élevé = risque de perte de pic à creux trop important."]} /></div>
+          <div className="eyebrow">Stress-test IA géopolitique <HelpHint text={UI_HELP_HINTS.aiStrategyStressTest.text} examples={UI_HELP_HINTS.aiStrategyStressTest.examples} /></div>
           <p className="subtle" style={{ marginTop: 10 }}>Ce test ne prédit pas le futur. Il sert à décider si on garde, réduit, retarde ou retravaille une stratégie avant d'exposer du vrai capital.</p>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <label className="field-stack"><span>Scénario à tester</span><input value={scenario} onChange={(e) => setScenario(e.target.value)} placeholder="Fed emergency hike" /></label>
@@ -1139,7 +1140,7 @@ export default function ConnectorsPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Prop Firm sans MT5 <HelpHint text="Cadrage pour les clients prop qui utilisent une plateforme proprietaire au lieu de MT5." examples={["Si la firme expose une API, TXT doit passer par un adaptateur natif plateforme plutot que par MT5.", "Sans API, la bonne voie est souvent un connecteur OMS/FIX ou un workflow semi-assiste, pas un faux bridge fragile."]} /></div>
+          <div className="eyebrow">Prop Firm sans MT5 <HelpHint text={UI_HELP_HINTS.connectorsPropFirmNoMt5.text} examples={UI_HELP_HINTS.connectorsPropFirmNoMt5.examples} /></div>
           <div className="row"><span>Option 1</span><span>Adaptateur natif plateforme</span></div>
           <div className="row"><span>Option 2</span><span>FIX / OpenAPI / broker SDK</span></div>
           <div className="row"><span>Option 3</span><span>OMS TXT + validation humaine</span></div>
@@ -1173,7 +1174,7 @@ export default function ConnectorsPage() {
 
       <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr 1fr" }}>
         <div className="panel">
-          <div className="eyebrow">Onboarding Connection Hub <HelpHint text="Point d'entree unique pour les demandes de connexion client/trader hors MT5 natif." examples={["Choisis exchange puis OKX si le client veut brancher un compte API spot/perp.", "Choisis wallet puis MetaMask si le trader veut un flux on-chain signe depuis son navigateur."]} /></div>
+          <div className="eyebrow">Onboarding Connection Hub <HelpHint text={UI_HELP_HINTS.connectorsOnboardingHub.text} examples={UI_HELP_HINTS.connectorsOnboardingHub.examples} /></div>
           <div className="form-grid" style={{ marginTop: 12 }}>
             <select value={connectionProviderType} onChange={(e) => setConnectionProviderType(e.target.value as "broker" | "exchange" | "wallet" | "prop")}>
               <option value="broker">broker</option>
@@ -1210,7 +1211,7 @@ export default function ConnectorsPage() {
       {result ? (
         <section className="grid" style={{ marginTop: 16, gridTemplateColumns: "1fr" }}>
           <div className="panel">
-            <div className="eyebrow">Dernier resultat <HelpHint text="Sortie detaillee de la derniere action API executee." examples={["Lis ce JSON juste apres une action pour comprendre la reponse brute du systeme.", "Si quelque chose echoue, copie surtout detail, status ou approval_id pour le diagnostic."]} /></div>
+            <div className="eyebrow">Dernier resultat <HelpHint text={UI_HELP_HINTS.connectorsLastResult.text} examples={UI_HELP_HINTS.connectorsLastResult.examples} /></div>
             <pre style={{ whiteSpace: "pre-wrap", margin: 0 }}>{JSON.stringify(result, null, 2)}</pre>
           </div>
         </section>

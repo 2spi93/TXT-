@@ -81,7 +81,7 @@ export default async function DriftAlertLogPage({
     <main className="shell txt-page-shell" data-testid="runtime-drift-alert-log-page">
       <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.4fr 1fr" }}>
         <div className="panel txt-page-hero">
-          <div className="eyebrow">Runtime Drift Alert Log</div>
+          <div className="eyebrow">Runtime Drift Log</div>
           <h1 className="title" style={{ fontSize: 34 }}>Journal dedie des derive et alertes runtime</h1>
           <p className="subtle txt-page-hero-copy">Vue lisible pour suivre les bascules `CALM / WATCH / DRIFT / CRITICAL`, l’historique derive heure par heure et la friction live venue-aware.</p>
           <OperatorPanelGuide
@@ -97,7 +97,7 @@ export default async function DriftAlertLogPage({
           <p>
             <Link href="/dashboard">Dashboard</Link>
             {" | "}
-            <Link href="/live-readiness">Live Readiness</Link>
+            <Link href="/live-readiness">Readiness</Link>
             {" | "}
             <Link href="/terminal">Trading Terminal</Link>
           </p>
