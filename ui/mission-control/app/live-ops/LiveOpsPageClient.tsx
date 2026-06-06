@@ -42,7 +42,7 @@ const SYSTEM_MODE_OVERRIDE_TTL_MS = 10 * 60 * 1000;
 const HYDRATION_SAFE_DATE_KEY = "1970-01-01";
 const INITIAL_LIVE_OPS_CONVERGENCE_DELAY_MS = 0;
 const LIVE_OPS_PRIMARY_FETCH_TIMEOUT_MS = 12_000;
-const LIVE_OPS_MODE_FETCH_TIMEOUT_MS = 20_000;
+const LIVE_OPS_MODE_FETCH_TIMEOUT_MS = 4_000;
 const LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS = 4_000;
 const LIVE_OPS_JOURNAL_CONTEXT = {
   symbol: "DESK",
@@ -72,6 +72,46 @@ function asRecord(value: unknown): JsonMap {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as JsonMap
     : {};
+}
+
+function formatApiErrorDetail(value: unknown, fallback: string): string {
+  if (typeof value === "string" && value.trim()) {
+    return value;
+  }
+  const detail = asRecord(value);
+  const direct = String(detail.detail || detail.reason || detail.status || "").trim();
+  const hardening = asRecord(detail.hardening);
+  const hardeningReasons = Array.isArray(hardening.reasons)
+    ? hardening.reasons.map((item) => String(item)).filter(Boolean).join(", ")
+    : "";
+  if (direct && hardeningReasons) {
+    return `${direct}: ${hardeningReasons}`;
+  }
+  if (direct) {
+    return direct;
+  }
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized && serialized !== "{}" ? serialized.slice(0, 280) : fallback;
+  } catch (_error) {
+    return fallback;
+  }
+}
+
+function resolveFtmoAutoSymbol(generatedAt: string): string {
+  const parsedMs = Date.parse(generatedAt || "");
+  const now = Number.isFinite(parsedMs) ? new Date(parsedMs) : new Date();
+  const weekday = now.getUTCDay();
+  const hour = now.getUTCHours();
+  const minute = now.getUTCMinutes();
+  const minutes = hour * 60 + minute;
+  const mondayOpenMinutes = 65;
+  const fridayCloseMinutes = 23 * 60 + 50;
+  const fxClosed = weekday === 0
+    || weekday === 6
+    || (weekday === 1 && minutes < mondayOpenMinutes)
+    || (weekday === 5 && minutes >= fridayCloseMinutes);
+  return fxClosed ? "BTCUSD" : "EURUSD";
 }
 
 function isSystemMode(value: unknown): value is SystemMode {
@@ -172,6 +212,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
   const auditFilter = String(searchParams?.get("audit_filter") || "").trim();
   const [liveOpsPayload, setLiveOpsPayload] = useState<JsonMap | null>(initialLiveOpsPayload);
   const [systemModePayload, setSystemModePayload] = useState<JsonMap | null>(null);
+  const [killSwitchPayload, setKillSwitchPayload] = useState<JsonMap | null>(null);
   const [executionPnlAnalyzerPayload, setExecutionPnlAnalyzerPayload] = useState<JsonMap | null>(null);
   const [executionAiV6Payload, setExecutionAiV6Payload] = useState<JsonMap | null>(null);
   const [mt5PendingPayload, setMt5PendingPayload] = useState<JsonMap | null>(null);
@@ -239,6 +280,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
       const [
         liveOpsResponse,
         systemModeResponse,
+        killSwitchResponse,
         pnlResponse,
         executionAiResponse,
         mt5PendingResponse,
@@ -248,6 +290,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
       ] = await Promise.all([
         fetchJsonWithTimeout(liveOpsUrl, LIVE_OPS_PRIMARY_FETCH_TIMEOUT_MS),
         fetchJsonWithTimeout("/api/system/mode", LIVE_OPS_MODE_FETCH_TIMEOUT_MS),
+        fetchJsonWithTimeout("/api/system/kill-switch", LIVE_OPS_MODE_FETCH_TIMEOUT_MS),
         fetchJsonWithTimeout("/api/execution/pnl-analyzer?scope_type=strategy&scope_id=mt5-live&limit=50", LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS),
         fetchJsonWithTimeout("/api/execution/ai/v6/state", LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS),
         fetchJsonWithTimeout("/api/mt5/orders/live-pending", LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS),
@@ -270,6 +313,9 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
       if (systemModeResponse.payload) {
         setSystemModePayload(systemModeResponse.payload);
       }
+      if (killSwitchResponse.payload) {
+        setKillSwitchPayload(killSwitchResponse.payload);
+      }
       setError(null);
       setLoading(false);
       setExecutionPnlAnalyzerPayload(pnlResponse.payload);
@@ -291,6 +337,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
   }
 
   async function submitAlphaReactivationRequest(): Promise<void> {
+    const alphaSymbol = resolveFtmoAutoSymbol(String(asRecord(liveOpsPayload).generated_at || ""));
     setAlphaSubmitBusy(true);
     setAlphaFeedback(null);
     try {
@@ -299,7 +346,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           account_id: "541283177",
-          symbol: "AUTO",
+          symbol: alphaSymbol,
           side: "buy",
           lots: 0.01,
           estimated_notional_usd: 5,
@@ -310,6 +357,11 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
           metadata: {
             source: "live-ops-alpha-reactivation-console",
             purpose: "proof_reactivation",
+            auto_symbol_resolution: {
+              requested: "AUTO",
+              resolved: alphaSymbol,
+              rule: "ftmo_week_window_else_btcusd",
+            },
             requires_second_operator: true,
             operator_visible_flow: "TXT proposes -> operator approves -> TXT executes -> TXT measures",
           },
@@ -322,7 +374,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
       });
       const payload = await response.json().catch(() => null);
       if (!response.ok) {
-        throw new Error(String(payload && typeof payload === "object" ? (payload as JsonMap).detail || "Demande live refusee" : "Demande live refusee"));
+        throw new Error(formatApiErrorDetail(payload && typeof payload === "object" ? (payload as JsonMap).detail || payload : payload, "Demande live refusee"));
       }
       const status = String(payload && typeof payload === "object" ? (payload as JsonMap).status || "submitted" : "submitted");
       const approvalId = String(payload && typeof payload === "object" ? (payload as JsonMap).approval_id || "" : "");
@@ -687,6 +739,19 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
   const modeConfig = asRecord(systemModePayload);
   const modeConfigMode = isSystemMode(modeConfig.system_mode) ? modeConfig.system_mode : null;
   const effectiveBackendMode = systemModeOverride || modeConfigMode || backendMode;
+  const killSwitchEnvelope = asRecord(killSwitchPayload);
+  const killSwitchState = asRecord(killSwitchEnvelope.state);
+  const watchdogTriggers = Array.isArray(watchdog.triggers) ? watchdog.triggers.map((item) => String(item)) : [];
+  const killSwitchSignalActive = watchdogTriggers.includes("kill_switch_active")
+    || alerts.some((item) => {
+      const alert = asRecord(item);
+      return String(alert.code || "") === "kill_switch_active"
+        || String(alert.detail || "").includes("kill_switch_active")
+        || String(alert.message || "").toLowerCase().includes("kill switch");
+    });
+  const killSwitchActive = Boolean(killSwitchState.active) || killSwitchSignalActive;
+  const killSwitchReason = String(killSwitchState.reason || (killSwitchSignalActive ? "runtime_truth_blocked" : "execution_locked"));
+  const alphaMt5Symbol = resolveFtmoAutoSymbol(String(snapshot.generated_at || ""));
   const pnlEnvelope = asRecord(executionPnlAnalyzerPayload);
   const pnlSummary = asRecord(pnlEnvelope.summary);
   const v6Envelope = asRecord(executionAiV6Payload);
@@ -774,7 +839,9 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
     { id: "GAP", label: "Reality Gap", count: recentGapCount, done: recentGapCount > 0 },
     { id: "LINK", label: "Boucle liee", count: recentLinkedLoopCount, done: recentLinkedLoopCount > 0 },
   ];
-  const alphaNextAction = recentAckCount <= 0
+  const alphaNextAction = killSwitchActive
+    ? "Reset kill switch avant demande"
+    : recentAckCount <= 0
     ? "Créer une demande micro-fill MT5"
     : recentFillCount <= 0
       ? "Approuver/executer pour obtenir le FILL"
@@ -783,6 +850,11 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
         : recentLinkedLoopCount <= 0
           ? "Relier decision_id / broker_ticket"
           : "Accumuler REAL_10";
+  const alphaSubmitBlockedReason = killSwitchActive
+    ? `Kill switch actif: ${killSwitchReason}. Aucune approval ne sera creee tant que le verrou n'est pas reset.`
+    : effectiveBackendMode !== "managed_live"
+      ? "Passe en Managed Live avant de creer une demande MT5 reelle."
+      : "";
   const alphaPanelTone = recentFillCount > 0 && recentLinkedLoopCount > 0
     ? "good"
     : mt5PendingApprovals.length > 0
@@ -1187,7 +1259,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
           <div className="row"><span>Mode backend</span><span>{effectiveBackendMode}</span></div>
           <div className="row"><span>Pending approvals</span><span className={mt5PendingApprovals.length > 0 ? "warn" : "subtle"}>{mt5PendingApprovals.length}</span></div>
           <div style={{ marginTop: 12, borderRadius: 12, border: "1px solid rgba(148, 163, 184, 0.18)", padding: 12, background: "rgba(2, 6, 23, 0.18)" }}>
-            <div className="row"><span>Proposition TXT</span><span>MT5 · AUTO · buy · 0.01 lot</span></div>
+            <div className="row"><span>Proposition TXT</span><span>MT5 · {alphaMt5Symbol} · buy · 0.01 lot</span></div>
             <div className="row"><span>Notional estime</span><span>5 USD</span></div>
             <div className="row"><span>Spread max</span><span>10 bps</span></div>
             <div className="row"><span>But</span><span>renouveler FILL reel</span></div>
@@ -1225,17 +1297,17 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}>
             <button
               type="button"
-              disabled={alphaSubmitBusy || effectiveBackendMode !== "managed_live"}
+              disabled={alphaSubmitBusy || Boolean(alphaSubmitBlockedReason)}
               onClick={() => { void submitAlphaReactivationRequest(); }}
             >
-              {alphaSubmitBusy ? "Preparation..." : "Preparer demande MT5"}
+              {alphaSubmitBusy ? "Preparation..." : killSwitchActive ? "Verrouille" : "Preparer demande MT5"}
             </button>
             <button type="button" disabled={busy} onClick={() => { void loadData(); }}>
               Rafraichir preuves
             </button>
           </div>
-          {effectiveBackendMode !== "managed_live" ? (
-            <p className="subtle mini" style={{ marginTop: 8 }}>Passe en Managed Live avant de creer une demande MT5 reelle.</p>
+          {alphaSubmitBlockedReason ? (
+            <p className="subtle mini" style={{ marginTop: 8 }}>{alphaSubmitBlockedReason}</p>
           ) : null}
           {alphaFeedback ? <p className="subtle" style={{ marginTop: 10 }}>{alphaFeedback}</p> : null}
         </div>

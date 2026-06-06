@@ -42,9 +42,10 @@ function sum(values: number[]): number {
 }
 
 const WATCHDOG_FRESHNESS_WINDOW_MS = 30 * 60 * 1000;
-const LIVE_OPS_CP_FETCH_TIMEOUT_MS = 6_000;
-const LIVE_OPS_EDGE_OBSERVATION_TIMEOUT_MS = 900;
-const LIVE_OPS_SERVER_TRUTH_TIMEOUT_MS = 4_500;
+const LIVE_OPS_CORE_CP_FETCH_TIMEOUT_MS = 3_500;
+const LIVE_OPS_OPTIONAL_CP_FETCH_TIMEOUT_MS = 1_800;
+const LIVE_OPS_EDGE_OBSERVATION_TIMEOUT_MS = 700;
+const LIVE_OPS_SERVER_TRUTH_TIMEOUT_MS = 1_800;
 
 type CpFetchJsonSafeResult = Awaited<ReturnType<typeof cpFetchJsonSafe>>;
 
@@ -131,7 +132,7 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: 
   ]);
 }
 
-function cpFetchJsonSafeBounded(path: string): Promise<CpFetchJsonSafeResult> {
+function cpFetchJsonSafeBounded(path: string, timeoutMs = LIVE_OPS_CORE_CP_FETCH_TIMEOUT_MS): Promise<CpFetchJsonSafeResult> {
   const fallback = timedOutCpFetchResult(path);
   const controller = new AbortController();
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
@@ -139,7 +140,7 @@ function cpFetchJsonSafeBounded(path: string): Promise<CpFetchJsonSafeResult> {
     timeoutId = setTimeout(() => {
       controller.abort();
       resolve(fallback);
-    }, LIVE_OPS_CP_FETCH_TIMEOUT_MS);
+    }, timeoutMs);
   });
   const fetchPromise = cpFetchJsonSafe(path, { signal: controller.signal })
     .catch(() => fallback)
@@ -307,11 +308,11 @@ export async function GET(request: Request): Promise<NextResponse> {
     cpFetchJsonSafeBounded("/v1/system/kill-switch"),
     cpFetchJsonSafeBounded("/v1/system/config"),
     cpFetchJsonSafeBounded("/v1/system/opportunity-gate"),
-    cpFetchJsonSafeBounded("/v1/execution/telemetry/recent?limit=40"),
-    cpFetchJsonSafeBounded("/v1/execution/reality-gap/recent?limit=40"),
-    cpFetchJsonSafeBounded("/v1/audit?limit=16"),
-    cpFetchJsonSafeBounded("/v1/outcomes/recent?limit=40"),
-    cpFetchJsonSafeBounded("/v1/dashboard/overview"),
+    cpFetchJsonSafeBounded("/v1/execution/telemetry/recent?limit=40", LIVE_OPS_OPTIONAL_CP_FETCH_TIMEOUT_MS),
+    cpFetchJsonSafeBounded("/v1/execution/reality-gap/recent?limit=40", LIVE_OPS_OPTIONAL_CP_FETCH_TIMEOUT_MS),
+    cpFetchJsonSafeBounded("/v1/audit?limit=16", LIVE_OPS_OPTIONAL_CP_FETCH_TIMEOUT_MS),
+    cpFetchJsonSafeBounded("/v1/outcomes/recent?limit=40", LIVE_OPS_OPTIONAL_CP_FETCH_TIMEOUT_MS),
+    cpFetchJsonSafeBounded("/v1/dashboard/overview", LIVE_OPS_OPTIONAL_CP_FETCH_TIMEOUT_MS),
     getEdgeObservationSummaryBounded(),
     withTimeout(
       buildRuntimeTruthSnapshot({ symbol: "DESK", marketInstrument: "BTCUSDT", timeframe: "live", strategy: "live-ops" }).catch(() => null),
