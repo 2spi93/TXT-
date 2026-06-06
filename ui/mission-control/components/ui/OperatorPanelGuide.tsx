@@ -20,6 +20,14 @@ type OperatorPanelGuideProps = {
   compact?: boolean;
 };
 
+function formatFallbackTermLabel(term: string): string {
+  return term
+    .replace(/[_-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (letter) => letter.toUpperCase()) || "Terme";
+}
+
 export default function OperatorPanelGuide({
   title,
   what,
@@ -52,12 +60,22 @@ export default function OperatorPanelGuide({
           <div className="txt-mini-guide-title">{title}</div>
           {terms.length > 0 ? (
             <div className="txt-mini-guide-terms" aria-label="Glossary terms">
-              {terms.map((term) => (
-                <span key={term} className="txt-mini-guide-term">
-                  {glossary[term].label}
-                  <HelpTooltip termKey={term} mode={uiMode} />
-                </span>
-              ))}
+              {terms.map((term) => {
+                const entry = glossary[term];
+                const fallbackLabel = formatFallbackTermLabel(term);
+                return (
+                  <span key={term} className="txt-mini-guide-term">
+                    {entry?.label || fallbackLabel}
+                    <HelpTooltip
+                      termKey={entry ? term : undefined}
+                      label={fallbackLabel}
+                      simple={entry ? undefined : "Definition a ajouter au glossaire."}
+                      whyItMatters={entry ? undefined : "Le guide reste disponible meme si ce terme n'est pas encore documente."}
+                      mode={uiMode}
+                    />
+                  </span>
+                );
+              })}
             </div>
           ) : null}
         </div>

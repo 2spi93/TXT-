@@ -2,13 +2,15 @@ import { NextResponse } from "next/server";
 
 import { cpFetchJsonSafe, getControlPlaneNetworkMetricsSnapshot } from "../../../../lib/controlPlane";
 
-const BROKER_BALANCE_TIMEOUT_MS = 4_000;
+const OPPORTUNITY_GATE_TIMEOUT_MS = 4_000;
 
 function fallbackPayload(detail: string): Record<string, unknown> {
   return {
-    status: "degraded",
+    status: "unknown",
+    opportunity_enabled: false,
+    valid_observation: false,
+    kill_switch_recommended: false,
     detail,
-    balances: [],
     network_metrics: getControlPlaneNetworkMetricsSnapshot(),
   };
 }
@@ -21,19 +23,19 @@ export async function GET(): Promise<NextResponse> {
       timeoutId = setTimeout(() => {
         controller.abort();
         resolve(null);
-      }, BROKER_BALANCE_TIMEOUT_MS);
+      }, OPPORTUNITY_GATE_TIMEOUT_MS);
     });
     const result = await Promise.race([
-      cpFetchJsonSafe("/v1/broker/balance", { signal: controller.signal }),
+      cpFetchJsonSafe("/v1/system/opportunity-gate", { signal: controller.signal }),
       timeout,
     ]);
     if (!result) {
-      return NextResponse.json(fallbackPayload("broker_balance_timeout"), { status: 200 });
+      return NextResponse.json(fallbackPayload("opportunity_gate_timeout"), { status: 200 });
     }
     const { response, payload } = result;
-    return NextResponse.json(payload, { status: response.status });
+    return NextResponse.json(payload, { status: response.ok ? 200 : response.status });
   } catch {
-    return NextResponse.json(fallbackPayload("broker_balance_unreachable"), { status: 200 });
+    return NextResponse.json(fallbackPayload("opportunity_gate_unreachable"), { status: 200 });
   } finally {
     if (timeoutId) {
       clearTimeout(timeoutId);

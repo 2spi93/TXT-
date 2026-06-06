@@ -140,7 +140,7 @@ export default function HelpTooltip({ termKey, entry, label, simple, example, wh
       >
         ?
       </button>
-      {typeof document !== "undefined" ? createPortal(popover, document.body) : null}
+      {open && typeof document !== "undefined" ? createPortal(popover, document.body) : null}
     </span>
   );
 }

@@ -4243,6 +4243,48 @@ function buildDeskRead(summary: RuntimeDecisionAnalyticsSummary): RuntimeDecisio
   };
 }
 
+const RUNTIME_DECISION_ANALYTICS_LOAD_TIMEOUT_MS = 3_500;
+
+async function withRuntimeDecisionTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((resolve) => {
+        timeoutId = setTimeout(() => resolve(fallback), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+function unavailableOpportunityTelemetry(): RuntimeDecisionOpportunityTelemetry {
+  return {
+    source: "context-only",
+    availability: "unavailable",
+    venueCount: 0,
+    marketVenueCount: 0,
+    routeVenueCount: 0,
+    avgSpreadBps: null,
+    avgAvailableDepthUsd: null,
+    avgDepthLatencyMs: null,
+    avgFillProbability: null,
+    avgStabilityScore: null,
+    avgRouteLatencyMs: null,
+    avgFillLatencyMs: null,
+    avgSlippageBps: null,
+    spreadBudgetBps: null,
+    latencyBudgetMs: null,
+    summary: "Runtime telemetry timeout: dashboard fallback lecture structurelle uniquement.",
+    rootCause: "NETWORK_FAILURE",
+    missingFields: ["telemetry"],
+    isStale: true,
+  };
+}
+
 export async function getRuntimeDecisionAnalytics(options?: {
   symbol?: string;
   timeframe?: string;
@@ -4259,10 +4301,26 @@ export async function getRuntimeDecisionAnalytics(options?: {
   const samples = Math.max(1, Math.min(10, Math.round(Number(options?.samples || 3))));
 
   const [entries, opportunityTelemetry, localTerminalCaptureStore, kpiSnapshotHistory] = await Promise.all([
-    readV2RiskJournalEntries({ symbol, timeframe, strategy, limit, sinceDays }),
-    readOpportunityTelemetry(),
-    readLocalTerminalCaptureStore(),
-    readRuntimeDecisionKpiSnapshots({ symbol, timeframe, strategy, limit: 168, sinceDays }),
+    withRuntimeDecisionTimeout(
+      readV2RiskJournalEntries({ symbol, timeframe, strategy, limit, sinceDays }).catch(() => []),
+      RUNTIME_DECISION_ANALYTICS_LOAD_TIMEOUT_MS,
+      [],
+    ),
+    withRuntimeDecisionTimeout(
+      readOpportunityTelemetry().catch(() => unavailableOpportunityTelemetry()),
+      RUNTIME_DECISION_ANALYTICS_LOAD_TIMEOUT_MS,
+      unavailableOpportunityTelemetry(),
+    ),
+    withRuntimeDecisionTimeout(
+      readLocalTerminalCaptureStore().catch(() => []),
+      RUNTIME_DECISION_ANALYTICS_LOAD_TIMEOUT_MS,
+      [],
+    ),
+    withRuntimeDecisionTimeout(
+      readRuntimeDecisionKpiSnapshots({ symbol, timeframe, strategy, limit: 168, sinceDays }).catch(() => []),
+      RUNTIME_DECISION_ANALYTICS_LOAD_TIMEOUT_MS,
+      [],
+    ),
   ]);
   const rows = deriveRows(entries);
   const localTerminalCaptures = flattenLocalTerminalCaptures(localTerminalCaptureStore);

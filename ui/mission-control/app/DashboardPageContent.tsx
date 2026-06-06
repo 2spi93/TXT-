@@ -3,7 +3,7 @@ import { redirect } from "next/navigation";
 
 import { cpFetch } from "../lib/controlPlane";
 import { readHealthwatchDashboard } from "../lib/healthwatchDashboard";
-import { getLatestLocalTerminalCapture } from "../lib/localTerminalCapture";
+import { defaultLocalTerminalCaptureStore, getLatestLocalTerminalCapture } from "../lib/localTerminalCapture";
 import { readLocalTerminalCaptureStore } from "../lib/localTerminalCaptureStore";
 import { getConnectorHealthView } from "../lib/connectorHealth";
 import HelpHint from "../components/HelpHint";
@@ -53,26 +53,89 @@ function isE2eDashboardFallbackEnabled(): boolean {
   return isPlaywright && isDegraded;
 }
 
-async function getJson(path: string): Promise<unknown> {
-  const response = await cpFetch(path);
-  if (!response.ok) {
-    return null;
+const DASHBOARD_CP_FETCH_TIMEOUT_MS = 4_000;
+const DASHBOARD_IMPROVEMENT_FETCH_TIMEOUT_MS = 3_000;
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((resolve) => {
+        timeoutId = setTimeout(() => resolve(fallback), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
   }
-  return response.json();
 }
 
-async function postJson(path: string, body: unknown): Promise<unknown> {
-  const response = await cpFetch(path, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
+async function getJson(path: string, timeoutMs = DASHBOARD_CP_FETCH_TIMEOUT_MS): Promise<unknown> {
+  const controller = new AbortController();
+  const response = await withTimeout(
+    cpFetch(path, { signal: controller.signal }).catch(() => null),
+    timeoutMs,
+    null,
+  );
+  if (!response) {
+    controller.abort();
+    return null;
+  }
   if (!response.ok) {
     return null;
   }
-  return response.json();
+  return withTimeout(response.json().catch(() => null), 1_000, null);
+}
+
+async function postJson(path: string, body: unknown, timeoutMs = DASHBOARD_CP_FETCH_TIMEOUT_MS): Promise<unknown> {
+  const controller = new AbortController();
+  const response = await withTimeout(
+    cpFetch(path, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    }).catch(() => null),
+    timeoutMs,
+    null,
+  );
+  if (!response) {
+    controller.abort();
+    return null;
+  }
+  if (!response.ok) {
+    return null;
+  }
+  return withTimeout(response.json().catch(() => null), 1_000, null);
+}
+
+async function getLocalJson<T>(promise: Promise<T>, timeoutMs = DASHBOARD_CP_FETCH_TIMEOUT_MS, fallback: T): Promise<T> {
+  return withTimeout(promise.catch(() => fallback), timeoutMs, fallback);
+}
+
+async function getServerRoleBounded(): Promise<Awaited<ReturnType<typeof getServerRole>>> {
+  return withTimeout(getServerRole().catch(() => null), 1_500, null);
+}
+
+async function readHealthwatchDashboardBounded(): Promise<Awaited<ReturnType<typeof readHealthwatchDashboard>>> {
+  return getLocalJson(readHealthwatchDashboard(), DASHBOARD_CP_FETCH_TIMEOUT_MS, null as Awaited<ReturnType<typeof readHealthwatchDashboard>>);
+}
+
+async function readLocalTerminalCaptureStoreBounded(): Promise<Awaited<ReturnType<typeof readLocalTerminalCaptureStore>>> {
+  return getLocalJson(readLocalTerminalCaptureStore(), 1_500, defaultLocalTerminalCaptureStore());
+}
+
+async function readBlueGreenStatusBounded(): Promise<Awaited<ReturnType<typeof readMissionControlBlueGreenStatus>>> {
+  return getLocalJson(readMissionControlBlueGreenStatus(), 1_500, {
+    activeSlot: "unknown",
+    inactiveSlot: "unknown",
+    slots: {},
+    generatedAt: new Date().toISOString(),
+  } as Awaited<ReturnType<typeof readMissionControlBlueGreenStatus>>);
 }
 
 function formatSignedMetric(value: unknown, fractionDigits = 2, suffix = ""): string {
@@ -126,11 +189,11 @@ export default async function DashboardPageContent() {
     getJson("/v1/intents/pending") as Promise<Record<string, RecordItem> | null>,
     getJson("/v1/strategies") as Promise<RecordItem[] | null>,
     getJson("/v1/connectors/status") as Promise<RecordItem | null>,
-    readHealthwatchDashboard(),
-    readLocalTerminalCaptureStore(),
+    readHealthwatchDashboardBounded(),
+    readLocalTerminalCaptureStoreBounded(),
     getRuntimeDecisionAnalytics({ limit: 1200, sinceDays: 7, samples: 2 }),
-    readMissionControlBlueGreenStatus(),
-    getServerRole(),
+    readBlueGreenStatusBounded(),
+    getServerRoleBounded(),
   ]);
 
   const effectiveMe = me || (serverRole
@@ -256,20 +319,20 @@ export default async function DashboardPageContent() {
       limit: "80",
     });
     [improvementProposalsPayload, improvementValidationPayload, improvementSimulationPayload, improvementDeploymentPayload, improvementDeploymentMonitoringPayload, improvementDeploymentGovernorPayload] = await Promise.all([
-      getJson(`/v1/system/improvement-proposals?${params.toString()}`) as Promise<RecordItem | null>,
+      getJson(`/v1/system/improvement-proposals?${params.toString()}`, DASHBOARD_IMPROVEMENT_FETCH_TIMEOUT_MS) as Promise<RecordItem | null>,
       postJson("/v1/system/improvement-validations", {
         scope_type: primaryImprovementScope.scopeType,
         scope_id: primaryImprovementScope.scopeId,
         limit: 80,
-      }) as Promise<RecordItem | null>,
+      }, DASHBOARD_IMPROVEMENT_FETCH_TIMEOUT_MS) as Promise<RecordItem | null>,
       postJson("/v1/system/improvement-simulations", {
         scope_type: primaryImprovementScope.scopeType,
         scope_id: primaryImprovementScope.scopeId,
         limit: 80,
-      }) as Promise<RecordItem | null>,
-      getJson("/v1/system/improvement-deployments?active_only=1") as Promise<RecordItem | null>,
-      getJson("/v1/system/improvement-deployments/monitor") as Promise<RecordItem | null>,
-      getJson("/v1/system/improvement-deployments/governor?fresh=1") as Promise<RecordItem | null>,
+      }, DASHBOARD_IMPROVEMENT_FETCH_TIMEOUT_MS) as Promise<RecordItem | null>,
+      getJson("/v1/system/improvement-deployments?active_only=1", DASHBOARD_IMPROVEMENT_FETCH_TIMEOUT_MS) as Promise<RecordItem | null>,
+      getJson("/v1/system/improvement-deployments/monitor", DASHBOARD_IMPROVEMENT_FETCH_TIMEOUT_MS) as Promise<RecordItem | null>,
+      getJson("/v1/system/improvement-deployments/governor?fresh=1", DASHBOARD_IMPROVEMENT_FETCH_TIMEOUT_MS) as Promise<RecordItem | null>,
     ]);
   }
   const improvementProposalRows = Array.isArray(improvementProposalsPayload?.proposals)
