@@ -47,6 +47,7 @@ HOST_OUTPUT_DIR="${HOST_OUTPUT_DIR:-$ROOT_DIR/logs/spread_audit}"
 SHARED_OUTPUT_DIR="${SHARED_OUTPUT_DIR:-/opt/shared-ingress/ops/remediation}"
 WEBHOOK_TIMEOUT_SEC="${WEBHOOK_TIMEOUT_SEC:-10}"
 STATE_FILE="${STATE_FILE:-$HOST_OUTPUT_DIR/remediation_snapshot_state.json}"
+REMEDIATION_SNAPSHOT_PUBLISH="${REMEDIATION_SNAPSHOT_PUBLISH:-1}"
 
 WEBHOOK_URL="${WEBHOOK_URL:-}"
 WEBHOOK_URL_FILE="${WEBHOOK_URL_FILE:-$ROOT_DIR/secrets/remediation_snapshot_webhook_url}"
@@ -284,7 +285,7 @@ print(json.dumps(payload, ensure_ascii=True))
 PY
 )"
 
-report_json="$(python3 - <<'PY' "$snapshot_envelope" "$execution_evidence" "$STATE_FILE" "$REMEDIATION_PROVEN_MIN_IMPACT_DELTA_PTS" "$REMEDIATION_PROVEN_MIN_COVERAGE_DELTA_PCT" "$CONDITION_PROVEN_MIN_IMPACT_DELTA_PTS" "$CONDITION_ELIMINATED_MIN_IMPACT_DELTA_PTS" "$CONDITION_ELIMINATED_MIN_EVENTS_AFTER_FIX" "$DECISION_MC_DC_TARGET_PCT" "$CONDITION_ELIMINATED_MIN_EVENTS_AFTER_FIX_CUMULATIVE" "$DECISION_MC_DC_PROOF_COVERAGE_MIN_PCT" "$DECISION_MC_DC_UNKNOWN_CONDITIONS_MAX" "$DECISION_MC_DC_TOP_UNKNOWN_STABLE_MIN_RUNS" "$DECISION_MC_DC_ELIMINATION_COVERAGE_MIN_PCT" "$DECISION_REALITY_TARGET_COVERAGE_PCT" "$DECISION_REALITY_MAX_IGNORED_RATE_PCT" "$BROKER_REALITY_MIN_ACK_COUNT" "$BROKER_REALITY_MIN_FILL_COUNT" "$EXECUTION_GAP_MIN_OUTCOME_COUNT" "$EXECUTION_GAP_MIN_SAMPLE_COUNT" "$PROOF_RENEWAL_ACK_FRESH_DAYS" "$PROOF_RENEWAL_ACK_STALE_DAYS" "$PROOF_RENEWAL_ACK_EXPIRED_DAYS" "$PROOF_RENEWAL_FILL_FRESH_DAYS" "$PROOF_RENEWAL_FILL_STALE_DAYS" "$PROOF_RENEWAL_FILL_EXPIRED_DAYS" "$PROOF_RENEWAL_OUTCOME_FRESH_DAYS" "$PROOF_RENEWAL_OUTCOME_STALE_DAYS" "$PROOF_RENEWAL_OUTCOME_EXPIRED_DAYS" "$PROOF_RENEWAL_GAP_FRESH_DAYS" "$PROOF_RENEWAL_GAP_STALE_DAYS" "$PROOF_RENEWAL_GAP_EXPIRED_DAYS"
+report_json="$(python3 - <<'PY' "$snapshot_envelope" "$execution_evidence" "$STATE_FILE" "$REMEDIATION_PROVEN_MIN_IMPACT_DELTA_PTS" "$REMEDIATION_PROVEN_MIN_COVERAGE_DELTA_PCT" "$CONDITION_PROVEN_MIN_IMPACT_DELTA_PTS" "$CONDITION_ELIMINATED_MIN_IMPACT_DELTA_PTS" "$CONDITION_ELIMINATED_MIN_EVENTS_AFTER_FIX" "$DECISION_MC_DC_TARGET_PCT" "$CONDITION_ELIMINATED_MIN_EVENTS_AFTER_FIX_CUMULATIVE" "$DECISION_MC_DC_PROOF_COVERAGE_MIN_PCT" "$DECISION_MC_DC_UNKNOWN_CONDITIONS_MAX" "$DECISION_MC_DC_TOP_UNKNOWN_STABLE_MIN_RUNS" "$DECISION_MC_DC_ELIMINATION_COVERAGE_MIN_PCT" "$DECISION_REALITY_TARGET_COVERAGE_PCT" "$DECISION_REALITY_MAX_IGNORED_RATE_PCT" "$BROKER_REALITY_MIN_ACK_COUNT" "$BROKER_REALITY_MIN_FILL_COUNT" "$EXECUTION_GAP_MIN_OUTCOME_COUNT" "$EXECUTION_GAP_MIN_SAMPLE_COUNT" "$PROOF_RENEWAL_ACK_FRESH_DAYS" "$PROOF_RENEWAL_ACK_STALE_DAYS" "$PROOF_RENEWAL_ACK_EXPIRED_DAYS" "$PROOF_RENEWAL_FILL_FRESH_DAYS" "$PROOF_RENEWAL_FILL_STALE_DAYS" "$PROOF_RENEWAL_FILL_EXPIRED_DAYS" "$PROOF_RENEWAL_OUTCOME_FRESH_DAYS" "$PROOF_RENEWAL_OUTCOME_STALE_DAYS" "$PROOF_RENEWAL_OUTCOME_EXPIRED_DAYS" "$PROOF_RENEWAL_GAP_FRESH_DAYS" "$PROOF_RENEWAL_GAP_STALE_DAYS" "$PROOF_RENEWAL_GAP_EXPIRED_DAYS" "$REMEDIATION_SNAPSHOT_PUBLISH"
 import datetime as dt
 import json
 import pathlib
@@ -332,6 +333,7 @@ proof_renewal_thresholds = {
     'expired_days': float(sys.argv[32]),
   },
 }
+publish_enabled = sys.argv[33] != '0'
 strict_v1_decision_mc_dc_target_pct = 80.0
 strict_v1_decision_mc_dc_proof_coverage_min_pct = 60.0
 strict_v1_decision_mc_dc_unknown_conditions_max = 2
@@ -392,6 +394,33 @@ def proof_age_state(value, thresholds):
 def worst_proof_state(states):
     order = {'FRESH': 0, 'AGING': 1, 'STALE': 2, 'EXPIRED': 3}
     return max(states, key=lambda item: order.get(item, 3)) if states else 'EXPIRED'
+
+def proof_renewal_lag_days(value, thresholds):
+    if value is None:
+        return None
+    try:
+        return round(max(float(value) - float(thresholds.get('fresh_days') or 0.0), 0.0), 6)
+    except Exception:
+        return None
+
+def proof_days_until(value, threshold_days):
+    if value is None:
+        return None
+    try:
+        return round(float(threshold_days) - float(value), 6)
+    except Exception:
+        return None
+
+def proof_signal(value, thresholds, latest_at):
+    return {
+      'state': proof_age_state(value, thresholds),
+      'age_days': value,
+      'renewal_lag_days': proof_renewal_lag_days(value, thresholds),
+      'days_until_stale': proof_days_until(value, thresholds.get('stale_days')),
+      'days_until_expired': proof_days_until(value, thresholds.get('expired_days')),
+      'thresholds': thresholds,
+      'latest_at': latest_at,
+    }
 
 def fmt_pts(value):
     if value is None:
@@ -662,35 +691,71 @@ days_since_last_outcome = execution_evidence.get('days_since_last_outcome')
 days_since_last_gap_sample = execution_evidence.get('days_since_last_gap_sample')
 proof_staleness = execution_evidence.get('proof_staleness') if isinstance(execution_evidence.get('proof_staleness'), dict) else {}
 proof_renewal_signals = {
-  'ack': {
-    'state': proof_age_state(days_since_last_ack, proof_renewal_thresholds['ack']),
-    'age_days': days_since_last_ack,
-    'thresholds': proof_renewal_thresholds['ack'],
-    'latest_at': execution_evidence.get('latest_ack_at'),
-  },
-  'fill': {
-    'state': proof_age_state(days_since_last_fill, proof_renewal_thresholds['fill']),
-    'age_days': days_since_last_fill,
-    'thresholds': proof_renewal_thresholds['fill'],
-    'latest_at': execution_evidence.get('latest_fill_at'),
-  },
-  'outcome': {
-    'state': proof_age_state(days_since_last_outcome, proof_renewal_thresholds['outcome']),
-    'age_days': days_since_last_outcome,
-    'thresholds': proof_renewal_thresholds['outcome'],
-    'latest_at': execution_evidence.get('latest_outcome_at'),
-  },
-  'gap_sample': {
-    'state': proof_age_state(days_since_last_gap_sample, proof_renewal_thresholds['gap_sample']),
-    'age_days': days_since_last_gap_sample,
-    'thresholds': proof_renewal_thresholds['gap_sample'],
-    'latest_at': execution_evidence.get('latest_gap_sample_at'),
-  },
+  'ack': proof_signal(days_since_last_ack, proof_renewal_thresholds['ack'], execution_evidence.get('latest_ack_at')),
+  'fill': proof_signal(days_since_last_fill, proof_renewal_thresholds['fill'], execution_evidence.get('latest_fill_at')),
+  'outcome': proof_signal(days_since_last_outcome, proof_renewal_thresholds['outcome'], execution_evidence.get('latest_outcome_at')),
+  'gap_sample': proof_signal(days_since_last_gap_sample, proof_renewal_thresholds['gap_sample'], execution_evidence.get('latest_gap_sample_at')),
 }
 proof_renewal_state = worst_proof_state([item['state'] for item in proof_renewal_signals.values()])
 fresh_proven = bool(all(item['state'] == 'FRESH' for item in proof_renewal_signals.values()))
 proof_renewal_due = bool(any(item['state'] in ('STALE', 'EXPIRED') for item in proof_renewal_signals.values()))
 proof_expired = bool(any(item['state'] == 'EXPIRED' for item in proof_renewal_signals.values()))
+renewal_velocity = {
+  'state': 'FRESH' if fresh_proven else proof_renewal_state,
+  'max_lag_days': max(
+    [item['renewal_lag_days'] for item in proof_renewal_signals.values() if item.get('renewal_lag_days') is not None],
+    default=None,
+  ),
+  'signals_over_fresh_target': [
+    name for name, item in proof_renewal_signals.items()
+    if item.get('renewal_lag_days') is not None and float(item.get('renewal_lag_days') or 0.0) > 0.0
+  ],
+  'renewal_priority': sorted(
+    [
+      {
+        'signal': name,
+        'state': item.get('state'),
+        'age_days': item.get('age_days'),
+        'fresh_days': item.get('thresholds', {}).get('fresh_days'),
+        'renewal_lag_days': item.get('renewal_lag_days'),
+        'days_until_expired': item.get('days_until_expired'),
+        'latest_at': item.get('latest_at'),
+      }
+      for name, item in proof_renewal_signals.items()
+    ],
+    key=lambda item: (
+      0 if item.get('renewal_lag_days') is None else 1,
+      0.0 if item.get('renewal_lag_days') is None else -float(item.get('renewal_lag_days') or 0.0),
+      str(item.get('signal') or ''),
+    ),
+  ),
+  'expiration_priority': sorted(
+    [
+      {
+        'signal': name,
+        'state': item.get('state'),
+        'age_days': item.get('age_days'),
+        'expired_days': item.get('thresholds', {}).get('expired_days'),
+        'days_until_expired': item.get('days_until_expired'),
+        'latest_at': item.get('latest_at'),
+      }
+      for name, item in proof_renewal_signals.items()
+    ],
+    key=lambda item: (
+      0 if item.get('days_until_expired') is None else 1,
+      0.0 if item.get('days_until_expired') is None else float(item.get('days_until_expired') or 0.0),
+      str(item.get('signal') or ''),
+    ),
+  ),
+}
+renewal_velocity['next_signal_to_renew'] = (
+  renewal_velocity['renewal_priority'][0]['signal'] if renewal_velocity['renewal_priority'] else None
+)
+renewal_velocity['next_signal_to_expire'] = (
+  renewal_velocity['expiration_priority'][0]['signal'] if renewal_velocity['expiration_priority'] else None
+)
+proof_decay_detected = bool(proof_renewal_state in ('AGING', 'STALE', 'EXPIRED'))
+proof_invalidated = bool(proof_expired or proof_staleness.get('missing_signals'))
 broker_reality_validated = bool(
   ack_count >= broker_reality_min_ack_count
   and fill_count >= broker_reality_min_fill_count
@@ -749,6 +814,9 @@ short_lines.append(
 )
 short_lines.append(
   f"Proof Renewal: state={proof_renewal_state} fresh={'yes' if fresh_proven else 'no'} due={'yes' if proof_renewal_due else 'no'} expired={'yes' if proof_expired else 'no'} | ack={proof_renewal_signals['ack']['state']} fill={proof_renewal_signals['fill']['state']} outcome={proof_renewal_signals['outcome']['state']} gap={proof_renewal_signals['gap_sample']['state']}"
+)
+short_lines.append(
+  f"Renewal Velocity: max_lag={fmt_days(renewal_velocity.get('max_lag_days'))} renew_next={renewal_velocity.get('next_signal_to_renew') or 'none'} expire_next={renewal_velocity.get('next_signal_to_expire') or 'none'} decay={'yes' if proof_decay_detected else 'no'} invalidated={'yes' if proof_invalidated else 'no'}"
 )
 short_lines.append(
   f"Evidence Counts(all-time): ack={ack_count} fill={fill_count} outcome={outcome_count} gap={reality_gap_sample_count}"
@@ -894,6 +962,9 @@ record = {
         'fresh_proven': fresh_proven,
         'proof_renewal_due': proof_renewal_due,
         'proof_expired': proof_expired,
+        'proof_decay_detected': proof_decay_detected,
+        'proof_invalidated': proof_invalidated,
+        'renewal_velocity': renewal_velocity,
         'signals': proof_renewal_signals,
       },
       'latest': {
@@ -925,6 +996,9 @@ record = {
         'fresh_proven': fresh_proven,
         'proof_renewal_due': proof_renewal_due,
         'proof_expired': proof_expired,
+        'proof_decay_detected': proof_decay_detected,
+        'proof_invalidated': proof_invalidated,
+        'renewal_velocity': renewal_velocity,
         'error': execution_evidence.get('error'),
       },
       'thresholds': {
@@ -936,29 +1010,30 @@ record = {
     },
 }
 
-state_path.parent.mkdir(parents=True, exist_ok=True)
-state_path.write_text(
-    json.dumps(
-        {
-            'top1_key': new_top_key,
-            'top1_impact_pct_points': new_top_impact,
-            'top1_condition_key': new_top_condition_key,
-            'top1_condition': new_top_condition,
-            'top1_condition_impact_pct_points': new_top_condition_impact,
-            'top1_condition_ignored_rate_pct': new_top_condition_share,
-            'decision_quote_coverage_pct': new_coverage_pct,
-            'decision_quote_observed_ignored_rate_pct': new_ignored_rate_pct,
-            'repeat_count': repeat_count,
-            'condition_elimination_candidate': elimination_candidate,
-            'decision_condition_states': condition_states,
-            'top_unknown_condition': top_unknown_condition,
-            'top_unknown_stable_runs': top_unknown_stable_runs,
-            'unknown_conditions_count': len(unknown_conditions),
-        },
-        ensure_ascii=True,
-    ),
-    encoding='utf-8',
-)
+if publish_enabled:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                'top1_key': new_top_key,
+                'top1_impact_pct_points': new_top_impact,
+                'top1_condition_key': new_top_condition_key,
+                'top1_condition': new_top_condition,
+                'top1_condition_impact_pct_points': new_top_condition_impact,
+                'top1_condition_ignored_rate_pct': new_top_condition_share,
+                'decision_quote_coverage_pct': new_coverage_pct,
+                'decision_quote_observed_ignored_rate_pct': new_ignored_rate_pct,
+                'repeat_count': repeat_count,
+                'condition_elimination_candidate': elimination_candidate,
+                'decision_condition_states': condition_states,
+                'top_unknown_condition': top_unknown_condition,
+                'top_unknown_stable_runs': top_unknown_stable_runs,
+                'unknown_conditions_count': len(unknown_conditions),
+            },
+            ensure_ascii=True,
+        ),
+        encoding='utf-8',
+    )
 print(json.dumps(record, ensure_ascii=True))
 PY
 )"
@@ -968,10 +1043,11 @@ latest_txt="$HOST_OUTPUT_DIR/remediation_snapshot_latest.txt"
 shared_json="$SHARED_OUTPUT_DIR/remediation_snapshot_latest.json"
 shared_txt="$SHARED_OUTPUT_DIR/remediation_snapshot_latest.txt"
 
-printf '%s\n' "$report_json" > "$latest_json"
-printf '%s\n' "$report_json" > "$shared_json"
+if [[ "$REMEDIATION_SNAPSHOT_PUBLISH" != '0' ]]; then
+  printf '%s\n' "$report_json" > "$latest_json"
+  printf '%s\n' "$report_json" > "$shared_json"
 
-python3 - <<'PY' "$report_json" "$latest_txt" "$shared_txt"
+  python3 - <<'PY' "$report_json" "$latest_txt" "$shared_txt"
 import json
 import pathlib
 import sys
@@ -982,6 +1058,7 @@ for path in (pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text + '\n', encoding='utf-8')
 PY
+fi
 
 send_telegram_alert() {
   local report_payload="$1"
@@ -1020,8 +1097,10 @@ send_webhook_alert() {
   curl -fsS -m "$WEBHOOK_TIMEOUT_SEC" -H 'Content-Type: application/json' -X POST --data "$report_payload" "$WEBHOOK_URL" >/dev/null
 }
 
-send_telegram_alert "$report_json" || log_json error "telegram_delivery_failed"
-send_webhook_alert "$report_json" || log_json error "webhook_delivery_failed"
+if [[ "$REMEDIATION_SNAPSHOT_PUBLISH" != '0' ]]; then
+  send_telegram_alert "$report_json" || log_json error "telegram_delivery_failed"
+  send_webhook_alert "$report_json" || log_json error "webhook_delivery_failed"
+fi
 
 log_json info "remediation_snapshot_daily_done"
 printf '%s\n' "$report_json"
