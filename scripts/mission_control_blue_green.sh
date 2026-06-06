@@ -24,7 +24,8 @@ slot_service() {
 
 prepare_slot_dist_dir() {
   local dist_dir="$1"
-  mkdir -p "$UI_DIR/$dist_dir/server" "$UI_DIR/$dist_dir/static"
+  mkdir -p "$UI_DIR/$dist_dir/server" "$UI_DIR/$dist_dir/static" "$UI_DIR/$dist_dir/types"
+  : >"$UI_DIR/$dist_dir/types/routes.d.ts"
 }
 
 ensure_active_slot_file() {

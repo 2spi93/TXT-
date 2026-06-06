@@ -1204,6 +1204,7 @@ const TERMINAL_UI_DEBUG_STORAGE_KEY = "txt.terminal.ui-debug.v1";
 const TERMINAL_OPS_TRANSITION_LOCK_MS = 180;
 const TERMINAL_LIGHT_BOOT_CHART_DELAY_MS = 140;
 const TERMINAL_LIGHT_BOOT_DECKS_DELAY_MS = 900;
+const TERMINAL_DECK_FETCH_TIMEOUT_MS = 8_000;
 type TerminalRenderProbeDomainId = "shell" | "market" | "ops" | "telemetry" | "governance" | "replay" | "overlays";
 type TerminalRenderProbeDomainSnapshot = {
   id: TerminalRenderProbeDomainId;
@@ -8401,16 +8402,35 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
     const isCurrentRequest = () => loadDeckRequestSeqRef.current === requestSeq;
 
     let sawUnauthorized = false;
-    const fetchMaybeUnauthorized = async (url: string, init: RequestInit = {}): Promise<unknown> => {
-      const response = await fetch(url, { cache: "no-store", ...init });
-      if (response.status === 401 || response.status === 403) {
-        sawUnauthorized = true;
-        return null;
+    const fetchMaybeUnauthorized = async (
+      url: string,
+      init: RequestInit = {},
+      timeoutMs = TERMINAL_DECK_FETCH_TIMEOUT_MS,
+    ): Promise<unknown> => {
+      const abortController = new AbortController();
+      const timeoutId = window.setTimeout(() => abortController.abort(), timeoutMs);
+      try {
+        const response = await fetch(url, {
+          cache: "no-store",
+          ...init,
+          signal: init.signal || abortController.signal,
+        });
+        if (response.status === 401 || response.status === 403) {
+          sawUnauthorized = true;
+          return null;
+        }
+        if (!response.ok) {
+          throw new Error(`${url} -> ${response.status}`);
+        }
+        return response.json();
+      } catch (err) {
+        if (err instanceof Error && err.name === "AbortError") {
+          return null;
+        }
+        throw err;
+      } finally {
+        window.clearTimeout(timeoutId);
       }
-      if (!response.ok) {
-        throw new Error(`${url} -> ${response.status}`);
-      }
-      return response.json();
     };
 
     const fetchArrayFallback = async (url: string): Promise<unknown[]> => {

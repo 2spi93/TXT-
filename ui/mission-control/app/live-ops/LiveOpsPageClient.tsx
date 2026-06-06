@@ -29,12 +29,17 @@ type LiveOpsPageClientProps = {
   initialLiveOpsPayload?: JsonMap | null;
 };
 
+type FetchJsonResult = {
+  response: Response | null;
+  payload: JsonMap | null;
+};
+
 const DAILY_PLAN_SPRINT_STORAGE_KEY = "txt.liveops.daily-plan.sprint-start.v1";
 const DAILY_PLAN_CHECKS_STORAGE_KEY = "txt.liveops.daily-plan.checks.v1";
 const HYDRATION_SAFE_DATE_KEY = "1970-01-01";
 const INITIAL_LIVE_OPS_CONVERGENCE_DELAY_MS = 0;
-const LIVE_OPS_PRIMARY_FETCH_TIMEOUT_MS = 6_000;
-const LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS = 2_500;
+const LIVE_OPS_PRIMARY_FETCH_TIMEOUT_MS = 12_000;
+const LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS = 4_000;
 const LIVE_OPS_JOURNAL_CONTEXT = {
   symbol: "DESK",
   timeframe: "live",
@@ -63,6 +68,26 @@ function asRecord(value: unknown): JsonMap {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as JsonMap
     : {};
+}
+
+function unwrapRows(payload: JsonMap | null): JsonMap[] {
+  if (!payload) {
+    return [];
+  }
+  if (Array.isArray(payload)) {
+    return payload as JsonMap[];
+  }
+  const rows = payload.rows || payload.items || payload.data || payload.results || payload.payload;
+  if (Array.isArray(rows)) {
+    return rows as JsonMap[];
+  }
+  return [];
+}
+
+function valueTimeMs(row: JsonMap): number {
+  const raw = row.ts_fill_final || row.filled_at || row.created_at || row.executed_at || row.labeled_at || row.timestamp || row.ts;
+  const parsed = Date.parse(String(raw || ""));
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 function startOfLocalDay(input: Date): Date {
@@ -110,11 +135,18 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
   const [liveOpsPayload, setLiveOpsPayload] = useState<JsonMap | null>(initialLiveOpsPayload);
   const [executionPnlAnalyzerPayload, setExecutionPnlAnalyzerPayload] = useState<JsonMap | null>(null);
   const [executionAiV6Payload, setExecutionAiV6Payload] = useState<JsonMap | null>(null);
+  const [mt5PendingPayload, setMt5PendingPayload] = useState<JsonMap | null>(null);
+  const [executionTelemetryPayload, setExecutionTelemetryPayload] = useState<JsonMap | null>(null);
+  const [recentOutcomesPayload, setRecentOutcomesPayload] = useState<JsonMap | null>(null);
+  const [recentGapPayload, setRecentGapPayload] = useState<JsonMap | null>(null);
   const [dailyPlanSprintStart, setDailyPlanSprintStart] = useState<string>(HYDRATION_SAFE_DATE_KEY);
   const [dailyPlanChecks, setDailyPlanChecks] = useState<Record<string, boolean>>({});
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(!initialLiveOpsPayload);
   const [error, setError] = useState<string | null>(null);
+  const [alphaSubmitBusy, setAlphaSubmitBusy] = useState(false);
+  const [alphaApproveBusyId, setAlphaApproveBusyId] = useState<string | null>(null);
+  const [alphaFeedback, setAlphaFeedback] = useState<string | null>(null);
   const [emergencyStopBusy, setEmergencyStopBusy] = useState(false);
   const [emergencyStopFeedback, setEmergencyStopFeedback] = useState<string | null>(null);
   const [systemModeBusy, setSystemModeBusy] = useState(false);
@@ -140,7 +172,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
     loadSequenceRef.current = loadSequence;
     setBusy(true);
     try {
-      const fetchJsonWithTimeout = async (url: string, timeoutMs: number): Promise<{ response: Response | null; payload: JsonMap | null }> => {
+      const fetchJsonWithTimeout = async (url: string, timeoutMs: number): Promise<FetchJsonResult> => {
         const controller = new AbortController();
         let settled = false;
         const timeout = window.setTimeout(() => {
@@ -164,10 +196,22 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
       const liveOpsUrl = auditFilter
         ? `/api/system/live-ops?audit_filter=${encodeURIComponent(auditFilter)}`
         : "/api/system/live-ops";
-      const [liveOpsResponse, pnlResponse, executionAiResponse] = await Promise.all([
+      const [
+        liveOpsResponse,
+        pnlResponse,
+        executionAiResponse,
+        mt5PendingResponse,
+        telemetryResponse,
+        outcomesResponse,
+        gapResponse,
+      ] = await Promise.all([
         fetchJsonWithTimeout(liveOpsUrl, LIVE_OPS_PRIMARY_FETCH_TIMEOUT_MS),
         fetchJsonWithTimeout("/api/execution/pnl-analyzer?scope_type=strategy&scope_id=mt5-live&limit=50", LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS),
         fetchJsonWithTimeout("/api/execution/ai/v6/state", LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS),
+        fetchJsonWithTimeout("/api/mt5/orders/live-pending", LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS),
+        fetchJsonWithTimeout("/api/execution/telemetry/recent?limit=80", LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS),
+        fetchJsonWithTimeout("/api/outcomes/recent?limit=80", LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS),
+        fetchJsonWithTimeout("/api/execution/reality-gap/recent?limit=80", LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS),
       ]);
       if (loadSequenceRef.current !== loadSequence) {
         return;
@@ -185,6 +229,10 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
       setLoading(false);
       setExecutionPnlAnalyzerPayload(pnlResponse.payload);
       setExecutionAiV6Payload(executionAiResponse.payload);
+      setMt5PendingPayload(mt5PendingResponse.payload);
+      setExecutionTelemetryPayload(telemetryResponse.payload);
+      setRecentOutcomesPayload(outcomesResponse.payload);
+      setRecentGapPayload(gapResponse.payload);
     } catch (err) {
       if (loadSequenceRef.current === loadSequence) {
         setError(err instanceof Error ? err.message : "Erreur inconnue");
@@ -194,6 +242,86 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
         setBusy(false);
         setLoading(false);
       }
+    }
+  }
+
+  async function submitAlphaReactivationRequest(): Promise<void> {
+    setAlphaSubmitBusy(true);
+    setAlphaFeedback(null);
+    try {
+      const response = await fetch("/api/mt5/orders/filter", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          account_id: "541283177",
+          symbol: "AUTO",
+          side: "buy",
+          lots: 0.01,
+          estimated_notional_usd: 5,
+          max_spread_bps: 10,
+          confidence: 0.8,
+          preferred_venue: "mt5",
+          rationale: "TXT alpha reactivation console: produce recent ACK/FILL proof loop",
+          metadata: {
+            source: "live-ops-alpha-reactivation-console",
+            purpose: "proof_reactivation",
+            requires_second_operator: true,
+            operator_visible_flow: "TXT proposes -> operator approves -> TXT executes -> TXT measures",
+          },
+          order_intent: {
+            source: "live-ops-alpha-reactivation-console",
+            mode: "proof_reactivation",
+            preset: "mt5_micro_fill",
+          },
+        }),
+      });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        throw new Error(String(payload && typeof payload === "object" ? (payload as JsonMap).detail || "Demande live refusee" : "Demande live refusee"));
+      }
+      const status = String(payload && typeof payload === "object" ? (payload as JsonMap).status || "submitted" : "submitted");
+      const approvalId = String(payload && typeof payload === "object" ? (payload as JsonMap).approval_id || "" : "");
+      setAlphaFeedback(approvalId ? `Demande creee: ${status} · approval ${approvalId}` : `Demande envoyee: ${status}`);
+      void appendLiveOpsJournalEntry("alpha-reactivation-requested", "Demande MT5 micro-fill creee depuis Live Ops", {
+        source: "live-ops-alpha-reactivation-console",
+        status,
+        approval_id: approvalId || null,
+      });
+      await loadData();
+    } catch (err) {
+      setAlphaFeedback(err instanceof Error ? err.message : "Erreur inconnue");
+    } finally {
+      setAlphaSubmitBusy(false);
+    }
+  }
+
+  async function approveAlphaReactivationRequest(approvalId: string): Promise<void> {
+    const cleanApprovalId = approvalId.trim();
+    if (!cleanApprovalId) {
+      return;
+    }
+    setAlphaApproveBusyId(cleanApprovalId);
+    setAlphaFeedback(null);
+    try {
+      const response = await fetch(`/api/mt5/orders/live-approve/${encodeURIComponent(cleanApprovalId)}`, {
+        method: "POST",
+      });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        throw new Error(String(payload && typeof payload === "object" ? (payload as JsonMap).detail || "Approbation refusee" : "Approbation refusee"));
+      }
+      const status = String(payload && typeof payload === "object" ? (payload as JsonMap).status || "approved" : "approved");
+      setAlphaFeedback(`Approbation envoyee: ${status}`);
+      void appendLiveOpsJournalEntry("alpha-reactivation-approved", `Approval ${cleanApprovalId} envoyee depuis Live Ops`, {
+        source: "live-ops-alpha-reactivation-console",
+        approval_id: cleanApprovalId,
+        status,
+      });
+      await loadData();
+    } catch (err) {
+      setAlphaFeedback(err instanceof Error ? err.message : "Erreur inconnue");
+    } finally {
+      setAlphaApproveBusyId(null);
     }
   }
 
@@ -539,6 +667,122 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
       + (learningFrozen ? 0.15 : 0),
     ),
   );
+  const mt5PendingApprovals = unwrapRows(mt5PendingPayload)
+    .map((row) => ({
+      approvalId: String(row.approval_id || ""),
+      accountId: String(row.account_id || "-"),
+      firstApprovedBy: String(row.first_approved_by || "-"),
+      createdAt: String(row.created_at || ""),
+      orderPayload: asRecord(row.order_payload),
+    }))
+    .filter((row) => row.approvalId)
+    .slice(0, 5);
+  const nowMs = Date.now();
+  const recentWindowMs = 24 * 60 * 60 * 1000;
+  const telemetryRows = unwrapRows(executionTelemetryPayload);
+  const recentTelemetryRows = telemetryRows.filter((row) => {
+    const timestamp = valueTimeMs(row);
+    return timestamp > 0 && nowMs - timestamp <= recentWindowMs;
+  });
+  const recentMt5TelemetryRows = recentTelemetryRows.filter((row) => {
+    const venueText = `${String(row.venue || "")} ${String(row.provider || "")} ${String(row.execution_mode || "")} ${String(row.route || "")}`.toLowerCase();
+    return venueText.includes("mt5") || Boolean(row.broker_ticket) || Boolean(row.ts_broker_accept);
+  });
+  const recentOutcomeRows = unwrapRows(recentOutcomesPayload).filter((row) => {
+    const timestamp = valueTimeMs(row);
+    return timestamp > 0 && nowMs - timestamp <= recentWindowMs;
+  });
+  const recentGapRows = unwrapRows(recentGapPayload).filter((row) => {
+    const timestamp = valueTimeMs(row);
+    return timestamp > 0 && nowMs - timestamp <= recentWindowMs;
+  });
+  const recentAckCount = recentMt5TelemetryRows.filter((row) => Boolean(row.ts_broker_accept || row.broker_ticket || row.accepted_at)).length;
+  const recentFillRows = recentMt5TelemetryRows.filter((row) => Boolean(row.ts_fill_final || row.filled_at || row.fill_count || row.avg_fill_price));
+  const recentFillCount = recentFillRows.length;
+  const recentOutcomeCount = recentOutcomeRows.length;
+  const recentGapCount = recentGapRows.length;
+  const recentFillDecisionIds = new Set(
+    recentFillRows
+      .map((row) => String(row.decision_id || row.intent_id || row.approval_id || row.broker_ticket || "").trim())
+      .filter(Boolean),
+  );
+  const recentOutcomeDecisionIds = new Set(
+    recentOutcomeRows
+      .map((row) => String(row.decision_id || row.intent_id || row.approval_id || row.broker_ticket || "").trim())
+      .filter(Boolean),
+  );
+  const recentGapDecisionIds = new Set(
+    recentGapRows
+      .map((row) => String(row.decision_id || row.intent_id || row.approval_id || row.broker_ticket || "").trim())
+      .filter(Boolean),
+  );
+  const recentLinkedLoopCount = [...recentFillDecisionIds].filter((id) => recentOutcomeDecisionIds.has(id) && recentGapDecisionIds.has(id)).length;
+  const alphaProofSteps = [
+    { id: "ACK", label: "ACK broker", count: recentAckCount, done: recentAckCount > 0 },
+    { id: "FILL", label: "FILL reel", count: recentFillCount, done: recentFillCount > 0 },
+    { id: "OUTCOME", label: "Outcome", count: recentOutcomeCount, done: recentOutcomeCount > 0 },
+    { id: "GAP", label: "Reality Gap", count: recentGapCount, done: recentGapCount > 0 },
+    { id: "LINK", label: "Boucle liee", count: recentLinkedLoopCount, done: recentLinkedLoopCount > 0 },
+  ];
+  const alphaNextAction = recentAckCount <= 0
+    ? "Créer une demande micro-fill MT5"
+    : recentFillCount <= 0
+      ? "Approuver/executer pour obtenir le FILL"
+      : recentOutcomeCount <= 0 || recentGapCount <= 0
+        ? "Attendre ou réparer Outcome/GAP"
+        : recentLinkedLoopCount <= 0
+          ? "Relier decision_id / broker_ticket"
+          : "Accumuler REAL_10";
+  const alphaPanelTone = recentFillCount > 0 && recentLinkedLoopCount > 0
+    ? "good"
+    : mt5PendingApprovals.length > 0
+      ? "warn"
+      : "subtle";
+  const marketTruthLayer = asRecord(runtimeTruthLayers.market_truth);
+  const executionRealityLayer = asRecord(runtimeTruthLayers.execution_reality);
+  const executionRealityGovernanceLayer = asRecord(runtimeTruthLayers.execution_reality_governance);
+  const finalDecisionTruthLayer = asRecord(runtimeTruthLayers.final_decision_truth);
+  const confidenceLayer = asRecord(finalDecisionTruthLayer.confidence);
+  const marketTruthScorePct = toNumber(marketTruthLayer.score_pct, 0);
+  const executionQualityPct = toNumber(
+    asRecord(executionRealityLayer.metrics).execution_quality_score_pct,
+    toNumber(executionRealityLayer.score_pct, 0),
+  );
+  const regimeContribution = Math.round(Math.max(0, Math.min(24, marketTruthScorePct * 0.24)));
+  const executionContribution = Math.round(Math.max(0, Math.min(18, executionQualityPct * 0.18)));
+  const confidenceContribution = Math.round(Math.max(0, Math.min(22, toNumber(confidenceLayer.final_score_pct, 0) * 0.22)));
+  const governanceContribution = backendMode === "managed_live" ? 12 : backendMode === "guarded_auto" ? 6 : 2;
+  const proofNeedContribution = recentFillCount <= 0 ? 14 : 4;
+  const approvalRiskPenalty = mt5PendingApprovals.length > 0 ? 8 : 0;
+  const spreadRiskPenalty = Math.round(Math.max(0, Math.min(8, avgSlippageBps > 4 ? 8 : avgSlippageBps > 3 ? 5 : avgSlippageBps > 2 ? 3 : 0)));
+  const executionGovPenalty = String(executionRealityGovernanceLayer.state || "").toUpperCase() === "LOCKDOWN" ? 12 : 0;
+  const opportunityScore = Math.max(
+    0,
+    Math.min(
+      100,
+      20
+      + regimeContribution
+      + executionContribution
+      + confidenceContribution
+      + governanceContribution
+      + proofNeedContribution
+      - approvalRiskPenalty
+      - spreadRiskPenalty
+      - executionGovPenalty,
+    ),
+  );
+  const opportunityDrivers = [
+    { label: "Regime", value: regimeContribution },
+    { label: "Execution", value: executionContribution },
+    { label: "Confidence", value: confidenceContribution },
+    { label: "Governance", value: governanceContribution },
+    { label: "Proof need", value: proofNeedContribution },
+  ];
+  const opportunityRisks = [
+    { label: "Approval pending", value: -approvalRiskPenalty },
+    { label: "Spread/slippage", value: -spreadRiskPenalty },
+    { label: "Execution governance", value: -executionGovPenalty },
+  ].filter((item) => item.value < 0);
   const truthLine = (() => {
     const runtimeTruthVerdict = String(runtimeTruth.verdict || "").toUpperCase();
     if (runtimeTruthVerdict === "BLOCKED") {
@@ -776,8 +1020,13 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
         <section className="panel txt-page-hero">
           <div className="eyebrow">TXT</div>
           <h1 className="title" style={{ fontSize: 34 }}>Synchronisation Live Ops</h1>
-          <p className="subtle">La salle de controle attend une payload runtime reelle avant d'afficher l'etat operateur.</p>
+          <p className="subtle">La salle de controle charge le snapshot runtime. Si un endpoint est lent, l'etat operateur reste en mode degrade plutot que de bloquer une action.</p>
           {error ? <p className="warn">{error}</p> : null}
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 14 }}>
+            <button type="button" disabled={busy} onClick={() => { void loadData(); }}>
+              {busy || loading ? "Synchronisation..." : "Reessayer"}
+            </button>
+          </div>
         </section>
       </main>
     );
@@ -869,6 +1118,122 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
             </button>
           </div>
           {systemModeFeedback ? <p className="subtle" style={{ marginTop: 10 }}>{systemModeFeedback}</p> : null}
+        </div>
+      </section>
+
+      <section className="grid" style={{ gridTemplateColumns: "1.05fr 0.95fr", marginBottom: 16 }}>
+        <div className="panel" data-testid="alpha-reactivation-console">
+          <OperatorPanelGuide
+            title="Alpha Reactivation Console"
+            what="Flux unique: TXT propose, l'operateur approuve, TXT execute, puis les preuves ACK/FILL/OUTCOME/GAP sont mesurees."
+            why="Eviter de perdre une session parce que l'approbation humaine attendait ailleurs."
+            example="S'il y a une approval pending, le prochain geste operateur est visible ici."
+            compact
+          />
+          <div className="row" style={{ marginTop: 10 }}>
+            <span>Next action</span>
+            <span className={alphaPanelTone}>{alphaNextAction}</span>
+          </div>
+          <div className="row"><span>Mode backend</span><span>{backendMode}</span></div>
+          <div className="row"><span>Pending approvals</span><span className={mt5PendingApprovals.length > 0 ? "warn" : "subtle"}>{mt5PendingApprovals.length}</span></div>
+          <div style={{ marginTop: 12, borderRadius: 12, border: "1px solid rgba(148, 163, 184, 0.18)", padding: 12, background: "rgba(2, 6, 23, 0.18)" }}>
+            <div className="row"><span>Proposition TXT</span><span>MT5 · AUTO · buy · 0.01 lot</span></div>
+            <div className="row"><span>Notional estime</span><span>5 USD</span></div>
+            <div className="row"><span>Spread max</span><span>10 bps</span></div>
+            <div className="row"><span>But</span><span>renouveler FILL reel</span></div>
+            <div className="subtle mini" style={{ marginTop: 8 }}>Ordre reel potentiel. Le compte live MT5 cree une demande en attente, puis un second operateur doit approuver.</div>
+          </div>
+          <div style={{ marginTop: 12, borderRadius: 12, border: "1px solid rgba(56, 189, 248, 0.22)", padding: 12, background: "rgba(8, 47, 73, 0.22)" }}>
+            <div className="row">
+              <span>Opportunity score</span>
+              <span className={opportunityScore >= 70 ? "good" : opportunityScore >= 50 ? "subtle" : "warn"}>{opportunityScore}/100</span>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 10 }}>
+              <div>
+                <div className="subtle mini" style={{ marginBottom: 6 }}>Pourquoi proposer</div>
+                {opportunityDrivers.map((item) => (
+                  <div key={item.label} className="row" style={{ marginTop: 4 }}>
+                    <span>{item.label}</span>
+                    <span className="good">+{item.value}</span>
+                  </div>
+                ))}
+              </div>
+              <div>
+                <div className="subtle mini" style={{ marginBottom: 6 }}>Risques</div>
+                {opportunityRisks.length > 0 ? opportunityRisks.map((item) => (
+                  <div key={item.label} className="row" style={{ marginTop: 4 }}>
+                    <span>{item.label}</span>
+                    <span className="warn">{item.value}</span>
+                  </div>
+                )) : (
+                  <div className="subtle mini">Aucun risque principal detecte dans le snapshot courant.</div>
+                )}
+              </div>
+            </div>
+            <div className="subtle mini" style={{ marginTop: 8 }}>Ce score explique la demande operateur; il ne remplace pas le risk gateway ni la double approbation.</div>
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}>
+            <button
+              type="button"
+              disabled={alphaSubmitBusy || backendMode !== "managed_live"}
+              onClick={() => { void submitAlphaReactivationRequest(); }}
+            >
+              {alphaSubmitBusy ? "Preparation..." : "Preparer demande MT5"}
+            </button>
+            <button type="button" disabled={busy} onClick={() => { void loadData(); }}>
+              Rafraichir preuves
+            </button>
+          </div>
+          {backendMode !== "managed_live" ? (
+            <p className="subtle mini" style={{ marginTop: 8 }}>Passe en Managed Live avant de creer une demande MT5 reelle.</p>
+          ) : null}
+          {alphaFeedback ? <p className="subtle" style={{ marginTop: 10 }}>{alphaFeedback}</p> : null}
+        </div>
+        <div className="panel">
+          <div className="eyebrow">Preuves 24h</div>
+          <div style={{ display: "grid", gap: 8, marginTop: 10 }}>
+            {alphaProofSteps.map((step) => (
+              <div key={step.id} className="row">
+                <span>{step.id} · {step.label}</span>
+                <span className={step.done ? "good" : "warn"}>{step.done ? "OK" : "manquant"} · {step.count}</span>
+              </div>
+            ))}
+          </div>
+          <div style={{ marginTop: 14 }}>
+            <div className="subtle mini" style={{ marginBottom: 6 }}>Approbations MT5 en attente</div>
+            {mt5PendingApprovals.length > 0 ? (
+              <div style={{ display: "grid", gap: 8 }}>
+                {mt5PendingApprovals.map((approval) => {
+                  const payload = approval.orderPayload;
+                  return (
+                    <div key={approval.approvalId} style={{ border: "1px solid rgba(148, 163, 184, 0.16)", borderRadius: 12, padding: 10, background: "rgba(15, 23, 42, 0.22)" }}>
+                      <div className="row">
+                        <span>{String(payload.symbol || "AUTO")} · {String(payload.side || "buy")}</span>
+                        <span className="warn">approval pending</span>
+                      </div>
+                      <div className="subtle mini" style={{ marginTop: 4 }}>
+                        id {approval.approvalId} · first {approval.firstApprovedBy} · account {approval.accountId}
+                      </div>
+                      <div className="subtle mini" style={{ marginTop: 4 }}>
+                        lots {String(payload.lots || "0.01")} · notional {String(payload.estimated_notional_usd || "5")} USD · {approval.createdAt ? formatClock(approval.createdAt) : "-"}
+                      </div>
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+                        <button
+                          type="button"
+                          disabled={Boolean(alphaApproveBusyId)}
+                          onClick={() => { void approveAlphaReactivationRequest(approval.approvalId); }}
+                        >
+                          {alphaApproveBusyId === approval.approvalId ? "Approbation..." : "Approuver maintenant"}
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="subtle mini">Aucune approbation MT5 en attente. Si tu attendais un trade, c'est ici que l'attente doit apparaitre.</div>
+            )}
+          </div>
         </div>
       </section>
 
