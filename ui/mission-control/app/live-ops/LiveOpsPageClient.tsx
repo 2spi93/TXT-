@@ -10,6 +10,7 @@ import { UI_TERMS, formatReasonLabel } from "../../lib/uiLexicon";
 import { ControlRoomMonitoringPanel, ExecutionPnlTruthMonitoringPanel, OperatorActionSummary } from "../terminal/TerminalSecondaryPanels";
 
 type JsonMap = Record<string, unknown>;
+type SystemMode = "suggest" | "guarded_auto" | "managed_live";
 type DailyPlanTemplateTask = {
   id: string;
   title: string;
@@ -36,9 +37,12 @@ type FetchJsonResult = {
 
 const DAILY_PLAN_SPRINT_STORAGE_KEY = "txt.liveops.daily-plan.sprint-start.v1";
 const DAILY_PLAN_CHECKS_STORAGE_KEY = "txt.liveops.daily-plan.checks.v1";
+const SYSTEM_MODE_OVERRIDE_STORAGE_KEY = "txt.liveops.system-mode-override.v1";
+const SYSTEM_MODE_OVERRIDE_TTL_MS = 10 * 60 * 1000;
 const HYDRATION_SAFE_DATE_KEY = "1970-01-01";
 const INITIAL_LIVE_OPS_CONVERGENCE_DELAY_MS = 0;
 const LIVE_OPS_PRIMARY_FETCH_TIMEOUT_MS = 12_000;
+const LIVE_OPS_MODE_FETCH_TIMEOUT_MS = 20_000;
 const LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS = 4_000;
 const LIVE_OPS_JOURNAL_CONTEXT = {
   symbol: "DESK",
@@ -68,6 +72,40 @@ function asRecord(value: unknown): JsonMap {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as JsonMap
     : {};
+}
+
+function isSystemMode(value: unknown): value is SystemMode {
+  return value === "suggest" || value === "guarded_auto" || value === "managed_live";
+}
+
+function readSystemModeOverride(): SystemMode | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  try {
+    const raw = window.sessionStorage.getItem(SYSTEM_MODE_OVERRIDE_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw) as JsonMap;
+    const mode = parsed.mode;
+    const updatedAtMs = Number(parsed.updatedAtMs || 0);
+    if (!isSystemMode(mode) || !Number.isFinite(updatedAtMs) || Date.now() - updatedAtMs > SYSTEM_MODE_OVERRIDE_TTL_MS) {
+      window.sessionStorage.removeItem(SYSTEM_MODE_OVERRIDE_STORAGE_KEY);
+      return null;
+    }
+    return mode;
+  } catch (_error) {
+    window.sessionStorage.removeItem(SYSTEM_MODE_OVERRIDE_STORAGE_KEY);
+    return null;
+  }
+}
+
+function persistSystemModeOverride(mode: SystemMode): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  window.sessionStorage.setItem(SYSTEM_MODE_OVERRIDE_STORAGE_KEY, JSON.stringify({ mode, updatedAtMs: Date.now() }));
 }
 
 function unwrapRows(payload: JsonMap | null): JsonMap[] {
@@ -133,6 +171,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
   const searchParams = useSearchParams();
   const auditFilter = String(searchParams?.get("audit_filter") || "").trim();
   const [liveOpsPayload, setLiveOpsPayload] = useState<JsonMap | null>(initialLiveOpsPayload);
+  const [systemModePayload, setSystemModePayload] = useState<JsonMap | null>(null);
   const [executionPnlAnalyzerPayload, setExecutionPnlAnalyzerPayload] = useState<JsonMap | null>(null);
   const [executionAiV6Payload, setExecutionAiV6Payload] = useState<JsonMap | null>(null);
   const [mt5PendingPayload, setMt5PendingPayload] = useState<JsonMap | null>(null);
@@ -151,6 +190,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
   const [emergencyStopFeedback, setEmergencyStopFeedback] = useState<string | null>(null);
   const [systemModeBusy, setSystemModeBusy] = useState(false);
   const [systemModeFeedback, setSystemModeFeedback] = useState<string | null>(null);
+  const [systemModeOverride, setSystemModeOverride] = useState<SystemMode | null>(() => readSystemModeOverride());
   const [hydrated, setHydrated] = useState(false);
   const loadSequenceRef = useRef(0);
 
@@ -198,6 +238,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
         : "/api/system/live-ops";
       const [
         liveOpsResponse,
+        systemModeResponse,
         pnlResponse,
         executionAiResponse,
         mt5PendingResponse,
@@ -206,6 +247,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
         gapResponse,
       ] = await Promise.all([
         fetchJsonWithTimeout(liveOpsUrl, LIVE_OPS_PRIMARY_FETCH_TIMEOUT_MS),
+        fetchJsonWithTimeout("/api/system/mode", LIVE_OPS_MODE_FETCH_TIMEOUT_MS),
         fetchJsonWithTimeout("/api/execution/pnl-analyzer?scope_type=strategy&scope_id=mt5-live&limit=50", LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS),
         fetchJsonWithTimeout("/api/execution/ai/v6/state", LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS),
         fetchJsonWithTimeout("/api/mt5/orders/live-pending", LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS),
@@ -224,6 +266,9 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
       }
       if (liveOpsResponse.payload) {
         setLiveOpsPayload(liveOpsResponse.payload);
+      }
+      if (systemModeResponse.payload) {
+        setSystemModePayload(systemModeResponse.payload);
       }
       setError(null);
       setLoading(false);
@@ -351,7 +396,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
     }
   }
 
-  async function changeSystemMode(mode: "suggest" | "guarded_auto" | "managed_live"): Promise<void> {
+  async function changeSystemMode(mode: SystemMode): Promise<void> {
     const previousMode = backendMode;
     setSystemModeBusy(true);
     setSystemModeFeedback(null);
@@ -365,6 +410,8 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
       if (!response.ok) {
         throw new Error(String(payload && typeof payload === "object" ? (payload as JsonMap).detail || "Changement de mode refuse" : "Changement de mode refuse"));
       }
+      persistSystemModeOverride(mode);
+      setSystemModeOverride(mode);
       setSystemModeFeedback(`Mode systeme mis a jour: ${mode}`);
       void appendLiveOpsJournalEntry("system-mode-changed", `Mode ${previousMode} -> ${mode}`, {
         source: "live-ops-page",
@@ -637,6 +684,9 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
   const collectionTone = collectionStatus === "READY" ? "good" : collectionStatus === "LOCKED" || collectionStatus === "BLOCKED" ? "warn" : "subtle";
   const alerts = Array.isArray(snapshot.alerts) ? snapshot.alerts : [];
   const backendMode = String(governance.backend_mode || "guarded_auto");
+  const modeConfig = asRecord(systemModePayload);
+  const modeConfigMode = isSystemMode(modeConfig.system_mode) ? modeConfig.system_mode : null;
+  const effectiveBackendMode = systemModeOverride || modeConfigMode || backendMode;
   const pnlEnvelope = asRecord(executionPnlAnalyzerPayload);
   const pnlSummary = asRecord(pnlEnvelope.summary);
   const v6Envelope = asRecord(executionAiV6Payload);
@@ -1105,15 +1155,15 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
             example="Passe en managed_live seulement si la route live, les credentials et la gouvernance sont prets."
             compact
           />
-          <div className="row"><span>Mode backend actif</span><span>{backendMode}</span></div>
+          <div className="row"><span>Mode backend actif</span><span>{effectiveBackendMode}</span></div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}>
-            <button type="button" disabled={systemModeBusy || backendMode === "suggest"} onClick={() => { void changeSystemMode("suggest"); }}>
+            <button type="button" disabled={systemModeBusy || effectiveBackendMode === "suggest"} onClick={() => { void changeSystemMode("suggest"); }}>
               Suggest
             </button>
-            <button type="button" disabled={systemModeBusy || backendMode === "guarded_auto"} onClick={() => { void changeSystemMode("guarded_auto"); }}>
+            <button type="button" disabled={systemModeBusy || effectiveBackendMode === "guarded_auto"} onClick={() => { void changeSystemMode("guarded_auto"); }}>
               Guarded Auto
             </button>
-            <button type="button" disabled={systemModeBusy || backendMode === "managed_live"} onClick={() => { void changeSystemMode("managed_live"); }}>
+            <button type="button" disabled={systemModeBusy || effectiveBackendMode === "managed_live"} onClick={() => { void changeSystemMode("managed_live"); }}>
               Managed Live
             </button>
           </div>
@@ -1134,7 +1184,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
             <span>Next action</span>
             <span className={alphaPanelTone}>{alphaNextAction}</span>
           </div>
-          <div className="row"><span>Mode backend</span><span>{backendMode}</span></div>
+          <div className="row"><span>Mode backend</span><span>{effectiveBackendMode}</span></div>
           <div className="row"><span>Pending approvals</span><span className={mt5PendingApprovals.length > 0 ? "warn" : "subtle"}>{mt5PendingApprovals.length}</span></div>
           <div style={{ marginTop: 12, borderRadius: 12, border: "1px solid rgba(148, 163, 184, 0.18)", padding: 12, background: "rgba(2, 6, 23, 0.18)" }}>
             <div className="row"><span>Proposition TXT</span><span>MT5 · AUTO · buy · 0.01 lot</span></div>
@@ -1175,7 +1225,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}>
             <button
               type="button"
-              disabled={alphaSubmitBusy || backendMode !== "managed_live"}
+              disabled={alphaSubmitBusy || effectiveBackendMode !== "managed_live"}
               onClick={() => { void submitAlphaReactivationRequest(); }}
             >
               {alphaSubmitBusy ? "Preparation..." : "Preparer demande MT5"}
@@ -1184,7 +1234,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
               Rafraichir preuves
             </button>
           </div>
-          {backendMode !== "managed_live" ? (
+          {effectiveBackendMode !== "managed_live" ? (
             <p className="subtle mini" style={{ marginTop: 8 }}>Passe en Managed Live avant de creer une demande MT5 reelle.</p>
           ) : null}
           {alphaFeedback ? <p className="subtle" style={{ marginTop: 10 }}>{alphaFeedback}</p> : null}

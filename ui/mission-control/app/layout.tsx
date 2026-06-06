@@ -209,6 +209,8 @@ export const metadata: Metadata = {
   description: "Human-first trading platform",
 };
 
+export const dynamic = "force-dynamic";
+
 export default async function RootLayout({ children }: { children: ReactNode }) {
   const roleGroup = await getServerRoleGroup();
   return (

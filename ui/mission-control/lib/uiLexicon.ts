@@ -537,6 +537,13 @@ export const UI_HELP_HINTS = {
       "Effacer la source remet broker_session a vide pour couper l'ingestion automatique et l'execution live.",
     ],
   },
+  connectionsRegisterExchange: {
+    text: "Enregistre un compte exchange API sans confondre connexion, allocation et autorisation live.",
+    examples: [
+      "Un exchange peut etre visible ici avant d'etre autorise a recevoir du capital ou des ordres live.",
+      "Apres enregistrement, verifie les capabilities, balances et routes avant toute execution gouvernee.",
+    ],
+  },
   connectionsLiveIntegrationRoute: {
     text: "Expose la creation de route pour un signal autonome vers un compte lie, exchange ou broker MT5/FTMO.",
     examples: [
