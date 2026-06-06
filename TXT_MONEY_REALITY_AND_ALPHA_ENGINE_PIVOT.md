@@ -185,7 +185,7 @@ Do not optimize governance while the real-money loop is inactive.
 5. Accumulate 50 real-money outcome rows for Alpha Engine 30D candidate evaluation.
 6. Accumulate 100 real-money outcome rows across 20 active days before Alpha Engine V2 activation.
 7. Run targeted Latency, Refusal, and Attribution audits.
-8. Build Alpha Attribution Engine before allocation, opportunity cost, competition, opportunity, regime V2, or full alpha decay.
+8. Build Alpha Attribution Engine before allocation, opportunity cost, market memory, competition, opportunity, regime V2, or full alpha decay.
 9. Permit Capital Allocation to reduce or pause strategies early, but do not permit material capital scale-up until attribution and alpha-decay guard exist.
 
 Operational runbook:
@@ -193,6 +193,7 @@ Operational runbook:
 ```text
 TXT_ALPHA_REACTIVATION.md
 TXT_ALPHA_ENGINE_V2_SELECTION_ARCHITECTURE.md
+TXT_ALPHA_ENGINE_V2_ACTIVATION_ROADMAP.md
 TXT_PROOF_REACTIVATION_RUNBOOK.md
 ```
 

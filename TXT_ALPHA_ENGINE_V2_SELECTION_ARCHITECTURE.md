@@ -400,14 +400,17 @@ Do this only after the board passes `alpha-v2`, which means `REAL_100`, 20 activ
 1. Alpha Attribution Engine
 2. Capital Allocation Engine
 3. Opportunity Cost Engine
-4. Strategy Competition Engine
-5. Opportunity Engine
-6. Regime Switching Engine V2
-7. Alpha Decay Engine
-8. Multi-Timeframe Engine
-9. Self-Evolving Strategy Lab
-10. Sentiment / Geopolitics Advanced
+4. Market Memory Engine
+5. Strategy Competition Engine
+6. Opportunity Engine
+7. Regime Switching Engine V2
+8. Alpha Decay Engine
+9. Multi-Timeframe Engine
+10. Self-Evolving Strategy Lab
+11. Sentiment / Geopolitics Advanced
 ```
+
+The operational activation contract lives in `TXT_ALPHA_ENGINE_V2_ACTIVATION_ROADMAP.md`.
 
 Scale-up constraint:
 
