@@ -3,12 +3,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+PREFLIGHT_HTTP_TIMEOUT="${PREFLIGHT_HTTP_TIMEOUT:-15}"
+
 python3 - <<'PY'
 import json
+import os
 import urllib.error
 import urllib.request
 from pathlib import Path
 
+PREFLIGHT_HTTP_TIMEOUT = max(3, min(60, int(float(os.getenv("PREFLIGHT_HTTP_TIMEOUT", "15")))))
 
 def read_edge_evidence() -> dict:
     path = Path("logs/reaction_regime_cell_maturity.json")
@@ -31,7 +35,7 @@ def read_edge_evidence() -> dict:
     }
 
 
-def fetch_json(url: str, timeout: int = 8) -> dict:
+def fetch_json(url: str, timeout: int = PREFLIGHT_HTTP_TIMEOUT) -> dict:
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
             return {"ok": 200 <= response.status < 300, "status": response.status, "body": json.load(response)}
@@ -66,13 +70,15 @@ print(json.dumps({
 }, sort_keys=True))
 PY
 
-docker exec -i control-plane python3 - <<'PY'
+docker exec -i -e PREFLIGHT_HTTP_TIMEOUT="$PREFLIGHT_HTTP_TIMEOUT" control-plane python3 - <<'PY'
 import json
+import os
 import urllib.error
 import urllib.request
 
+PREFLIGHT_HTTP_TIMEOUT = max(3, min(60, int(float(os.getenv("PREFLIGHT_HTTP_TIMEOUT", "15")))))
 
-def fetch_json(url: str, timeout: int = 8) -> dict:
+def fetch_json(url: str, timeout: int = PREFLIGHT_HTTP_TIMEOUT) -> dict:
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
             return {"ok": 200 <= response.status < 300, "status": response.status, "body": json.load(response)}
@@ -87,7 +93,7 @@ def fetch_json(url: str, timeout: int = 8) -> dict:
         return {"ok": False, "status": 0, "body": {"error": str(exc)}}
 
 try:
-    with urllib.request.urlopen("http://mt5-bridge:8006/health", timeout=8) as response:
+    with urllib.request.urlopen("http://mt5-bridge:8006/health", timeout=PREFLIGHT_HTTP_TIMEOUT) as response:
         body = json.load(response)
         print(json.dumps({"section": "mt5_bridge_health", "ok": 200 <= response.status < 300, "status": response.status, "body": body}, sort_keys=True, default=str))
 except urllib.error.HTTPError as exc:

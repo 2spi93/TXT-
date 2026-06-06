@@ -116,6 +116,7 @@ class Mt5BrokerTruthPreferenceTests(unittest.TestCase):
                 "positions": [{"symbol": "OLD", "quantity": 1.0}],
                 "protective_orders": [{"order_id": "old"}],
                 "broker_session": {"snapshot_url": "http://bridge.local/state", "payload_path": "payload"},
+                "broker_runtime_session": {"client_id": "ftmo-ld6-bridge", "last_heartbeat_at": "2026-05-15T11:54:58+00:00"},
             },
             {
                 "positions": [{"symbol": "EURUSD", "quantity": 1.2}],
@@ -132,6 +133,8 @@ class Mt5BrokerTruthPreferenceTests(unittest.TestCase):
         self.assertEqual(metadata["balances"][0]["asset_symbol"], "USD")
         self.assertEqual(metadata["broker_session"]["snapshot_url"], "http://bridge.local/state")
         self.assertEqual(metadata["broker_runtime_session"]["terminal"], "mt5-main")
+        self.assertEqual(metadata["broker_runtime_session"]["client_id"], "ftmo-ld6-bridge")
+        self.assertEqual(metadata["broker_runtime_session"]["last_heartbeat_at"], "2026-05-15T11:54:58+00:00")
         self.assertEqual(metadata["truth_source"], "mt5-broker-state")
         self.assertEqual(metadata["broker_state_updated_at"], "2026-05-15T11:55:00+00:00")
 

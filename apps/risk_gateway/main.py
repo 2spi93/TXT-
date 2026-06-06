@@ -27,6 +27,13 @@ class Mt5OrderRiskRequest(BaseModel):
     estimated_notional_usd: float = Field(gt=0)
     max_spread_bps: int = Field(gt=0)
     system_mode: str = "suggest"
+    dry_run: bool = False
+
+
+class Mt5OrderRiskReleaseRequest(BaseModel):
+    symbol: str
+    side: str = Field(pattern="^(buy|sell)$")
+    estimated_notional_usd: float = Field(gt=0)
 
 
 def load_policy() -> dict:
@@ -222,23 +229,48 @@ async def mt5_order_check(request: Mt5OrderRiskRequest) -> dict:
             "policy_version": policy["policy_version"],
             "risk_snapshot": {
                 "daily_notional_used_usd": STATE["daily_notional_used_usd"],
+                "exposure_by_instrument": STATE["exposure_by_instrument"],
                 "paper_only": policy["paper_only"],
+                "dry_run": request.dry_run,
             },
         }
 
-    STATE["daily_notional_used_usd"] += request.estimated_notional_usd
-    signed_notional = request.estimated_notional_usd if request.side == "buy" else -request.estimated_notional_usd
-    current = STATE["exposure_by_instrument"].get(request.symbol, 0.0)
-    STATE["exposure_by_instrument"][request.symbol] = current + signed_notional
+    if not request.dry_run:
+        STATE["daily_notional_used_usd"] += request.estimated_notional_usd
+        signed_notional = request.estimated_notional_usd if request.side == "buy" else -request.estimated_notional_usd
+        current = STATE["exposure_by_instrument"].get(request.symbol, 0.0)
+        STATE["exposure_by_instrument"][request.symbol] = current + signed_notional
 
     return {
         "decision": "accept",
-        "reasons": ["within_policy"],
+        "reasons": ["within_policy_dry_run" if request.dry_run else "within_policy"],
         "policy_version": policy["policy_version"],
         "approved_notional_usd": request.estimated_notional_usd,
         "risk_snapshot": {
             "daily_notional_used_usd": STATE["daily_notional_used_usd"],
             "exposure_by_instrument": STATE["exposure_by_instrument"],
             "paper_only": policy["paper_only"],
+            "dry_run": request.dry_run,
+        },
+    }
+
+
+@app.post("/v1/checks/mt5-order/release")
+async def mt5_order_release(request: Mt5OrderRiskReleaseRequest) -> dict:
+    notional = float(request.estimated_notional_usd)
+    STATE["daily_notional_used_usd"] = max(0.0, float(STATE["daily_notional_used_usd"]) - notional)
+    current = float(STATE["exposure_by_instrument"].get(request.symbol, 0.0))
+    signed_notional = notional if request.side == "buy" else -notional
+    next_value = current - signed_notional
+    if abs(next_value) < 1e-9:
+        STATE["exposure_by_instrument"].pop(request.symbol, None)
+    else:
+        STATE["exposure_by_instrument"][request.symbol] = next_value
+    return {
+        "status": "released",
+        "released_notional_usd": notional,
+        "risk_snapshot": {
+            "daily_notional_used_usd": STATE["daily_notional_used_usd"],
+            "exposure_by_instrument": STATE["exposure_by_instrument"],
         },
     }

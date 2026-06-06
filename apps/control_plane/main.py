@@ -67,6 +67,7 @@ MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "http://127.0.0.1:8003")
 BROKER_ADAPTER_URL = os.getenv("BROKER_ADAPTER_URL", "http://127.0.0.1:8004")
 AI_ORCHESTRATOR_URL = os.getenv("AI_ORCHESTRATOR_URL", "http://127.0.0.1:8005")
 MT5_BRIDGE_URL = os.getenv("MT5_BRIDGE_URL", "http://127.0.0.1:8006")
+MT5_LIVE_APPROVAL_MAX_AGE_HOURS = max(1, int(os.getenv("MT5_LIVE_APPROVAL_MAX_AGE_HOURS", "2")))
 BINANCE_API_BASE_URL = os.getenv("BINANCE_API_BASE_URL", "https://api.binance.com").rstrip("/")
 BINANCE_FUTURES_API_BASE_URL = os.getenv("BINANCE_FUTURES_API_BASE_URL", "https://fapi.binance.com").rstrip("/")
 BINANCE_COINM_API_BASE_URL = os.getenv("BINANCE_COINM_API_BASE_URL", "https://dapi.binance.com").rstrip("/")
@@ -20569,7 +20570,7 @@ async def execution_rust_preview(payload: dict, auth: AuthContext = Depends(any_
     del auth
     if not RUST_EXECUTION_ENGINE_ENABLED:
         raise HTTPException(status_code=503, detail="Rust execution engine disabled")
-    risk_body = await _risk_check_mt5_order(payload)
+    risk_body = await _risk_check_mt5_order(payload, dry_run=True)
     routing = await _compute_route_plan(str(payload.get("symbol", "")), _predictor_context(payload))
     preferred_venue = str(payload.get("preferred_venue") or (routing.get("best") or {}).get("venue") or "").strip()
     predictor = await _evaluate_predictor_gate(payload, routing, risk_body, preferred_venue)
@@ -20608,6 +20609,22 @@ async def execution_rust_execute(payload: dict, auth: AuthContext = Depends(oper
 @app.get("/v1/mt5/orders/live-pending")
 async def mt5_live_pending(auth: AuthContext = Depends(operator_auth)) -> list[dict]:
     del auth
+    stale_body = {
+        "status": "stale_approval_cancelled",
+        "reason": "pending_live_approval_expired",
+        "max_age_hours": MT5_LIVE_APPROVAL_MAX_AGE_HOURS,
+    }
+    execute(
+        """
+        UPDATE mt5_live_approvals
+        SET status = 'cancelled',
+            execution_result = %s::jsonb,
+            executed_at = NOW()
+        WHERE status = 'pending'
+          AND created_at < NOW() - (%s * INTERVAL '1 hour')
+        """,
+        (json_dumps(stale_body), MT5_LIVE_APPROVAL_MAX_AGE_HOURS),
+    )
     return fetch_all(
         """
         SELECT approval_id, account_id, order_payload, first_approved_by, second_approved_by, status, created_at, executed_at
@@ -21414,7 +21431,7 @@ def _spread_decision_remediation_snapshot(summary: dict[str, Any], top_n: int = 
     }
 
 
-@app.get("/v1/mt5/orders/spread-decision-trace/remediation-snapshot")
+@app.get("/v1/mt5/orders/spread-decision-trace/remediation-snapshot", response_model=None)
 async def mt5_spread_decision_trace_remediation_snapshot(
     lookback_hours: float = 24.0,
     limit: int = 2500,
@@ -21487,7 +21504,7 @@ async def mt5_spread_decision_trace_remediation_snapshot(
 async def mt5_live_second_approve(approval_id: str, auth: AuthContext = Depends(operator_auth)) -> dict:
     approval = fetch_one(
         """
-        SELECT approval_id, account_id, order_payload, first_approved_by, status
+        SELECT approval_id, account_id, order_payload, first_approved_by, status, created_at
         FROM mt5_live_approvals
         WHERE approval_id = %s
         """,
@@ -21497,6 +21514,34 @@ async def mt5_live_second_approve(approval_id: str, auth: AuthContext = Depends(
         raise HTTPException(status_code=404, detail="Approval request not found")
     if approval["status"] != "pending":
         raise HTTPException(status_code=409, detail="Approval already resolved")
+    approval_created_at = approval.get("created_at")
+    if isinstance(approval_created_at, datetime) and approval_created_at < _now_utc() - timedelta(hours=MT5_LIVE_APPROVAL_MAX_AGE_HOURS):
+        stale_body = {
+            "status": "stale_approval_cancelled",
+            "approval_id": approval_id,
+            "max_age_hours": MT5_LIVE_APPROVAL_MAX_AGE_HOURS,
+            "created_at": approval_created_at.isoformat(),
+        }
+        execute(
+            """
+            UPDATE mt5_live_approvals
+            SET status = 'cancelled',
+                execution_result = %s::jsonb,
+                executed_at = NOW()
+            WHERE approval_id = %s
+            """,
+            (json_dumps(stale_body), approval_id),
+        )
+        append_audit(
+            "mt5_live_order_stale_approval_cancelled",
+            {
+                "approval_id": approval_id,
+                "first_approved_by": approval["first_approved_by"],
+                "attempted_second_approver": auth.username,
+                "max_age_hours": MT5_LIVE_APPROVAL_MAX_AGE_HOURS,
+            },
+        )
+        raise HTTPException(status_code=409, detail=stale_body)
     if approval["first_approved_by"] == auth.username:
         raise HTTPException(status_code=403, detail="Second approval must be from a different operator")
 
@@ -21509,7 +21554,63 @@ async def mt5_live_second_approve(approval_id: str, auth: AuthContext = Depends(
             "approval_id": approval_id,
             "approval_mode": "mt5_double_approval",
         }
-    body = await _execute_mt5_filtered_order(order_payload)
+    try:
+        body = await _execute_mt5_filtered_order(order_payload)
+    except HTTPException as exc:
+        failure_body = {
+            "status": "rejected_after_second_approval",
+            "approval_id": approval_id,
+            "http_status": exc.status_code,
+            "detail": exc.detail,
+        }
+        execute(
+            """
+            UPDATE mt5_live_approvals
+            SET second_approved_by = %s,
+                status = 'rejected',
+                execution_result = %s::jsonb,
+                executed_at = NOW()
+            WHERE approval_id = %s
+            """,
+            (auth.username, json_dumps(failure_body), approval_id),
+        )
+        append_audit(
+            "mt5_live_order_rejected_after_second_approval",
+            {
+                "approval_id": approval_id,
+                "first_approved_by": approval["first_approved_by"],
+                "second_approved_by": auth.username,
+                "failure": failure_body,
+            },
+        )
+        raise
+    except Exception as exc:
+        failure_body = {
+            "status": "execution_failed_after_second_approval",
+            "approval_id": approval_id,
+            "detail": str(exc)[:500] or exc.__class__.__name__,
+        }
+        execute(
+            """
+            UPDATE mt5_live_approvals
+            SET second_approved_by = %s,
+                status = 'rejected',
+                execution_result = %s::jsonb,
+                executed_at = NOW()
+            WHERE approval_id = %s
+            """,
+            (auth.username, json_dumps(failure_body), approval_id),
+        )
+        append_audit(
+            "mt5_live_order_rejected_after_second_approval",
+            {
+                "approval_id": approval_id,
+                "first_approved_by": approval["first_approved_by"],
+                "second_approved_by": auth.username,
+                "failure": failure_body,
+            },
+        )
+        raise HTTPException(status_code=503, detail=failure_body) from exc
     execute(
         """
         UPDATE mt5_live_approvals
@@ -21533,7 +21634,7 @@ async def mt5_live_second_approve(approval_id: str, auth: AuthContext = Depends(
     return {"status": "executed", "approval_id": approval_id, "result": body}
 
 
-async def _risk_check_mt5_order(payload: dict) -> dict:
+async def _risk_check_mt5_order(payload: dict, *, dry_run: bool = False) -> dict:
     risk_payload = {
         "account_id": payload.get("account_id", ""),
         "symbol": payload.get("symbol", ""),
@@ -21542,10 +21643,51 @@ async def _risk_check_mt5_order(payload: dict) -> dict:
         "estimated_notional_usd": payload.get("estimated_notional_usd", 0),
         "max_spread_bps": payload.get("max_spread_bps", 0),
         "system_mode": CURRENT_SYSTEM_MODE.value,
+        "dry_run": dry_run,
     }
     async with httpx.AsyncClient(timeout=12.0) as client:
-        response = await client.post(f"{RISK_GATEWAY_URL}/v1/checks/mt5-order", json=risk_payload)
+        try:
+            response = await client.post(f"{RISK_GATEWAY_URL}/v1/checks/mt5-order", json=risk_payload)
+        except httpx.RequestError as exc:
+            return {
+                "decision": "reject",
+                "reasons": ["risk_gateway_unavailable"],
+                "policy_version": "unavailable",
+                "risk_snapshot": {
+                    "dry_run": dry_run,
+                    "request": risk_payload,
+                    "error": str(exc)[:500],
+                },
+            }
+        if response.status_code >= 400:
+            return {
+                "decision": "reject",
+                "reasons": ["risk_gateway_error"],
+                "policy_version": "unavailable",
+                "risk_snapshot": {
+                    "dry_run": dry_run,
+                    "upstream_status": response.status_code,
+                    "upstream_detail": _upstream_json_payload(response),
+                },
+            }
         return response.json()
+
+
+async def _release_mt5_order_risk_budget(payload: dict) -> dict:
+    release_payload = {
+        "symbol": payload.get("symbol", ""),
+        "side": payload.get("side", "buy"),
+        "estimated_notional_usd": payload.get("estimated_notional_usd", 0),
+    }
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        try:
+            response = await client.post(f"{RISK_GATEWAY_URL}/v1/checks/mt5-order/release", json=release_payload)
+        except httpx.RequestError as exc:
+            return {"status": "release_failed", "reason": "risk_gateway_unavailable", "error": str(exc)[:500]}
+        if response.status_code >= 400:
+            return {"status": "release_failed", "reason": "risk_gateway_error", "upstream_status": response.status_code, "upstream_detail": _upstream_json_payload(response)}
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {"status": "release_unknown"}
 
 
 async def _fetch_mt5_quote_evidence(account_id: str, symbol: str) -> dict[str, Any] | None:
@@ -21771,7 +21913,7 @@ async def _execute_mt5_filtered_order(payload: dict) -> dict:
         str(payload.get("account_id") or ""),
         str(payload.get("symbol") or ""),
     )
-    risk_body = await _risk_check_mt5_order(payload)
+    risk_body = await _risk_check_mt5_order(payload, dry_run=True)
     if risk_body.get("decision") != "accept":
         spread_live_used = _to_float((quote_evidence or {}).get("spread_bps"), None)
         spread_source = str((quote_evidence or {}).get("source") or "").strip() or "policy_only"
@@ -21814,7 +21956,6 @@ async def _execute_mt5_filtered_order(payload: dict) -> dict:
         raise HTTPException(status_code=409, detail={"status": "blocked_by_predictor", "predictor": predictor_gate})
 
     adjusted_payload = _apply_predictor_execution_adjustments(payload, predictor_gate)
-
     routed_execution_result: dict = {}
     rust_execution_result = await _call_rust_execution_engine(adjusted_payload, routing, risk_body, preferred_venue)
     if isinstance(rust_execution_result, dict) and rust_execution_result.get("accepted"):
@@ -21862,6 +22003,30 @@ async def _execute_mt5_filtered_order(payload: dict) -> dict:
     selected_route = ((routed_execution_result.get("route") or {}).get("chosen") or route_best)
     selected_backup = ((routed_execution_result.get("route") or {}).get("backup") or route_backup)
 
+    risk_body = await _risk_check_mt5_order(adjusted_payload, dry_run=False)
+    risk_committed = risk_body.get("decision") == "accept"
+    if not risk_committed:
+        spread_live_used = _to_float((quote_evidence or {}).get("spread_bps"), None)
+        spread_source = str((quote_evidence or {}).get("source") or "").strip() or "policy_only"
+        append_audit(
+            "mt5_order_rejected",
+            {
+                "risk": risk_body,
+                "account_id": adjusted_payload.get("account_id", ""),
+                "symbol": adjusted_payload.get("symbol", ""),
+                "side": adjusted_payload.get("side", "buy"),
+                "max_spread_bps": _to_float(adjusted_payload.get("max_spread_bps"), None),
+                "broker_bid": _to_float((quote_evidence or {}).get("bid"), None),
+                "broker_ask": _to_float((quote_evidence or {}).get("ask"), None),
+                "broker_spread_bps": spread_live_used,
+                "broker_quote_observed_at": (quote_evidence or {}).get("observed_at"),
+                "spread_live_used": spread_live_used,
+                "spread_source": spread_source,
+                "quote": quote_evidence,
+            },
+        )
+        raise HTTPException(status_code=400, detail=risk_body)
+
     bridge_payload = dict(adjusted_payload)
     bridge_payload["risk_gate"] = risk_body
     bridge_payload["routing_plan"] = routing
@@ -21873,9 +22038,35 @@ async def _execute_mt5_filtered_order(payload: dict) -> dict:
         if isinstance(bridge_payload.get("metadata"), dict):
             bridge_payload["metadata"]["go_live_hardening"] = hardening_snapshot
     async with httpx.AsyncClient(timeout=12.0) as client:
-        response = await client.post(f"{MT5_BRIDGE_URL}/v1/orders/filter", json=bridge_payload)
+        try:
+            response = await client.post(f"{MT5_BRIDGE_URL}/v1/orders/filter", json=bridge_payload)
+        except httpx.RequestError as exc:
+            release_result = await _release_mt5_order_risk_budget(adjusted_payload) if risk_committed else {"status": "not_committed"}
+            append_audit(
+                "mt5_order_risk_budget_released",
+                {
+                    "account_id": adjusted_payload.get("account_id", ""),
+                    "symbol": adjusted_payload.get("symbol", ""),
+                    "side": adjusted_payload.get("side", "buy"),
+                    "reason": "mt5_bridge_request_error",
+                    "release": release_result,
+                },
+            )
+            raise HTTPException(status_code=502, detail={"status": "mt5_bridge_unavailable", "error": str(exc)[:500]}) from exc
         if response.status_code >= 400:
             _record_api_error("mt5-bridge", "order_filter_failed")
+            release_result = await _release_mt5_order_risk_budget(adjusted_payload) if risk_committed else {"status": "not_committed"}
+            append_audit(
+                "mt5_order_risk_budget_released",
+                {
+                    "account_id": adjusted_payload.get("account_id", ""),
+                    "symbol": adjusted_payload.get("symbol", ""),
+                    "side": adjusted_payload.get("side", "buy"),
+                    "reason": "mt5_bridge_rejected_order",
+                    "bridge_status": response.status_code,
+                    "release": release_result,
+                },
+            )
             if 400 <= response.status_code < 500:
                 try:
                     bridge_error: Any = response.json()

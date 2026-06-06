@@ -15,7 +15,8 @@ SYMBOL="${SYMBOL:-AUTO}"
 SIDE="${SIDE:-buy}"
 LOTS="${LOTS:-0.01}"
 NOTIONAL_USD="${NOTIONAL_USD:-5}"
-MAX_SPREAD_BPS="${MAX_SPREAD_BPS:-25}"
+MAX_SPREAD_BPS="${MAX_SPREAD_BPS:-10}"
+CONFIDENCE="${CONFIDENCE:-0.8}"
 PREFERRED_VENUE="${PREFERRED_VENUE:-mt5}"
 RATIONALE="${RATIONALE:-operator mt5 live smoke}"
 CONFIRM_LIVE="${CONFIRM_LIVE:-}"
@@ -36,7 +37,8 @@ Options:
   --side VALUE               buy or sell (default: buy)
   --lots VALUE               MT5 lots to send (default: 0.01)
   --notional-usd VALUE       Estimated notional in USD (default: 5)
-  --max-spread-bps VALUE     Max spread bps (default: 25)
+  --max-spread-bps VALUE     Max spread bps (default: 10)
+  --confidence VALUE         Live hardening confidence (default: 0.8)
   --preferred-venue VALUE    Preferred venue (default: mt5)
   --rationale VALUE          Human rationale note
   --confirm-live VALUE       Must equal MT5_LIVE_SMOKE to submit/approve live
@@ -65,6 +67,7 @@ while [ "$#" -gt 0 ]; do
     --lots) LOTS="$2"; shift 2 ;;
     --notional-usd) NOTIONAL_USD="$2"; shift 2 ;;
     --max-spread-bps) MAX_SPREAD_BPS="$2"; shift 2 ;;
+    --confidence) CONFIDENCE="$2"; shift 2 ;;
     --preferred-venue) PREFERRED_VENUE="$2"; shift 2 ;;
     --rationale) RATIONALE="$2"; shift 2 ;;
     --confirm-live) CONFIRM_LIVE="$2"; shift 2 ;;
@@ -162,7 +165,7 @@ if [ -n "$APPROVAL_ID" ]; then
     -H 'content-type: application/json' \
     -X POST "$CONTROL_PLANE_URL/v1/mt5/orders/live-approve/$APPROVAL_ID")"
 else
-  REQUEST_BODY="$(ACCOUNT_ID="$ACCOUNT_ID" SYMBOL="$SELECTED_SYMBOL" SIDE="$SIDE" LOTS="$LOTS" NOTIONAL_USD="$NOTIONAL_USD" MAX_SPREAD_BPS="$MAX_SPREAD_BPS" PREFERRED_VENUE="$PREFERRED_VENUE" RATIONALE="$RATIONALE" python3 - <<'PY'
+  REQUEST_BODY="$(ACCOUNT_ID="$ACCOUNT_ID" SYMBOL="$SELECTED_SYMBOL" SIDE="$SIDE" LOTS="$LOTS" NOTIONAL_USD="$NOTIONAL_USD" MAX_SPREAD_BPS="$MAX_SPREAD_BPS" CONFIDENCE="$CONFIDENCE" PREFERRED_VENUE="$PREFERRED_VENUE" RATIONALE="$RATIONALE" python3 - <<'PY'
 import json
 import os
 
@@ -173,11 +176,13 @@ print(json.dumps({
     "lots": float(os.environ["LOTS"]),
     "estimated_notional_usd": float(os.environ["NOTIONAL_USD"]),
     "max_spread_bps": int(float(os.environ["MAX_SPREAD_BPS"])),
+    "confidence": float(os.environ["CONFIDENCE"]),
     "preferred_venue": os.environ["PREFERRED_VENUE"],
     "rationale": os.environ["RATIONALE"],
     "metadata": {
         "source": "scripts/mt5_live_operator_smoke.sh",
         "smoke": True,
+        "confidence": float(os.environ["CONFIDENCE"]),
     },
 }))
 PY
@@ -208,6 +213,11 @@ print(f"symbol={os.environ['SELECTED_SYMBOL']}")
 if os.environ["APPROVAL_ID"]:
     print(f"approval_id={os.environ['APPROVAL_ID']}")
 print(f"status={body.get('status', '-')}")
+hardening = body.get("hardening") if isinstance(body.get("hardening"), dict) else {}
+if hardening:
+    print(f"hardening_status={hardening.get('status', '-')}")
+    print(f"hardening_effective_confidence={hardening.get('effective_confidence', '-')}")
+    print(f"hardening_reasons={','.join(hardening.get('reasons') or [])}")
 if isinstance(body.get("detail"), dict):
     detail = body["detail"]
     print(f"detail_status={detail.get('status', '-')}")

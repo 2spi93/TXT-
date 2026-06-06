@@ -1048,7 +1048,8 @@ def _merge_mt5_broker_state_metadata(existing_metadata: dict[str, Any] | None, p
 
     broker_session = broker_state.get("session") if isinstance(broker_state.get("session"), dict) else request_payload.get("session") if isinstance(request_payload.get("session"), dict) else None
     if isinstance(broker_session, dict) and broker_session:
-        metadata["broker_runtime_session"] = broker_session
+        existing_runtime_session = metadata.get("broker_runtime_session") if isinstance(metadata.get("broker_runtime_session"), dict) else {}
+        metadata["broker_runtime_session"] = {**existing_runtime_session, **broker_session}
 
     truth_source = str(
         broker_state.get("truth_source")
