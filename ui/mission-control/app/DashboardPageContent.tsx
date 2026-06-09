@@ -16,6 +16,12 @@ import RuntimeStabilityDebugView from "../components/ui/RuntimeStabilityDebugVie
 import { readMissionControlBlueGreenStatus } from "../lib/blueGreenUiStatus";
 import { getRuntimeDecisionAnalytics } from "../lib/runtimeDecisionAnalytics";
 import { ensureRuntimeDecisionWriterStarted } from "../lib/runtimeDecisionWriter";
+import { readSourceTreeProvenanceAudit } from "../lib/sourceTreeProvenance";
+import {
+  describeSourceTreePromotionBlock,
+  formatSourceTreeProvenanceStatus,
+  getSourceTreeCommitDeltaLines,
+} from "../lib/sourceTreeProvenanceView";
 import { UI_HELP_HINTS, UI_TERMS } from "../lib/uiLexicon";
 import { getRoleGroup, getRoleDisplayLabel, isClientRole } from "../lib/roleGroups";
 import { getServerRole } from "../lib/serverAuth";
@@ -131,11 +137,12 @@ async function readLocalTerminalCaptureStoreBounded(): Promise<Awaited<ReturnTyp
 
 async function readBlueGreenStatusBounded(): Promise<Awaited<ReturnType<typeof readMissionControlBlueGreenStatus>>> {
   return getLocalJson(readMissionControlBlueGreenStatus(), 1_500, {
-    activeSlot: "unknown",
-    inactiveSlot: "unknown",
-    slots: {},
-    generatedAt: new Date().toISOString(),
-  } as Awaited<ReturnType<typeof readMissionControlBlueGreenStatus>>);
+    activeSlot: "blue",
+    inactiveSlot: "green",
+    slotFilePath: "/workspace/data/mission-control/ui-active-slot.conf",
+    slotFileSummary: "fallback status unavailable",
+    slots: [],
+  });
 }
 
 function formatSignedMetric(value: unknown, fractionDigits = 2, suffix = ""): string {
@@ -179,7 +186,7 @@ export default async function DashboardPageContent() {
   ensureRuntimeDecisionWriterStarted();
 
   const runtimeDecisionExportHref = "/api/system/runtime-decision/export?limit=1200&sinceDays=7&historyLimit=20&download=1";
-  const [me, overview, audit, positions, quotes, balances, pending, strategies, connectorsStatus, healthwatchDashboard, localTerminalCaptureStore, runtimeDecisionSummary, blueGreenStatus, serverRole] = await Promise.all([
+  const [me, overview, audit, positions, quotes, balances, pending, strategies, connectorsStatus, healthwatchDashboard, localTerminalCaptureStore, runtimeDecisionSummary, blueGreenStatus, serverRole, sourceTreeProvenance] = await Promise.all([
     getJson("/v1/auth/me") as Promise<RecordItem | null>,
     getJson("/v1/dashboard/overview") as Promise<RecordItem | null>,
     getJson("/v1/audit") as Promise<RecordItem[] | null>,
@@ -194,6 +201,7 @@ export default async function DashboardPageContent() {
     getRuntimeDecisionAnalytics({ limit: 1200, sinceDays: 7, samples: 2 }),
     readBlueGreenStatusBounded(),
     getServerRoleBounded(),
+    readSourceTreeProvenanceAudit(),
   ]);
 
   const effectiveMe = me || (serverRole
@@ -244,6 +252,8 @@ export default async function DashboardPageContent() {
   const safeBalances = balances || { balances: [] };
   const safePending = pending || {};
   const safeStrategies = strategies || [];
+  const strategyPromotionGuard = describeSourceTreePromotionBlock(sourceTreeProvenance);
+  const strategyPromotionCommitDelta = getSourceTreeCommitDeltaLines(sourceTreeProvenance);
   const safeConnectors = Array.isArray(connectorsStatus?.connectors)
     ? connectorsStatus.connectors.filter((item): item is RecordItem => Boolean(item) && typeof item === "object" && !Array.isArray(item))
     : [];
@@ -782,7 +792,10 @@ export default async function DashboardPageContent() {
                     <input type="text" name="rationale" placeholder={`Promote to L${nextLevel}`} required />
                     <input type="number" step="0.01" name="sharpe" placeholder="sharpe" />
                     <input type="number" step="0.01" name="max_dd" placeholder="max_dd" />
-                    <button type="submit">Promote</button>
+                    <button type="submit" disabled={strategyPromotionGuard.blocked}>Promote</button>
+                    {strategyPromotionGuard.blocked ? <div className="warn mini">{strategyPromotionGuard.reason}</div> : null}
+                    <div className="subtle mini">Provenance {formatSourceTreeProvenanceStatus(sourceTreeProvenance.status)} · {sourceTreeProvenance.commit_alignment_rate.toFixed(0)}%</div>
+                    {strategyPromotionCommitDelta.length > 0 ? <div className="subtle mini">Delta commit: {strategyPromotionCommitDelta.join(" · ")}</div> : null}
                   </form>
                 ) : (
                   <span className="pill">L6 max</span>

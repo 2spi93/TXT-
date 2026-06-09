@@ -11,6 +11,7 @@ import {
   readRuntimeDecisionKpiSnapshots,
 } from "./runtimeDecisionKpiStore";
 import {
+  defaultLocalTerminalCaptureStore,
   type LocalTerminalRuntimeCapture,
   type PersistedLocalTerminalCaptureStore,
 } from "./localTerminalCapture";
@@ -4312,9 +4313,9 @@ export async function getRuntimeDecisionAnalytics(options?: {
       unavailableOpportunityTelemetry(),
     ),
     withRuntimeDecisionTimeout(
-      readLocalTerminalCaptureStore().catch(() => []),
+      readLocalTerminalCaptureStore().catch(() => defaultLocalTerminalCaptureStore()),
       RUNTIME_DECISION_ANALYTICS_LOAD_TIMEOUT_MS,
-      [],
+      defaultLocalTerminalCaptureStore(),
     ),
     withRuntimeDecisionTimeout(
       readRuntimeDecisionKpiSnapshots({ symbol, timeframe, strategy, limit: 168, sinceDays }).catch(() => []),

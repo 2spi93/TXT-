@@ -17,7 +17,7 @@ import time
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from uuid import uuid4
 
 import httpx
@@ -451,6 +451,81 @@ async def _opportunity_gate_loop() -> None:
 
 def _normalize_account_id(value: Any) -> str:
     return str(value or "").strip().lower()
+
+
+def _exception_detail_text(exc: BaseException) -> str:
+    detail = str(exc).strip()
+    return detail or exc.__class__.__name__
+
+
+def _configured_internal_service_token() -> str:
+    candidate = str(os.getenv("CONTROL_PLANE_INTERNAL_TOKEN") or "").strip()
+    if candidate:
+        return candidate
+    return str(os.getenv("CONTROL_PLANE_TOKEN") or "").strip()
+
+
+def _internal_service_role(allowed_roles: set[str]) -> str:
+    for role in ("admin", "operator", "viewer"):
+        if role in allowed_roles:
+            return role
+    return ""
+
+
+def _resolve_internal_service_auth(
+    authorization: str | None,
+    allowed_roles: set[str],
+    internal_proxy_header: str | None,
+) -> AuthContext | None:
+    if str(internal_proxy_header or "").strip() != "1":
+        return None
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = authorization.removeprefix("Bearer ").strip()
+    expected = _configured_internal_service_token()
+    if not expected or not token or not hmac.compare_digest(token, expected):
+        raise HTTPException(status_code=401, detail="Invalid internal service token")
+    role = _internal_service_role(allowed_roles)
+    if not role:
+        raise HTTPException(status_code=403, detail="Insufficient role")
+    return AuthContext(
+        user_id=0,
+        principal="mission-control-internal",
+        username="mission-control-internal",
+        role=role,
+        session_id="internal-proxy",
+    )
+
+
+async def _downstream_get(url: str, *, timeout: float, service: str, params: dict[str, Any] | None = None) -> httpx.Response:
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            return await client.get(url, params=params)
+    except httpx.TimeoutException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=_flatten_downstream_error(f"{service}_timeout", _exception_detail_text(exc)),
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=_flatten_downstream_error(f"{service}_unreachable", _exception_detail_text(exc)),
+        ) from exc
+
+
+def _is_self_referential_mt5_snapshot_url(state_url: str, account_id: str) -> bool:
+    normalized_url = str(state_url or "").strip()
+    if not normalized_url:
+        return False
+    parsed = urlparse(normalized_url)
+    hostname = str(parsed.hostname or "").strip().lower()
+    if not hostname:
+        return False
+    expected_path = f"/v1/accounts/{_normalize_account_id(account_id)}/normalized-state"
+    if parsed.path.rstrip("/") != expected_path:
+        return False
+    internal_hostname = str(urlparse(MT5_BRIDGE_URL).hostname or "").strip().lower()
+    return hostname in {internal_hostname, "bridge.txt.gtixt.com", "localhost", "127.0.0.1"}
 
 
 def _upstream_json_payload(response: httpx.Response) -> Any:
@@ -9454,10 +9529,18 @@ async def _reconcile_live_position_protection_loop() -> None:
     while True:
         rows = fetch_all(
             """
-            SELECT account_id, connector_type, status
-            FROM accounts_registry
-            WHERE connector_type = ANY(%s) AND status = 'active'
-            ORDER BY updated_at DESC, created_at DESC
+            SELECT
+                ar.account_id,
+                ar.connector_type,
+                ar.status,
+                ma.mode AS mt5_mode,
+                ma.status AS mt5_status,
+                ma.metadata AS mt5_metadata
+            FROM accounts_registry ar
+            LEFT JOIN mt5_accounts ma
+              ON LOWER(BTRIM(ma.account_id)) = LOWER(BTRIM(ar.account_id))
+            WHERE ar.connector_type = ANY(%s) AND ar.status = 'active'
+            ORDER BY ar.updated_at DESC, ar.created_at DESC
             """,
             (["bingx", "mt5"],),
         )
@@ -9468,6 +9551,12 @@ async def _reconcile_live_position_protection_loop() -> None:
                 continue
             try:
                 if connector_type == "mt5":
+                    mt5_mode = str(row.get("mt5_mode") or "").strip().lower()
+                    mt5_status = str(row.get("mt5_status") or "").strip().lower()
+                    mt5_metadata = row.get("mt5_metadata") if isinstance(row.get("mt5_metadata"), dict) else {}
+                    alias_for = str(mt5_metadata.get("bridge_alias_for") or mt5_metadata.get("alias_of_account_id") or "").strip()
+                    if mt5_mode != "live" or mt5_status not in {"connected", "active", "ready"} or alias_for:
+                        continue
                     await _sync_mt5_account_state(account_id)
                 else:
                     await _sync_supported_connector_account_state(account_id, row)
@@ -11427,7 +11516,11 @@ def _resolve_auth(
     authorization: str | None,
     allowed_roles: set[str],
     require_password_fresh: bool = True,
+    internal_proxy_header: str | None = None,
 ) -> AuthContext:
+    internal_auth = _resolve_internal_service_auth(authorization, allowed_roles, internal_proxy_header)
+    if internal_auth:
+        return internal_auth
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
     token = authorization.removeprefix("Bearer ").strip()
@@ -11476,14 +11569,28 @@ def viewer_auth(authorization: str | None = Header(default=None)) -> AuthContext
     return _resolve_auth(authorization, {"viewer", "operator", "admin"})
 
 
-def operator_auth(authorization: str | None = Header(default=None)) -> AuthContext:
+def viewer_auth(
+    authorization: str | None = Header(default=None),
+    x_mc_internal_proxy: str | None = Header(default=None, alias="X-MC-Internal-Proxy"),
+) -> AuthContext:
+    """Internal-only read access: viewer · operator · admin."""
+    return _resolve_auth(authorization, {"viewer", "operator", "admin"}, internal_proxy_header=x_mc_internal_proxy)
+
+
+def operator_auth(
+    authorization: str | None = Header(default=None),
+    x_mc_internal_proxy: str | None = Header(default=None, alias="X-MC-Internal-Proxy"),
+) -> AuthContext:
     """Internal write access: operator · admin."""
-    return _resolve_auth(authorization, {"operator", "admin"})
+    return _resolve_auth(authorization, {"operator", "admin"}, internal_proxy_header=x_mc_internal_proxy)
 
 
-def admin_auth(authorization: str | None = Header(default=None)) -> AuthContext:
+def admin_auth(
+    authorization: str | None = Header(default=None),
+    x_mc_internal_proxy: str | None = Header(default=None, alias="X-MC-Internal-Proxy"),
+) -> AuthContext:
     """Admin-only access."""
-    return _resolve_auth(authorization, {"admin"})
+    return _resolve_auth(authorization, {"admin"}, internal_proxy_header=x_mc_internal_proxy)
 
 
 # ── Client / external roles ────────────────────────────────────────────────
@@ -11494,24 +11601,40 @@ _PHASE1_INTERNAL_CLIENT_ID = "txt-internal"
 _PHASE1_INTERNAL_PORTFOLIO_ID = "pf-internal-main"
 
 
-def client_auth(authorization: str | None = Header(default=None)) -> AuthContext:
+def client_auth(
+    authorization: str | None = Header(default=None),
+    x_mc_internal_proxy: str | None = Header(default=None, alias="X-MC-Internal-Proxy"),
+) -> AuthContext:
     """External client access: client · trader · investor · premium · pro."""
-    return _resolve_auth(authorization, _CLIENT_ROLES)
+    return _resolve_auth(authorization, _CLIENT_ROLES, internal_proxy_header=x_mc_internal_proxy)
 
 
-def any_read_auth(authorization: str | None = Header(default=None)) -> AuthContext:
+def any_read_auth(
+    authorization: str | None = Header(default=None),
+    x_mc_internal_proxy: str | None = Header(default=None, alias="X-MC-Internal-Proxy"),
+) -> AuthContext:
     """Any authenticated user (internal or client) — for market-data endpoints."""
-    return _resolve_auth(authorization, _ALL_ROLES)
+    return _resolve_auth(authorization, _ALL_ROLES, internal_proxy_header=x_mc_internal_proxy)
 
 
-def relaxed_auth(authorization: str | None = Header(default=None)) -> AuthContext:
+def relaxed_auth(
+    authorization: str | None = Header(default=None),
+    x_mc_internal_proxy: str | None = Header(default=None, alias="X-MC-Internal-Proxy"),
+) -> AuthContext:
     """Any authenticated user, no password-freshness check. Used for auth/me, logout, etc."""
-    return _resolve_auth(authorization, _ALL_ROLES, require_password_fresh=False)
+    return _resolve_auth(authorization, _ALL_ROLES, require_password_fresh=False, internal_proxy_header=x_mc_internal_proxy)
 
 
-def connector_manage_auth(authorization: str | None = Header(default=None)) -> AuthContext:
+def connector_manage_auth(
+    authorization: str | None = Header(default=None),
+    x_mc_internal_proxy: str | None = Header(default=None, alias="X-MC-Internal-Proxy"),
+) -> AuthContext:
     """Connector management access for admins, operators, and external client roles."""
-    return _resolve_auth(authorization, {"admin", "operator", "client", "trader", "investor", "premium", "pro"})
+    return _resolve_auth(
+        authorization,
+        {"admin", "operator", "client", "trader", "investor", "premium", "pro"},
+        internal_proxy_header=x_mc_internal_proxy,
+    )
 
 
 def _normalize_db_row(row: dict | None) -> dict | None:
@@ -12194,6 +12317,8 @@ async def _pull_mt5_broker_state_from_external_session(account_id: str) -> dict[
     ).strip()
     if not state_url:
         return None
+    if _is_self_referential_mt5_snapshot_url(state_url, normalized_account_id):
+        return None
     auto_sync_raw = broker_session.get("auto_sync")
     if auto_sync_raw is not None and str(auto_sync_raw).strip().lower() in {"0", "false", "no", "off"}:
         return None
@@ -12225,7 +12350,7 @@ async def _pull_mt5_broker_state_from_external_session(account_id: str) -> dict[
     except Exception as exc:
         append_audit(
             "mt5_external_broker_state_pull_failed",
-            {"account_id": normalized_account_id, "detail": str(exc)[:500]},
+            {"account_id": normalized_account_id, "detail": _exception_detail_text(exc)[:500]},
         )
         return None
 
@@ -12275,7 +12400,7 @@ async def _pull_mt5_broker_state_from_external_session(account_id: str) -> dict[
     except Exception as exc:
         append_audit(
             "mt5_external_broker_state_ingest_failed",
-            {"account_id": normalized_account_id, "detail": str(exc)[:500]},
+            {"account_id": normalized_account_id, "detail": _exception_detail_text(exc)[:500]},
         )
         return None
 
@@ -12308,7 +12433,7 @@ async def _fetch_mt5_normalized_state(account_id: str) -> dict | None:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(f"{MT5_BRIDGE_URL}/v1/accounts/{account_id}/normalized-state")
     except Exception as exc:
-        append_audit("mt5_account_state_sync_failed", {"account_id": account_id, "detail": str(exc)[:500]})
+        append_audit("mt5_account_state_sync_failed", {"account_id": account_id, "detail": _exception_detail_text(exc)[:500]})
         return None
 
     if response.status_code == 404:
@@ -17216,11 +17341,33 @@ async def get_opportunity_gate(auth: AuthContext = Depends(viewer_auth)) -> dict
 @app.post("/v1/system/mode")
 async def set_system_mode(request: SystemModeChangeRequest, auth: AuthContext = Depends(operator_auth)) -> dict:
     global CURRENT_SYSTEM_MODE
-    del auth
+    previous_mode = CURRENT_SYSTEM_MODE.value
+    next_mode = request.mode.value
+    source = str(request.source or "mission-control-ui").strip() or "mission-control-ui"
+    reason = str(request.reason or "desk_posture_change").strip() or "desk_posture_change"
+    requested_previous_mode = str(request.previous_mode or "").strip().lower() or None
     CURRENT_SYSTEM_MODE = request.mode
     persist_system_mode()
-    append_audit("system_mode_changed", {"mode": CURRENT_SYSTEM_MODE})
-    return {"status": "updated", "system_mode": CURRENT_SYSTEM_MODE}
+    changed = previous_mode != next_mode
+    append_audit(
+        "system_mode_changed" if changed else "system_mode_reaffirmed",
+        {
+            "mode": CURRENT_SYSTEM_MODE.value,
+            "previous_mode": previous_mode,
+            "next_mode": next_mode,
+            "requested_previous_mode": requested_previous_mode,
+            "source": source,
+            "reason": reason,
+            "by": auth.username,
+        },
+    )
+    return {
+        "status": "updated" if changed else "unchanged",
+        "system_mode": CURRENT_SYSTEM_MODE.value,
+        "previous_mode": previous_mode,
+        "source": source,
+        "reason": reason,
+    }
 
 
 @app.get("/v1/intents/pending")
@@ -18633,17 +18780,15 @@ async def dashboard_overview(auth: AuthContext = Depends(viewer_auth)) -> dict:
 @app.get("/v1/market/quotes")
 async def proxy_market_quotes(auth: AuthContext = Depends(any_read_auth)) -> list[dict]:
     del auth
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(f"{MARKET_DATA_URL}/v1/quotes")
-        return _proxy_json_response(response)
+    response = await _downstream_get(f"{MARKET_DATA_URL}/v1/quotes", timeout=10.0, service="market_data")
+    return _proxy_json_response(response)
 
 
 @app.get("/v1/market/venues/telemetry")
 async def proxy_market_venue_telemetry(auth: AuthContext = Depends(any_read_auth)) -> dict:
     del auth
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(f"{MARKET_DATA_URL}/v1/market/venues/telemetry")
-        return _proxy_json_response(response)
+    response = await _downstream_get(f"{MARKET_DATA_URL}/v1/market/venues/telemetry", timeout=10.0, service="market_data")
+    return _proxy_json_response(response)
 
 
 @app.get("/v1/routes/venues/telemetry")
@@ -18652,28 +18797,27 @@ async def proxy_route_venue_telemetry(
     auth: AuthContext = Depends(any_read_auth),
 ) -> dict:
     del auth
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(
-            f"{EXECUTION_ROUTER_URL}/v1/routes/venues/telemetry",
-            params={"lookback_minutes": max(5, min(lookback_minutes, 1440))},
-        )
-        return _proxy_json_response(response)
+    response = await _downstream_get(
+        f"{EXECUTION_ROUTER_URL}/v1/routes/venues/telemetry",
+        timeout=10.0,
+        service="execution_router",
+        params={"lookback_minutes": max(5, min(lookback_minutes, 1440))},
+    )
+    return _proxy_json_response(response)
 
 
 @app.get("/v1/execution/optimizer/live-state")
 async def proxy_execution_optimizer_live_state(auth: AuthContext = Depends(any_read_auth)) -> dict:
     del auth
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(f"{EXECUTION_ROUTER_URL}/v1/execution-optimizer/live-state")
-        return _proxy_json_response(response)
+    response = await _downstream_get(f"{EXECUTION_ROUTER_URL}/v1/execution-optimizer/live-state", timeout=10.0, service="execution_router")
+    return _proxy_json_response(response)
 
 
 @app.get("/v1/execution-ai/v6/state")
 async def proxy_execution_ai_v6_state(auth: AuthContext = Depends(any_read_auth)) -> dict:
     del auth
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(f"{EXECUTION_ROUTER_URL}/v1/execution-ai/v6/state")
-        return _proxy_json_response(response)
+    response = await _downstream_get(f"{EXECUTION_ROUTER_URL}/v1/execution-ai/v6/state", timeout=10.0, service="execution_router")
+    return _proxy_json_response(response)
 
 
 async def _fetch_market_quotes() -> list[dict]:
@@ -19537,20 +19681,18 @@ async def proxy_embeddings_retrieval_kpi(window_hours: int = 24, auth: AuthConte
 @app.get("/v1/mt5/health")
 async def proxy_mt5_health(auth: AuthContext = Depends(viewer_auth)) -> dict:
     del auth
-    async with httpx.AsyncClient(timeout=12.0) as client:
-        response = await client.get(f"{MT5_BRIDGE_URL}/health")
-        if response.status_code >= 400:
-            raise HTTPException(status_code=502, detail="MT5 bridge unavailable")
-        return response.json()
+    response = await _downstream_get(f"{MT5_BRIDGE_URL}/health", timeout=12.0, service="mt5_bridge")
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail="MT5 bridge unavailable")
+    return response.json()
 
 
 @app.get("/v1/mt5/accounts")
 async def proxy_mt5_accounts(auth: AuthContext = Depends(viewer_auth)) -> list[dict]:
-    async with httpx.AsyncClient(timeout=12.0) as client:
-        response = await client.get(f"{MT5_BRIDGE_URL}/v1/accounts")
-        if response.status_code >= 400:
-            raise HTTPException(status_code=502, detail="MT5 bridge unavailable")
-        payload = response.json()
+    response = await _downstream_get(f"{MT5_BRIDGE_URL}/v1/accounts", timeout=12.0, service="mt5_bridge")
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail="MT5 bridge unavailable")
+    payload = response.json()
 
     accounts = payload if isinstance(payload, list) else []
     visible_accounts = _filter_mt5_accounts_for_auth(accounts, auth)
@@ -19581,11 +19723,14 @@ async def proxy_mt5_account_quote(account_id: str, symbol: str) -> dict:
     safe_symbol = str(symbol or "").strip().upper()
     if not safe_account_id or not safe_symbol:
         raise HTTPException(status_code=400, detail="account_id and symbol are required")
-    async with httpx.AsyncClient(timeout=12.0) as client:
-        response = await client.get(f"{MT5_BRIDGE_URL}/v1/accounts/{safe_account_id}/quote/{safe_symbol}")
-        if response.status_code >= 400:
-            raise HTTPException(status_code=502, detail="MT5 bridge unavailable")
-        return response.json()
+    response = await _downstream_get(
+        f"{MT5_BRIDGE_URL}/v1/accounts/{safe_account_id}/quote/{safe_symbol}",
+        timeout=12.0,
+        service="mt5_bridge",
+    )
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail="MT5 bridge unavailable")
+    return response.json()
 
 
 @app.post("/v1/mt5/accounts")

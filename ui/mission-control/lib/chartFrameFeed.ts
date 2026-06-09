@@ -60,13 +60,50 @@ export type LiveChartFrameBatch = {
   frames: LiveChartFrame[];
 };
 
+export type ChartFramePublishOutcome = "published" | "rejected-invalid-feed-key" | "rejected-empty" | "rejected-duplicate";
+
+export type ChartFramePublishResult = {
+  feedKey: string;
+  requestedAt: number;
+  publishedAt: number | null;
+  outcome: ChartFramePublishOutcome;
+  reason: string | null;
+  candleCount: number;
+  signature: string | null;
+  previousSignature: string | null;
+  requestedCount: number;
+  publishedCount: number;
+  rejectedCount: number;
+  meta: Pick<LiveChartFrameMeta, "syncStatus" | "partial" | "coalesced" | "confidence"> | null;
+};
+
 type LiveChartFrameListener = (frame: LiveChartFrame) => void;
 type LiveChartFrameBatchListener = (batch: LiveChartFrameBatch) => void;
 
 const frameListeners = new Map<string, Set<LiveChartFrameListener>>();
 const batchListeners = new Set<LiveChartFrameBatchListener>();
 const latestFrames = new Map<string, LiveChartFrame>();
+const latestPublishResults = new Map<string, ChartFramePublishResult>();
+const publishCounters = new Map<string, { requested: number; published: number; rejected: number }>();
 let latestBatch: LiveChartFrameBatch | null = null;
+
+function nextPublishCounters(feedKey: string): { requested: number; published: number; rejected: number } {
+  const previous = publishCounters.get(feedKey) || { requested: 0, published: 0, rejected: 0 };
+  const next = {
+    requested: previous.requested + 1,
+    published: previous.published,
+    rejected: previous.rejected,
+  };
+  publishCounters.set(feedKey, next);
+  return next;
+}
+
+function storePublishResult(result: ChartFramePublishResult): ChartFramePublishResult {
+  if (result.feedKey) {
+    latestPublishResults.set(result.feedKey, result);
+  }
+  return result;
+}
 
 function normalizeFrameTruth(truth?: Partial<LiveChartFrameTruth>): LiveChartFrameTruth {
   const integrityStatus = truth?.integrity_status === "clean" || truth?.integrity_status === "degraded" || truth?.integrity_status === "invalid"
@@ -207,28 +244,117 @@ function frameSignature(candles: LiveChartCandle[], meta: LiveChartFrameMeta): s
   ].join("|");
 }
 
-export function publishChartFrame(feedKey: string, candles: LiveChartCandle[], meta?: Partial<LiveChartFrameMeta>): void {
+export function publishChartFrame(feedKey: string, candles: LiveChartCandle[], meta?: Partial<LiveChartFrameMeta>): ChartFramePublishResult {
+  const requestedAt = Date.now();
   if (!feedKey) {
-    return;
+    return {
+      feedKey: "",
+      requestedAt,
+      publishedAt: null,
+      outcome: "rejected-invalid-feed-key",
+      reason: "feed_key_missing",
+      candleCount: Array.isArray(candles) ? candles.length : 0,
+      signature: null,
+      previousSignature: null,
+      requestedCount: 0,
+      publishedCount: 0,
+      rejectedCount: 1,
+      meta: null,
+    };
   }
+  const counters = nextPublishCounters(feedKey);
   const normalizedMeta = normalizeFrameMeta(meta);
-  const frame = buildFrameSnapshot(feedKey, candles, Date.now(), normalizedMeta);
+  const frame = buildFrameSnapshot(feedKey, candles, requestedAt, normalizedMeta);
   if (frame.candles.length === 0) {
-    return;
+    const nextCounters = {
+      requested: counters.requested,
+      published: counters.published,
+      rejected: counters.rejected + 1,
+    };
+    publishCounters.set(feedKey, nextCounters);
+    return storePublishResult({
+      feedKey,
+      requestedAt,
+      publishedAt: null,
+      outcome: "rejected-empty",
+      reason: "empty_candle_snapshot",
+      candleCount: 0,
+      signature: frame.signature,
+      previousSignature: latestFrames.get(feedKey)?.signature || null,
+      requestedCount: nextCounters.requested,
+      publishedCount: nextCounters.published,
+      rejectedCount: nextCounters.rejected,
+      meta: {
+        syncStatus: frame.meta.syncStatus,
+        partial: frame.meta.partial,
+        coalesced: frame.meta.coalesced,
+        confidence: frame.meta.confidence,
+      },
+    });
   }
   const signature = frame.signature;
   const previous = latestFrames.get(feedKey);
   if (previous?.signature === signature) {
-    return;
+    const nextCounters = {
+      requested: counters.requested,
+      published: counters.published,
+      rejected: counters.rejected + 1,
+    };
+    publishCounters.set(feedKey, nextCounters);
+    return storePublishResult({
+      feedKey,
+      requestedAt,
+      publishedAt: null,
+      outcome: "rejected-duplicate",
+      reason: "duplicate_signature",
+      candleCount: frame.candles.length,
+      signature,
+      previousSignature: previous.signature,
+      requestedCount: nextCounters.requested,
+      publishedCount: nextCounters.published,
+      rejectedCount: nextCounters.rejected,
+      meta: {
+        syncStatus: frame.meta.syncStatus,
+        partial: frame.meta.partial,
+        coalesced: frame.meta.coalesced,
+        confidence: frame.meta.confidence,
+      },
+    });
   }
   latestFrames.set(feedKey, frame);
+  const nextCounters = {
+    requested: counters.requested,
+    published: counters.published + 1,
+    rejected: counters.rejected,
+  };
+  publishCounters.set(feedKey, nextCounters);
   const listeners = frameListeners.get(feedKey);
+  const result = storePublishResult({
+    feedKey,
+    requestedAt,
+    publishedAt: frame.publishedAt,
+    outcome: "published",
+    reason: null,
+    candleCount: frame.candles.length,
+    signature,
+    previousSignature: previous?.signature || null,
+    requestedCount: nextCounters.requested,
+    publishedCount: nextCounters.published,
+    rejectedCount: nextCounters.rejected,
+    meta: {
+      syncStatus: frame.meta.syncStatus,
+      partial: frame.meta.partial,
+      coalesced: frame.meta.coalesced,
+      confidence: frame.meta.confidence,
+    },
+  });
   if (!listeners || listeners.size === 0) {
-    return;
+    return result;
   }
   for (const listener of listeners) {
     listener(frame);
   }
+  return result;
 }
 
 export function subscribeChartFrame(feedKey: string, listener: LiveChartFrameListener): () => void {
@@ -298,9 +424,17 @@ export function getLatestChartFrameBatch(): LiveChartFrameBatch | null {
   return latestBatch;
 }
 
+export function getLatestChartFramePublishResult(feedKey: string): ChartFramePublishResult | null {
+  if (!feedKey) {
+    return null;
+  }
+  return latestPublishResults.get(feedKey) || null;
+}
+
 export function clearChartFrame(feedKey: string): void {
   if (!feedKey) {
     return;
   }
   latestFrames.delete(feedKey);
+  latestPublishResults.delete(feedKey);
 }

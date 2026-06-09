@@ -3,7 +3,7 @@ type JsonMap = Record<string, unknown>;
 import { normalizeOhlcvRows, type NormalizedOhlcvBar } from "./ohlcvIntegrity";
 import { MarketDataEngineV5, type GapRange, type SyncedMarketFrame } from "./marketDataEngineV5";
 import type { DepthRow } from "./marketDataEngineV4";
-import { clearChartFrame, publishChartFrame, type LiveChartCandle, type LiveChartFrameMeta, type LiveChartFrameTruth } from "./chartFrameFeed";
+import { clearChartFrame, publishChartFrame, type ChartFramePublishResult, type LiveChartCandle, type LiveChartFrameMeta, type LiveChartFrameTruth } from "./chartFrameFeed";
 import { GoldenFrameSequenceGuard } from "./goldenFrameSequenceGuard";
 import { GoldenFrameWorkerAdapter, type GoldenFrameWorkerEvent, type GoldenFrameWorkerFrameInput, type GoldenFrameWorkerTelemetry } from "./goldenFrameWorkerAdapter";
 import { PriceFusionEngineV6, type RouteCandidate, type VenueQuote } from "./priceFusionEngineV6";
@@ -180,6 +180,76 @@ type WorkerPendingRenderFrame = PendingRenderFrame & {
   backlog: number;
   adaptiveGraceMs: number;
 };
+
+type CanonicalFrameProducerAudit = {
+  requestCount: number;
+  calculatedCount: number;
+  publishCount: number;
+  rejectCount: number;
+  lastOutcome: string;
+  lastPublishMode: "none" | "immediate" | "gated" | "worker";
+  lastRequestedAt: string | null;
+  lastCalculatedAt: string | null;
+  lastPublishedAt: string | null;
+  lastRejectedAt: string | null;
+  lastRejectedReason: string | null;
+  lastFeedKey: string | null;
+  lastCalculatedCandleCount: number;
+  lastPublishedCandleCount: number;
+};
+
+type CanonicalFrameIngressAudit = {
+  expected: boolean;
+  called: boolean;
+  source: string;
+  reason: string | null;
+  blockedBy: string | null;
+  symbol: string | null;
+  venue: string | null;
+  frameKey: string | null;
+  timestamp: string | null;
+  lastCandidateEvent: string | null;
+  candidateCount: number;
+  calledCount: number;
+  blockedCount: number;
+};
+
+function createCanonicalFrameProducerAudit(): CanonicalFrameProducerAudit {
+  return {
+    requestCount: 0,
+    calculatedCount: 0,
+    publishCount: 0,
+    rejectCount: 0,
+    lastOutcome: "idle",
+    lastPublishMode: "none",
+    lastRequestedAt: null,
+    lastCalculatedAt: null,
+    lastPublishedAt: null,
+    lastRejectedAt: null,
+    lastRejectedReason: null,
+    lastFeedKey: null,
+    lastCalculatedCandleCount: 0,
+    lastPublishedCandleCount: 0,
+  };
+}
+
+function createCanonicalFrameIngressAudit(): CanonicalFrameIngressAudit {
+  return {
+    expected: false,
+    called: false,
+    source: "none",
+    reason: null,
+    blockedBy: null,
+    symbol: null,
+    venue: null,
+    frameKey: null,
+    timestamp: null,
+    lastCandidateEvent: null,
+    candidateCount: 0,
+    calledCount: 0,
+    blockedCount: 0,
+  };
+}
 
 type StreamKind = "ohlcv" | "depth";
 
@@ -750,6 +820,8 @@ class MarketDataBus {
   private lastLiveReactBarTime = "";
   private currentDynamicBufferMs = RENDER_BUFFER_DEFAULT_MS;
   private lastCanonicalFramePublishedAt = 0;
+  private canonicalFrameProducerAudit: CanonicalFrameProducerAudit = createCanonicalFrameProducerAudit();
+  private canonicalFrameIngressAudit: CanonicalFrameIngressAudit = createCanonicalFrameIngressAudit();
   private lastDepthEventTsMs = 0;
   private lastDepthSequence: number | null = null;
   private lastTradeEventTsMs = 0;
@@ -814,15 +886,26 @@ class MarketDataBus {
       listener_count: this.listeners.size,
     };
     if (this.snapshot.configKey === nextKey) {
+      const hasSeededFrame = this.snapshot.ohlcvBars.length > 0 || this.lastCanonicalFramePublishedAt > 0;
       this.hydrationTrace = {
         ...this.hydrationTrace,
-        last_connect_short_circuit: "same-config-key",
+        last_connect_short_circuit: hasSeededFrame ? "same-config-key" : "same-config-key-without-seed",
       };
+      this.recordCanonicalFrameIngress({
+        source: "market_data_subscription",
+        called: false,
+        reason: "connect_same_config_key",
+        blockedBy: hasSeededFrame ? "same_config_reuse_existing_frame" : "same_config_short_circuit_without_seed",
+        frameKey: nextKey,
+      });
       this.snapshot = {
         ...this.snapshot,
         busMeta: this.buildWorkerBusMeta(this.snapshot.busMeta),
       };
       this.emit();
+      if (!hasSeededFrame) {
+        void this.refreshNow("ai");
+      }
       return;
     }
 
@@ -851,6 +934,13 @@ class MarketDataBus {
           lastCandleUpdateAt: nextBars.length > 0 ? new Date().toISOString() : this.snapshot.kernelTelemetry.lastCandleUpdateAt,
         },
       };
+      this.recordCanonicalFrameIngress({
+        source: "terminal_bootstrap",
+        called: nextBars.length > 0,
+        reason: "reuse_existing_engine_series",
+        blockedBy: nextBars.length > 0 ? null : "empty_engine_series",
+        frameKey: nextKey,
+      });
       this.publishEngineFrame(nextBars, nextKey);
       this.emit();
       void this.refreshNow("ai");
@@ -913,6 +1003,12 @@ class MarketDataBus {
     this.configureSyntheticHeartbeat();
     this.connectOhlcvSocket();
     this.connectDepthSocket();
+    this.recordCanonicalFrameIngress({
+      source: "market_data_subscription",
+      called: false,
+      reason: "connect_initialized_refresh_pending",
+      frameKey: nextKey,
+    });
     void this.refreshNow("ai");
   }
 
@@ -1061,7 +1157,128 @@ class MarketDataBus {
         ...this.hydrationTrace,
       },
       reconstruction: this.buildReconstructionFrameMeta(this.snapshot.ohlcvBars),
+      canonical_frame_producer: {
+        request_count: this.canonicalFrameProducerAudit.requestCount,
+        calculated_count: this.canonicalFrameProducerAudit.calculatedCount,
+        publish_count: this.canonicalFrameProducerAudit.publishCount,
+        reject_count: this.canonicalFrameProducerAudit.rejectCount,
+        last_outcome: this.canonicalFrameProducerAudit.lastOutcome,
+        last_publish_mode: this.canonicalFrameProducerAudit.lastPublishMode,
+        last_requested_at: this.canonicalFrameProducerAudit.lastRequestedAt,
+        last_calculated_at: this.canonicalFrameProducerAudit.lastCalculatedAt,
+        last_published_at: this.canonicalFrameProducerAudit.lastPublishedAt,
+        last_rejected_at: this.canonicalFrameProducerAudit.lastRejectedAt,
+        last_rejected_reason: this.canonicalFrameProducerAudit.lastRejectedReason,
+        last_feed_key: this.canonicalFrameProducerAudit.lastFeedKey,
+        last_calculated_candle_count: this.canonicalFrameProducerAudit.lastCalculatedCandleCount,
+        last_published_candle_count: this.canonicalFrameProducerAudit.lastPublishedCandleCount,
+      },
+      canonical_frame_ingress: {
+        expected: this.canonicalFrameIngressAudit.expected,
+        called: this.canonicalFrameIngressAudit.called,
+        source: this.canonicalFrameIngressAudit.source,
+        reason: this.canonicalFrameIngressAudit.reason,
+        blocked_by: this.canonicalFrameIngressAudit.blockedBy,
+        symbol: this.canonicalFrameIngressAudit.symbol,
+        venue: this.canonicalFrameIngressAudit.venue,
+        frame_key: this.canonicalFrameIngressAudit.frameKey,
+        timestamp: this.canonicalFrameIngressAudit.timestamp,
+        last_candidate_event: this.canonicalFrameIngressAudit.lastCandidateEvent,
+        candidate_count: this.canonicalFrameIngressAudit.candidateCount,
+        called_count: this.canonicalFrameIngressAudit.calledCount,
+        blocked_count: this.canonicalFrameIngressAudit.blockedCount,
+      },
     };
+  }
+
+  private updateCanonicalFrameProducerAudit(patch: Partial<CanonicalFrameProducerAudit>): void {
+    this.canonicalFrameProducerAudit = {
+      ...this.canonicalFrameProducerAudit,
+      ...patch,
+    };
+    this.snapshot = {
+      ...this.snapshot,
+      busMeta: this.buildWorkerBusMeta(this.snapshot.busMeta),
+    };
+  }
+
+  private recordCanonicalFrameIngress(input: {
+    source: string;
+    called: boolean;
+    reason?: string | null;
+    blockedBy?: string | null;
+    frameKey?: string | null;
+  }): void {
+    const called = Boolean(input.called);
+    const blockedBy = input.blockedBy || null;
+    this.canonicalFrameIngressAudit = {
+      expected: true,
+      called,
+      source: input.source,
+      reason: input.reason ?? null,
+      blockedBy,
+      symbol: this.config?.instrument || null,
+      venue: this.config?.venue || null,
+      frameKey: input.frameKey ?? (this.snapshot.configKey || null),
+      timestamp: new Date().toISOString(),
+      lastCandidateEvent: `${input.source}:${called ? "called" : blockedBy ? `blocked:${blockedBy}` : "candidate"}`,
+      candidateCount: this.canonicalFrameIngressAudit.candidateCount + 1,
+      calledCount: this.canonicalFrameIngressAudit.calledCount + (called ? 1 : 0),
+      blockedCount: this.canonicalFrameIngressAudit.blockedCount + (!called && blockedBy ? 1 : 0),
+    };
+    this.snapshot = {
+      ...this.snapshot,
+      busMeta: this.buildWorkerBusMeta(this.snapshot.busMeta),
+    };
+  }
+
+  private recordCanonicalFrameRequest(feedKey: string, mode: CanonicalFrameProducerAudit["lastPublishMode"]): void {
+    this.updateCanonicalFrameProducerAudit({
+      requestCount: this.canonicalFrameProducerAudit.requestCount + 1,
+      lastOutcome: "requested",
+      lastPublishMode: mode,
+      lastRequestedAt: new Date().toISOString(),
+      lastFeedKey: feedKey || null,
+    });
+  }
+
+  private recordCanonicalFrameCalculated(feedKey: string, mode: CanonicalFrameProducerAudit["lastPublishMode"], candleCount: number): void {
+    this.updateCanonicalFrameProducerAudit({
+      calculatedCount: this.canonicalFrameProducerAudit.calculatedCount + 1,
+      lastOutcome: "calculated",
+      lastPublishMode: mode,
+      lastCalculatedAt: new Date().toISOString(),
+      lastFeedKey: feedKey || null,
+      lastCalculatedCandleCount: Math.max(0, candleCount),
+    });
+  }
+
+  private recordCanonicalFrameRejected(feedKey: string, mode: CanonicalFrameProducerAudit["lastPublishMode"], reason: string): void {
+    this.updateCanonicalFrameProducerAudit({
+      rejectCount: this.canonicalFrameProducerAudit.rejectCount + 1,
+      lastOutcome: "rejected",
+      lastPublishMode: mode,
+      lastRejectedAt: new Date().toISOString(),
+      lastRejectedReason: reason,
+      lastFeedKey: feedKey || null,
+    });
+  }
+
+  private applyCanonicalFramePublishResult(result: ChartFramePublishResult, mode: CanonicalFrameProducerAudit["lastPublishMode"]): void {
+    if (result.outcome === "published") {
+      this.updateCanonicalFrameProducerAudit({
+        publishCount: this.canonicalFrameProducerAudit.publishCount + 1,
+        lastOutcome: "published",
+        lastPublishMode: mode,
+        lastPublishedAt: result.publishedAt ? new Date(result.publishedAt).toISOString() : new Date().toISOString(),
+        lastFeedKey: result.feedKey || null,
+        lastPublishedCandleCount: Math.max(0, result.candleCount),
+        lastRejectedReason: null,
+      });
+      this.lastCanonicalFramePublishedAt = Date.now();
+      return;
+    }
+    this.recordCanonicalFrameRejected(result.feedKey, mode, result.reason || result.outcome);
   }
 
   private buildReconstructionFrameMeta(bars: OhlcvBar[]): Partial<LiveChartFrameMeta> {
@@ -1303,8 +1520,10 @@ class MarketDataBus {
       return;
     }
 
-    publishChartFrame(event.frame.feedKey, event.frame.candles, event.frame.meta);
-    this.lastCanonicalFramePublishedAt = Date.now();
+    this.recordCanonicalFrameRequest(event.frame.feedKey, "worker");
+    this.recordCanonicalFrameCalculated(event.frame.feedKey, "worker", event.frame.candles.length);
+    const publishResult = publishChartFrame(event.frame.feedKey, event.frame.candles, event.frame.meta);
+    this.applyCanonicalFramePublishResult(publishResult, "worker");
     const partial = event.frame.meta.partial;
     const renderedFrames = this.snapshot.kernelTelemetry.renderedFrames + 1;
     const atomicFrames = this.snapshot.kernelTelemetry.atomicFrames + (partial ? 0 : 1);
@@ -1505,7 +1724,7 @@ class MarketDataBus {
         ? "coalesced"
         : "atomic";
     const confidence = this.computeFrameConfidence(pending, partial, stallAgeMs);
-    publishChartFrame(pending.feedKey, pending.candles, {
+    const publishResult = publishChartFrame(pending.feedKey, pending.candles, {
       ...(pending.reconstructionMeta || {}),
       syncStatus,
       partial,
@@ -1518,7 +1737,7 @@ class MarketDataBus {
       depthEventTs: pending.depthTsMs,
       tradeEventTs: pending.tradeTsMs,
     });
-    this.lastCanonicalFramePublishedAt = Date.now();
+    this.applyCanonicalFramePublishResult(publishResult, "gated");
     const renderedFrames = this.snapshot.kernelTelemetry.renderedFrames + 1;
     const atomicFrames = this.snapshot.kernelTelemetry.atomicFrames + (partial ? 0 : 1);
     const partialFrames = this.snapshot.kernelTelemetry.partialFrames + (partial ? 1 : 0);
@@ -1632,6 +1851,12 @@ class MarketDataBus {
   async refreshNow(requestType: MarketBusRequestType = "ai"): Promise<void> {
     const config = this.config;
     if (!config) {
+      this.recordCanonicalFrameIngress({
+        source: "runtime_snapshot",
+        called: false,
+        reason: `refresh_${requestType}`,
+        blockedBy: "missing_config",
+      });
       this.hydrationTrace = {
         ...this.hydrationTrace,
         last_refresh_stage: "failed",
@@ -1650,7 +1875,20 @@ class MarketDataBus {
     };
 
     const sideFetchConfigKey = `${config.instrument}|${config.venue}|${config.timeframe}`;
+    this.recordCanonicalFrameIngress({
+      source: "runtime_snapshot",
+      called: false,
+      reason: `refresh_${requestType}_started`,
+      frameKey: sideFetchConfigKey,
+    });
     if (this.sideFetchController && this.sideFetchConfigKey === sideFetchConfigKey) {
+      this.recordCanonicalFrameIngress({
+        source: "runtime_snapshot",
+        called: false,
+        reason: `refresh_${requestType}`,
+        blockedBy: "side_fetch_already_active",
+        frameKey: sideFetchConfigKey,
+      });
       this.hydrationTrace = {
         ...this.hydrationTrace,
         last_refresh_stage: "skipped",
@@ -1660,6 +1898,13 @@ class MarketDataBus {
     }
 
     if (Date.now() < this.snapshotFailureCooldownUntil) {
+      this.recordCanonicalFrameIngress({
+        source: "runtime_snapshot",
+        called: false,
+        reason: `refresh_${requestType}`,
+        blockedBy: "snapshot_retry_cooldown",
+        frameKey: sideFetchConfigKey,
+      });
       this.hydrationTrace = {
         ...this.hydrationTrace,
         last_refresh_stage: "skipped",
@@ -1703,6 +1948,13 @@ class MarketDataBus {
     ]);
 
     if (controller.signal.aborted || this.config?.instrument !== instrument || this.config?.timeframe !== config.timeframe || this.config?.venue !== venue) {
+      this.recordCanonicalFrameIngress({
+        source: "runtime_snapshot",
+        called: false,
+        reason: `refresh_${requestType}`,
+        blockedBy: "request_aborted_or_config_changed",
+        frameKey: sideFetchConfigKey,
+      });
       this.hydrationTrace = {
         ...this.hydrationTrace,
         last_refresh_stage: "aborted",
@@ -1815,6 +2067,12 @@ class MarketDataBus {
       this.engine.syncLatencyFromV4();
     }
     const canonicalBars = this.engine ? this.engine.getSeries(config.timeframe) : fallbackBars;
+    this.recordCanonicalFrameIngress({
+      source: "runtime_snapshot",
+      called: true,
+      reason: snapshotResponse.ok ? "snapshot_bootstrap" : "snapshot_fallback_bootstrap",
+      frameKey: sideFetchConfigKey,
+    });
     this.publishEngineFrame(canonicalBars, sideFetchConfigKey);
     const fallbackDepth = busPayload.depth_snapshot && typeof busPayload.depth_snapshot === "object"
       ? busPayload.depth_snapshot as JsonMap
@@ -2014,7 +2272,19 @@ class MarketDataBus {
         ...this.snapshot,
         ohlcvBars: nextBars || [],
       };
+      this.recordCanonicalFrameIngress({
+        source: "chart_tick",
+        called: true,
+        reason: source === "synthetic-heartbeat" ? "synthetic_heartbeat_tick" : "live_price_tick",
+      });
       this.publishEngineFrame(nextBars || []);
+    } else {
+      this.recordCanonicalFrameIngress({
+        source: "chart_tick",
+        called: false,
+        reason: source === "synthetic-heartbeat" ? "synthetic_heartbeat_tick" : "live_price_tick",
+        blockedBy: "tick_no_candle_change",
+      });
     }
     this.emit();
   }
@@ -2032,7 +2302,14 @@ class MarketDataBus {
   ): OhlcvBar[] {
     const bars = sourceBars || (this.engine ? this.engine.getSeries() : this.snapshot.ohlcvBars);
     const activeFeedKey = feedKey || this.snapshot.configKey;
-    if (!bars.length || !activeFeedKey) {
+    const publishMode = frameContext?.mode === "gated" ? "gated" : "immediate";
+    this.recordCanonicalFrameRequest(activeFeedKey || "", publishMode);
+    if (!activeFeedKey) {
+      this.recordCanonicalFrameRejected("", publishMode, "feed_key_missing");
+      return bars;
+    }
+    if (!bars.length) {
+      this.recordCanonicalFrameRejected(activeFeedKey, publishMode, "bars_missing");
       return bars;
     }
     const reconstructionMeta = this.buildReconstructionFrameMeta(bars);
@@ -2041,6 +2318,7 @@ class MarketDataBus {
       const swapped = this.engine.swapFrame(this.config?.timeframe);
       if (swapped.length > 0) {
         const candles = barsToLiveCandles(swapped);
+        this.recordCanonicalFrameCalculated(activeFeedKey, publishMode, candles.length);
         if (frameContext?.mode === "gated") {
           this.queueRenderFrame(candles, activeFeedKey, {
             tradeTsMs: frameContext.tradeTsMs,
@@ -2050,7 +2328,7 @@ class MarketDataBus {
             reconstructionMeta,
           });
         } else {
-          publishChartFrame(activeFeedKey, candles, {
+          const publishResult = publishChartFrame(activeFeedKey, candles, {
             ...reconstructionMeta,
             syncStatus: "atomic",
             partial: false,
@@ -2063,12 +2341,13 @@ class MarketDataBus {
             depthEventTs: this.lastDepthEventTsMs || null,
             tradeEventTs: this.lastTradeEventTsMs || null,
           });
-          this.lastCanonicalFramePublishedAt = Date.now();
+          this.applyCanonicalFramePublishResult(publishResult, "immediate");
         }
         return swapped;
       }
     }
     const candles = barsToLiveCandles(bars);
+    this.recordCanonicalFrameCalculated(activeFeedKey, publishMode, candles.length);
     if (frameContext?.mode === "gated") {
       this.queueRenderFrame(candles, activeFeedKey, {
         tradeTsMs: frameContext.tradeTsMs,
@@ -2078,7 +2357,7 @@ class MarketDataBus {
         reconstructionMeta,
       });
     } else {
-      publishChartFrame(activeFeedKey, candles, {
+      const publishResult = publishChartFrame(activeFeedKey, candles, {
         ...reconstructionMeta,
         syncStatus: "atomic",
         partial: false,
@@ -2091,7 +2370,7 @@ class MarketDataBus {
         depthEventTs: this.lastDepthEventTsMs || null,
         tradeEventTs: this.lastTradeEventTsMs || null,
       });
-      this.lastCanonicalFramePublishedAt = Date.now();
+      this.applyCanonicalFramePublishResult(publishResult, "immediate");
     }
     return bars;
   }
@@ -2194,6 +2473,11 @@ class MarketDataBus {
     }
 
     this.engine.syncLatencyFromV4();
+    this.recordCanonicalFrameIngress({
+      source: "market_data_subscription",
+      called: true,
+      reason: "accepted_live_trades",
+    });
     const mergedBars = this.publishEngineFrame();
     this.snapshot = {
       ...this.snapshot,
@@ -2631,6 +2915,11 @@ class MarketDataBus {
 
     this.engine.syncLatencyFromV4();
     this.lastTradeEventTsMs = Math.max(this.lastTradeEventTsMs, latestTradeTsMs);
+    this.recordCanonicalFrameIngress({
+      source: "market_data_subscription",
+      called: true,
+      reason: "trade_ring_drain",
+    });
     const mergedBars = this.publishEngineFrame(undefined, undefined, {
       mode: "gated",
       tradeTsMs: latestTradeTsMs || this.lastTradeEventTsMs,
@@ -3108,6 +3397,11 @@ class MarketDataBus {
               sequence: Number.isFinite(sequence) ? sequence : null,
             });
           }
+          this.recordCanonicalFrameIngress({
+            source: "runtime_snapshot",
+            called: true,
+            reason: "depth_snapshot",
+          });
           const nextBars = this.publishEngineFrame(this.snapshot.ohlcvBars, undefined, {
             mode: "gated",
             depthTsMs: eventTime,
@@ -3140,6 +3434,11 @@ class MarketDataBus {
               sequence: Number.isFinite(sequence) ? sequence : null,
             });
           }
+          this.recordCanonicalFrameIngress({
+            source: "runtime_snapshot",
+            called: true,
+            reason: "depth_delta",
+          });
           const nextBars = this.publishEngineFrame(this.snapshot.ohlcvBars, undefined, {
             mode: "gated",
             depthTsMs: eventTime,

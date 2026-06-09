@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 
 import { cpFetch } from "../../../../../lib/controlPlane";
+import { evaluateDecisionGovernanceCapability } from "../../../../../lib/decisionGovernanceControl";
+import { isSourceTreePromotionBlocked, readSourceTreeProvenanceAudit } from "../../../../../lib/sourceTreeProvenance";
 
 export async function POST(
   request: Request,
@@ -8,6 +10,24 @@ export async function POST(
 ): Promise<NextResponse> {
   const resolved = await params;
   const contentType = request.headers.get("content-type") || "";
+  const provenanceAudit = await readSourceTreeProvenanceAudit();
+  if (isSourceTreePromotionBlocked(provenanceAudit)) {
+    if (contentType.includes("application/json")) {
+      return NextResponse.json({
+        detail: "source_tree_provenance_blocked",
+        provenance: provenanceAudit,
+      }, { status: 412 });
+    }
+    return NextResponse.redirect(new URL("/?promote_error=source_tree_provenance_blocked", request.url));
+  }
+  const governance = await evaluateDecisionGovernanceCapability("alpha_v2");
+  if (!governance.allowed) {
+    if (contentType.includes("application/json")) {
+      return NextResponse.json(governance, { status: 412 });
+    }
+    return NextResponse.redirect(new URL("/?promote_error=decision_governance_blocked", request.url));
+  }
+
   if (contentType.includes("application/json")) {
     const payload = await request.json().catch(() => ({}));
     const response = await cpFetch(`/v1/strategies/${resolved.strategyId}/promote`, {

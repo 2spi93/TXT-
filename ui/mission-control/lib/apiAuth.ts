@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { getControlPlaneToken } from "./controlPlane";
+import { getServerRole } from "./serverAuth";
 
 export function unauthorizedJson(message = "Authentication required"): NextResponse {
   return NextResponse.json(
@@ -15,6 +15,6 @@ export function unauthorizedJson(message = "Authentication required"): NextRespo
 }
 
 export async function requireControlPlaneSession(): Promise<NextResponse | null> {
-  const token = await getControlPlaneToken();
-  return token ? null : unauthorizedJson();
+  const role = await getServerRole();
+  return role ? null : unauthorizedJson();
 }

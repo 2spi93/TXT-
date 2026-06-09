@@ -8,6 +8,7 @@ TERMINAL_PATH="${TERMINAL_PATH:-/terminal?engine=v4&terminal_passive_mode=1&boot
 READY_PATH="${READY_PATH:-/login}"
 HOST_JSONL_PATH="${OUT:-$ROOT_DIR/logs/terminal-truth-observer.jsonl}"
 STATE_FILE="${STATE_FILE:-$ROOT_DIR/logs/terminal-truth-observer.state.json}"
+CRASH_FORENSICS_DIR="${CRASH_FORENSICS_DIR:-$ROOT_DIR/logs/terminal_crash_forensics}"
 MISSION_CONTROL_UI_SLOT="${MISSION_CONTROL_UI_SLOT:-active}"
 MISSION_CONTROL_UI_CONTAINER="${MISSION_CONTROL_UI_CONTAINER:-}"
 BASE_URL_OVERRIDE="${BASE_URL:-}"
@@ -63,6 +64,7 @@ resolve_runtime_secret() {
 
 mkdir -p "$(dirname "$HOST_JSONL_PATH")"
 mkdir -p "$(dirname "$STATE_FILE")"
+mkdir -p "$CRASH_FORENSICS_DIR"
 
 TELEGRAM_BOT_TOKEN="$(resolve_runtime_secret "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_BOT_TOKEN_FILE")"
 TELEGRAM_CHAT_ID="$(resolve_runtime_secret "$TELEGRAM_CHAT_ID" "$TELEGRAM_CHAT_ID_FILE")"
@@ -139,8 +141,15 @@ try {
 build_error_record() {
   local reason="$1"
   local base_url="$2"
+  local snapshot_payload="${3:-}"
   local terminal_url="${base_url%/}${TERMINAL_PATH}"
-  node -e 'const record = { iteration: 1, capturedAt: new Date().toISOString(), status: "error", reason: process.argv[1], readyMs: null, terminalUrl: process.argv[2], state: null, responseErrors: [], requestFailures: [], consoleEvents: [], pageErrors: [] }; process.stdout.write(JSON.stringify(record));' "$reason" "$terminal_url"
+  node -e 'const reason = process.argv[1]; const terminalUrl = process.argv[2]; const snapshotRaw = process.argv[3] || ""; let snapshot = null; if (snapshotRaw) { try { snapshot = JSON.parse(snapshotRaw); } catch {} } const record = { iteration: 1, capturedAt: new Date().toISOString(), status: "error", reason, readyMs: null, terminalUrl, state: snapshot?.state ?? null, certification: snapshot?.certification ?? null, crashForensics: snapshot?.crashForensics ?? null, responseErrors: [], requestFailures: [], consoleEvents: [], pageErrors: [] }; if (snapshot?.phase) record.observerPhase = snapshot.phase; if (snapshot?.capturedAt) record.observerSnapshotCapturedAt = snapshot.capturedAt; process.stdout.write(JSON.stringify(record));' "$reason" "$terminal_url" "$snapshot_payload"
+}
+
+read_container_snapshot() {
+  local container="$1"
+  local snapshot_path="$2"
+  docker exec "$container" sh -lc "cat '$snapshot_path' 2>/dev/null || true; rm -f '$snapshot_path' >/dev/null 2>&1 || true" || true
 }
 
 with_observer_attempt_metadata() {
@@ -174,6 +183,26 @@ wait_until_ready() {
 append_host_record() {
   local record="$1"
   printf '%s\n' "$record" >>"$HOST_JSONL_PATH"
+}
+
+write_crash_forensics_record() {
+  local record="$1"
+  local status reason captured_at slot sanitized_reason timestamp_safe output_path
+  status="$(json_get_field "$record" status)"
+  if [[ "$status" != 'error' ]]; then
+    return 0
+  fi
+  reason="$(json_get_field "$record" reason)"
+  captured_at="$(json_get_field "$record" capturedAt)"
+  slot="$(json_get_field "$record" slot)"
+  sanitized_reason="$(printf '%s' "$reason" | tr -cs 'A-Za-z0-9._-' '-')"
+  sanitized_reason="${sanitized_reason#-}"
+  sanitized_reason="${sanitized_reason%-}"
+  sanitized_reason="${sanitized_reason:-error}"
+  timestamp_safe="${captured_at:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+  timestamp_safe="${timestamp_safe//:/-}"
+  output_path="$CRASH_FORENSICS_DIR/${timestamp_safe}-${slot:-unknown}-${sanitized_reason}.json"
+  printf '%s\n' "$record" >"$output_path"
 }
 
 read_previous_status() {
@@ -247,15 +276,17 @@ is_retryable_observer_reason() {
 run_single_observer_attempt() {
   local container="$1"
   local base_url="$2"
-  local stdout_summary detail_record container_output_path exit_code
+  local stdout_summary detail_record snapshot_record container_output_path snapshot_output_path exit_code
 
   container_output_path="${CONTAINER_OUTPUT_PATH}.$$.$RANDOM.jsonl"
+  snapshot_output_path="${container_output_path}.snapshot"
 
   set +e
   stdout_summary="$(timeout --kill-after=10s "${OBSERVER_ATTEMPT_TIMEOUT_SEC}s" docker exec -i \
     -e BASE_URL="$base_url" \
     -e TERMINAL_PATH="$TERMINAL_PATH" \
     -e OUT="$container_output_path" \
+    -e SNAPSHOT_OUT="$snapshot_output_path" \
     -e RUN_FOREVER=0 \
     -e ITERATIONS=1 \
     -e CHECK_EVERY_MS="$CYCLE_INTERVAL_MS" \
@@ -269,15 +300,17 @@ run_single_observer_attempt() {
     printf '%s\n' "$stdout_summary" >&2
   fi
 
+  snapshot_record="$(read_container_snapshot "$container" "$snapshot_output_path")"
+
   if [[ "$exit_code" -eq 124 || "$exit_code" -eq 137 ]]; then
     docker exec "$container" sh -lc "rm -f '$container_output_path'" >/dev/null 2>&1 || true
-    build_error_record "observer_attempt_timeout" "$base_url"
+    build_error_record "observer_attempt_timeout" "$base_url" "$snapshot_record"
     return 0
   fi
 
   detail_record="$(docker exec "$container" sh -lc "tail -n 1 '$container_output_path' 2>/dev/null || true; rm -f '$container_output_path'" )"
   if [[ -z "$detail_record" ]]; then
-    build_error_record "observer_output_missing" "$base_url"
+    build_error_record "observer_output_missing" "$base_url" "$snapshot_record"
     return 0
   fi
 
@@ -360,6 +393,7 @@ process_record() {
 
   enriched_record="$(with_observer_repeat_count "$record" "$current_repeat_count" "$alert_mode")"
   append_host_record "$enriched_record"
+  write_crash_forensics_record "$enriched_record"
   if [[ "$alert_mode" != 'none' ]]; then
     send_webhook_alert "$enriched_record" || printf '{"status":"error","reason":"webhook_delivery_failed","webhookUrl":"%s"}\n' "$WEBHOOK_URL" >&2
     if [[ "$AUTO_RECOVERY_ENABLED" == '1' && -x "$AUTO_RECOVERY_SCRIPT" ]]; then

@@ -44,7 +44,58 @@ function isTruthyEnvFlag(name: string): boolean {
 }
 
 function getFallbackControlPlaneToken(): string {
-  return process.env.CONTROL_PLANE_TOKEN || "";
+  return String(process.env.CONTROL_PLANE_INTERNAL_TOKEN || process.env.CONTROL_PLANE_TOKEN || "").trim();
+}
+
+async function readControlPlaneCookieTokens(): Promise<{ cookieToken: string; compatCookieToken: string }> {
+  let cookieToken = "";
+  let compatCookieToken = "";
+  try {
+    const maybeCookies = cookies as unknown as (() => Promise<{ get?: (name: string) => { value?: string } | undefined }>) | undefined;
+    const store = typeof maybeCookies === "function" ? await maybeCookies() : undefined;
+    cookieToken = store?.get?.("mc_token")?.value || "";
+    compatCookieToken = store?.get?.("mc_token_compat")?.value || "";
+  } catch {
+    cookieToken = "";
+    compatCookieToken = "";
+  }
+  return { cookieToken, compatCookieToken };
+}
+
+function isInternalControlPlaneCandidate(candidate: string): boolean {
+  return String(candidate).includes("/__mc_internal/control-plane");
+}
+
+function resolveControlPlaneAuthorizationToken(candidate: string, sessionToken: string, serviceToken: string): string {
+  if (isInternalControlPlaneCandidate(candidate)) {
+    return serviceToken || sessionToken;
+  }
+  return sessionToken;
+}
+
+type ControlPlaneAuthMode = "auto" | "service" | "session";
+
+type ControlPlaneFetchInit = RequestInit & {
+  authMode?: ControlPlaneAuthMode;
+};
+
+function resolveControlPlaneAuthMode(init: ControlPlaneFetchInit): ControlPlaneAuthMode {
+  return init.authMode || "auto";
+}
+
+function selectControlPlaneAuthorizationToken(
+  candidate: string,
+  sessionToken: string,
+  serviceToken: string,
+  authMode: ControlPlaneAuthMode,
+): string {
+  if (authMode === "service") {
+    return serviceToken;
+  }
+  if (authMode === "session") {
+    return sessionToken;
+  }
+  return resolveControlPlaneAuthorizationToken(candidate, sessionToken, serviceToken);
 }
 
 function isControlPlaneDevNoiseSuppressed(): boolean {
@@ -486,18 +537,13 @@ function toRouteFamily(path: string): string {
 }
 
 export async function getControlPlaneToken(): Promise<string> {
-  let cookieToken = "";
-  let compatCookieToken = "";
-  try {
-    const maybeCookies = cookies as unknown as (() => Promise<{ get?: (name: string) => { value?: string } | undefined }>) | undefined;
-    const store = typeof maybeCookies === "function" ? await maybeCookies() : undefined;
-    cookieToken = store?.get?.("mc_token")?.value || "";
-    compatCookieToken = store?.get?.("mc_token_compat")?.value || "";
-  } catch {
-    cookieToken = "";
-    compatCookieToken = "";
-  }
+  const { cookieToken, compatCookieToken } = await readControlPlaneCookieTokens();
   return cookieToken || compatCookieToken || getFallbackControlPlaneToken();
+}
+
+export async function getControlPlaneSessionToken(): Promise<string> {
+  const { cookieToken, compatCookieToken } = await readControlPlaneCookieTokens();
+  return cookieToken || compatCookieToken;
 }
 
 export function getControlPlaneUrl(): string {
@@ -664,14 +710,13 @@ export function extractMcContextHeaders(request: Request): Headers {
   return forwarded;
 }
 
-export async function cpFetch(path: string, init: RequestInit = {}): Promise<Response> {
-  const token = await getControlPlaneToken();
-  const headers = new Headers(init.headers || {});
+export async function cpFetch(path: string, init: ControlPlaneFetchInit = {}): Promise<Response> {
+  const sessionToken = await getControlPlaneSessionToken();
+  const serviceToken = getFallbackControlPlaneToken();
+  const baseHeaders = new Headers(init.headers || {});
   const method = getRequestMethod(init);
+  const authMode = resolveControlPlaneAuthMode(init);
   const requestPolicy = buildControlPlaneRequestPolicy(path, method);
-  if (token) {
-    headers.set("Authorization", `Bearer ${token}`);
-  }
   let lastError: unknown;
   let lastFailure: ControlPlaneFailureDetails | null = null;
   let attemptedBaseUrls: string[] = [];
@@ -689,6 +734,13 @@ export async function cpFetch(path: string, init: RequestInit = {}): Promise<Res
       for (let attemptIndex = 0; attemptIndex < requestPolicy.attempts; attemptIndex += 1) {
         attemptedTargets.push(`${candidate}#${attemptIndex + 1}`);
         try {
+          const headers = new Headers(baseHeaders);
+          const candidateToken = selectControlPlaneAuthorizationToken(candidate, sessionToken, serviceToken, authMode);
+          if (candidateToken) {
+            headers.set("Authorization", `Bearer ${candidateToken}`);
+          } else {
+            headers.delete("Authorization");
+          }
           const response = await fetch(`${candidate}${path}`, {
             ...init,
             headers,
@@ -870,7 +922,7 @@ export async function readJsonFromResponseSafe(response: Response): Promise<unkn
   }
 }
 
-export async function cpFetchJsonSafe(path: string, init: RequestInit = {}): Promise<{
+export async function cpFetchJsonSafe(path: string, init: ControlPlaneFetchInit = {}): Promise<{
   response: Response;
   payload: unknown;
   network: ControlPlaneNetworkMeta;

@@ -1,15 +1,21 @@
 import { NextResponse } from "next/server";
 
 import { requireControlPlaneSession } from "../../../../lib/apiAuth";
+import { buildCanonicalSpineHealthSnapshot, inspectCanonicalSpineSnapshotCache } from "../../../../lib/canonicalSpineHealth";
 import { cpFetchJsonSafe, getControlPlaneNetworkMetricsSnapshot, type ControlPlaneNetworkMeta } from "../../../../lib/controlPlane";
 import { getEdgeObservationSummary, type EdgeObservationSummary } from "../../../../lib/edgeObservation";
+import { buildHardeningAnalyticsSnapshot } from "../../../../lib/hardeningAnalytics";
+import { appendLiveOpsDiagnosticsSample, readLiveOpsDiagnosticsWindowSummary } from "../../../../lib/liveOpsDiagnosticsJournal";
 import { computeExecutionDomination } from "../../../../lib/liveOps/executionDominationEngine";
 import { classifyMarketState } from "../../../../lib/liveOps/marketStateEngine";
 import { detectSmartMoney } from "../../../../lib/liveOps/smartMoneyDetector";
 import { detectSpoofing } from "../../../../lib/liveOps/spoofDetectionEngine";
 import { evaluateVenueArbitrage, type VenueQuoteSnapshot } from "../../../../lib/liveOps/venueArbitrageEngine";
-import { buildRuntimeTruthSnapshot } from "../../../../lib/runtimeTruth";
+import { buildRuntimeTruthSnapshot, inspectRuntimeTruthCache } from "../../../../lib/runtimeTruth";
 import { getMetricsSnapshot } from "../../../../lib/shadowMode";
+import { readSourceTreeProvenanceAudit } from "../../../../lib/sourceTreeProvenance";
+import { buildTradeLifecycleHealthSnapshot } from "../../../../lib/tradeLifecycleHealth";
+import { buildTruthReliabilitySnapshot, type TruthReliabilitySnapshot } from "../../../../lib/truthReliabilityIndex";
 
 type JsonMap = Record<string, unknown>;
 
@@ -41,11 +47,30 @@ function sum(values: number[]): number {
   return values.reduce((total, value) => total + value, 0);
 }
 
+function dedupeNonEmptyStrings(values: Array<unknown>): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const normalized = String(value || "").trim();
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    result.push(normalized);
+  }
+  return result;
+}
+
 const WATCHDOG_FRESHNESS_WINDOW_MS = 30 * 60 * 1000;
 const LIVE_OPS_CORE_CP_FETCH_TIMEOUT_MS = 3_500;
 const LIVE_OPS_OPTIONAL_CP_FETCH_TIMEOUT_MS = 1_800;
 const LIVE_OPS_EDGE_OBSERVATION_TIMEOUT_MS = 700;
 const LIVE_OPS_SERVER_TRUTH_TIMEOUT_MS = 1_800;
+const LIVE_OPS_SERVER_PROJECTION_TIMEOUT_MS = 1_500;
+const LIVE_OPS_SOURCE_TREE_PROVENANCE_TIMEOUT_MS = 700;
+const LIVE_OPS_DIAGNOSTICS_HISTORY_TIMEOUT_MS = 250;
+const RUNTIME_TRUTH_TRI_TTL_MS = Math.max(1_000, toNumber(process.env.RUNTIME_TRUTH_SNAPSHOT_TTL_MS, 15_000));
+const CANONICAL_SPINE_TRI_TTL_MS = Math.max(1_000, toNumber(process.env.CANONICAL_SPINE_SNAPSHOT_TTL_MS, 60_000));
 
 type CpFetchJsonSafeResult = Awaited<ReturnType<typeof cpFetchJsonSafe>>;
 
@@ -130,6 +155,54 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: 
     }),
     timeoutPromise,
   ]);
+}
+
+async function withTimingAndTimeout<T>(
+  operation: () => Promise<T>,
+  timeoutMs: number,
+  fallback: T,
+): Promise<{
+  value: T;
+  duration_ms: number;
+  timed_out: boolean;
+  failed: boolean;
+}> {
+  const startedAtMs = Date.now();
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<{
+    value: T;
+    duration_ms: number;
+    timed_out: boolean;
+    failed: boolean;
+  }>((resolve) => {
+    timeoutId = setTimeout(() => {
+      resolve({
+        value: fallback,
+        duration_ms: Date.now() - startedAtMs,
+        timed_out: true,
+        failed: false,
+      });
+    }, timeoutMs);
+  });
+  const operationPromise = operation()
+    .then((value) => ({
+      value,
+      duration_ms: Date.now() - startedAtMs,
+      timed_out: false,
+      failed: false,
+    }))
+    .catch(() => ({
+      value: fallback,
+      duration_ms: Date.now() - startedAtMs,
+      timed_out: false,
+      failed: true,
+    }))
+    .finally(() => {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+    });
+  return Promise.race([operationPromise, timeoutPromise]);
 }
 
 function cpFetchJsonSafeBounded(path: string, timeoutMs = LIVE_OPS_CORE_CP_FETCH_TIMEOUT_MS): Promise<CpFetchJsonSafeResult> {
@@ -304,7 +377,12 @@ export async function GET(request: Request): Promise<NextResponse> {
   const auditFilter = String(url.searchParams.get("audit_filter") || "").trim();
   const shadowSnapshot = getMetricsSnapshot();
   const networkSnapshot = getControlPlaneNetworkMetricsSnapshot();
-  const [killSwitchResult, systemConfigResult, gateResult, telemetryResult, realityGapResult, auditResult, outcomesResult, dashboardResult, edgeObservationSummary, runtimeTruth] = await Promise.all([
+  const runtimeTruthInput = { symbol: "DESK", marketInstrument: "BTCUSDT", timeframe: "live", strategy: "live-ops" } as const;
+  const [runtimeTruthCacheAudit, canonicalSpineCacheAudit] = await Promise.all([
+    inspectRuntimeTruthCache(runtimeTruthInput),
+    inspectCanonicalSpineSnapshotCache({ sinceDays: 30 }),
+  ]);
+  const [killSwitchResult, systemConfigResult, gateResult, telemetryResult, realityGapResult, auditResult, outcomesResult, dashboardResult, connectorsStatusResult, mt5HealthResult, microLiveStageResult, edgeObservationSummary, runtimeTruthTimed, canonicalSpineTimed, tradeLifecycleHealthTimed, hardeningAnalytics30dTimed, sourceTreeProvenanceTimed] = await Promise.all([
     cpFetchJsonSafeBounded("/v1/system/kill-switch"),
     cpFetchJsonSafeBounded("/v1/system/config"),
     cpFetchJsonSafeBounded("/v1/system/opportunity-gate"),
@@ -313,13 +391,59 @@ export async function GET(request: Request): Promise<NextResponse> {
     cpFetchJsonSafeBounded("/v1/audit?limit=16", LIVE_OPS_OPTIONAL_CP_FETCH_TIMEOUT_MS),
     cpFetchJsonSafeBounded("/v1/outcomes/recent?limit=40", LIVE_OPS_OPTIONAL_CP_FETCH_TIMEOUT_MS),
     cpFetchJsonSafeBounded("/v1/dashboard/overview", LIVE_OPS_OPTIONAL_CP_FETCH_TIMEOUT_MS),
+    cpFetchJsonSafeBounded("/v1/connectors/status", LIVE_OPS_OPTIONAL_CP_FETCH_TIMEOUT_MS),
+    cpFetchJsonSafeBounded("/v1/mt5/health", LIVE_OPS_OPTIONAL_CP_FETCH_TIMEOUT_MS),
+    cpFetchJsonSafeBounded("/v1/system/micro-live-stage?provider=mt5", LIVE_OPS_OPTIONAL_CP_FETCH_TIMEOUT_MS),
     getEdgeObservationSummaryBounded(),
-    withTimeout(
-      buildRuntimeTruthSnapshot({ symbol: "DESK", marketInstrument: "BTCUSDT", timeframe: "live", strategy: "live-ops" }).catch(() => null),
+    withTimingAndTimeout(
+      () => buildRuntimeTruthSnapshot({ ...runtimeTruthInput, allowStaleOnMiss: true }),
       LIVE_OPS_SERVER_TRUTH_TIMEOUT_MS,
       null,
     ),
+    withTimingAndTimeout(
+      () => buildCanonicalSpineHealthSnapshot({ sinceDays: 30, allowStaleOnMiss: true }),
+      LIVE_OPS_SERVER_PROJECTION_TIMEOUT_MS,
+      null,
+    ),
+    withTimingAndTimeout(
+      () => buildTradeLifecycleHealthSnapshot({
+        sinceDays: 30,
+        truthReliabilityInput: {
+          spineMatchRatePct: 0,
+          runtimeTruthSnapshotAgeMs: runtimeTruthCacheAudit.age_ms,
+          canonicalSpineSnapshotAgeMs: canonicalSpineCacheAudit.age_ms,
+          runtimeTruthTtlMs: RUNTIME_TRUTH_TRI_TTL_MS,
+          canonicalSpineTtlMs: CANONICAL_SPINE_TRI_TTL_MS,
+        },
+      }),
+      LIVE_OPS_SERVER_PROJECTION_TIMEOUT_MS,
+      null,
+    ),
+    withTimingAndTimeout(
+      () => buildHardeningAnalyticsSnapshot({ sinceDays: 30 }),
+      LIVE_OPS_SERVER_PROJECTION_TIMEOUT_MS,
+      null,
+    ),
+    withTimingAndTimeout(
+      () => readSourceTreeProvenanceAudit(),
+      LIVE_OPS_SOURCE_TREE_PROVENANCE_TIMEOUT_MS,
+      {
+        workspace_commit: null,
+        runtime_commit: null,
+        build_commit: null,
+        active_slot_commit: null,
+        commit_alignment_rate: 0,
+        status: "UNKNOWN",
+        observable_commit_count: 0,
+        aligned_commit_count: 0,
+        publish_blocked: true,
+      },
+    ),
   ]);
+  const runtimeTruth = runtimeTruthTimed.value;
+  const canonicalSpine = canonicalSpineTimed.value;
+  let tradeLifecycleHealth = tradeLifecycleHealthTimed.value;
+  const hardeningAnalytics30d = hardeningAnalytics30dTimed.value;
   const boundedTimeoutPaths = [
     ["/v1/system/kill-switch", killSwitchResult],
     ["/v1/system/config", systemConfigResult],
@@ -329,11 +453,68 @@ export async function GET(request: Request): Promise<NextResponse> {
     ["/v1/audit", auditResult],
     ["/v1/outcomes/recent", outcomesResult],
     ["/v1/dashboard/overview", dashboardResult],
+    ["/v1/connectors/status", connectorsStatusResult],
+    ["/v1/mt5/health", mt5HealthResult],
+    ["/v1/system/micro-live-stage?provider=mt5", microLiveStageResult],
   ].filter(([, result]) => (result as CpFetchJsonSafeResult).network.failure_classification === "timeout")
     .map(([path]) => String(path));
   if (edgeObservationSummary.filePath === "timeout") {
     boundedTimeoutPaths.push("edge_observation_summary");
   }
+  const localProjectionTimeoutPaths = [
+    runtimeTruthTimed.timed_out ? "runtime_truth" : null,
+    canonicalSpineTimed.timed_out ? "canonical_spine" : null,
+    tradeLifecycleHealthTimed.timed_out ? "trade_lifecycle_health" : null,
+    hardeningAnalytics30dTimed.timed_out ? "hardening_analytics_30d" : null,
+    sourceTreeProvenanceTimed.timed_out ? "source_tree_provenance" : null,
+  ].filter(Boolean) as string[];
+  const localProjectionFailedPaths = [
+    runtimeTruthTimed.failed ? "runtime_truth" : null,
+    canonicalSpineTimed.failed ? "canonical_spine" : null,
+    tradeLifecycleHealthTimed.failed ? "trade_lifecycle_health" : null,
+    hardeningAnalytics30dTimed.failed ? "hardening_analytics_30d" : null,
+    sourceTreeProvenanceTimed.failed ? "source_tree_provenance" : null,
+  ].filter(Boolean) as string[];
+  const degradedProjectionPaths = [...new Set([...localProjectionTimeoutPaths, ...localProjectionFailedPaths])];
+  const runtimeTruthSourceDiagnostics = asRecord(asRecord(runtimeTruth).source_diagnostics);
+  const canonicalSpineSourceDiagnostics = asRecord(asRecord(canonicalSpine).source_diagnostics);
+  const tradeLifecycleHealthSourceDiagnostics = asRecord(asRecord(tradeLifecycleHealth).source_diagnostics);
+  const hardeningAnalyticsSourceDiagnostics = asRecord(asRecord(hardeningAnalytics30d).source_diagnostics);
+  const computedTruthReliability = buildTruthReliabilitySnapshot({
+    decisionContinuityPct: toNumber(asRecord(tradeLifecycleHealth).decision_continuity_score_pct, 0),
+    evidenceQualityPct: toNumber(asRecord(asRecord(tradeLifecycleHealth).decision_evidence_quality).score_pct, 0),
+    spineMatchRatePct: toNumber(asRecord(canonicalSpine).spine_match_rate_pct, 0),
+    runtimeTruthSnapshotAgeMs: runtimeTruthCacheAudit.age_ms,
+    canonicalSpineSnapshotAgeMs: canonicalSpineCacheAudit.age_ms,
+    runtimeTruthTtlMs: RUNTIME_TRUTH_TRI_TTL_MS,
+    canonicalSpineTtlMs: CANONICAL_SPINE_TRI_TTL_MS,
+  });
+  if (tradeLifecycleHealth && typeof tradeLifecycleHealth === "object") {
+    tradeLifecycleHealth = {
+      ...tradeLifecycleHealth,
+      tri_score: computedTruthReliability.score_pct,
+      tri_status: computedTruthReliability.status,
+      tri_cap: computedTruthReliability.cap_pct,
+      tri_continuity: computedTruthReliability.components.decision_continuity_pct,
+      tri_evidence: computedTruthReliability.components.evidence_quality_pct,
+      tri_spine_match: computedTruthReliability.components.spine_match_rate_pct,
+      tri_freshness: computedTruthReliability.components.snapshot_freshness_pct,
+      truth_reliability_index: computedTruthReliability,
+    };
+  }
+  const decisionJourneyCompletion = asRecord(asRecord(tradeLifecycleHealth).decision_journey_completion);
+  const decisionGovernance = asRecord(asRecord(tradeLifecycleHealth).decision_governance);
+  const journeyCompletionRatePct = toNumber(
+    decisionJourneyCompletion.completion_rate_pct,
+    toNumber(asRecord(tradeLifecycleHealth).decision_continuity_score_pct, 0),
+  );
+  const createdDecisionTotal = toNumber(decisionJourneyCompletion.created_decision_total, 0);
+  const completeDecisionTotal = toNumber(decisionJourneyCompletion.complete_decision_total, 0);
+  const sourceTreeCertificationCapPct = sourceTreeProvenanceTimed.value.observable_commit_count < 4
+    ? 0
+    : sourceTreeProvenanceTimed.value.commit_alignment_rate;
+  const certifiedTriPct = Math.min(computedTruthReliability.score_pct, sourceTreeCertificationCapPct);
+  const certifiedJourneyCompletionPct = Math.min(journeyCompletionRatePct, sourceTreeCertificationCapPct);
   const criticalControlPlaneTimeout = boundedTimeoutPaths.some((path) => path === "/v1/system/kill-switch" || path === "/v1/system/config");
 
   const killSwitchPayload = asRecord(killSwitchResult.payload);
@@ -349,6 +530,19 @@ export async function GET(request: Request): Promise<NextResponse> {
   const outcomesRows = asArray<JsonMap>(outcomesResult.payload);
   const systemConfig = asRecord(systemConfigResult.payload);
   const dashboard = asRecord(dashboardResult.payload);
+  const connectorsStatusRows = asArray<JsonMap>(connectorsStatusResult.payload);
+  const mt5Health = asRecord(mt5HealthResult.payload);
+  const microLiveStage = asRecord(microLiveStageResult.payload);
+  const microLiveEnvelope = asRecord(microLiveStage.micro_live);
+  const microLiveState = asRecord(microLiveEnvelope.state);
+  const microLiveCurrentStageConfig = asRecord(microLiveEnvelope.current_stage_config);
+  const microLiveCurrentStageAutoSizing = asRecord(microLiveCurrentStageConfig.auto_sizing);
+  const microLiveStageBuckets = asArray<JsonMap>(microLiveCurrentStageAutoSizing.buckets);
+  const microLivePhaseHistory = asArray<JsonMap>(microLiveState.history);
+  const microLiveHardening = asRecord(microLiveStage.go_live_hardening);
+  const microLiveNoTradePolicy = asRecord(microLiveHardening.no_trade_policy);
+  const microLiveDrawdownVelocity = asRecord(microLiveHardening.drawdown_velocity);
+  const microLiveOracleStability = asRecord(microLiveHardening.oracle_stability);
 
   const nowMs = Date.now();
   const operationalTelemetryRows = telemetryRows.filter((row) => isFreshOperationalRow(row, nowMs) && !hasSyntheticHarnessMarker(row));
@@ -415,6 +609,42 @@ export async function GET(request: Request): Promise<NextResponse> {
       ? String(preTradeMemoryGate.status).toUpperCase()
       : "OK";
   const dominantCause = String(asRecord(latestGap).failure_source || (asArray<string>(asRecord(latestGap).failure_reasons)[0] || "none")).trim() || "none";
+  const mt5BridgeHealthy = String(mt5Health.status || "").trim().toLowerCase() === "healthy";
+  const degradedConnectors = connectorsStatusRows
+    .filter((row) => !Boolean(row.healthy))
+    .map((row) => String(row.name || row.provider || row.transport || "unknown").trim() || "unknown")
+    .slice(0, 8);
+  const microLiveCurrentStage = String(microLiveEnvelope.current_stage || microLiveState.current_stage || "").trim();
+  const microLiveStageCapUsd = toNumber(microLiveCurrentStageConfig.max_order_notional_usd, 0);
+  const microLiveStageAvailable = Boolean(microLiveCurrentStage) && microLiveStageCapUsd > 0;
+  const microLiveHardeningStatus = String(microLiveHardening.status || hardening.status || "unknown").trim().toUpperCase();
+  const microLiveHardeningReasons = asArray<string>(microLiveHardening.reasons).map((item) => String(item)).filter(Boolean);
+  const microLiveEntryReasons = dedupeNonEmptyStrings([
+    !mt5BridgeHealthy ? `mt5_bridge_${String(mt5Health.status || "unknown").toLowerCase() || "unknown"}` : null,
+    degradedConnectors.length > 0 ? `connecteurs_degrades:${degradedConnectors.join(",")}` : null,
+    Boolean(dashboard.paper_only) ? "paper_only_active" : null,
+    !microLiveStageAvailable ? "micro_live_stage_unavailable" : null,
+  ]);
+  const microLiveCutSwitches = dedupeNonEmptyStrings([
+    killSwitchActive ? `kill_switch_active:${String(killSwitchState.reason || "execution_locked")}` : null,
+    gateKnown && !gateEnabled ? `opportunity_gate_blocked:${String(gateState.status || "no-go")}` : null,
+    runtimeTruthVerdict === "BLOCKED" ? `runtime_truth_blocked:${runtimeTruthBlockers.join(",") || String(runtimeTruthRecord.summary || "canonical truth blocked")}` : null,
+    effectiveWatchdogStatus === "HALT" ? "watchdog_halt" : null,
+    microLiveHardeningStatus === "BLOCKED" ? `hardening_blocked:${microLiveHardeningReasons.join(",") || "hardening"}` : null,
+    Boolean(microLiveDrawdownVelocity.blocked) ? "drawdown_velocity_blocked" : null,
+    Boolean(microLiveOracleStability.blocked) ? "oracle_stability_blocked" : null,
+  ]);
+  const microLiveWarningReasons = dedupeNonEmptyStrings([
+    runtimeTruthVerdict === "DEGRADED" ? `runtime_truth_degraded:${runtimeTruthDetails.join(",") || String(runtimeTruthRecord.summary || "runtime truth degraded")}` : null,
+    effectiveWatchdogStatus === "WARNING" ? "watchdog_warning" : null,
+    avgLatencyMs > 120 ? `latency_${avgLatencyMs.toFixed(0)}ms` : null,
+    avgSlippageBps > 3 ? `slippage_${avgSlippageBps.toFixed(2)}bps` : null,
+  ]);
+  const microLiveEntryStatus = microLiveCutSwitches.length > 0 || microLiveEntryReasons.length > 0
+    ? "BLOCKED"
+    : microLiveWarningReasons.length > 0
+      ? "REDUCE"
+      : "OPEN";
 
   const quotes: VenueQuoteSnapshot[] = operationalTelemetryRows.slice(0, 4).map((row, index) => ({
     venue: String(row.route_chosen || row.route_backup || `venue-${index + 1}`).trim().toLowerCase() || `venue-${index + 1}`,
@@ -461,6 +691,8 @@ export async function GET(request: Request): Promise<NextResponse> {
     runtimeTruthVerdict === "BLOCKED" ? { severity: "critical", code: "runtime_truth_blocked", message: "Runtime truth blocked", detail: runtimeTruthBlockers.join(", ") || String(runtimeTruthRecord.summary || "canonical truth blocked") } : null,
     runtimeTruthVerdict === "DEGRADED" ? { severity: "warn", code: "runtime_truth_degraded", message: "Runtime truth degraded", detail: runtimeTruthDetails.join(", ") || String(runtimeTruthRecord.summary || "canonical truth degraded") } : null,
     boundedTimeoutPaths.length > 0 ? { severity: criticalControlPlaneTimeout ? "critical" : "warn", code: "live_ops_partial_data", message: "Live Ops partial data", detail: boundedTimeoutPaths.join(", ") } : null,
+    localProjectionTimeoutPaths.length > 0 ? { severity: "warn", code: "live_ops_projection_timeout", message: "Live Ops local projections timed out", detail: localProjectionTimeoutPaths.join(", ") } : null,
+    localProjectionFailedPaths.length > 0 ? { severity: "warn", code: "live_ops_projection_failed", message: "Live Ops local projections failed", detail: localProjectionFailedPaths.join(", ") } : null,
     avgDriftScore > 0.2 ? { severity: "warn", code: "execution_drift", message: "Execution drift detected", detail: `drift=${avgDriftScore.toFixed(3)}` } : null,
     avgSlippageBps > 10 ? { severity: "warn", code: "slippage_spike", message: "Slippage spike", detail: `${avgSlippageBps.toFixed(2)} bps` } : null,
     gateKnown && !gateEnabled ? { severity: "critical", code: "opportunity_gate_blocked", message: "Opportunity gate blocked", detail: String(gateReasons.join(", ") || "gate blocked") } : null,
@@ -485,8 +717,7 @@ export async function GET(request: Request): Promise<NextResponse> {
 
   const auditTrail = buildAuditTrail(auditRows, telemetryRows, realityGapRows);
   const filteredAuditTrail = filterAuditTrailRows(auditTrail, auditFilter);
-
-  return NextResponse.json({
+  const responseBody = {
     status: "ok",
     generated_at: new Date().toISOString(),
     watchdog_state: {
@@ -525,6 +756,10 @@ export async function GET(request: Request): Promise<NextResponse> {
       operator_override: !killSwitchActive,
       high_risk_trades_blocked: killSwitchActive || mapSystemMode(String(systemConfig.system_mode || dashboard.system_mode || "guarded_auto"), killSwitchActive) !== "LIVE",
       paper_only: Boolean(dashboard.paper_only),
+      advanced_programs_frozen: Array.isArray(decisionGovernance.freeze_controls)
+        ? decisionGovernance.freeze_controls.some((entry) => Boolean(asRecord(entry).frozen))
+        : false,
+      decision_system: decisionGovernance,
       opportunity_gate: gateState,
     },
     recovery: {
@@ -563,6 +798,152 @@ export async function GET(request: Request): Promise<NextResponse> {
       staleness: edgeObservationSummary.staleness,
       latest_classified_intent_at: edgeObservationSummary.latestClassifiedIntentAt,
     },
+    micro_live_program: {
+      provider: "mt5",
+      entry_status: microLiveEntryStatus,
+      entry_reasons: microLiveEntryReasons,
+      warning_reasons: microLiveWarningReasons,
+      active_cut_switches: microLiveCutSwitches,
+      infrastructure: {
+        mt5_bridge_status: String(mt5Health.status || "unknown"),
+        mt5_accounts: toNumber(mt5Health.accounts, 0),
+        degraded_connector_count: degradedConnectors.length,
+        degraded_connectors: degradedConnectors,
+        opportunity_gate_status: gateKnown ? String(gateState.status || (gateEnabled ? "go" : "no-go")) : "unknown",
+        paper_only: Boolean(dashboard.paper_only),
+        watchdog_status: effectiveWatchdogStatus,
+        backend_mode: String(systemConfig.system_mode || dashboard.system_mode || "guarded_auto"),
+      },
+      session_targets: {
+        created_decisions_target: 100,
+        complete_decisions_target: 50,
+        micro_executions_target_min: 100,
+        micro_executions_target_max: 500,
+      },
+      progress: {
+        created_decisions: createdDecisionTotal,
+        complete_decisions: completeDecisionTotal,
+        created_progress_pct: Number(((Math.min(createdDecisionTotal, 100) / 100) * 100).toFixed(1)),
+        complete_progress_pct: Number(((Math.min(completeDecisionTotal, 50) / 50) * 100).toFixed(1)),
+      },
+      stage: {
+        current_stage: microLiveCurrentStage || null,
+        max_order_notional_usd: microLiveStageCapUsd,
+        max_notional_pct_of_exploitable_capital: toNumber(microLiveCurrentStageConfig.max_notional_pct_of_exploitable_capital, 0),
+        buckets: microLiveStageBuckets,
+        transition_history: microLivePhaseHistory.slice(0, 8),
+      },
+      hardening: {
+        status: microLiveHardeningStatus,
+        reasons: microLiveHardeningReasons,
+        no_trade_policy: microLiveNoTradePolicy,
+        drawdown_velocity: microLiveDrawdownVelocity,
+        oracle_stability: microLiveOracleStability,
+      },
+    },
+    canonical_spine: canonicalSpine,
+    trade_lifecycle_health: tradeLifecycleHealth,
+    source_tree_provenance: sourceTreeProvenanceTimed.value,
+    source_tree_certification: {
+      cap_pct: Number(sourceTreeCertificationCapPct.toFixed(1)),
+      certified_tri_pct: Number(certifiedTriPct.toFixed(1)),
+      certified_journey_completion_pct: Number(certifiedJourneyCompletionPct.toFixed(1)),
+      blocked: sourceTreeProvenanceTimed.value.publish_blocked,
+      rule: sourceTreeProvenanceTimed.value.publish_blocked
+        ? "commit_alignment_rate < 100 or observability < 4 forbids promotion and caps certified KPIs"
+        : "full provenance alignment allows uncapped certified KPIs",
+    },
+    hardening_analytics_30d: hardeningAnalytics30d,
+    live_ops_diagnostics: {
+      aggregate_window_days: 30,
+      runtime_truth_ms: runtimeTruthTimed.duration_ms,
+      canonical_spine_ms: canonicalSpineTimed.duration_ms,
+      trade_lifecycle_ms: tradeLifecycleHealthTimed.duration_ms,
+      source_tree_provenance_ms: sourceTreeProvenanceTimed.duration_ms,
+      hardening_analytics_ms: hardeningAnalytics30dTimed.duration_ms,
+      timeout_projections: localProjectionTimeoutPaths,
+      degraded_projections: degradedProjectionPaths,
+      control_plane_timeout_paths: boundedTimeoutPaths,
+      local_projection_timeout_paths: localProjectionTimeoutPaths,
+      local_projection_failed_paths: localProjectionFailedPaths,
+      projection_durations_ms: {
+        runtime_truth: runtimeTruthTimed.duration_ms,
+        canonical_spine: canonicalSpineTimed.duration_ms,
+        trade_lifecycle_health: tradeLifecycleHealthTimed.duration_ms,
+        source_tree_provenance: sourceTreeProvenanceTimed.duration_ms,
+        hardening_analytics_30d: hardeningAnalytics30dTimed.duration_ms,
+      },
+      projection_source_audits: {
+        runtime_truth: {
+          rows_scanned: toNumber(runtimeTruthSourceDiagnostics.rows_scanned, 0),
+          rows_returned: toNumber(runtimeTruthSourceDiagnostics.rows_returned, 0),
+          cache_hit: runtimeTruthCacheAudit.cache_hit,
+          cache_miss: runtimeTruthCacheAudit.cache_miss,
+          cache_age_ms: runtimeTruthCacheAudit.age_ms,
+        },
+        canonical_spine: {
+          rows_scanned: toNumber(canonicalSpineSourceDiagnostics.rows_scanned, 0),
+          rows_returned: toNumber(canonicalSpineSourceDiagnostics.rows_returned, 0),
+          cache_hit: canonicalSpineCacheAudit.cache_hit,
+          cache_miss: canonicalSpineCacheAudit.cache_miss,
+          cache_age_ms: canonicalSpineCacheAudit.age_ms,
+        },
+        trade_lifecycle_health: {
+          rows_scanned: toNumber(tradeLifecycleHealthSourceDiagnostics.rows_scanned, 0),
+          rows_returned: toNumber(tradeLifecycleHealthSourceDiagnostics.rows_returned, 0),
+          cache_hit: 0,
+          cache_miss: 1,
+          cache_age_ms: null,
+        },
+        source_tree_provenance: {
+          rows_scanned: 4,
+          rows_returned: [
+            sourceTreeProvenanceTimed.value.workspace_commit,
+            sourceTreeProvenanceTimed.value.runtime_commit,
+            sourceTreeProvenanceTimed.value.build_commit,
+            sourceTreeProvenanceTimed.value.active_slot_commit,
+          ].filter(Boolean).length,
+          cache_hit: 0,
+          cache_miss: 1,
+          cache_age_ms: null,
+        },
+        hardening_analytics_30d: {
+          rows_scanned: toNumber(hardeningAnalyticsSourceDiagnostics.rows_scanned, 0),
+          rows_returned: toNumber(hardeningAnalyticsSourceDiagnostics.rows_returned, 0),
+          cache_hit: 0,
+          cache_miss: 1,
+          cache_age_ms: null,
+        },
+      },
+      measurement_window_7d: null,
+      runtime_truth_cache_hit_rate_24h: 0,
+      canonical_spine_cache_hit_rate_24h: 0,
+      runtime_truth_rebuild_count_24h: 0,
+      canonical_spine_rebuild_count_24h: 0,
+      runtime_truth_avg_snapshot_age_ms_24h: 0,
+      runtime_truth_max_snapshot_age_ms_24h: 0,
+      canonical_spine_avg_snapshot_age_ms_24h: 0,
+      canonical_spine_max_snapshot_age_ms_24h: 0,
+      truth_reliability_index_pct: 0,
+      truth_reliability_index: {
+        score_pct: 0,
+        raw_score_pct: 0,
+        status: "unusable",
+        cap_pct: null,
+        cap_reasons: [],
+        components: {
+          decision_continuity_pct: 0,
+          evidence_quality_pct: 0,
+          spine_match_rate_pct: 0,
+          snapshot_freshness_pct: 0,
+          runtime_truth_snapshot_age_ms: null,
+          canonical_spine_snapshot_age_ms: null,
+        },
+      },
+      payload_size_bytes: 0,
+      payload_bytes: 0,
+      measurement_window_30d: null,
+    },
     alerts,
     warfare_core: {
       arbitrage,
@@ -575,13 +956,192 @@ export async function GET(request: Request): Promise<NextResponse> {
       runtime_truth: runtimeTruth,
       kill_switch: killSwitchPayload,
       opportunity_gate: gatePayload,
+      connectors_status: connectorsStatusRows,
+      mt5_health: mt5Health,
+      micro_live_stage: microLiveStage,
       network: networkSnapshot,
       shadow: {
         fallback_rate: shadowSnapshot.fallback_rate,
         metrics: shadowSnapshot.metrics,
       },
     },
-  }, {
+  };
+  const tradeLifecycleTruthReliability = asRecord(asRecord(tradeLifecycleHealth).truth_reliability_index);
+  const truthReliability = Object.keys(tradeLifecycleTruthReliability).length > 0
+    ? tradeLifecycleTruthReliability as unknown as TruthReliabilitySnapshot
+    : computedTruthReliability;
+  responseBody.live_ops_diagnostics.truth_reliability_index_pct = truthReliability.score_pct;
+  responseBody.live_ops_diagnostics.truth_reliability_index = truthReliability;
+  const diagnosticsHistoryTimed = await withTimingAndTimeout(
+    () => readLiveOpsDiagnosticsWindowSummary({ sinceDays: 7, limit: 5000 }),
+    LIVE_OPS_DIAGNOSTICS_HISTORY_TIMEOUT_MS,
+    null,
+  );
+  const diagnosticsHistory30dTimed = await withTimingAndTimeout(
+    () => readLiveOpsDiagnosticsWindowSummary({ sinceDays: 30, limit: 10000 }),
+    LIVE_OPS_DIAGNOSTICS_HISTORY_TIMEOUT_MS,
+    null,
+  );
+  const diagnosticsHistory24hTimed = await withTimingAndTimeout(
+    () => readLiveOpsDiagnosticsWindowSummary({ sinceDays: 1, limit: 2000 }),
+    LIVE_OPS_DIAGNOSTICS_HISTORY_TIMEOUT_MS,
+    null,
+  );
+  if (diagnosticsHistoryTimed.value) {
+    responseBody.live_ops_diagnostics.measurement_window_7d = diagnosticsHistoryTimed.value;
+  }
+  if (diagnosticsHistory30dTimed.value) {
+    responseBody.live_ops_diagnostics.measurement_window_30d = diagnosticsHistory30dTimed.value;
+  }
+  if (diagnosticsHistory24hTimed.value) {
+    const runtimeTruth24h = diagnosticsHistory24hTimed.value.projection_source_audits.runtime_truth;
+    const canonicalSpine24h = diagnosticsHistory24hTimed.value.projection_source_audits.canonical_spine;
+    responseBody.live_ops_diagnostics.runtime_truth_cache_hit_rate_24h = runtimeTruth24h.cache_hit_rate_pct;
+    responseBody.live_ops_diagnostics.canonical_spine_cache_hit_rate_24h = canonicalSpine24h.cache_hit_rate_pct;
+    responseBody.live_ops_diagnostics.runtime_truth_rebuild_count_24h = runtimeTruth24h.rebuild_count;
+    responseBody.live_ops_diagnostics.canonical_spine_rebuild_count_24h = canonicalSpine24h.rebuild_count;
+    responseBody.live_ops_diagnostics.runtime_truth_avg_snapshot_age_ms_24h = runtimeTruth24h.cache_age_ms_avg;
+    responseBody.live_ops_diagnostics.runtime_truth_max_snapshot_age_ms_24h = runtimeTruth24h.cache_age_ms_max;
+    responseBody.live_ops_diagnostics.canonical_spine_avg_snapshot_age_ms_24h = canonicalSpine24h.cache_age_ms_avg;
+    responseBody.live_ops_diagnostics.canonical_spine_max_snapshot_age_ms_24h = canonicalSpine24h.cache_age_ms_max;
+  }
+  responseBody.live_ops_diagnostics.payload_bytes = new TextEncoder().encode(JSON.stringify(responseBody)).length;
+  responseBody.live_ops_diagnostics.payload_size_bytes = responseBody.live_ops_diagnostics.payload_bytes;
+  await withTimingAndTimeout(
+    () => appendLiveOpsDiagnosticsSample({
+      timestamp_iso: String(responseBody.generated_at || new Date().toISOString()),
+      aggregate_window_days: 30,
+      runtime_truth_ms: runtimeTruthTimed.duration_ms,
+      canonical_spine_ms: canonicalSpineTimed.duration_ms,
+      trade_lifecycle_ms: tradeLifecycleHealthTimed.duration_ms,
+      hardening_analytics_ms: hardeningAnalytics30dTimed.duration_ms,
+      payload_size_bytes: responseBody.live_ops_diagnostics.payload_size_bytes,
+      tri_score: toNumber(truthReliability.score_pct, 0),
+      tri_status: String(truthReliability.status || "unusable"),
+      tri_cap: truthReliability.cap_pct,
+      tri_continuity: toNumber(asRecord(truthReliability.components).decision_continuity_pct, 0),
+      tri_evidence: toNumber(asRecord(truthReliability.components).evidence_quality_pct, 0),
+      tri_spine_match: toNumber(asRecord(truthReliability.components).spine_match_rate_pct, 0),
+      tri_freshness: toNumber(asRecord(truthReliability.components).snapshot_freshness_pct, 0),
+      source_tree_provenance: {
+        status: sourceTreeProvenanceTimed.value.status,
+        commit_alignment_rate: sourceTreeProvenanceTimed.value.commit_alignment_rate,
+        observable_commit_count: sourceTreeProvenanceTimed.value.observable_commit_count,
+        aligned_commit_count: sourceTreeProvenanceTimed.value.aligned_commit_count,
+        publish_blocked: sourceTreeProvenanceTimed.value.publish_blocked,
+      },
+      decision_gap_reduction: {
+        incomplete_decision_total: toNumber(asRecord(asRecord(tradeLifecycleHealth).decision_gap_reduction).incomplete_decision_total, 0),
+        by_stage: (() => {
+          const gapReduction = asRecord(asRecord(tradeLifecycleHealth).decision_gap_reduction);
+          return asArray<Record<string, unknown>>(gapReduction.by_stage).map((stage) => ({
+            stage_key: String(stage.stage_key || "").trim(),
+            label: String(stage.label || "").trim(),
+            gap_label: String(stage.gap_label || "").trim(),
+            blocked_decision_total: toNumber(stage.blocked_decision_total, 0),
+            share_pct: toNumber(stage.share_pct, 0),
+            exemplar_decision_ids: asArray<Record<string, unknown>>(stage.exemplar_decisions).map((item) => String(item.decision_id || "").trim()).filter(Boolean).slice(0, 12),
+          }));
+        })(),
+      },
+      decision_gap_resolution: {
+        open_gap_total: toNumber(asRecord(asRecord(tradeLifecycleHealth).decision_gap_resolution).open_gap_total, 0),
+        resolved_gap_total: toNumber(asRecord(asRecord(tradeLifecycleHealth).decision_gap_resolution).resolved_gap_total, 0),
+        gap_resolution_rate_pct: toNumber(asRecord(asRecord(tradeLifecycleHealth).decision_gap_resolution).gap_resolution_rate_pct, 0),
+        mean_time_to_continuity_hours: Number.isFinite(Number(asRecord(asRecord(tradeLifecycleHealth).decision_gap_resolution).mean_time_to_continuity_hours))
+          ? toNumber(asRecord(asRecord(tradeLifecycleHealth).decision_gap_resolution).mean_time_to_continuity_hours, 0)
+          : null,
+        dominant_open_gap_stage_key: String(asRecord(asRecord(tradeLifecycleHealth).decision_gap_resolution).dominant_open_gap_stage_key || "").trim() || null,
+        dominant_open_gap_label: String(asRecord(asRecord(tradeLifecycleHealth).decision_gap_resolution).dominant_open_gap_label || "").trim() || null,
+        dominant_open_gap_total: toNumber(asRecord(asRecord(tradeLifecycleHealth).decision_gap_resolution).dominant_open_gap_total, 0),
+        dominant_open_gap_share_pct: toNumber(asRecord(asRecord(tradeLifecycleHealth).decision_gap_resolution).dominant_open_gap_share_pct, 0),
+        backlog_age_buckets: (() => {
+          const gapResolution = asRecord(asRecord(tradeLifecycleHealth).decision_gap_resolution);
+          return asArray<Record<string, unknown>>(gapResolution.backlog_age_buckets).map((bucket) => ({
+            bucket_key: String(bucket.bucket_key || "").trim(),
+            label: String(bucket.label || "").trim(),
+            open_gap_total: toNumber(bucket.open_gap_total, 0),
+            share_pct: toNumber(bucket.share_pct, 0),
+          }));
+        })(),
+        oldest_open_gap: (() => {
+          const oldestOpenGap = asRecord(asRecord(asRecord(tradeLifecycleHealth).decision_gap_resolution).oldest_open_gap);
+          if (Object.keys(oldestOpenGap).length === 0) {
+            return null;
+          }
+          return {
+            decision_id: String(oldestOpenGap.decision_id || "").trim() || null,
+            gap_label: String(oldestOpenGap.gap_label || "").trim() || null,
+            open_age_hours: toNumber(oldestOpenGap.open_age_hours, 0),
+            root_cause_code: String(oldestOpenGap.root_cause_code || "").trim() || null,
+          };
+        })(),
+        dominant_gap_cardinality: (() => {
+          const cardinality = asRecord(asRecord(asRecord(tradeLifecycleHealth).decision_gap_resolution).dominant_gap_cardinality);
+          if (Object.keys(cardinality).length === 0) {
+            return null;
+          }
+          return {
+            gap_occurrence_total: toNumber(cardinality.gap_occurrence_total, 0),
+            unique_decision_total: toNumber(cardinality.unique_decision_total, 0),
+            unique_trade_lifecycle_total: toNumber(cardinality.unique_trade_lifecycle_total, 0),
+            unique_root_cause_total: toNumber(cardinality.unique_root_cause_total, 0),
+            by_root_cause: asArray<Record<string, unknown>>(cardinality.by_root_cause).map((cause) => ({
+              root_cause_code: String(cause.root_cause_code || "").trim(),
+              label: String(cause.label || "").trim(),
+              open_gap_total: toNumber(cause.open_gap_total, 0),
+              share_pct: toNumber(cause.share_pct, 0),
+            })).filter((cause) => cause.root_cause_code.length > 0).slice(0, 12),
+          };
+        })(),
+      },
+      control_plane_timeout_paths: boundedTimeoutPaths,
+      local_projection_timeout_paths: localProjectionTimeoutPaths,
+      local_projection_failed_paths: localProjectionFailedPaths,
+      timeout_projections: localProjectionTimeoutPaths,
+      degraded_projections: degradedProjectionPaths,
+      projection_durations_ms: {
+        runtime_truth: runtimeTruthTimed.duration_ms,
+        canonical_spine: canonicalSpineTimed.duration_ms,
+        trade_lifecycle_health: tradeLifecycleHealthTimed.duration_ms,
+        hardening_analytics_30d: hardeningAnalytics30dTimed.duration_ms,
+      },
+      projection_source_audits: {
+        runtime_truth: {
+          rows_scanned: toNumber(runtimeTruthSourceDiagnostics.rows_scanned, 0),
+          rows_returned: toNumber(runtimeTruthSourceDiagnostics.rows_returned, 0),
+          cache_hit: runtimeTruthCacheAudit.cache_hit,
+          cache_miss: runtimeTruthCacheAudit.cache_miss,
+          cache_age_ms: runtimeTruthCacheAudit.age_ms,
+        },
+        canonical_spine: {
+          rows_scanned: toNumber(canonicalSpineSourceDiagnostics.rows_scanned, 0),
+          rows_returned: toNumber(canonicalSpineSourceDiagnostics.rows_returned, 0),
+          cache_hit: canonicalSpineCacheAudit.cache_hit,
+          cache_miss: canonicalSpineCacheAudit.cache_miss,
+          cache_age_ms: canonicalSpineCacheAudit.age_ms,
+        },
+        trade_lifecycle_health: {
+          rows_scanned: toNumber(tradeLifecycleHealthSourceDiagnostics.rows_scanned, 0),
+          rows_returned: toNumber(tradeLifecycleHealthSourceDiagnostics.rows_returned, 0),
+          cache_hit: 0,
+          cache_miss: 1,
+          cache_age_ms: null,
+        },
+        hardening_analytics_30d: {
+          rows_scanned: toNumber(hardeningAnalyticsSourceDiagnostics.rows_scanned, 0),
+          rows_returned: toNumber(hardeningAnalyticsSourceDiagnostics.rows_returned, 0),
+          cache_hit: 0,
+          cache_miss: 1,
+          cache_age_ms: null,
+        },
+      },
+    }).then(() => true),
+    LIVE_OPS_DIAGNOSTICS_HISTORY_TIMEOUT_MS,
+    false,
+  );
+
+  return NextResponse.json(responseBody, {
     status: 200,
     headers: { "Cache-Control": "no-store" },
   });

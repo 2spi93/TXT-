@@ -12,6 +12,14 @@ import {
   type ExchangeCapability,
 } from "../../lib/exchangeCapabilities";
 import { openOpsCopilotPrompt } from "../../lib/opsCopilot";
+import {
+  describeSourceTreePromotionBlock,
+  EMPTY_SOURCE_TREE_PROVENANCE,
+  formatSourceTreeProvenanceStatus,
+  getSourceTreeCommitDeltaLines,
+  normalizeSourceTreeProvenance,
+  type SourceTreeProvenanceSnapshot,
+} from "../../lib/sourceTreeProvenanceView";
 import { UI_HELP_HINTS } from "../../lib/uiLexicon";
 
 type JsonMap = Record<string, unknown>;
@@ -243,6 +251,11 @@ function toNumber(value: unknown, fallback = 0): number {
   return Number.isFinite(numeric) ? numeric : fallback;
 }
 
+function toNullableNumber(value: unknown): number | null {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
 function formatUsd(value: number | null | undefined): string {
   if (!Number.isFinite(Number(value))) {
     return "-";
@@ -353,6 +366,36 @@ type AttributionRow = {
   pnl_contribution_pct: number;
   trade_count: number;
   fees_usd: number;
+  allocation_contribution_usd: number | null;
+  allocation_alpha_bps_avg: number | null;
+  signal_alpha_bps_avg: number | null;
+  timing_alpha_bps_avg: number | null;
+  execution_alpha_bps_avg: number | null;
+  spread_cost_bps_avg: number | null;
+  slippage_cost_bps_avg: number | null;
+  winner_component: string | null;
+  loser_component: string | null;
+  attribution_status: string | null;
+};
+
+type OpportunityCostAttributionRow = {
+  gate_reason: string | null;
+  market_regime: string | null;
+  strategy_id: string | null;
+  symbol: string | null;
+  timeframe: string | null;
+  entry_count: number;
+  computed_entry_count: number;
+  pending_entry_count: number;
+  expected_alpha_bps_avg: number | null;
+  realized_move_bps_avg: number | null;
+  missed_alpha_bps_avg: number | null;
+  saved_loss_bps_avg: number | null;
+  net_opportunity_alpha_bps_avg: number | null;
+  counterfactual_confidence_avg: number | null;
+  matching_quality_avg: number | null;
+  followup_delay_minutes_avg: number | null;
+  attribution_status: string | null;
 };
 
 type PocketCapitalView = {
@@ -419,6 +462,68 @@ function formatPct(value: number | null | undefined, digits = 1): string {
     return "-";
   }
   return `${Number(value).toLocaleString("fr-FR", { minimumFractionDigits: digits, maximumFractionDigits: digits })}%`;
+}
+
+function formatBps(value: number | null | undefined, digits = 1): string {
+  if (!Number.isFinite(Number(value))) {
+    return "-";
+  }
+  return `${Number(value).toLocaleString("fr-FR", { minimumFractionDigits: digits, maximumFractionDigits: digits })} bps`;
+}
+
+function formatAttributionComponentLabel(value: string | null | undefined): string {
+  const normalized = String(value || "").trim().toLowerCase();
+  const labels: Record<string, string> = {
+    allocation: "Allocation",
+    signal: "Signal",
+    timing: "Timing",
+    execution: "Execution",
+    spread_cost: "Spread",
+    slippage_cost: "Slippage",
+  };
+  return labels[normalized] || (normalized ? normalized.replace(/_/g, " ") : "-");
+}
+
+function weightedAverageAttribution(rows: AttributionRow[], field: "allocation_alpha_bps_avg" | "signal_alpha_bps_avg" | "timing_alpha_bps_avg" | "execution_alpha_bps_avg" | "spread_cost_bps_avg" | "slippage_cost_bps_avg"): number | null {
+  let weightedSum = 0;
+  let totalWeight = 0;
+  for (const row of rows) {
+    const value = row[field];
+    if (value === null) {
+      continue;
+    }
+    const weight = Math.max(1, row.trade_count || 0);
+    weightedSum += value * weight;
+    totalWeight += weight;
+  }
+  return totalWeight > 0 ? weightedSum / totalWeight : null;
+}
+
+function weightedAverageOpportunityCost(rows: OpportunityCostAttributionRow[], field: "net_opportunity_alpha_bps_avg" | "counterfactual_confidence_avg" | "followup_delay_minutes_avg"): number | null {
+  let weightedSum = 0;
+  let totalWeight = 0;
+  for (const row of rows) {
+    const value = row[field];
+    if (value === null) {
+      continue;
+    }
+    const weight = Math.max(1, row.entry_count || 0);
+    weightedSum += value * weight;
+    totalWeight += weight;
+  }
+  return totalWeight > 0 ? weightedSum / totalWeight : null;
+}
+
+function dominantAttributionComponent(rows: AttributionRow[], field: "winner_component" | "loser_component"): string | null {
+  const weights = new Map<string, number>();
+  for (const row of rows) {
+    const component = String(row[field] || "").trim();
+    if (!component) {
+      continue;
+    }
+    weights.set(component, (weights.get(component) || 0) + Math.max(1, row.trade_count || 0));
+  }
+  return [...weights.entries()].sort((left, right) => right[1] - left[1])[0]?.[0] || null;
 }
 
 function formatQty(value: number | null | undefined): string {
@@ -699,6 +804,38 @@ function normalizeAttributionRow(row: JsonMap): AttributionRow {
     pnl_contribution_pct: toNumber(row.pnl_contribution_pct, 0),
     trade_count: toNumber(row.trade_count, 0),
     fees_usd: toNumber(row.fees_usd, 0),
+    allocation_contribution_usd: toNullableNumber(row.allocation_contribution_usd),
+    allocation_alpha_bps_avg: toNullableNumber(row.allocation_alpha_bps_avg),
+    signal_alpha_bps_avg: toNullableNumber(row.signal_alpha_bps_avg),
+    timing_alpha_bps_avg: toNullableNumber(row.timing_alpha_bps_avg),
+    execution_alpha_bps_avg: toNullableNumber(row.execution_alpha_bps_avg),
+    spread_cost_bps_avg: toNullableNumber(row.spread_cost_bps_avg),
+    slippage_cost_bps_avg: toNullableNumber(row.slippage_cost_bps_avg),
+    winner_component: row.winner_component ? String(row.winner_component) : null,
+    loser_component: row.loser_component ? String(row.loser_component) : null,
+    attribution_status: row.attribution_status ? String(row.attribution_status) : null,
+  };
+}
+
+function normalizeOpportunityCostAttributionRow(row: JsonMap): OpportunityCostAttributionRow {
+  return {
+    gate_reason: row.gate_reason ? String(row.gate_reason) : null,
+    market_regime: row.market_regime ? String(row.market_regime) : null,
+    strategy_id: row.strategy_id ? String(row.strategy_id) : null,
+    symbol: row.symbol ? String(row.symbol) : null,
+    timeframe: row.timeframe ? String(row.timeframe) : null,
+    entry_count: toNumber(row.entry_count, 0),
+    computed_entry_count: toNumber(row.computed_entry_count, 0),
+    pending_entry_count: toNumber(row.pending_entry_count, 0),
+    expected_alpha_bps_avg: toNullableNumber(row.expected_alpha_bps_avg),
+    realized_move_bps_avg: toNullableNumber(row.realized_move_bps_avg),
+    missed_alpha_bps_avg: toNullableNumber(row.missed_alpha_bps_avg),
+    saved_loss_bps_avg: toNullableNumber(row.saved_loss_bps_avg),
+    net_opportunity_alpha_bps_avg: toNullableNumber(row.net_opportunity_alpha_bps_avg),
+    counterfactual_confidence_avg: toNullableNumber(row.counterfactual_confidence_avg),
+    matching_quality_avg: toNullableNumber(row.matching_quality_avg),
+    followup_delay_minutes_avg: toNullableNumber(row.followup_delay_minutes_avg),
+    attribution_status: row.attribution_status ? String(row.attribution_status) : null,
   };
 }
 
@@ -837,6 +974,7 @@ export default function LiveCapitalPage() {
 
   const [portfolioRisk, setPortfolioRisk] = useState<JsonMap | null>(null);
   const [portfolioAttribution, setPortfolioAttribution] = useState<AttributionRow[]>([]);
+  const [portfolioOpportunityCostAttribution, setPortfolioOpportunityCostAttribution] = useState<OpportunityCostAttributionRow[]>([]);
   const [portfolioCapitalIntegration, setPortfolioCapitalIntegration] = useState<JsonMap | null>(null);
 
   const [deskVehicle, setDeskVehicle] = useState("managed-account");
@@ -857,6 +995,7 @@ export default function LiveCapitalPage() {
   const [strategyMarket, setStrategyMarket] = useState("fx");
   const [strategySetupType, setStrategySetupType] = useState("regime-execution");
   const [strategyNotes, setStrategyNotes] = useState("Allocation live reliee a une source gouvernee, avec cap USD strict et controles explicites par plateforme.");
+  const [sourceTreeProvenance, setSourceTreeProvenance] = useState<SourceTreeProvenanceSnapshot>(EMPTY_SOURCE_TREE_PROVENANCE);
 
   function upsertConnectorAccount(nextAccount: ConnectorAccountRow): void {
     setConnectorAccounts((current) => {
@@ -866,13 +1005,14 @@ export default function LiveCapitalPage() {
   }
 
   async function refreshDesk(): Promise<void> {
-    const [accountsRes, connectorsRes, portfoliosRes, strategiesRes, pendingRes, capabilitiesRes] = await Promise.all([
+    const [accountsRes, connectorsRes, portfoliosRes, strategiesRes, pendingRes, capabilitiesRes, provenanceRes] = await Promise.all([
       fetch("/api/accounts", { cache: "no-store" }),
       fetch("/api/connectors/accounts", { cache: "no-store" }),
       fetch("/api/portfolios", { cache: "no-store" }),
       fetch("/api/strategies", { cache: "no-store" }),
       fetch("/api/mt5/orders/live-pending", { cache: "no-store" }),
       fetch("/api/connectors/exchange-capabilities", { cache: "no-store" }),
+      fetch("/api/system/source-tree-provenance", { cache: "no-store" }).catch(() => null),
     ]);
 
     if (!accountsRes.ok || !connectorsRes.ok || !portfoliosRes.ok || !strategiesRes.ok || !pendingRes.ok || !capabilitiesRes.ok) {
@@ -885,6 +1025,7 @@ export default function LiveCapitalPage() {
     const strategiesPayload = await strategiesRes.json().catch(() => []);
     const pendingPayload = await pendingRes.json().catch(() => []);
     const capabilitiesPayload = await capabilitiesRes.json().catch(() => ({}));
+    const provenancePayload = provenanceRes ? await provenanceRes.json().catch(() => null) : null;
 
     setAccounts(Array.isArray(accountsPayload) ? accountsPayload.map((item) => normalizeAccount(item as JsonMap)) : []);
     setConnectorAccounts(Array.isArray((connectorsPayload as JsonMap).accounts) ? ((connectorsPayload as JsonMap).accounts as JsonMap[]).map((item) => normalizeConnectorAccount(item)) : []);
@@ -892,6 +1033,7 @@ export default function LiveCapitalPage() {
     setStrategies(Array.isArray(strategiesPayload) ? strategiesPayload.map((item) => normalizeStrategy(item as JsonMap)) : []);
     setPendingLive(Array.isArray(pendingPayload) ? pendingPayload as JsonMap[] : []);
     setExchangeCapabilities(normalizeExchangeCapabilityMap(capabilitiesPayload));
+    setSourceTreeProvenance(normalizeSourceTreeProvenance(provenancePayload));
   }
 
   useEffect(() => {
@@ -899,6 +1041,8 @@ export default function LiveCapitalPage() {
   }, []);
 
   const canonicalAccountMap = useMemo(() => new Map(accounts.map((row) => [row.account_id, row])), [accounts]);
+  const strategyPromotionGuard = useMemo(() => describeSourceTreePromotionBlock(sourceTreeProvenance), [sourceTreeProvenance]);
+  const strategyPromotionCommitDelta = useMemo(() => getSourceTreeCommitDeltaLines(sourceTreeProvenance), [sourceTreeProvenance]);
 
   const capitalSources = useMemo<CapitalSourceRow[]>(() => {
     const canonicalRows = accounts.map((row) => {
@@ -1242,6 +1386,16 @@ export default function LiveCapitalPage() {
   const attributionByVenue = useMemo(() => aggregateAttribution(portfolioAttribution, "venue").slice(0, 5), [portfolioAttribution]);
   const attributionByStrategy = useMemo(() => aggregateAttribution(portfolioAttribution, "strategy_id").slice(0, 5), [portfolioAttribution]);
   const attributionByAsset = useMemo(() => aggregateAttribution(portfolioAttribution, "symbol").slice(0, 5), [portfolioAttribution]);
+  const topPortfolioAttributionRows = useMemo(() => portfolioAttribution.slice(0, 4), [portfolioAttribution]);
+  const portfolioAllocationAlphaAvg = useMemo(() => weightedAverageAttribution(portfolioAttribution, "allocation_alpha_bps_avg"), [portfolioAttribution]);
+  const portfolioSignalAlphaAvg = useMemo(() => weightedAverageAttribution(portfolioAttribution, "signal_alpha_bps_avg"), [portfolioAttribution]);
+  const portfolioExecutionAlphaAvg = useMemo(() => weightedAverageAttribution(portfolioAttribution, "execution_alpha_bps_avg"), [portfolioAttribution]);
+  const portfolioWinnerComponent = useMemo(() => dominantAttributionComponent(portfolioAttribution, "winner_component"), [portfolioAttribution]);
+  const portfolioLoserComponent = useMemo(() => dominantAttributionComponent(portfolioAttribution, "loser_component"), [portfolioAttribution]);
+  const topPortfolioOpportunityCostRows = useMemo(() => portfolioOpportunityCostAttribution.slice(0, 4), [portfolioOpportunityCostAttribution]);
+  const portfolioOpportunityNetAlphaAvg = useMemo(() => weightedAverageOpportunityCost(portfolioOpportunityCostAttribution, "net_opportunity_alpha_bps_avg"), [portfolioOpportunityCostAttribution]);
+  const portfolioOpportunityConfidenceAvg = useMemo(() => weightedAverageOpportunityCost(portfolioOpportunityCostAttribution, "counterfactual_confidence_avg"), [portfolioOpportunityCostAttribution]);
+  const portfolioOpportunityDelayAvg = useMemo(() => weightedAverageOpportunityCost(portfolioOpportunityCostAttribution, "followup_delay_minutes_avg"), [portfolioOpportunityCostAttribution]);
   const capitalIntegrationSleeves = useMemo(
     () => Array.isArray(portfolioCapitalIntegration?.sleeves)
       ? (portfolioCapitalIntegration.sleeves as JsonMap[]).map((item) => normalizePortfolioCapitalIntegrationRow(item))
@@ -1274,6 +1428,7 @@ export default function LiveCapitalPage() {
     if (!activePortfolioId) {
       setPortfolioRisk(null);
       setPortfolioAttribution([]);
+      setPortfolioOpportunityCostAttribution([]);
       setPortfolioCapitalIntegration(null);
       return () => {
         cancelled = true;
@@ -1283,11 +1438,13 @@ export default function LiveCapitalPage() {
     Promise.all([
       fetch(`/api/portfolios/${encodeURIComponent(activePortfolioId)}/risk`, { cache: "no-store" }),
       fetch(`/api/performance/attribution?scope_type=portfolio&scope_id=${encodeURIComponent(activePortfolioId)}&group_by=strategy,symbol,venue`, { cache: "no-store" }),
+      fetch(`/api/performance/opportunity-cost?scope_type=portfolio&scope_id=${encodeURIComponent(activePortfolioId)}&group_by=gate_reason,market_regime,symbol,timeframe`, { cache: "no-store" }),
       fetch(`/api/portfolios/${encodeURIComponent(activePortfolioId)}/capital-integration`, { cache: "no-store" }),
     ])
-      .then(async ([riskResponse, attributionResponse, capitalIntegrationResponse]) => {
+      .then(async ([riskResponse, attributionResponse, opportunityCostResponse, capitalIntegrationResponse]) => {
         const riskPayload = riskResponse.ok ? await riskResponse.json().catch(() => null) : null;
         const attributionPayload = attributionResponse.ok ? await attributionResponse.json().catch(() => ({})) : {};
+        const opportunityCostPayload = opportunityCostResponse.ok ? await opportunityCostResponse.json().catch(() => ({})) : {};
         const capitalIntegrationPayload = capitalIntegrationResponse.ok ? await capitalIntegrationResponse.json().catch(() => null) : null;
         if (cancelled) {
           return;
@@ -1295,6 +1452,9 @@ export default function LiveCapitalPage() {
         setPortfolioRisk(riskPayload && typeof riskPayload === "object" ? (riskPayload as JsonMap) : null);
         setPortfolioAttribution(Array.isArray((attributionPayload as JsonMap).rows)
           ? (((attributionPayload as JsonMap).rows as JsonMap[]).map((row) => normalizeAttributionRow(row)))
+          : []);
+        setPortfolioOpportunityCostAttribution(Array.isArray((opportunityCostPayload as JsonMap).rows)
+          ? (((opportunityCostPayload as JsonMap).rows as JsonMap[]).map((row) => normalizeOpportunityCostAttributionRow(row)))
           : []);
         setPortfolioCapitalIntegration(capitalIntegrationPayload && typeof capitalIntegrationPayload === "object" ? (capitalIntegrationPayload as JsonMap) : null);
       })
@@ -1304,6 +1464,7 @@ export default function LiveCapitalPage() {
         }
         setPortfolioRisk(null);
         setPortfolioAttribution([]);
+        setPortfolioOpportunityCostAttribution([]);
         setPortfolioCapitalIntegration(null);
       });
 
@@ -2515,14 +2676,17 @@ export default function LiveCapitalPage() {
             <div className="row"><span>Strategie sélectionnée</span><span>{selectedStrategy ? `${selectedStrategy.strategy_id} · L${selectedStrategy.current_level}` : strategyId}</span></div>
             <div className="row"><span>Promotion</span><span>{selectedStrategy ? `next L${Math.min(selectedStrategy.current_level + 1, 6)}` : "L1"}</span></div>
             <div className="row"><span>Source liée</span><span>{selectedSource ? `${selectedSource.display_name} · ${selectedSource.environment}` : "-"}</span></div>
+            <div className="row"><span>Provenance</span><span className={strategyPromotionGuard.blocked ? "warn" : "good"}>{formatSourceTreeProvenanceStatus(sourceTreeProvenance.status)} · {sourceTreeProvenance.commit_alignment_rate.toFixed(0)}%</span></div>
             <button
               type="button"
-              disabled={busy || !selectedStrategy || selectedStrategy.current_level >= 6}
+              disabled={busy || strategyPromotionGuard.blocked || !selectedStrategy || selectedStrategy.current_level >= 6}
               onClick={() => promoteStrategy(Math.min((selectedStrategy?.current_level || 0) + 1, 6))}
               style={{ marginTop: 10 }}
             >
               Promouvoir la stratégie
             </button>
+            {strategyPromotionGuard.blocked ? <p className="warn" style={{ marginTop: 10 }}>{strategyPromotionGuard.reason}</p> : null}
+            {strategyPromotionCommitDelta.length > 0 ? <p className="subtle" style={{ marginTop: 8 }}>Delta commit: {strategyPromotionCommitDelta.join(" · ")}</p> : null}
           </div>
         </div>
       </section>
@@ -2700,6 +2864,9 @@ export default function LiveCapitalPage() {
           <div className="eyebrow">Portfolio Attribution <HelpHint text={UI_HELP_HINTS.livePortfolioAttribution.text} examples={UI_HELP_HINTS.livePortfolioAttribution.examples} /></div>
           <div className="row"><span>Sleeve courant</span><span>{capitalSleeve}</span></div>
           <div className="row"><span>Portefeuille</span><span>{activePortfolioId || "non sélectionné"}</span></div>
+            <div className="row"><span>Winner / loser dominant</span><span>{formatAttributionComponentLabel(portfolioWinnerComponent)} / {formatAttributionComponentLabel(portfolioLoserComponent)}</span></div>
+            <div className="row"><span>Alpha V1 moyen</span><span>{formatBps(portfolioAllocationAlphaAvg)} alloc · {formatBps(portfolioSignalAlphaAvg)} signal · {formatBps(portfolioExecutionAlphaAvg)} exec</span></div>
+            <div className="row"><span>Opportunity Cost V1</span><span>{formatBps(portfolioOpportunityNetAlphaAvg)} net · conf {portfolioOpportunityConfidenceAvg != null ? formatPct(portfolioOpportunityConfidenceAvg * 100, 0) : "-"} · delai {portfolioOpportunityDelayAvg != null ? `${portfolioOpportunityDelayAvg.toFixed(0)} min` : "-"}</span></div>
           {portfolioAttribution.length === 0 ? <p className="subtle" style={{ marginTop: 10 }}>Aucune ligne d'attribution disponible pour ce portefeuille sur la période courante.</p> : null}
           {portfolioAttribution.length > 0 ? (
             <div className="grid" style={{ marginTop: 12, gridTemplateColumns: "1fr 1fr 1fr" }}>
@@ -2732,6 +2899,26 @@ export default function LiveCapitalPage() {
               </div>
             </div>
           ) : null}
+          <div className="grid" style={{ marginTop: 12, gridTemplateColumns: "1fr 1fr" }}>
+            <div className="panel" style={{ borderRadius: 12 }}>
+              <div className="eyebrow">Top causal rows</div>
+              {topPortfolioAttributionRows.length > 0 ? topPortfolioAttributionRows.map((row, index) => (
+                <div key={`attr-causal-${row.symbol || row.strategy_id || "none"}-${row.venue || "none"}-${index}`} className="row">
+                  <span>{row.symbol || row.strategy_id || "n/a"} · {row.venue || "-"}</span>
+                  <span>{formatBps(row.execution_alpha_bps_avg)} exec · {formatAttributionComponentLabel(row.winner_component)} / {formatAttributionComponentLabel(row.loser_component)}</span>
+                </div>
+              )) : <p className="subtle" style={{ marginTop: 10 }}>Pas encore de décomposition causale exploitable.</p>}
+            </div>
+            <div className="panel" style={{ borderRadius: 12 }}>
+              <div className="eyebrow">Opportunity Cost V1</div>
+              {topPortfolioOpportunityCostRows.length > 0 ? topPortfolioOpportunityCostRows.map((row, index) => (
+                <div key={`opp-cost-${row.gate_reason || "none"}-${row.market_regime || "none"}-${row.symbol || "none"}-${row.timeframe || "none"}-${index}`} className="row">
+                  <span>{row.gate_reason || "gate inconnu"} · {row.market_regime || "-"}</span>
+                  <span>{row.symbol || "-"}/{row.timeframe || "-"} · {formatBps(row.net_opportunity_alpha_bps_avg)} · conf {row.counterfactual_confidence_avg != null ? formatPct(row.counterfactual_confidence_avg * 100, 0) : "-"}</span>
+                </div>
+              )) : <p className="subtle" style={{ marginTop: 10 }}>Aucun bucket opportunity cost sur la période courante.</p>}
+            </div>
+          </div>
         </div>
       </section>
 

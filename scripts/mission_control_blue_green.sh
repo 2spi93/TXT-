@@ -22,6 +22,75 @@ slot_service() {
   printf 'mission-control-ui-%s\n' "$1"
 }
 
+workspace_commit() {
+  git -C "$UI_DIR" rev-parse HEAD 2>/dev/null | tr -d '\r\n'
+}
+
+slot_build_commit() {
+  local slot="$1"
+  local commit_file
+  commit_file="$UI_DIR/$(slot_dist_dir "$slot")/BUILD_COMMIT"
+  if [[ -f "$commit_file" ]]; then
+    tr -d '\r\n' < "$commit_file"
+  fi
+}
+
+ensure_slot_provenance_aligned() {
+  local slot="$1"
+  local workspace target
+  workspace="$(workspace_commit || true)"
+  target="$(slot_build_commit "$slot" || true)"
+
+  if [[ -z "$workspace" || -z "$target" ]]; then
+    printf '[blue-green] refusing to flip slot %s: provenance unknown workspace_commit=%s target_commit=%s\n' "$slot" "${workspace:-unknown}" "${target:-unknown}" >&2
+    return 1
+  fi
+
+  if [[ "$workspace" != "$target" ]]; then
+    printf '[blue-green] refusing to flip slot %s: workspace_commit=%s target_commit=%s\n' "$slot" "$workspace" "$target" >&2
+    return 1
+  fi
+}
+
+sync_root_journals_from_slot_to_shared() {
+  local slot="$1"
+  local service
+  service="$(slot_service "$slot")"
+
+  docker exec "$service" sh -lc '
+set -eu
+mkdir -p /workspace/logs
+for name in \
+  mission-control-allocation-decisions.jsonl \
+  mission-control-execution-facts.jsonl \
+  mission-control-opportunity-costs.jsonl
+do
+  src="/tmp/$name"
+  dst="/workspace/logs/$name"
+  if [ ! -s "$src" ]; then
+    continue
+  fi
+
+  src_lines=$(wc -l < "$src" 2>/dev/null || echo 0)
+  if [ -f "$dst" ]; then
+    dst_lines=$(wc -l < "$dst" 2>/dev/null || echo 0)
+  else
+    dst_lines=0
+  fi
+  if [ "$src_lines" -gt "$dst_lines" ]; then
+    cp "$src" "$dst"
+    printf "[blue-green] synced %s lines=%s from active slot\n" "$name" "$src_lines"
+  fi
+done
+' >/dev/null
+}
+
+sync_active_root_journals() {
+  local slot
+  slot="$(active_slot)"
+  sync_root_journals_from_slot_to_shared "$slot"
+}
+
 prepare_slot_dist_dir() {
   local dist_dir="$1"
   mkdir -p "$UI_DIR/$dist_dir/server" "$UI_DIR/$dist_dir/static" "$UI_DIR/$dist_dir/types"
@@ -86,6 +155,26 @@ wait_for_healthy() {
   return 1
 }
 
+warmup_slot_snapshots() {
+  local slot="$1"
+  local service port
+  service="$(slot_service "$slot")"
+  port="$(slot_port "$slot")"
+  if [[ "${MC_UI_WARMUP_ON_DEPLOY:-1}" != '1' ]]; then
+    printf '[blue-green] snapshot warmup disabled for slot %s\n' "$slot"
+    return 0
+  fi
+  printf '[blue-green] warming snapshots for slot=%s\n' "$slot"
+  docker exec "$service" sh -lc "
+set -eu
+base=\"http://127.0.0.1:${port}\"
+wget -qO- \"\$base/api/system/canonical-spine?fresh=1\" >/dev/null
+wget -qO- \"\$base/api/runtime/truth?fresh=1\" >/dev/null
+wget -qO- \"\$base/api/system/live-ops\" >/dev/null
+"
+  printf '[blue-green] snapshots warm for slot=%s\n' "$slot"
+}
+
 reload_gateway() {
   docker exec mission-control-gateway nginx -s reload >/dev/null
 }
@@ -113,6 +202,8 @@ deploy_cmd() {
   dist_dir="$(slot_dist_dir "$slot")"
   service="$(slot_service "$slot")"
 
+  sync_active_root_journals
+
   printf '[blue-green] building slot=%s dist=%s port=%s\n' "$slot" "$dist_dir" "$port"
   (
     cd "$UI_DIR"
@@ -124,12 +215,16 @@ deploy_cmd() {
   printf '[blue-green] starting %s\n' "$service"
   "${COMPOSE[@]}" up -d --no-deps "$service"
   wait_for_healthy "$slot"
+  warmup_slot_snapshots "$slot"
+  wait_for_healthy "$slot"
   printf '[blue-green] slot %s is healthy\n' "$slot"
 }
 
 flip_cmd() {
   local slot="${1:-$(inactive_slot)}"
+  sync_active_root_journals
   wait_for_healthy "$slot"
+  ensure_slot_provenance_aligned "$slot"
   write_active_slot "$slot"
   reload_gateway
   printf '[blue-green] active slot switched to %s\n' "$slot"

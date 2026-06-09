@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -147,6 +147,101 @@ class RealityGapCalibrationProfile(BaseModel):
     updated_at: str = Field(default_factory=utc_now_iso)
 
 
+class ExecutionFactDeterminism(BaseModel):
+    runtime_epoch: str | None = None
+    governance_epoch: str | None = None
+    stream_offset: str | None = None
+    decision_hash: str | None = None
+    truth_hash: str | None = None
+    policy_hash: str | None = None
+
+
+class ExecutionAlphaAttribution(BaseModel):
+    status: Literal["pending", "partial", "computed"] = "pending"
+    pnl_usd: float | None = None
+    regime_contribution_usd: float | None = None
+    signal_contribution_usd: float | None = None
+    execution_contribution_usd: float | None = None
+    timing_contribution_usd: float | None = None
+    spread_contribution_usd: float | None = None
+    slippage_contribution_usd: float | None = None
+    notes: list[str] = Field(default_factory=list)
+
+
+class TradeExecutionFact(BaseModel):
+    fact_id: str = Field(default_factory=lambda: str(uuid4()))
+    decision_id: str
+    intent_id: str
+    order_id: str | None = None
+    portfolio_id: str
+    strategy_id: str
+    venue: str
+    instrument: str
+    timeframe: str
+    side: str
+    execution_mode: str = "paper"
+    approval_level: str = "none"
+    approval_timestamp: str | None = None
+    regime_at_decision: str = "UNKNOWN"
+    regime_at_fill: str | None = None
+    decision_outcome: Literal["correct", "false_positive", "unknown"] | None = None
+    target_notional_usd: float | None = None
+    filled_notional_usd: float | None = None
+    avg_fill_price: float | None = None
+    determinism: ExecutionFactDeterminism = Field(default_factory=ExecutionFactDeterminism)
+    alpha_attribution: ExecutionAlphaAttribution = Field(default_factory=ExecutionAlphaAttribution)
+    market_context: dict[str, Any] = Field(default_factory=dict)
+    approval_context: dict[str, Any] = Field(default_factory=dict)
+    created_at: str = Field(default_factory=utc_now_iso)
+    filled_at: str | None = None
+
+
+class OpportunityCostRecord(BaseModel):
+    entry_id: str = Field(default_factory=lambda: str(uuid4()))
+    decision_id: str | None = None
+    intent_id: str | None = None
+    portfolio_id: str | None = None
+    strategy_id: str | None = None
+    venue: str
+    instrument: str
+    timeframe: str
+    side: str
+    regime: str = "UNKNOWN"
+    decision_type: Literal["executed", "refused", "ignored", "missed"]
+    refusal_reason: str | None = None
+    gate_name: str | None = None
+    predicted_alpha_bps: float | None = None
+    ex_post_market_move_bps: float | None = None
+    ex_post_opportunity_cost_bps: float | None = None
+    captured_price: float | None = None
+    horizon_minutes: int = Field(default=0, ge=0)
+    market_context: dict[str, Any] = Field(default_factory=dict)
+    approval_context: dict[str, Any] = Field(default_factory=dict)
+    status: Literal["pending", "scored"] = "pending"
+    created_at: str = Field(default_factory=utc_now_iso)
+    scored_at: str | None = None
+
+
+class AllocationDecisionStrategyRecord(BaseModel):
+    strategy_id: str
+    regime: str = "UNKNOWN"
+    allocated_pct: float = 0.0
+    score: float = 0.0
+    blocked: bool = False
+    reasons: list[str] = Field(default_factory=list)
+
+
+class AllocationDecisionRecord(BaseModel):
+    allocation_id: str = Field(default_factory=lambda: str(uuid4()))
+    portfolio_id: str
+    market_regime: str = "UNKNOWN"
+    market_temperature: str = "UNKNOWN"
+    truth_quality_pct: float = 0.0
+    memory_cues: list[str] = Field(default_factory=list)
+    strategies: list[AllocationDecisionStrategyRecord] = Field(default_factory=list)
+    created_at: str = Field(default_factory=utc_now_iso)
+
+
 class IntentSubmissionRequest(BaseModel):
     intent: TradeIntent
     auto_execute: bool = True
@@ -163,6 +258,9 @@ class IntentSubmissionResponse(BaseModel):
 
 class SystemModeChangeRequest(BaseModel):
     mode: SystemMode
+    previous_mode: str | None = None
+    source: str | None = None
+    reason: str | None = None
 
 
 class ApprovalRequest(BaseModel):

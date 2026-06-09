@@ -15,30 +15,66 @@ function uniq(values) {
   return Array.from(new Set(values.filter(Boolean)));
 }
 
+function parseUrlParts(value) {
+  const url = typeof value === "string" ? value : "";
+  if (!url) return null;
+  try {
+    return new URL(url);
+  } catch {
+    return null;
+  }
+}
+
+function isLoopbackUrl(parsed) {
+  if (!parsed) return false;
+  const host = String(parsed.hostname || "").trim().toLowerCase();
+  return host === "127.0.0.1" || host === "localhost";
+}
+
+function isNoiseFailure(item) {
+  const parsed = parseUrlParts(item?.url);
+  if (!parsed) {
+    return false;
+  }
+  if (parsed.searchParams.has("_rsc")) {
+    return true;
+  }
+  if (parsed.pathname.startsWith("/_next/")) {
+    return true;
+  }
+  return false;
+}
+
+function renderPathWithStatus(item) {
+  const url = typeof item?.url === "string" ? item.url : "";
+  const status = item?.status == null ? "" : String(item.status);
+  const parsed = parseUrlParts(url);
+  if (!parsed) {
+    return url ? `${url}${status ? ` (HTTP ${status})` : ""}` : (status ? `HTTP ${status}` : "");
+  }
+  const path = `${parsed.pathname}${parsed.search || ""}`;
+  return `${path}${status ? ` (HTTP ${status})` : ""}`;
+}
+
+function renderDisplayUrl(value, fallback, options = {}) {
+  const parsed = parseUrlParts(value);
+  if (!parsed) {
+    return fallback;
+  }
+  if (isLoopbackUrl(parsed)) {
+    if (options.pathOnly) {
+      return `${parsed.pathname}${parsed.search || ""}`;
+    }
+    return fallback;
+  }
+  return parsed.toString();
+}
+
 function summarizeFailures(record) {
   const requestFailures = Array.isArray(record.requestFailures) ? record.requestFailures : [];
   const responseErrors = Array.isArray(record.responseErrors) ? record.responseErrors : [];
-  const failures = uniq(requestFailures.slice(0, 3).map((item) => {
-    const url = typeof item?.url === "string" ? item.url : "";
-    if (!url) return "";
-    try {
-      const parsed = new URL(url);
-      return `${parsed.pathname}${parsed.search || ""}`;
-    } catch {
-      return url;
-    }
-  }));
-  const responses = uniq(responseErrors.slice(0, 3).map((item) => {
-    const url = typeof item?.url === "string" ? item.url : "";
-    const status = item?.status == null ? "" : String(item.status);
-    if (!url) return status ? `HTTP ${status}` : "";
-    try {
-      const parsed = new URL(url);
-      return `${parsed.pathname}${parsed.search || ""}${status ? ` (HTTP ${status})` : ""}`;
-    } catch {
-      return `${url}${status ? ` (HTTP ${status})` : ""}`;
-    }
-  }));
+  const failures = uniq(requestFailures.filter((item) => !isNoiseFailure(item)).slice(0, 3).map((item) => renderPathWithStatus(item)));
+  const responses = uniq(responseErrors.filter((item) => !isNoiseFailure(item)).slice(0, 3).map((item) => renderPathWithStatus(item)));
   return { failures, responses };
 }
 
@@ -67,6 +103,7 @@ function classifyDependencyImpact(record) {
 function statusLabel(status) {
   if (status === "error") return "Incident technique";
   if (status === "degraded") return "Surveillance degradee";
+  if (status === "warming") return "Surveillance en chauffe";
   if (status === "ready") return "Surveillance operationnelle";
   return "Etat inconnu";
 }
@@ -100,6 +137,14 @@ function explainReason(record) {
       summary: "Le terminal a ete charge et la telemetrie minimale est lisible.",
       impact: "La surveillance confirme que l ecran est exploitable sur ce cycle.",
       action: "Aucune action urgente. Continuer la surveillance normale.",
+    };
+  }
+
+  if (reason === "telemetry_warming") {
+    return {
+      summary: "Le terminal repond mais ses preuves de telemetrie sont encore en phase de chauffe.",
+      impact: "Le cycle observe un warmup normal et ne confirme pas encore un etat pleinement exploitable.",
+      action: "Aucune escalade immediate. Attendre le cycle suivant et n investiguer que si l etat persiste ou regresse.",
     };
   }
 
@@ -271,8 +316,8 @@ function buildHumanAlert(recordInput) {
     "Details techniques:",
     `- Statut brut: ${status}`,
     `- Motif brut: ${reasonLine}`,
-    `- URL de base: ${record.baseUrl || "unknown"}`,
-    `- URL terminal: ${record.terminalUrl || "unknown"}`,
+    `- URL de base: ${renderDisplayUrl(record.baseUrl, "interne au conteneur")}`,
+    `- URL terminal: ${renderDisplayUrl(record.terminalUrl, "interne au conteneur", { pathOnly: true })}`,
   );
 
   return {

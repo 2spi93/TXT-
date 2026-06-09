@@ -17,7 +17,8 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     || "BTCUSDT";
   const timeframe = request.nextUrl.searchParams.get("timeframe") || "live";
   const strategy = request.nextUrl.searchParams.get("strategy") || "live-ops";
-  const bypassCache = request.nextUrl.searchParams.get("bypassCache") === "1";
+  const bypassCache = request.nextUrl.searchParams.get("bypassCache") === "1"
+    || ["1", "true", "yes"].includes(String(request.nextUrl.searchParams.get("fresh") || "").toLowerCase());
 
   const snapshot = await buildRuntimeTruthSnapshot({
     symbol,

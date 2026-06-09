@@ -170,3 +170,7 @@ Do not move to calibration if one of these remains true:
 - no auto-promotion to policy changes
 - no execution automation rollout
 - no replacing the operator with a policy loop
+
+## Related Runbooks
+
+- Use [micro-live-governed-runbook.md](micro-live-governed-runbook.md) when the system is ready to leave pure observation and start bounded live evidence collection under stage, preview, and closure-governance control.

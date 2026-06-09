@@ -4,6 +4,7 @@ import { createHash, createHmac } from "node:crypto";
 import { appendAutoTuningAudit, readAutoTuningAudit } from "../../../../lib/autoTuningAudit";
 import { getCachedIdempotentResult, saveIdempotentResult } from "../../../../lib/autoTuningIdempotency";
 import { cpFetch, getControlPlaneToken, readJsonFromResponseSafe } from "../../../../lib/controlPlane";
+import { evaluateDecisionGovernanceCapability } from "../../../../lib/decisionGovernanceControl";
 
 type RecommendationPayload = {
   strategyId: string;
@@ -215,6 +216,16 @@ export async function POST(request: Request): Promise<NextResponse> {
   const options = parseOptions(body);
   const recommendations = applyOptions(baseRecommendations, options);
   const requestHash = sha256Hex(rawBody);
+  if (!dryRun) {
+    const governance = await evaluateDecisionGovernanceCapability("strategy_expansion");
+    if (!governance.allowed) {
+      const payload = governance;
+      if (idempotencyKey) {
+        await saveIdempotentResult(idempotencyKeyHash, 412, payload, idempotencyTtlMs());
+      }
+      return NextResponse.json(payload, { status: 412 });
+    }
+  }
 
   // Optional hardening: if admin key is configured, apply always requires key,
   // and dry-run requires key when AUTO_TUNING_ADMIN_REQUIRED_FOR_DRYRUN is enabled.

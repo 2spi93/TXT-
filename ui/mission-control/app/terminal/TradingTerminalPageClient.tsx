@@ -15,6 +15,13 @@ import PanelShell from "../../components/ui/PanelShell";
 import type RuntimeStabilityDebugViewType from "../../components/ui/RuntimeStabilityDebugView";
 import type IncidentCausalSummaryCardType from "../../components/ui/IncidentCausalSummaryCard";
 import { openOpsCopilotPrompt } from "../../lib/opsCopilot";
+import {
+  describeSourceTreePromotionBlock,
+  EMPTY_SOURCE_TREE_PROVENANCE,
+  getSourceTreeCommitDeltaLines,
+  normalizeSourceTreeProvenance,
+  type SourceTreeProvenanceSnapshot,
+} from "../../lib/sourceTreeProvenanceView";
 import { UI_HELP_HINTS } from "../../lib/uiLexicon";
 import {
   applyLocalUserUiPreferences,
@@ -327,7 +334,7 @@ import { riskGate } from "../../lib/riskAI";
 import { routeOrder } from "../../lib/smartRouter";
 import { SelfLearningSchedulerController, type ShadowSchedulerSnapshot } from "../../lib/selfLearningScheduler";
 import { createMarketDataBus, type MarketDataBusKernelTelemetry, type OhlcvBar } from "../../lib/marketDataBus";
-import { clearChartFrame, subscribeChartFrame, subscribeChartFrameBatch, type LiveChartCandle, type LiveChartFrameMeta } from "../../lib/chartFrameFeed";
+import { clearChartFrame, getLatestChartFramePublishResult, subscribeChartFrame, subscribeChartFrameBatch, type LiveChartCandle, type LiveChartFrameMeta } from "../../lib/chartFrameFeed";
 import { DomHistoryBuffer, type DomHistoryFrame } from "../../lib/domHistoryBuffer";
 import type { SyncedMarketFrame } from "../../lib/syncedMarketFrame";
 import type { OrderflowDomSnapshot as RuntimeOrderflowDomSnapshot, OrderflowFootprintSnapshot as RuntimeOrderflowFootprintSnapshot, OrderflowRuntimeSnapshot } from "../../lib/orderflowRuntimeEngine";
@@ -920,6 +927,35 @@ type PerformanceAttributionItem = {
   avg_mae: number;
   avg_mfe: number;
   group_by: string[];
+  allocation_contribution_usd: number | null;
+  allocation_alpha_bps_avg: number | null;
+  signal_alpha_bps_avg: number | null;
+  timing_alpha_bps_avg: number | null;
+  execution_alpha_bps_avg: number | null;
+  spread_cost_bps_avg: number | null;
+  slippage_cost_bps_avg: number | null;
+  winner_component: string | null;
+  loser_component: string | null;
+  attribution_status: string | null;
+};
+type OpportunityCostAttributionItem = {
+  gate_reason: string | null;
+  market_regime: string | null;
+  strategy_id: string | null;
+  symbol: string | null;
+  timeframe: string | null;
+  entry_count: number;
+  computed_entry_count: number;
+  pending_entry_count: number;
+  expected_alpha_bps_avg: number | null;
+  realized_move_bps_avg: number | null;
+  missed_alpha_bps_avg: number | null;
+  saved_loss_bps_avg: number | null;
+  net_opportunity_alpha_bps_avg: number | null;
+  counterfactual_confidence_avg: number | null;
+  matching_quality_avg: number | null;
+  followup_delay_minutes_avg: number | null;
+  attribution_status: string | null;
 };
 type PerformanceCapitalSource = {
   key: string;
@@ -1894,6 +1930,11 @@ function toNumber(value: unknown, fallback = 0): number {
   return Number.isFinite(numeric) ? numeric : fallback;
 }
 
+function toNullableNumber(value: unknown): number | null {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
 function asJsonMap(value: unknown): JsonMap {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonMap) : {};
 }
@@ -1902,6 +1943,126 @@ function asJsonArray(value: unknown): JsonMap[] {
   return Array.isArray(value)
     ? value.filter((item): item is JsonMap => Boolean(item) && typeof item === "object" && !Array.isArray(item))
     : [];
+}
+
+function normalizePerformanceAttributionItem(value: unknown): PerformanceAttributionItem {
+  const row = asJsonMap(value);
+  return {
+    strategy_id: row.strategy_id ? String(row.strategy_id) : null,
+    symbol: row.symbol ? String(row.symbol) : null,
+    venue: row.venue ? String(row.venue) : null,
+    realized_pnl_usd: toNumber(row.realized_pnl_usd, 0),
+    unrealized_pnl_usd: toNumber(row.unrealized_pnl_usd, 0),
+    fees_usd: toNumber(row.fees_usd, 0),
+    trade_count: toNumber(row.trade_count, 0),
+    win_rate_pct: toNumber(row.win_rate_pct, 0),
+    expectancy_usd: toNumber(row.expectancy_usd, 0),
+    avg_slippage_bps: toNumber(row.avg_slippage_bps, 0),
+    avg_latency_ms: toNumber(row.avg_latency_ms, 0),
+    avg_score_pre_trade: toNumber(row.avg_score_pre_trade, 0),
+    gross_profit_usd: toNumber(row.gross_profit_usd, 0),
+    gross_loss_usd: toNumber(row.gross_loss_usd, 0),
+    profit_factor: toNullableNumber(row.profit_factor),
+    pnl_contribution_pct: toNumber(row.pnl_contribution_pct, 0),
+    avg_mae: toNumber(row.avg_mae, 0),
+    avg_mfe: toNumber(row.avg_mfe, 0),
+    group_by: Array.isArray(row.group_by) ? row.group_by.map((item) => String(item || "")).filter(Boolean) : [],
+    allocation_contribution_usd: toNullableNumber(row.allocation_contribution_usd),
+    allocation_alpha_bps_avg: toNullableNumber(row.allocation_alpha_bps_avg),
+    signal_alpha_bps_avg: toNullableNumber(row.signal_alpha_bps_avg),
+    timing_alpha_bps_avg: toNullableNumber(row.timing_alpha_bps_avg),
+    execution_alpha_bps_avg: toNullableNumber(row.execution_alpha_bps_avg),
+    spread_cost_bps_avg: toNullableNumber(row.spread_cost_bps_avg),
+    slippage_cost_bps_avg: toNullableNumber(row.slippage_cost_bps_avg),
+    winner_component: row.winner_component ? String(row.winner_component) : null,
+    loser_component: row.loser_component ? String(row.loser_component) : null,
+    attribution_status: row.attribution_status ? String(row.attribution_status) : null,
+  };
+}
+
+function normalizeOpportunityCostAttributionItem(value: unknown): OpportunityCostAttributionItem {
+  const row = asJsonMap(value);
+  return {
+    gate_reason: row.gate_reason ? String(row.gate_reason) : null,
+    market_regime: row.market_regime ? String(row.market_regime) : null,
+    strategy_id: row.strategy_id ? String(row.strategy_id) : null,
+    symbol: row.symbol ? String(row.symbol) : null,
+    timeframe: row.timeframe ? String(row.timeframe) : null,
+    entry_count: toNumber(row.entry_count, 0),
+    computed_entry_count: toNumber(row.computed_entry_count, 0),
+    pending_entry_count: toNumber(row.pending_entry_count, 0),
+    expected_alpha_bps_avg: toNullableNumber(row.expected_alpha_bps_avg),
+    realized_move_bps_avg: toNullableNumber(row.realized_move_bps_avg),
+    missed_alpha_bps_avg: toNullableNumber(row.missed_alpha_bps_avg),
+    saved_loss_bps_avg: toNullableNumber(row.saved_loss_bps_avg),
+    net_opportunity_alpha_bps_avg: toNullableNumber(row.net_opportunity_alpha_bps_avg),
+    counterfactual_confidence_avg: toNullableNumber(row.counterfactual_confidence_avg),
+    matching_quality_avg: toNullableNumber(row.matching_quality_avg),
+    followup_delay_minutes_avg: toNullableNumber(row.followup_delay_minutes_avg),
+    attribution_status: row.attribution_status ? String(row.attribution_status) : null,
+  };
+}
+
+function formatBps(value: number | null | undefined, digits = 1): string {
+  if (!Number.isFinite(Number(value))) {
+    return "-";
+  }
+  return `${Number(value).toLocaleString("fr-FR", { minimumFractionDigits: digits, maximumFractionDigits: digits })} bps`;
+}
+
+function formatAttributionComponentLabel(value: string | null | undefined): string {
+  const normalized = String(value || "").trim().toLowerCase();
+  const labels: Record<string, string> = {
+    allocation: "Allocation",
+    signal: "Signal",
+    timing: "Timing",
+    execution: "Execution",
+    spread_cost: "Spread",
+    slippage_cost: "Slippage",
+  };
+  return labels[normalized] || (normalized ? normalized.replace(/_/g, " ") : "-");
+}
+
+function weightedAveragePerformanceAttribution(rows: PerformanceAttributionItem[], field: "allocation_alpha_bps_avg" | "signal_alpha_bps_avg" | "execution_alpha_bps_avg"): number | null {
+  let weightedSum = 0;
+  let totalWeight = 0;
+  for (const row of rows) {
+    const value = row[field];
+    if (value === null) {
+      continue;
+    }
+    const weight = Math.max(1, row.trade_count || 0);
+    weightedSum += value * weight;
+    totalWeight += weight;
+  }
+  return totalWeight > 0 ? weightedSum / totalWeight : null;
+}
+
+function dominantPerformanceComponent(rows: PerformanceAttributionItem[], field: "winner_component" | "loser_component"): string | null {
+  const weights = new Map<string, number>();
+  for (const row of rows) {
+    const component = String(row[field] || "").trim();
+    if (!component) {
+      continue;
+    }
+    weights.set(component, (weights.get(component) || 0) + Math.max(1, row.trade_count || 0));
+  }
+  return [...weights.entries()].sort((left, right) => right[1] - left[1])[0]?.[0] || null;
+}
+
+function weightedAverageOpportunityCost(rows: OpportunityCostAttributionItem[], field: "net_opportunity_alpha_bps_avg" | "counterfactual_confidence_avg" | "followup_delay_minutes_avg"): number | null {
+  let weightedSum = 0;
+  let totalWeight = 0;
+  for (const row of rows) {
+    const value = row[field];
+    if (value === null) {
+      continue;
+    }
+    const weight = Math.max(1, row.entry_count || 0);
+    weightedSum += value * weight;
+    totalWeight += weight;
+  }
+  return totalWeight > 0 ? weightedSum / totalWeight : null;
 }
 
 function formatFeatureFamilyLabel(value: string): string {
@@ -4852,6 +5013,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
   const [balance, setBalance] = useState<JsonMap | null>(null);
   const [performanceSummary, setPerformanceSummary] = useState<PerformanceSummaryPayload | null>(null);
   const [performanceAttribution, setPerformanceAttribution] = useState<PerformanceAttributionItem[]>([]);
+  const [opportunityCostAttribution, setOpportunityCostAttribution] = useState<OpportunityCostAttributionItem[]>([]);
   const [performanceCapitalSources, setPerformanceCapitalSources] = useState<PerformanceCapitalSource[]>([]);
   const [investorReports, setInvestorReports] = useState<InvestorReportItem[]>([]);
   const [orderbook, setOrderbook] = useState<JsonMap | null>(null);
@@ -5347,6 +5509,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
   const attentionJournalSignatureRef = useRef("");
   const microstructureJournalSignatureRef = useRef("");
   const marketMicrostructureAnomalySignatureRef = useRef("");
+  const allocationDecisionJournalSignatureRef = useRef("");
   const capitalScalingJournalSignatureRef = useRef("");
   const executionLockJournalSignatureRef = useRef("");
   const tradabilityJournalSignatureRef = useRef("");
@@ -5610,6 +5773,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
   const [selfLearningV5Busy, setSelfLearningV5Busy] = useState(false);
   const [selfLearningV5PromotionBusy, setSelfLearningV5PromotionBusy] = useState(false);
   const [selfLearningV5Status, setSelfLearningV5Status] = useState("");
+  const [sourceTreeProvenance, setSourceTreeProvenance] = useState<SourceTreeProvenanceSnapshot>(EMPTY_SOURCE_TREE_PROVENANCE);
   const [selfLearningShadowSchedulerEnabled, setSelfLearningShadowSchedulerEnabled] = useState(false);
   const [selfLearningShadowSchedulerIntervalMin, setSelfLearningShadowSchedulerIntervalMin] = useState(15);
   const [selfLearningShadowSchedulerSnapshot, setSelfLearningShadowSchedulerSnapshot] = useState<{
@@ -5633,6 +5797,20 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
     lastError: null,
     inFlight: false,
   });
+  const loadSourceTreeProvenance = useCallback(async (): Promise<SourceTreeProvenanceSnapshot> => {
+    try {
+      const response = await fetch("/api/system/source-tree-provenance", { cache: "no-store" });
+      const payload = await response.json().catch(() => null);
+      const normalized = normalizeSourceTreeProvenance(payload);
+      setSourceTreeProvenance(normalized);
+      return normalized;
+    } catch {
+      return EMPTY_SOURCE_TREE_PROVENANCE;
+    }
+  }, []);
+  useEffect(() => {
+    void loadSourceTreeProvenance();
+  }, [loadSourceTreeProvenance]);
   const handleV2DomEntryFromLevel = useCallback((price: number, sideLabel: "bid" | "ask") => {
     const entry = Math.max(0.0000001, Number(price));
     const ticketSide: "buy" | "sell" = sideLabel === "ask" ? "buy" : "sell";
@@ -8513,7 +8691,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
     setQuoteHistory((current) => appendQuoteHistorySnapshot(current, nextQuotes, 40));
 
     sawUnauthorized = false;
-    const [overviewPayload, executionPnlAnalyzerResponsePayload, executionOptimizerLiveResponsePayload, executionAiV6ResponsePayload, marketVenueTelemetryResponsePayload, routeVenueTelemetryResponsePayload, incidentPayload, pendingPayload, outcomePayload, performanceSummaryPayload, performanceAttributionPayload, accountsPayload, connectorAccountsPayload, investorReportsPayload] = await Promise.all([
+    const [overviewPayload, executionPnlAnalyzerResponsePayload, executionOptimizerLiveResponsePayload, executionAiV6ResponsePayload, marketVenueTelemetryResponsePayload, routeVenueTelemetryResponsePayload, incidentPayload, pendingPayload, outcomePayload, performanceSummaryPayload, performanceAttributionPayload, opportunityCostAttributionPayload, accountsPayload, connectorAccountsPayload, investorReportsPayload] = await Promise.all([
       passiveObservationMode ? Promise.resolve(null) : fetchMaybeUnauthorized("/api/dashboard/overview"),
       passiveObservationMode ? Promise.resolve(null) : fetchMaybeUnauthorized("/api/execution/pnl-analyzer?scope_type=strategy&scope_id=mt5-live&limit=50", {
         headers: buildRoutingRequestHeaders("ui", selectedChartSymbol),
@@ -8533,6 +8711,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
       passiveObservationMode ? Promise.resolve([]) : fetchArrayFallback("/api/outcomes/recent?limit=20"),
       passiveObservationMode ? Promise.resolve(null) : fetchMaybeUnauthorized("/api/performance/summary?scope_type=strategy&scope_id=mt5-live"),
       passiveObservationMode ? Promise.resolve(null) : fetchMaybeUnauthorized("/api/performance/attribution?scope_type=strategy&scope_id=mt5-live&group_by=strategy,symbol,venue"),
+      passiveObservationMode ? Promise.resolve(null) : fetchMaybeUnauthorized("/api/performance/opportunity-cost?scope_type=strategy&scope_id=mt5-live&group_by=gate_reason,market_regime,symbol,timeframe"),
       passiveObservationMode ? Promise.resolve(null) : fetchMaybeUnauthorized("/api/accounts"),
       passiveObservationMode ? Promise.resolve(null) : fetchMaybeUnauthorized("/api/connectors/accounts"),
       passiveObservationMode ? Promise.resolve(null) : fetchMaybeUnauthorized("/api/investor-reports?portfolio_id=pf-internal-main&limit=1"),
@@ -8562,7 +8741,12 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
     setPerformanceSummary(performanceSummaryPayload && typeof performanceSummaryPayload === "object" ? (performanceSummaryPayload as PerformanceSummaryPayload) : null);
     setPerformanceAttribution(
       performanceAttributionPayload && typeof performanceAttributionPayload === "object"
-        ? ((((performanceAttributionPayload as JsonMap).rows as PerformanceAttributionItem[] | undefined) || []).slice(0, 6))
+        ? asJsonArray((performanceAttributionPayload as JsonMap).rows).map((row) => normalizePerformanceAttributionItem(row)).slice(0, 6)
+        : [],
+    );
+    setOpportunityCostAttribution(
+      opportunityCostAttributionPayload && typeof opportunityCostAttributionPayload === "object"
+        ? asJsonArray((opportunityCostAttributionPayload as JsonMap).rows).map((row) => normalizeOpportunityCostAttributionItem(row)).slice(0, 6)
         : [],
     );
     setPerformanceCapitalSources(normalizePerformanceCapitalSources(accountsPayload, connectorAccountsPayload));
@@ -8996,9 +9180,9 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
       setRoutingScore(snapshot.routingScore);
       setOhlcvStreamState(snapshot.ohlcvStreamState);
       setChartLoading(snapshot.chartLoading);
-      if (snapshot.ohlcvBars.length > 0) {
-        const frame = marketDataBusRef.current?.getSyncedFrame() ?? null;
-        if (frame) setSyncedFrame(frame);
+      const frame = marketDataBusRef.current?.getSyncedFrame() ?? null;
+      if (frame?.candle || snapshot.ohlcvBars.length > 0) {
+        setSyncedFrame(frame);
       }
     });
     return () => {
@@ -9029,6 +9213,13 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
       return;
     }
     if (authSessionRequired) {
+      if (terminalPassiveMode) {
+        setOhlcvStreamState("offline");
+        setDepthStreamState("offline");
+        setChartLoading(false);
+        marketDataBusRef.current?.disconnect(`passive-auth-session-required-${authStatus}`);
+        return;
+      }
       setOhlcvBars([]);
       setNativeTrades([]);
       setMarketMicro(null);
@@ -9209,11 +9400,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
       chartRestFallbackKeyRef.current = "";
       return;
     }
-    if (terminalPassiveMode) {
-      chartRestFallbackKeyRef.current = "";
-      return;
-    }
-    if (authSessionRequired || authStatus !== "authenticated") {
+    if ((authSessionRequired || authStatus !== "authenticated") && !terminalPassiveMode) {
       chartRestFallbackKeyRef.current = "";
       return;
     }
@@ -9235,6 +9422,8 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
 
     const hydrateChartFallback = async () => {
       try {
+        // Passive observer still needs a REST seed when canonical bus frames are unavailable;
+        // otherwise local terminal truth stays stuck at 0/0 bars and blocks operator metrics.
         const [barsResponse, depthResponse] = await Promise.all([
           fetch(`/api/market/ohlcv?instrument=${encodeURIComponent(selectedChartInstrument)}&venue=${encodeURIComponent(selectedChartVenue)}&timeframe=${encodeURIComponent(chartTimeframe)}&limit=500`, {
             cache: "no-store",
@@ -13381,6 +13570,8 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
   const selfLearningV5ActiveLiquidityWeight = selfLearningV5ActiveParams?.liquidityWeight ?? 0.15;
   const selfLearningV5Observation = selfLearningV5State?.snapshot.registry.observation || null;
   const selfLearningV5LatestPromotionAudit = selfLearningV5State?.snapshot.registry.promotionAuditTrail[0] || null;
+  const selfLearningV5PromotionGuard = describeSourceTreePromotionBlock(sourceTreeProvenance);
+  const selfLearningV5PromotionCommitDelta = getSourceTreeCommitDeltaLines(sourceTreeProvenance);
   const selfLearningV5LiveFrame = useMemo<SelfLearningV5Frame>(() => ({
     id: `live-${selectedChartSymbol}-${chartTimeframe}`,
     timestampIso: new Date().toISOString(),
@@ -20943,6 +21134,12 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
     if (selfLearningV5PromotionBusy || !strategyId) {
       return;
     }
+    const provenanceSnapshot = await loadSourceTreeProvenance();
+    const promotionGuard = describeSourceTreePromotionBlock(provenanceSnapshot);
+    if (promotionGuard.blocked) {
+      setSelfLearningV5Status(promotionGuard.reason);
+      return;
+    }
     setSelfLearningV5PromotionBusy(true);
     setSelfLearningV5Status("");
     try {
@@ -24368,6 +24565,210 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
     () => (localTerminalCapturePayload ? JSON.stringify(localTerminalCapturePayload) : ""),
     [localTerminalCapturePayload],
   );
+  const terminalCrashForensics = useMemo(() => {
+    const performanceMemory = typeof performance !== "undefined"
+      ? ((performance as Performance & {
+        memory?: {
+          usedJSHeapSize?: number;
+          jsHeapSizeLimit?: number;
+        };
+      }).memory || null)
+      : null;
+    const hydrationTrace = routingInputDiagnostics.routing_debug?.hydration_trace;
+    const gateTrace = routingInputDiagnostics.routing_debug?.gate_trace;
+    const canonicalFrameProducerAudit = asJsonMap(marketBusMeta?.canonical_frame_producer);
+    const canonicalFrameIngressAudit = asJsonMap(marketBusMeta?.canonical_frame_ingress);
+    const chartFramePublishResult = getLatestChartFramePublishResult(chartLiveFeedKey);
+    const activeSubscriptions = Math.max(0, Number(hydrationTrace?.listener_count || 0));
+    const wsConnections = [hydrationTrace?.trade_ws_state, hydrationTrace?.depth_ws_state]
+      .filter((value) => ["open", "live", "connecting"].includes(String(value || "").toLowerCase()))
+      .length;
+    const observerState = terminalPassiveMode
+      ? localOhlcvAnalysis.signal === "OHLCV_RENDERABLE"
+        ? "READY"
+        : localOhlcvAnalysis.signal === "OHLCV_PARTIAL"
+          ? "DEGRADED"
+          : "WARMING"
+      : marketBusHealthStatus === "ok"
+        ? "READY"
+        : "DEGRADED";
+    const lastRenderDuration = chartEngineMode === "v4"
+      ? (gpuPerceptualTelemetry?.performance?.fps && gpuPerceptualTelemetry.performance.fps > 0
+        ? 1000 / gpuPerceptualTelemetry.performance.fps
+        : null)
+      : (chartPerceptualTelemetry?.performance?.frameTimeMs ?? null);
+    const canonicalFrameProduced = terminalPassiveFrameCandles.length > 0 || Boolean(syncedFrame?.candle);
+    const canonicalFramePublishedAtMs = Number.isFinite(Number(terminalPassiveFrameMeta?.batchPublishedAt))
+      ? Number(terminalPassiveFrameMeta?.batchPublishedAt)
+      : null;
+    const fallbackFrameTsMs = Number.isFinite(Number(syncedFrame?.ts)) ? Number(syncedFrame?.ts) : null;
+    const canonicalFrameAgeMs = canonicalFrameProduced
+      ? canonicalFramePublishedAtMs != null
+        ? Math.max(0, Date.now() - canonicalFramePublishedAtMs)
+        : fallbackFrameTsMs != null
+          ? Math.max(0, Date.now() - fallbackFrameTsMs)
+          : null
+      : null;
+    const canonicalFrameFailureReason = canonicalFrameProduced
+      ? ""
+      : [
+        typeof chartFramePublishResult?.reason === "string" ? chartFramePublishResult.reason : "",
+        typeof canonicalFrameProducerAudit?.last_rejected_reason === "string" ? canonicalFrameProducerAudit.last_rejected_reason : "",
+        terminalPassiveFrameMeta?.truth?.reasons?.[0],
+        terminalPassiveFrameMeta?.reconstructionReason,
+        localOhlcvAnalysis.reasons[0],
+        marketBusHealthStatus !== "ok" ? `market_bus_${marketBusHealthStatus}` : "",
+        terminalPassiveMode ? "passive_canonical_frame_pending" : "canonical_frame_unavailable",
+      ].find((value) => String(value || "").trim().length > 0) || "canonical_frame_unavailable";
+    const lastEvent = [
+      hydrationTrace?.trade_ws_last_type,
+      hydrationTrace?.depth_ws_last_type,
+      gateTrace?.last_connect_error,
+      localOhlcvAnalysis.reasons[0],
+    ].find((value) => String(value || "").trim().length > 0) || "idle";
+    return {
+      timestamp: new Date().toISOString(),
+      heap_used: Number.isFinite(Number(performanceMemory?.usedJSHeapSize)) ? Number(performanceMemory?.usedJSHeapSize) : null,
+      heap_limit: Number.isFinite(Number(performanceMemory?.jsHeapSizeLimit)) ? Number(performanceMemory?.jsHeapSizeLimit) : null,
+      active_subscriptions: activeSubscriptions,
+      chart_count: terminalPassiveMode ? 1 : Math.max(1, multiChartCaptureIntegrity.activeTiles || 1),
+      ws_connections: wsConnections,
+      observer_state: observerState,
+      last_event: String(lastEvent),
+      last_render_duration: Number.isFinite(Number(lastRenderDuration)) ? Number(lastRenderDuration) : null,
+      canonical_frame: {
+        frame_requested: terminalPassiveMode,
+        frame_produced: canonicalFrameProduced,
+        producer: terminalPassiveFrameCandles.length > 0
+          ? "chart_frame_feed"
+          : syncedFrame?.candle
+            ? `market_data_bus_${syncedFrame.source}`
+            : "none",
+        last_frame_age_ms: canonicalFrameAgeMs,
+        upstream_source: terminalPassiveFrameMeta?.truth?.reconstruction_flag === "source_gap"
+          ? "reconstruction_source_gap"
+          : terminalPassiveFrameMeta?.truth?.reconstruction_flag === "observer_resumed"
+            ? "observer_resumed"
+            : syncedFrame?.source || (terminalPassiveMode ? "passive_chart_frame_feed" : "market_data_bus"),
+        failure_reason: String(canonicalFrameFailureReason),
+        producer_audit: {
+          request_count: Math.max(0, Number(canonicalFrameProducerAudit?.request_count || 0)),
+          calculated_count: Math.max(0, Number(canonicalFrameProducerAudit?.calculated_count || 0)),
+          publish_count: Math.max(0, Number(canonicalFrameProducerAudit?.publish_count || 0)),
+          reject_count: Math.max(0, Number(canonicalFrameProducerAudit?.reject_count || 0)),
+          last_outcome: typeof canonicalFrameProducerAudit?.last_outcome === "string" ? canonicalFrameProducerAudit.last_outcome : "unknown",
+          last_publish_mode: typeof canonicalFrameProducerAudit?.last_publish_mode === "string" ? canonicalFrameProducerAudit.last_publish_mode : "none",
+          last_rejected_reason: typeof canonicalFrameProducerAudit?.last_rejected_reason === "string" ? canonicalFrameProducerAudit.last_rejected_reason : null,
+          last_requested_at: typeof canonicalFrameProducerAudit?.last_requested_at === "string" ? canonicalFrameProducerAudit.last_requested_at : null,
+          last_calculated_at: typeof canonicalFrameProducerAudit?.last_calculated_at === "string" ? canonicalFrameProducerAudit.last_calculated_at : null,
+          last_published_at: typeof canonicalFrameProducerAudit?.last_published_at === "string" ? canonicalFrameProducerAudit.last_published_at : null,
+          last_rejected_at: typeof canonicalFrameProducerAudit?.last_rejected_at === "string" ? canonicalFrameProducerAudit.last_rejected_at : null,
+          last_calculated_candle_count: Math.max(0, Number(canonicalFrameProducerAudit?.last_calculated_candle_count || 0)),
+          last_published_candle_count: Math.max(0, Number(canonicalFrameProducerAudit?.last_published_candle_count || 0)),
+          chart_frame_feed_outcome: typeof chartFramePublishResult?.outcome === "string" ? chartFramePublishResult.outcome : "unknown",
+          chart_frame_feed_reason: typeof chartFramePublishResult?.reason === "string" ? chartFramePublishResult.reason : null,
+        },
+      },
+      canonical_frame_ingress: {
+        expected: Boolean(canonicalFrameIngressAudit?.expected || marketBusGateTrace.shouldConnect),
+        called: Boolean(canonicalFrameIngressAudit?.called),
+        source: typeof canonicalFrameIngressAudit?.source === "string" ? canonicalFrameIngressAudit.source : "none",
+        reason: typeof canonicalFrameIngressAudit?.reason === "string" ? canonicalFrameIngressAudit.reason : null,
+        blocked_by: typeof canonicalFrameIngressAudit?.blocked_by === "string"
+          ? canonicalFrameIngressAudit.blocked_by
+          : marketBusGateTrace.shouldConnect && !Boolean(canonicalFrameIngressAudit?.called)
+            ? String(marketBusGateTrace.blockReason || "unknown")
+            : null,
+        last_candidate_event: typeof canonicalFrameIngressAudit?.last_candidate_event === "string" ? canonicalFrameIngressAudit.last_candidate_event : null,
+        symbol: typeof canonicalFrameIngressAudit?.symbol === "string" ? canonicalFrameIngressAudit.symbol : selectedChartInstrument,
+        venue: typeof canonicalFrameIngressAudit?.venue === "string" ? canonicalFrameIngressAudit.venue : selectedChartVenue,
+        frame_key: typeof canonicalFrameIngressAudit?.frame_key === "string" ? canonicalFrameIngressAudit.frame_key : chartLiveFeedKey,
+        timestamp: typeof canonicalFrameIngressAudit?.timestamp === "string" ? canonicalFrameIngressAudit.timestamp : null,
+        candidate_count: Math.max(0, Number(canonicalFrameIngressAudit?.candidate_count || 0)),
+        called_count: Math.max(0, Number(canonicalFrameIngressAudit?.called_count || 0)),
+        blocked_count: Math.max(0, Number(canonicalFrameIngressAudit?.blocked_count || 0)),
+      },
+    };
+  }, [
+    chartEngineMode,
+    chartLiveFeedKey,
+    chartPerceptualTelemetry,
+    gpuPerceptualTelemetry,
+    localOhlcvAnalysis.reasons,
+    localOhlcvAnalysis.signal,
+    marketBusGateTrace,
+    marketBusHealthStatus,
+    marketBusMeta,
+    multiChartCaptureIntegrity.activeTiles,
+    routingInputDiagnostics.routing_debug,
+    selectedChartInstrument,
+    selectedChartVenue,
+    syncedFrame,
+    terminalPassiveFrameCandles.length,
+    terminalPassiveFrameMeta,
+    terminalPassiveMode,
+  ]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const runtimeWindow = window as Window & {
+      __MC_TERMINAL_CRASH_FORENSICS__?: {
+        timestamp: string;
+        heap_used: number | null;
+        heap_limit: number | null;
+        active_subscriptions: number;
+        chart_count: number;
+        ws_connections: number;
+        observer_state: string;
+        last_event: string;
+        last_render_duration: number | null;
+        canonical_frame: {
+          frame_requested: boolean;
+          frame_produced: boolean;
+          producer: string;
+          last_frame_age_ms: number | null;
+          upstream_source: string;
+          failure_reason: string;
+          producer_audit: {
+            request_count: number;
+            calculated_count: number;
+            publish_count: number;
+            reject_count: number;
+            last_outcome: string;
+            last_publish_mode: string;
+            last_rejected_reason: string | null;
+            last_requested_at: string | null;
+            last_calculated_at: string | null;
+            last_published_at: string | null;
+            last_rejected_at: string | null;
+            last_calculated_candle_count: number;
+            last_published_candle_count: number;
+            chart_frame_feed_outcome: string;
+            chart_frame_feed_reason: string | null;
+          };
+        };
+        canonical_frame_ingress: {
+          expected: boolean;
+          called: boolean;
+          source: string;
+          reason: string | null;
+          blocked_by: string | null;
+          last_candidate_event: string | null;
+          symbol: string;
+          venue: string;
+          frame_key: string;
+          timestamp: string | null;
+          candidate_count: number;
+          called_count: number;
+          blocked_count: number;
+        };
+      } | null;
+    };
+    runtimeWindow.__MC_TERMINAL_CRASH_FORENSICS__ = terminalCrashForensics;
+    document.body.dataset.mcTerminalObserverState = terminalCrashForensics.observer_state;
+  }, [terminalCrashForensics]);
 
   useEffect(() => {
     try {
@@ -24640,6 +25041,20 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
     { label: "SLA breach", value: String(incidents.filter((i) => Boolean(i.sla_breached)).length), severity: incidents.some((i) => Boolean(i.sla_breached)) ? 3 : 1 },
   ];
   const topPerformanceAttribution = performanceAttribution.slice(0, 4);
+  const topOpportunityCostAttribution = opportunityCostAttribution.slice(0, 4);
+  const performanceAllocationAlphaAvg = useMemo(() => weightedAveragePerformanceAttribution(performanceAttribution, "allocation_alpha_bps_avg"), [performanceAttribution]);
+  const performanceSignalAlphaAvg = useMemo(() => weightedAveragePerformanceAttribution(performanceAttribution, "signal_alpha_bps_avg"), [performanceAttribution]);
+  const performanceExecutionAlphaAvg = useMemo(() => weightedAveragePerformanceAttribution(performanceAttribution, "execution_alpha_bps_avg"), [performanceAttribution]);
+  const performanceWinnerComponent = useMemo(() => dominantPerformanceComponent(performanceAttribution, "winner_component"), [performanceAttribution]);
+  const performanceLoserComponent = useMemo(() => dominantPerformanceComponent(performanceAttribution, "loser_component"), [performanceAttribution]);
+  const opportunityCostNetAlphaAvg = useMemo(() => weightedAverageOpportunityCost(opportunityCostAttribution, "net_opportunity_alpha_bps_avg"), [opportunityCostAttribution]);
+  const opportunityCostConfidenceAvg = useMemo(() => weightedAverageOpportunityCost(opportunityCostAttribution, "counterfactual_confidence_avg"), [opportunityCostAttribution]);
+  const opportunityCostDelayAvg = useMemo(() => weightedAverageOpportunityCost(opportunityCostAttribution, "followup_delay_minutes_avg"), [opportunityCostAttribution]);
+  const opportunityCostDeskTone = opportunityCostNetAlphaAvg === null
+    ? "watch"
+    : opportunityCostNetAlphaAvg > 0
+      ? "risk"
+      : "go";
   const swarmAnalyticsSnapshot = useMemo(() => {
     const finalScore = aiFusedProbability;
     const realizedWinrate = pnlAnalyticsSnapshot.stats.winrate;
@@ -24733,6 +25148,11 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
   const latestInvestorReportSummary = latestInvestorReport?.summary && typeof latestInvestorReport.summary === "object"
     ? latestInvestorReport.summary
     : null;
+  const allocationDecisionPortfolioId = String(
+    latestInvestorReport?.portfolio_id
+    || asJsonMap(latestInvestorReportSummary?.scope).portfolio_id
+    || "pf-internal-main",
+  ).trim() || "pf-internal-main";
   const performanceDeskTone = pnlAnalyticsSnapshot.autoOptimization.action === "disable"
     ? "bad"
     : performanceSummary && performanceSummary.trade_count > 0
@@ -24766,6 +25186,147 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
   const highlightedTapeIndex = activeTimeKey
     ? activeTape.findIndex((print) => print.timeKey === activeTimeKey)
     : -1;
+  useEffect(() => {
+    if (terminalPassiveMode || !finalDecisionTruth || portfolioAllocatorRows.length === 0) {
+      allocationDecisionJournalSignatureRef.current = "";
+      return;
+    }
+
+    const availableCapitalUsd = Number.isFinite(accountFreeUsd) ? Number(accountFreeUsd.toFixed(2)) : 0;
+    const marketRegime = String(volatilityRegimeSnapshot.regime || "UNKNOWN").trim().toUpperCase() || "UNKNOWN";
+    const marketTemperature = overlayDecisionRegime === "–"
+      ? "UNKNOWN"
+      : String(overlayDecisionRegime || "UNKNOWN").trim().toUpperCase() || "UNKNOWN";
+    const selectedStrategyId = String(
+      portfolioAllocatorSelectedEntry?.id
+      || strategyEvolutionV9Snapshot.selectedStrategy
+      || allocActiveStratId
+      || "",
+    ).trim();
+    const strategyPerformanceById = new Map(strategyPerformance.map((strategy) => [strategy.id, strategy]));
+    const strategies = portfolioAllocatorRows.map((entry) => {
+      const performance = strategyPerformanceById.get(entry.id);
+      const allocatedPct = Number((entry.allocation * 100).toFixed(2));
+      return {
+        strategy_id: entry.id,
+        regime: String(performance?.regime || marketRegime).trim().toUpperCase() || marketRegime,
+        allocated_pct: allocatedPct,
+        allocated_capital_usd: Number((availableCapitalUsd * entry.allocation).toFixed(2)),
+        score: Number(entry.score.toFixed(6)),
+        status: String(performance?.status || entry.status || "active").trim() || "active",
+        expected_edge_usd: Number(toNumber(performance?.expectancy, entry.expectancy).toFixed(2)),
+        expected_sharpe: Number(toNumber(performance?.sharpeLike, entry.sharpe).toFixed(3)),
+        expected_drawdown_pct: Number(
+          toNumber(performance?.maxDrawdownPct, entry.drawdown * 100).toFixed(2),
+        ),
+        expected_win_rate_pct: Number(
+          toNumber(performance?.winrate, toNumber(entry.winrate, 0) * 100).toFixed(2),
+        ),
+        sample_size: Math.max(0, Math.round(toNumber(performance?.total, entry.sampleSize ?? 0))),
+        blocked: entry.blocked,
+        reasons: [...new Set(entry.reasons.map((reason) => String(reason || "").trim()).filter(Boolean))].slice(0, 8),
+      };
+    });
+    const memoryCues = [...new Set([
+      `market:${String(finalDecisionTruth.market_truth.state || "UNKNOWN").toLowerCase()}`,
+      `edge:${String(finalDecisionTruth.edge_eligibility.state || "unknown").toLowerCase()}`,
+      `meta-risk:${String(metaRiskOfficer.tier || "unknown").toLowerCase()}`,
+      `capital-mode:${String(strategyEvolutionV9Snapshot.capitalMode || "unknown").toLowerCase()}`,
+      `evolution:${String(strategyEvolutionV9Snapshot.evolutionMode || "unknown").toLowerCase()}`,
+      ...strategyEvolutionV9Snapshot.reasons.slice(0, 6).map((reason) => String(reason || "").trim()).filter(Boolean),
+      ...(portfolioAllocatorSelectedEntry?.reasons || []).slice(0, 4).map((reason) => `selected:${String(reason || "").trim()}`),
+    ])].slice(0, 16);
+    const allocationCandidateId = String(finalDecisionTruth.oracle_fingerprint || "").trim();
+    const allocationDecisionId = allocationCandidateId || String(runtimeDecisionDeterminism?.decision_hash || "").trim();
+    const payload = {
+      allocation_id: allocationDecisionId ? `alloc-${allocationDecisionId}` : undefined,
+      portfolio_id: allocationDecisionPortfolioId,
+      trade_lifecycle_id: allocationCandidateId || null,
+      candidate_id: allocationCandidateId || null,
+      decision_id: allocationDecisionId || null,
+      causality_confidence: "native",
+      selected_strategy_id: selectedStrategyId,
+      allocator_version: "portfolio-allocator-v1",
+      capital_mode: strategyEvolutionV9Snapshot.capitalMode,
+      evolution_mode: strategyEvolutionV9Snapshot.evolutionMode,
+      market_state: String(finalDecisionTruth.market_truth.state || "UNKNOWN").trim().toUpperCase() || "UNKNOWN",
+      market_regime: marketRegime,
+      market_temperature: marketTemperature,
+      available_capital_usd: availableCapitalUsd,
+      selected_strategy_size_multiplier: Number(portfolioAllocatorSizeMultiplier.toFixed(4)),
+      truth_quality_pct: Number(toNumber(finalDecisionTruth.market_truth.score_pct, 0).toFixed(2)),
+      memory_cues: memoryCues,
+      strategies,
+      created_at_iso: new Date().toISOString(),
+      writer_timestamp_iso: new Date().toISOString(),
+    };
+    const signature = JSON.stringify({
+      portfolioId: payload.portfolio_id,
+      selectedStrategyId: payload.selected_strategy_id,
+      marketState: payload.market_state,
+      marketRegime: payload.market_regime,
+      marketTemperature: payload.market_temperature,
+      availableCapitalUsd: Math.round(payload.available_capital_usd),
+      truthQualityPct: Math.round(payload.truth_quality_pct),
+      sizeMultiplier: Math.round(payload.selected_strategy_size_multiplier * 1000),
+      memoryCues: payload.memory_cues,
+      strategies: payload.strategies.map((strategy) => ([
+        strategy.strategy_id,
+        Math.round(strategy.allocated_pct * 100),
+        Math.round(strategy.allocated_capital_usd),
+        Math.round(strategy.score * 1000),
+        strategy.status,
+        strategy.blocked ? 1 : 0,
+        strategy.reasons.join("|"),
+      ])),
+    });
+    if (signature === allocationDecisionJournalSignatureRef.current) {
+      return;
+    }
+    allocationDecisionJournalSignatureRef.current = signature;
+
+    void (async () => {
+      const reportWriterFailure = async (writerErrorCode: string, writerErrorDetail: string): Promise<void> => {
+        await fetch("/api/system/allocation-decisions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            allocation_id: payload.allocation_id,
+            portfolio_id: payload.portfolio_id,
+            trade_lifecycle_id: payload.trade_lifecycle_id,
+            candidate_id: payload.candidate_id,
+            decision_id: payload.decision_id,
+            selected_strategy_id: payload.selected_strategy_id,
+            allocator_version: payload.allocator_version,
+            writer_timestamp_iso: payload.writer_timestamp_iso,
+            audit_only: true,
+            writer_result: "failed",
+            writer_error_code: writerErrorCode,
+            writer_error_detail: writerErrorDetail,
+          }),
+        }).catch(() => null);
+      };
+
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), 4_000);
+      try {
+        await fetch("/api/system/allocation-decisions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+      } catch (error) {
+        const writerErrorCode = error instanceof DOMException && error.name === "AbortError"
+          ? "writer_timeout"
+          : "writer_journal_error";
+        const writerErrorDetail = error instanceof Error ? error.message : "allocation_writer_request_failed";
+        await reportWriterFailure(writerErrorCode, writerErrorDetail);
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
+    })();
+  }, [accountFreeUsd, allocActiveStratId, allocationDecisionPortfolioId, finalDecisionTruth, metaRiskOfficer.tier, overlayDecisionRegime, portfolioAllocatorRows, portfolioAllocatorSelectedEntry?.id, portfolioAllocatorSelectedEntry?.reasons, portfolioAllocatorSizeMultiplier, runtimeDecisionDeterminism?.decision_hash, strategyEvolutionV9Snapshot.capitalMode, strategyEvolutionV9Snapshot.evolutionMode, strategyEvolutionV9Snapshot.reasons, strategyEvolutionV9Snapshot.selectedStrategy, strategyPerformance, terminalPassiveMode, volatilityRegimeSnapshot.regime]);
   const chartVisualPresetLabel = chartMotionClass === "stable"
     ? "stable"
     : chartMotionClass === "aggressive"
@@ -25757,7 +26318,6 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
       committed.detail = domain.detail;
       if (changed) {
         committed.changeCount += 1;
-        committed.lastChangedAt = renderProbeChangedAt;
         committed.lastChangedCycle = terminalOpsRenderCycleRef.current;
         changedDomains.push({
           id: domain.id,
@@ -26789,6 +27349,8 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
               <div className="term-report-body" style={{ marginBottom: 12 }}>
                 <span>Scope agrégé: <strong>strategy = mt5-live</strong>, mais lecture source-capital désormais explicitée ci-dessous.</span>
                 <span>Le desk distingue les comptes broker live, broker paper, les sources exchange et les wallets pour éviter une lecture client ambiguë.</span>
+                <span>Alpha V1 moyen: <strong>{formatBps(performanceAllocationAlphaAvg)}</strong> allocation · <strong>{formatBps(performanceSignalAlphaAvg)}</strong> signal · <strong>{formatBps(performanceExecutionAlphaAvg)}</strong> execution.</span>
+                <span>Winner / loser dominant: <strong>{formatAttributionComponentLabel(performanceWinnerComponent)}</strong> / <strong>{formatAttributionComponentLabel(performanceLoserComponent)}</strong>.</span>
                 <span><Link href="/live-capital">Ouvrir Live Capital</Link> pour canoniser une source, vérifier ses fonds et poser un cap USD portefeuille.</span>
               </div>
               <div className="term-performance-metrics">
@@ -26820,12 +27382,40 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
                   <div key={`perf-row-${row.strategy_id || "none"}-${row.symbol || "none"}-${row.venue || "none"}-${index}`} className="term-performance-row">
                     <span>{row.symbol || row.strategy_id || "n/a"}</span>
                     <span>{row.venue || "–"}</span>
-                    <span>{row.trade_count} tr</span>
-                    <span>{`${row.pnl_contribution_pct.toFixed(0)}%`}</span>
+                    <span>{row.trade_count} tr · {`${row.pnl_contribution_pct.toFixed(0)}%`}</span>
+                    <span>{formatBps(row.execution_alpha_bps_avg)} exec · {formatAttributionComponentLabel(row.winner_component)} / {formatAttributionComponentLabel(row.loser_component)}</span>
                     <strong>{row.realized_pnl_usd.toLocaleString("fr-FR", { style: "currency", currency: "USD", maximumFractionDigits: 0 })}</strong>
                   </div>
                 )) : (
                   <div className="term-performance-empty">Aucune attribution exploitable sur le scope courant.</div>
+                )}
+              </div>
+            </article>
+
+            <article className={`term-performance-card tone-${opportunityCostDeskTone}`}>
+              <div className="term-performance-head">
+                <div>
+                  <span className="eyebrow">Opportunity Cost V1</span>
+                  <div className="term-performance-title">Gate reason · regime · symbol · timeframe</div>
+                </div>
+                <span className={`term-decision-badge tone-${opportunityCostDeskTone}`}>{topOpportunityCostAttribution.length} buckets</span>
+              </div>
+              <div className="term-report-body" style={{ marginBottom: 12 }}>
+                <span>Net opportunity alpha moyen: <strong>{formatBps(opportunityCostNetAlphaAvg)}</strong>.</span>
+                <span>Confiance contre-factuelle: <strong>{opportunityCostConfidenceAvg != null ? `${(opportunityCostConfidenceAvg * 100).toFixed(0)}%` : "-"}</strong> · délai moyen <strong>{opportunityCostDelayAvg != null ? `${opportunityCostDelayAvg.toFixed(0)} min` : "-"}</strong>.</span>
+                <span>Cette vue répond à “pourquoi TXT n'a pas pris ce trade ?” sans polluer l’attribution d’exécution.</span>
+              </div>
+              <div className="term-performance-table">
+                {topOpportunityCostAttribution.length > 0 ? topOpportunityCostAttribution.map((row, index) => (
+                  <div key={`opp-row-${row.gate_reason || "none"}-${row.market_regime || "none"}-${row.symbol || "none"}-${row.timeframe || "none"}-${index}`} className="term-performance-row">
+                    <span>{row.gate_reason || "gate inconnu"}</span>
+                    <span>{row.market_regime || "-"}</span>
+                    <span>{row.symbol || "-"} / {row.timeframe || "-"}</span>
+                    <span>{formatBps(row.net_opportunity_alpha_bps_avg)} · {row.entry_count} evt</span>
+                    <strong>{row.counterfactual_confidence_avg != null ? `${(row.counterfactual_confidence_avg * 100).toFixed(0)}% conf` : "conf -"}</strong>
+                  </div>
+                )) : (
+                  <div className="term-performance-empty">Aucun bucket opportunity cost sur le scope courant.</div>
                 )}
               </div>
             </article>
@@ -30788,6 +31378,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
                         className="learning-loop-shadow-btn"
                         disabled={
                           selfLearningV5PromotionBusy
+                          || selfLearningV5PromotionGuard.blocked
                           || !selfLearningV5State?.snapshot.registry.activeShadowStrategyId
                           || !selfLearningV5Observation.eligibleForPromotion
                         }
@@ -30803,6 +31394,8 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
                           : "manual promotion remains operator-audited"}
                       </span>
                     </div>
+                    {selfLearningV5PromotionGuard.blocked ? <div className="warn mini" style={{ marginTop: 8 }}>{selfLearningV5PromotionGuard.reason}</div> : null}
+                    {selfLearningV5PromotionCommitDelta.length > 0 ? <div className="subtle mini" style={{ marginTop: 6 }}>Delta commit · {selfLearningV5PromotionCommitDelta.join(" · ")}</div> : null}
                   </div>
                 )}
               </div>

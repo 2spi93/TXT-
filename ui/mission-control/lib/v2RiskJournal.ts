@@ -1,5 +1,7 @@
+import { createReadStream } from "node:fs";
 import { appendFile, mkdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
+import readline from "node:readline";
 
 export type V2RiskJournalEntry = {
   id: string;
@@ -21,6 +23,45 @@ type V2RiskJournalCache = {
 };
 
 let journalCache: V2RiskJournalCache | null = null;
+
+const OPERATIONAL_REFUSAL_CODES = new Set([
+  "engine-v4-off",
+  "fallback-mode",
+  "routing-blocked",
+  "routing-score-zero",
+  "runtime-kill-switch-active",
+]);
+
+function normalizeDecisionCode(row: V2RiskJournalEntry): string {
+  const meta = asRecord(row.meta);
+  const decisionAudit = asRecord(meta.decision_audit);
+  return String(decisionAudit.code || "").trim().toLowerCase() || "unknown";
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function isRefusalAction(action: string): boolean {
+  return action === "execution-v7-blocked"
+    || action === "execution-disabled-policy"
+    || action === "execution-disabled-fallback"
+    || action === "execution-disabled-routing";
+}
+
+export function isOpportunityEligibleRefusalEntry(row: V2RiskJournalEntry): boolean {
+  const action = String(row.action || "").trim().toLowerCase();
+  if (!isRefusalAction(action)) {
+    return false;
+  }
+  if (action === "execution-v7-blocked") {
+    return true;
+  }
+  const decisionCode = normalizeDecisionCode(row);
+  return !OPERATIONAL_REFUSAL_CODES.has(decisionCode);
+}
 
 function filePath(): string {
   const journalDir = process.env.V2_RISK_JOURNAL_DIR || "/tmp";
@@ -71,6 +112,142 @@ async function loadAllEntries(): Promise<V2RiskJournalEntry[]> {
   }
 }
 
+async function streamTailMatchingEntries(input: {
+  symbol: string;
+  timeframe: string;
+  strategy: string;
+  action: string;
+  cutoffMs: number;
+  limit: number;
+}): Promise<V2RiskJournalEntry[]> {
+  const target = filePath();
+  try {
+    const lines = readline.createInterface({
+      input: createReadStream(target, { encoding: "utf-8" }),
+      crlfDelay: Infinity,
+    });
+    const queue: V2RiskJournalEntry[] = [];
+    for await (const line of lines) {
+      if (!line) {
+        continue;
+      }
+      try {
+        const row = JSON.parse(line) as V2RiskJournalEntry;
+        if (!matchesJournalEntry(row, input)) {
+          continue;
+        }
+        queue.push(row);
+        if (queue.length > input.limit) {
+          queue.shift();
+        }
+      } catch {
+        continue;
+      }
+    }
+    return queue.reverse();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+}
+
+export async function scanV2RiskJournalDerivedActionIds(options?: {
+  sinceDays?: number;
+  postProducerStartIso?: string | null;
+}): Promise<{
+  executionOutcomeSourceIds: Set<string>;
+  refusalSourceIdsRaw: Set<string>;
+  refusalSourceIdsEligible: Set<string>;
+  refusalSourceIdsRawPostProducer: Set<string>;
+  operationalRefusalCountsByCode: Map<string, number>;
+  operationalRefusalCountsByCodePostProducer: Map<string, number>;
+}> {
+  const sinceDays = Math.max(0, Math.min(365, Number(options?.sinceDays || 0)));
+  const cutoffMs = sinceDays > 0 ? Date.now() - sinceDays * 24 * 60 * 60 * 1000 : 0;
+  const postProducerStartMs = Date.parse(String(options?.postProducerStartIso || ""));
+  const hasPostProducerStart = Number.isFinite(postProducerStartMs);
+  const target = filePath();
+  const executionOutcomeSourceIds = new Set<string>();
+  const refusalSourceIdsRaw = new Set<string>();
+  const refusalSourceIdsEligible = new Set<string>();
+  const refusalSourceIdsRawPostProducer = new Set<string>();
+  const operationalRefusalCountsByCode = new Map<string, number>();
+  const operationalRefusalCountsByCodePostProducer = new Map<string, number>();
+  try {
+    const lines = readline.createInterface({
+      input: createReadStream(target, { encoding: "utf-8" }),
+      crlfDelay: Infinity,
+    });
+    for await (const line of lines) {
+      if (!line) {
+        continue;
+      }
+      try {
+        const row = JSON.parse(line) as V2RiskJournalEntry;
+        const createdAtMs = Date.parse(String(row.createdAtIso || ""));
+        if (cutoffMs > 0 && Number.isFinite(createdAtMs) && createdAtMs < cutoffMs) {
+          continue;
+        }
+        const action = String(row.action || "").trim().toLowerCase();
+        if (action.startsWith("execution-v7-outcome-")) {
+          executionOutcomeSourceIds.add(String(row.id || "").trim());
+          continue;
+        }
+        if (isRefusalAction(action)) {
+          const sourceId = String(row.id || "").trim();
+          if (!sourceId) {
+            continue;
+          }
+          const decisionCode = normalizeDecisionCode(row);
+          refusalSourceIdsRaw.add(sourceId);
+          if (isOpportunityEligibleRefusalEntry(row)) {
+            refusalSourceIdsEligible.add(sourceId);
+          } else {
+            operationalRefusalCountsByCode.set(decisionCode, (operationalRefusalCountsByCode.get(decisionCode) || 0) + 1);
+          }
+          if (hasPostProducerStart && createdAtMs >= postProducerStartMs) {
+            refusalSourceIdsRawPostProducer.add(sourceId);
+            if (!isOpportunityEligibleRefusalEntry(row)) {
+              operationalRefusalCountsByCodePostProducer.set(decisionCode, (operationalRefusalCountsByCodePostProducer.get(decisionCode) || 0) + 1);
+            }
+          }
+        }
+      } catch {
+        continue;
+      }
+    }
+    return {
+      executionOutcomeSourceIds,
+      refusalSourceIdsRaw,
+      refusalSourceIdsEligible,
+      refusalSourceIdsRawPostProducer,
+      operationalRefusalCountsByCode,
+      operationalRefusalCountsByCodePostProducer,
+    };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return {
+        executionOutcomeSourceIds,
+        refusalSourceIdsRaw,
+        refusalSourceIdsEligible,
+        refusalSourceIdsRawPostProducer,
+        operationalRefusalCountsByCode,
+        operationalRefusalCountsByCodePostProducer,
+      };
+    }
+    return {
+      executionOutcomeSourceIds,
+      refusalSourceIdsRaw,
+      refusalSourceIdsEligible,
+      refusalSourceIdsRawPostProducer,
+      operationalRefusalCountsByCode,
+      operationalRefusalCountsByCodePostProducer,
+    };
+  }
+}
+
 function matchesJournalEntry(
   row: V2RiskJournalEntry,
   input: {
@@ -116,24 +293,7 @@ export async function readV2RiskJournalEntries(options?: {
   const cutoffMs = sinceDays > 0 ? Date.now() - sinceDays * 24 * 60 * 60 * 1000 : 0;
 
   try {
-    const rows = await loadAllEntries();
-    const results: V2RiskJournalEntry[] = [];
-
-    for (let index = rows.length - 1; index >= 0 && results.length < limit; index -= 1) {
-      const row = rows[index];
-      if (cutoffMs > 0) {
-        const createdAtMs = Date.parse(String(row.createdAtIso || ""));
-        if (Number.isFinite(createdAtMs) && createdAtMs < cutoffMs) {
-          break;
-        }
-      }
-      if (!matchesJournalEntry(row, { symbol, timeframe, strategy, action, cutoffMs })) {
-        continue;
-      }
-      results.push(row);
-    }
-
-    return results;
+    return await streamTailMatchingEntries({ symbol, timeframe, strategy, action, cutoffMs, limit });
   } catch {
     return [];
   }

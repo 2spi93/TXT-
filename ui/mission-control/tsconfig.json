@@ -26,13 +26,14 @@
   "include": [
     "**/*.ts",
     "**/*.tsx",
+    ".next-runtime-blue/types/**/*.ts",
     ".next-runtime-e2e-smoke/types/**/*.ts",
     ".next-runtime-e2e/types/**/*.ts",
     ".next-runtime-green/types/**/*.ts",
     ".next/dev/types/**/*.ts",
     ".next/types/**/*.ts",
     "next-env.d.ts",
-    ".next-runtime-blue/types/**/*.ts"
+    ".next-runtime/types/**/*.ts"
   ],
   "exclude": [
     "node_modules"

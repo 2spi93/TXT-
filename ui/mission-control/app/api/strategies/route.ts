@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { cpFetch, cpFetchJsonSafe } from "../../../lib/controlPlane";
+import { evaluateDecisionGovernanceCapability } from "../../../lib/decisionGovernanceControl";
 
 export async function GET(): Promise<NextResponse> {
   const { response, payload } = await cpFetchJsonSafe("/v1/strategies");
@@ -9,6 +10,13 @@ export async function GET(): Promise<NextResponse> {
 
 export async function POST(request: Request): Promise<NextResponse> {
   const contentType = request.headers.get("content-type") || "";
+  const governance = await evaluateDecisionGovernanceCapability("strategy_expansion");
+  if (!governance.allowed) {
+    if (contentType.includes("application/json")) {
+      return NextResponse.json(governance, { status: 412 });
+    }
+    return NextResponse.redirect(new URL("/?strategy_error=decision_governance_blocked", request.url));
+  }
   if (contentType.includes("application/json")) {
     const payload = await request.json().catch(() => ({}));
     const response = await cpFetch("/v1/strategies", {

@@ -6,6 +6,11 @@ import { useEffect, useRef, useState } from "react";
 
 import OperatorPanelGuide from "../../components/ui/OperatorPanelGuide";
 import { openOpsCopilotPrompt } from "../../lib/opsCopilot";
+import {
+  formatSourceTreeProvenanceStatus,
+  getSourceTreeCommitDeltaLines,
+  normalizeSourceTreeProvenance,
+} from "../../lib/sourceTreeProvenanceView";
 import { UI_TERMS, formatReasonLabel } from "../../lib/uiLexicon";
 import { ControlRoomMonitoringPanel, ExecutionPnlTruthMonitoringPanel, OperatorActionSummary } from "../terminal/TerminalSecondaryPanels";
 
@@ -49,6 +54,31 @@ const LIVE_OPS_JOURNAL_CONTEXT = {
   timeframe: "live",
   strategy: "live-ops",
 } as const;
+const DECISION_TRACE_EXPLORER_STAGES = [
+  { key: "allocation", label: "Allocation", missingDetail: "Allocation canonique absente pour cette decision." },
+  { key: "approval_1", label: "Approval #1", missingDetail: "Approval #1 absente ou non publiee." },
+  { key: "approval_2", label: "Approval #2", missingDetail: "Approval #2 absente, en attente, ou non publiee." },
+  { key: "hardening", label: "Hardening", missingDetail: "Decision de hardening absente ou non rattachee." },
+  { key: "execution", label: "Execution", missingDetail: "Execution fact absent pour cette decision." },
+  { key: "outcome", label: "Outcome", missingDetail: "Outcome absent ou non rattache a l execution." },
+  { key: "attribution", label: "Attribution", missingDetail: "Attribution non calculee ou non publiee." },
+  { key: "opportunity_cost", label: "Opportunity Cost", missingDetail: "Opportunity cost absente ou non rattachee." },
+] as const;
+const TRI_GOVERNANCE_RULES = [
+  { label: "TRI < 30", action: "Stop developpement alpha", objective: "Continuité causale seulement", minInclusive: Number.NEGATIVE_INFINITY, maxExclusive: 30, tone: "warn" },
+  { label: "TRI 30-50", action: "Reparer la continuité causale", objective: "Approval, execution, outcome, opportunity", minInclusive: 30, maxExclusive: 50, tone: "warn" },
+  { label: "TRI 50-70", action: "Ouvrir Attribution V1", objective: "Expliquer les gains et pertes avant V2", minInclusive: 50, maxExclusive: 70, tone: "subtle" },
+  { label: "TRI 70-85", action: "Autoriser allocation intelligente", objective: "Allocation plus riche mais toujours gouvernee", minInclusive: 70, maxExclusive: 85, tone: "good" },
+  { label: "TRI > 85", action: "Alpha V2 admissible", objective: "Seulement si les autres gates restent stables", minInclusive: 85, maxExclusive: Number.POSITIVE_INFINITY, tone: "good" },
+] as const;
+const DECISION_CONTINUITY_RULES = [
+  { label: "CRITICAL", action: "Decision Gap Reduction Campaign", objective: "Journey Completion 0-5% · Alpha V2 interdit", minInclusive: Number.NEGATIVE_INFINITY, maxExclusive: 5, tone: "warn" },
+  { label: "EXPLORATORY", action: "Decision Gap Reduction Campaign", objective: "Journey Completion 5-15% · faire baisser le first missing stage dominant", minInclusive: 5, maxExclusive: 15, tone: "warn" },
+  { label: "EMERGING", action: "Evidence Conversion Engine", objective: "Journey Completion 15-30% · convertir INFERRED vers BACKFILLED", minInclusive: 15, maxExclusive: 30, tone: "subtle" },
+  { label: "GOVERNABLE", action: "Economic Governance", objective: "Journey Completion 30-60% · hardening intelligence et friction economics", minInclusive: 30, maxExclusive: 60, tone: "subtle" },
+  { label: "TRUSTED", action: "Alpha Attribution V1 admissible", objective: "Journey Completion 60-85% · preuve assez mature pour attribution", minInclusive: 60, maxExclusive: 85, tone: "good" },
+  { label: "CERTIFIED", action: "Alpha V2 admissible", objective: "Journey Completion > 85% · gouvernance causale certifiee", minInclusive: 85, maxExclusive: Number.POSITIVE_INFINITY, tone: "good" },
+] as const;
 
 function formatClock(value: string): string {
   const parsed = Date.parse(value);
@@ -63,9 +93,94 @@ function formatClock(value: string): string {
   }).format(new Date(parsed));
 }
 
+function formatDateTimeCompact(value: unknown): string {
+  const raw = String(value || "").trim();
+  const parsed = Date.parse(raw);
+  if (!Number.isFinite(parsed)) {
+    return raw || "-";
+  }
+  return new Intl.DateTimeFormat("fr-FR", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: "UTC",
+  }).format(new Date(parsed));
+}
+
+function formatCommitHash(value: unknown): string {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "-";
+  }
+  return raw.length > 12 ? raw.slice(0, 12) : raw;
+}
+
+function formatUsd(value: number): string {
+  return `${value.toFixed(Math.abs(value) >= 100 ? 0 : 1)} USD`;
+}
+
 function toNumber(value: unknown, fallback = 0): number {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : fallback;
+}
+
+function toneClassForPct(value: number): string {
+  if (value >= 95) {
+    return "good";
+  }
+  if (value >= 70) {
+    return "subtle";
+  }
+  return "warn";
+}
+
+function dedupeNonEmptyStrings(values: Array<unknown>): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const normalized = String(value || "").trim();
+    if (!normalized || normalized === "-" || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    result.push(normalized);
+  }
+  return result;
+}
+
+function formatTruthReliabilityStatus(value: unknown): string {
+  switch (String(value || "").trim().toLowerCase()) {
+    case "certified":
+      return "CERTIFIED";
+    case "exploitable":
+      return "EXPLOITABLE";
+    case "partial":
+      return "PARTIAL";
+    default:
+      return "UNUSABLE";
+  }
+}
+
+function traceStatusClass(value: unknown): string {
+  switch (String(value || "").trim().toLowerCase()) {
+    case "completed":
+      return "good";
+    case "pending":
+      return "subtle";
+    case "blocked":
+      return "warn";
+    default:
+      return "subtle";
+  }
+}
+
+function resolveTriGovernanceRule(scorePct: number): typeof TRI_GOVERNANCE_RULES[number] {
+  return TRI_GOVERNANCE_RULES.find((rule) => scorePct >= rule.minInclusive && scorePct < rule.maxExclusive) || TRI_GOVERNANCE_RULES[0];
+}
+
+function resolveDecisionContinuityRule(scorePct: number): typeof DECISION_CONTINUITY_RULES[number] {
+  return DECISION_CONTINUITY_RULES.find((rule) => scorePct >= rule.minInclusive && scorePct < rule.maxExclusive) || DECISION_CONTINUITY_RULES[0];
 }
 
 function asRecord(value: unknown): JsonMap {
@@ -232,8 +347,14 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
   const [systemModeBusy, setSystemModeBusy] = useState(false);
   const [systemModeFeedback, setSystemModeFeedback] = useState<string | null>(null);
   const [systemModeOverride, setSystemModeOverride] = useState<SystemMode | null>(() => readSystemModeOverride());
+  const [selectedDecisionTraceId, setSelectedDecisionTraceId] = useState<string>("");
+  const [decisionTraceQueryInput, setDecisionTraceQueryInput] = useState<string>("");
+  const [decisionTracePayload, setDecisionTracePayload] = useState<JsonMap | null>(null);
+  const [decisionTraceBusy, setDecisionTraceBusy] = useState(false);
+  const [decisionTraceError, setDecisionTraceError] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
   const loadSequenceRef = useRef(0);
+  const decisionTraceLoadSequenceRef = useRef(0);
 
   async function appendLiveOpsJournalEntry(action: string, detail: string, meta: JsonMap = {}): Promise<void> {
     await fetch("/api/terminal/v2-risk-journal", {
@@ -332,6 +453,44 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
       if (loadSequenceRef.current === loadSequence) {
         setBusy(false);
         setLoading(false);
+      }
+    }
+  }
+
+  async function loadDecisionTrace(decisionId: string): Promise<void> {
+    const cleanDecisionId = decisionId.trim();
+    if (!cleanDecisionId) {
+      setDecisionTracePayload(null);
+      setDecisionTraceError(null);
+      return;
+    }
+    const loadSequence = decisionTraceLoadSequenceRef.current + 1;
+    decisionTraceLoadSequenceRef.current = loadSequence;
+    setDecisionTraceBusy(true);
+    setDecisionTraceError(null);
+    try {
+      const response = await fetch(`/api/system/decision-trace?decisionId=${encodeURIComponent(cleanDecisionId)}&mode=lite`, {
+        cache: "no-store",
+      });
+      const payload = await response.json().catch(() => null);
+      const normalizedPayload = payload && typeof payload === "object" ? payload as JsonMap : null;
+      if (decisionTraceLoadSequenceRef.current !== loadSequence) {
+        return;
+      }
+      setDecisionTracePayload(normalizedPayload);
+      if (!response.ok) {
+        setDecisionTraceError(formatApiErrorDetail(payload, "Trace decision indisponible"));
+        return;
+      }
+      setDecisionTraceError(null);
+    } catch (err) {
+      if (decisionTraceLoadSequenceRef.current === loadSequence) {
+        setDecisionTracePayload(null);
+        setDecisionTraceError(err instanceof Error ? err.message : "Erreur inconnue");
+      }
+    } finally {
+      if (decisionTraceLoadSequenceRef.current === loadSequence) {
+        setDecisionTraceBusy(false);
       }
     }
   }
@@ -449,26 +608,37 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
   }
 
   async function changeSystemMode(mode: SystemMode): Promise<void> {
-    const previousMode = backendMode;
+    const previousMode = effectiveBackendMode;
     setSystemModeBusy(true);
     setSystemModeFeedback(null);
     try {
       const response = await fetch("/api/system/mode", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode }),
+        body: JSON.stringify({
+          mode,
+          previous_mode: previousMode,
+          source: "live-ops-page",
+          reason: mode === "managed_live" ? "desk_live_cutover" : "desk_posture_change",
+        }),
       });
       const payload = await response.json().catch(() => null);
       if (!response.ok) {
         throw new Error(String(payload && typeof payload === "object" ? (payload as JsonMap).detail || "Changement de mode refuse" : "Changement de mode refuse"));
       }
-      persistSystemModeOverride(mode);
-      setSystemModeOverride(mode);
-      setSystemModeFeedback(`Mode systeme mis a jour: ${mode}`);
-      void appendLiveOpsJournalEntry("system-mode-changed", `Mode ${previousMode} -> ${mode}`, {
+      const nextMode = String(payload && typeof payload === "object" ? (payload as JsonMap).system_mode || mode : mode) as SystemMode;
+      const confirmedPreviousMode = String(payload && typeof payload === "object" ? (payload as JsonMap).previous_mode || previousMode : previousMode);
+      persistSystemModeOverride(nextMode);
+      setSystemModeOverride(nextMode);
+      setSystemModeFeedback(
+        String(payload && typeof payload === "object" ? (payload as JsonMap).status : "updated") === "unchanged"
+          ? `Mode systeme deja actif: ${nextMode}`
+          : `Mode systeme: ${confirmedPreviousMode} -> ${nextMode}`,
+      );
+      void appendLiveOpsJournalEntry("system-mode-changed", `Mode ${confirmedPreviousMode} -> ${nextMode}`, {
         source: "live-ops-page",
-        previous_mode: previousMode,
-        next_mode: mode,
+        previous_mode: confirmedPreviousMode,
+        next_mode: nextMode,
       });
       await loadData();
     } catch (err) {
@@ -541,10 +711,298 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
   }, [dailyPlanChecks]);
 
   const snapshot = asRecord(liveOpsPayload);
+  const liveOpsDiagnostics = asRecord(snapshot.live_ops_diagnostics);
+  const measurementWindow7d = asRecord(liveOpsDiagnostics.measurement_window_7d);
+  const measurementWindow30d = asRecord(liveOpsDiagnostics.measurement_window_30d);
+  const truthReliability = asRecord(liveOpsDiagnostics.truth_reliability_index);
+  const truthReliabilityScorePct = toNumber(liveOpsDiagnostics.truth_reliability_index_pct || truthReliability.score_pct, 0);
+  const truthReliabilityRawScorePct = toNumber(truthReliability.raw_score_pct, truthReliabilityScorePct);
+  const truthReliabilityStatus = formatTruthReliabilityStatus(truthReliability.status);
+  const truthReliabilityCapPct = Number.isFinite(Number(truthReliability.cap_pct)) ? Number(truthReliability.cap_pct) : null;
+  const truthReliabilityCapReasons = Array.isArray(truthReliability.cap_reasons) ? truthReliability.cap_reasons.map((item) => String(item)).filter(Boolean) : [];
+  const truthReliabilityComponents = asRecord(truthReliability.components);
+  const truthReliabilityFreshnessPct = toNumber(truthReliabilityComponents.snapshot_freshness_pct, 0);
+  const truthReliability7dWindow = asRecord(measurementWindow7d.truth_reliability);
+  const truthReliability30dWindow = asRecord(measurementWindow30d.truth_reliability);
+  const truthReliability7dLatestPct = toNumber(truthReliability7dWindow.latest_score_pct, truthReliabilityScorePct);
+  const truthReliability7dGrowthPct = toNumber(truthReliability7dWindow.reliability_growth_pct, 0);
+  const truthReliability30dLatestPct = toNumber(truthReliability30dWindow.latest_score_pct, truthReliabilityScorePct);
+  const truthReliability30dGrowthPct = toNumber(truthReliability30dWindow.reliability_growth_pct, 0);
+  const truthReliability7dContinuityAvgPct = toNumber(asRecord(truthReliability7dWindow.continuity_pct).avg, 0);
+  const truthReliability30dContinuityAvgPct = toNumber(asRecord(truthReliability30dWindow.continuity_pct).avg, 0);
+  const truthReliability7dEvidenceAvgPct = toNumber(asRecord(truthReliability7dWindow.evidence_pct).avg, 0);
+  const truthReliability30dEvidenceAvgPct = toNumber(asRecord(truthReliability30dWindow.evidence_pct).avg, 0);
+  const truthReliability30dStatusCounts = asRecord(truthReliability30dWindow.status_counts);
+  const truthReliabilityGovernanceRule = resolveTriGovernanceRule(truthReliabilityScorePct);
   const watchdog = asRecord(snapshot.watchdog_state);
   const governance = asRecord(snapshot.governance);
   const recovery = asRecord(snapshot.recovery);
   const memoryGap = asRecord(snapshot.memory_gap);
+  const canonicalSpine = asRecord(snapshot.canonical_spine);
+  const sourceTreeProvenance = asRecord(snapshot.source_tree_provenance);
+  const sourceTreeCertification = asRecord(snapshot.source_tree_certification);
+  const sourceTreeProvenanceNormalized = normalizeSourceTreeProvenance(sourceTreeProvenance);
+  const sourceTreeCommitDelta = getSourceTreeCommitDeltaLines(sourceTreeProvenanceNormalized);
+  const sourceTreeProvenance7d = asRecord(measurementWindow7d.source_tree_provenance);
+  const sourceTreeProvenance30d = asRecord(measurementWindow30d.source_tree_provenance);
+  const sourceTreeCommitAlignmentRatePct = toNumber(sourceTreeProvenance.commit_alignment_rate, 0);
+  const spineMatchRatePct = toNumber(canonicalSpine.spine_match_rate_pct, 0);
+  const spineAllocationLinkRatePct = toNumber(canonicalSpine.allocation_link_rate_pct, 0);
+  const spineApprovalLinkRatePct = toNumber(canonicalSpine.approval_link_rate_pct, 0);
+  const spineApprovalExecutionLinkRatePct = toNumber(canonicalSpine.approval_execution_link_rate_pct, 0);
+  const spineHardeningLinkRatePct = toNumber(canonicalSpine.hardening_link_rate_pct, 0);
+  const spineExecutionLinkRatePct = toNumber(canonicalSpine.execution_link_rate_pct, 0);
+  const spineOutcomeLinkRatePct = toNumber(canonicalSpine.outcome_link_rate_pct, 0);
+  const spineOpportunityLinkRatePct = toNumber(canonicalSpine.opportunity_link_rate_pct, 0);
+  const spineOpportunityLinkRateRawPct = toNumber(canonicalSpine.opportunity_link_rate_raw_pct, 0);
+  const spineOpportunityLinkRatePostProducerPct = toNumber(canonicalSpine.opportunity_link_rate_post_producer_pct, 0);
+  const spineExecutionDerivationRatePct = toNumber(canonicalSpine.execution_derivation_rate_pct, 0);
+  const spineMatchingRatePct = toNumber(canonicalSpine.opportunity_matching_rate_pct, 0);
+  const spineFollowupMatchingRatePct = toNumber(canonicalSpine.followup_expected_matching_rate_pct, 0);
+  const spineAlphaCoveragePct = toNumber(canonicalSpine.alpha_attribution_coverage_pct, 0);
+  const spineOperationalRefusalByCode = Array.isArray(canonicalSpine.operational_refusal_by_code)
+    ? (canonicalSpine.operational_refusal_by_code as Array<Record<string, unknown>>).slice(0, 4)
+    : [];
+  const spineOperationalRefusalByCodePostProducer = Array.isArray(canonicalSpine.operational_refusal_by_code_post_producer)
+    ? (canonicalSpine.operational_refusal_by_code_post_producer as Array<Record<string, unknown>>).slice(0, 4)
+    : [];
+  const spinePendingByGate = Array.isArray(canonicalSpine.pending_by_gate)
+    ? (canonicalSpine.pending_by_gate as Array<Record<string, unknown>>).slice(0, 4)
+    : [];
+  const tradeLifecycleHealth = asRecord(snapshot.trade_lifecycle_health);
+  const lifecycleObservedTotal = toNumber(tradeLifecycleHealth.lifecycle_total, 0);
+  const decisionJourneyCompletion = asRecord(tradeLifecycleHealth.decision_journey_completion);
+  const decisionGapReduction = asRecord(tradeLifecycleHealth.decision_gap_reduction);
+  const decisionGapResolution = asRecord(tradeLifecycleHealth.decision_gap_resolution);
+  const decisionGapReduction7d = asRecord(measurementWindow7d.decision_gap_reduction);
+  const decisionGapReduction30d = asRecord(measurementWindow30d.decision_gap_reduction);
+  const decisionGapResolution7d = asRecord(measurementWindow7d.decision_gap_resolution);
+  const decisionGapResolution30d = asRecord(measurementWindow30d.decision_gap_resolution);
+  const createdDecisionTotal = toNumber(decisionJourneyCompletion.created_decision_total, 0);
+  const completeDecisionTotal = toNumber(decisionJourneyCompletion.complete_decision_total, 0);
+  const incompleteDecisionTotal = toNumber(decisionJourneyCompletion.incomplete_decision_total, Math.max(0, createdDecisionTotal - completeDecisionTotal));
+  const journeyCompletionRatePct = toNumber(decisionJourneyCompletion.completion_rate_pct, toNumber(tradeLifecycleHealth.decision_continuity_score_pct, 0));
+  const decisionGapReductionByStage = Array.isArray(decisionGapReduction.by_stage)
+    ? (decisionGapReduction.by_stage as Array<Record<string, unknown>>)
+    : [];
+  const decisionGapReduction7dByStage = Array.isArray(decisionGapReduction7d.by_stage)
+    ? (decisionGapReduction7d.by_stage as Array<Record<string, unknown>>)
+    : [];
+  const decisionGapReduction30dByStage = Array.isArray(decisionGapReduction30d.by_stage)
+    ? (decisionGapReduction30d.by_stage as Array<Record<string, unknown>>)
+    : [];
+  const decisionGapReductionDominantStageRaw = decisionGapReductionByStage.reduce<Record<string, unknown> | null>((best, stage) => {
+    if (!best) {
+      return stage;
+    }
+    return toNumber(stage.blocked_decision_total, 0) > toNumber(best.blocked_decision_total, 0) ? stage : best;
+  }, null);
+  const decisionGapReductionDominantStage = decisionGapReductionDominantStageRaw && toNumber(decisionGapReductionDominantStageRaw.blocked_decision_total, 0) > 0
+    ? decisionGapReductionDominantStageRaw
+    : null;
+  const decisionGapReduction7dDominantStageKey = String(decisionGapReduction7d.dominant_stage_key_latest || "").trim();
+  const decisionGapReduction30dDominantStageKey = String(decisionGapReduction30d.dominant_stage_key_latest || "").trim();
+  const decisionGapReduction7dDominantStage = decisionGapReduction7dByStage.find((stage) => String(stage.stage_key || "").trim() === decisionGapReduction7dDominantStageKey) || null;
+  const decisionGapReduction30dDominantStage = decisionGapReduction30dByStage.find((stage) => String(stage.stage_key || "").trim() === decisionGapReduction30dDominantStageKey) || null;
+  const gapResolutionRatePct = toNumber(decisionGapResolution.gap_resolution_rate_pct, journeyCompletionRatePct);
+  const meanTimeToContinuityHours = Number.isFinite(Number(decisionGapResolution.mean_time_to_continuity_hours))
+    ? toNumber(decisionGapResolution.mean_time_to_continuity_hours, 0)
+    : null;
+  const dominantOpenGapLabel = String(decisionGapResolution.dominant_open_gap_label || decisionGapReductionDominantStage?.gap_label || "none").trim() || "none";
+  const dominantOpenGapTotal = toNumber(decisionGapResolution.dominant_open_gap_total, 0);
+  const dominantOpenGapSharePct = toNumber(decisionGapResolution.dominant_open_gap_share_pct, 0);
+  const gapResolutionRate7dPct = toNumber(asRecord(decisionGapResolution7d.gap_resolution_rate_pct).avg, 0);
+  const gapResolutionRate30dPct = toNumber(asRecord(decisionGapResolution30d.gap_resolution_rate_pct).avg, 0);
+  const meanTimeToContinuity7dHours = Number.isFinite(Number(asRecord(decisionGapResolution7d.mean_time_to_continuity_hours).avg))
+    ? toNumber(asRecord(decisionGapResolution7d.mean_time_to_continuity_hours).avg, 0)
+    : null;
+  const meanTimeToContinuity30dHours = Number.isFinite(Number(asRecord(decisionGapResolution30d.mean_time_to_continuity_hours).avg))
+    ? toNumber(asRecord(decisionGapResolution30d.mean_time_to_continuity_hours).avg, 0)
+    : null;
+  const backlogAgeBuckets = Array.isArray(decisionGapResolution.backlog_age_buckets)
+    ? (decisionGapResolution.backlog_age_buckets as Array<Record<string, unknown>>)
+    : [];
+  const backlogAgeBuckets7d = Array.isArray(decisionGapResolution7d.backlog_age_buckets)
+    ? (decisionGapResolution7d.backlog_age_buckets as Array<Record<string, unknown>>)
+    : [];
+  const backlogAgeBuckets30d = Array.isArray(decisionGapResolution30d.backlog_age_buckets)
+    ? (decisionGapResolution30d.backlog_age_buckets as Array<Record<string, unknown>>)
+    : [];
+  const oldestOpenGap = asRecord(decisionGapResolution.oldest_open_gap);
+  const oldestOpenGap7d = asRecord(decisionGapResolution7d.oldest_open_gap);
+  const oldestOpenGap30d = asRecord(decisionGapResolution30d.oldest_open_gap);
+  const dominantGapCardinality = asRecord(decisionGapResolution.dominant_gap_cardinality);
+  const dominantGapCardinality7d = asRecord(decisionGapResolution7d.dominant_gap_cardinality);
+  const dominantGapCardinality30d = asRecord(decisionGapResolution30d.dominant_gap_cardinality);
+  const dominantGapRootCauses = Array.isArray(dominantGapCardinality.by_root_cause)
+    ? (dominantGapCardinality.by_root_cause as Array<Record<string, unknown>>)
+    : [];
+  const dominantGapRootCauses7d = Array.isArray(dominantGapCardinality7d.by_root_cause)
+    ? (dominantGapCardinality7d.by_root_cause as Array<Record<string, unknown>>)
+    : [];
+  const dominantGapRootCauses30d = Array.isArray(dominantGapCardinality30d.by_root_cause)
+    ? (dominantGapCardinality30d.by_root_cause as Array<Record<string, unknown>>)
+    : [];
+  const gapLedgerRows = Array.isArray(decisionGapResolution.gap_ledger)
+    ? (decisionGapResolution.gap_ledger as Array<Record<string, unknown>>)
+    : [];
+  const dominantGapTopDecisions = Array.isArray(decisionGapResolution.dominant_gap_top_decisions)
+    ? (decisionGapResolution.dominant_gap_top_decisions as Array<Record<string, unknown>>)
+    : [];
+  const recentlyResolvedGaps = Array.isArray(decisionGapResolution.recently_resolved_gaps)
+    ? (decisionGapResolution.recently_resolved_gaps as Array<Record<string, unknown>>)
+    : [];
+  const openGapLedgerRows = gapLedgerRows.filter((entry) => String(entry.status || "open") === "open").slice(0, 10);
+  const resolvedGapLedgerRows = recentlyResolvedGaps.slice(0, 5);
+  const allocationWriterRootCauseCode = "allocation_writer_gap_downstream_present";
+  const currentAllocationWriterCause = dominantGapRootCauses.find((cause) => String(cause.root_cause_code || "").trim() === allocationWriterRootCauseCode) || null;
+  const allocationWriterCause7d = dominantGapRootCauses7d.find((cause) => String(cause.root_cause_code || "").trim() === allocationWriterRootCauseCode) || null;
+  const allocationWriterCause30d = dominantGapRootCauses30d.find((cause) => String(cause.root_cause_code || "").trim() === allocationWriterRootCauseCode) || null;
+  const allocationWriterClosure = asRecord(tradeLifecycleHealth.allocation_writer_closure);
+  const allocationWriterStateMachine = asRecord(allocationWriterClosure.state_machine);
+  const allocationWriterCoverage = asRecord(allocationWriterClosure.writer_coverage);
+  const allocationWriterIdentityPropagation = asRecord(allocationWriterClosure.identity_propagation);
+  const allocationWriterPropagation = asRecord(allocationWriterClosure.writer_propagation);
+  const allocationWriterLatency = asRecord(allocationWriterClosure.writer_latency);
+  const allocationWriterFailureTaxonomy = asRecord(allocationWriterClosure.writer_failure_taxonomy);
+  const allocationWriterClosureEvidence = asRecord(allocationWriterClosure.closure_evidence);
+  const allocationWriterNativeErrors = Array.isArray(allocationWriterClosure.writer_native_errors)
+    ? (allocationWriterClosure.writer_native_errors as Array<Record<string, unknown>>)
+    : [];
+  const allocationWriterProvenance = Array.isArray(allocationWriterClosure.writer_provenance)
+    ? (allocationWriterClosure.writer_provenance as Array<Record<string, unknown>>)
+    : [];
+  const allocationWriterFailureCategories = Array.isArray(allocationWriterFailureTaxonomy.by_category)
+    ? (allocationWriterFailureTaxonomy.by_category as Array<Record<string, unknown>>)
+      .filter((entry) => toNumber(entry.total, 0) > 0)
+      .sort((left, right) => toNumber(right.total, 0) - toNumber(left.total, 0))
+    : [];
+  const allocationWriterAuditActive = Boolean(
+    Object.keys(allocationWriterClosure).length > 0
+    || Object.keys(allocationWriterCoverage).length > 0
+    ||
+    currentAllocationWriterCause
+    || allocationWriterCause7d
+    || allocationWriterCause30d
+    || String(dominantGapCardinality7d.dominant_root_cause_code_latest || "").trim() === allocationWriterRootCauseCode
+    || String(dominantGapCardinality30d.dominant_root_cause_code_latest || "").trim() === allocationWriterRootCauseCode,
+  );
+  const lifecycleCoverageScorePct = toNumber(tradeLifecycleHealth.link_coverage_score_pct, 0);
+  const decisionContinuityScorePct = toNumber(tradeLifecycleHealth.decision_continuity_score_pct, 0);
+  const decisionEvidenceQuality = asRecord(tradeLifecycleHealth.decision_evidence_quality);
+  const decisionEvidenceQualityPct = toNumber(decisionEvidenceQuality.score_pct, 0);
+  const evidencePipeline = [
+    { key: "missing", label: "MISSING", value: toNumber(decisionEvidenceQuality.missing, 0), tone: "warn", next: "Convertir vers INFERRED" },
+    { key: "inferred", label: "INFERRED", value: toNumber(decisionEvidenceQuality.inferred, 0), tone: "warn", next: "Convertir vers BACKFILLED" },
+    { key: "backfilled", label: "BACKFILLED", value: toNumber(decisionEvidenceQuality.backfilled, 0), tone: "subtle", next: "Convertir vers NATIVE" },
+    { key: "native", label: "NATIVE", value: toNumber(decisionEvidenceQuality.native, 0), tone: "good", next: "Preuve directement exploitable" },
+  ];
+  const evidenceTotal = evidencePipeline.reduce((sum, step) => sum + step.value, 0);
+  const evidenceNativePct = evidenceTotal > 0 ? (toNumber(decisionEvidenceQuality.native, 0) / evidenceTotal) * 100 : 0;
+  const dominantRootCauseCurrent = currentAllocationWriterCause || dominantGapRootCauses[0] || null;
+  const dominantRootCause7d = allocationWriterCause7d || dominantGapRootCauses7d[0] || null;
+  const dominantRootCause30d = allocationWriterCause30d || dominantGapRootCauses30d[0] || null;
+  const dominantRootCauseLabel = String(
+    dominantRootCauseCurrent?.label
+    || dominantGapTopDecisions[0]?.root_cause
+    || dominantGapCardinality7d.dominant_root_cause_label_latest
+    || dominantGapCardinality30d.dominant_root_cause_label_latest
+    || "none",
+  ).trim() || "none";
+  const rootCauseConcentrationPct = toNumber(dominantRootCauseCurrent?.share_pct, 0);
+  const rootCauseConcentration7dPct = toNumber(asRecord(dominantRootCause7d?.share_pct).avg, 0);
+  const rootCauseConcentration30dPct = toNumber(asRecord(dominantRootCause30d?.share_pct).avg, 0);
+  const rootCauseConcentrationTone = rootCauseConcentrationPct >= 80 ? "warn" : rootCauseConcentrationPct >= 40 ? "subtle" : "good";
+  const allocationClosureRatePct = toNumber(allocationWriterStateMachine.allocation_closure_rate_pct, 0);
+  const allocationClosureRateTone = toneClassForPct(allocationClosureRatePct);
+  const rootCauseClosureRatePct = toNumber(allocationWriterClosureEvidence.root_cause_closure_rate_pct, 0);
+  const rootCauseClosureRateTone = toneClassForPct(rootCauseClosureRatePct);
+  const decisionEvidenceQualityByStage = Array.isArray(decisionEvidenceQuality.by_stage)
+    ? (decisionEvidenceQuality.by_stage as Array<Record<string, unknown>>)
+    : [];
+  const decisionContinuityGovernanceRule = resolveDecisionContinuityRule(journeyCompletionRatePct);
+  const lifecycleAllocationLinkRatePct = toNumber(tradeLifecycleHealth.allocation_link_rate_pct, 0);
+  const lifecycleApprovalLinkRatePct = toNumber(tradeLifecycleHealth.approval_link_rate_pct, 0);
+  const lifecycleHardeningLinkRatePct = toNumber(tradeLifecycleHealth.hardening_link_rate_pct, 0);
+  const lifecycleExecutionLinkRatePct = toNumber(tradeLifecycleHealth.execution_link_rate_pct, 0);
+  const lifecycleOutcomeLinkRatePct = toNumber(tradeLifecycleHealth.outcome_link_rate_pct, 0);
+  const lifecycleAttributionLinkRatePct = toNumber(tradeLifecycleHealth.attribution_link_rate_pct, 0);
+  const lifecycleOpportunityLinkRatePct = toNumber(tradeLifecycleHealth.opportunity_link_rate_pct, 0);
+  const lifecycleCausalityConfidence = asRecord(tradeLifecycleHealth.causality_confidence);
+  const decisionContinuityLinks = Array.isArray(tradeLifecycleHealth.decision_continuity_links)
+    ? (tradeLifecycleHealth.decision_continuity_links as Array<Record<string, unknown>>).slice(0, 5)
+    : [];
+  const lifecycleTopDecisionFriction = Array.isArray(tradeLifecycleHealth.top_decision_friction)
+    ? (tradeLifecycleHealth.top_decision_friction as Array<Record<string, unknown>>).slice(0, 4)
+    : [];
+  const lifecycleTopFrictionByGate = Array.isArray(tradeLifecycleHealth.top_friction_by_gate)
+    ? (tradeLifecycleHealth.top_friction_by_gate as Array<Record<string, unknown>>).slice(0, 4)
+    : [];
+  const decisionFriction = asRecord(tradeLifecycleHealth.decision_friction);
+  const decisionFrictionBlockedTotal = toNumber(decisionFriction.blocked_total, 0);
+  const decisionFrictionUniqueDecisionTotal = toNumber(decisionFriction.unique_decision_total, 0);
+  const decisionFrictionRepeatedDecisionTotal = toNumber(decisionFriction.repeated_decision_total, 0);
+  const decisionFrictionRepeatedBlockedTotal = toNumber(decisionFriction.repeated_blocked_total, 0);
+  const decisionFrictionRepeatedBlockedSharePct = toNumber(decisionFriction.repeated_blocked_share_pct, 0);
+  const decisionFrictionOpportunityCostBpsTotal = toNumber(decisionFriction.opportunity_cost_bps_total, 0);
+  const decisionFrictionMissedAlphaBpsTotal = toNumber(decisionFriction.missed_alpha_bps_total, 0);
+  const decisionFrictionCapitalImpactUsdTotal = toNumber(decisionFriction.capital_impact_usd_total, 0);
+  const decisionFrictionCapitalImpactPerDecision = toNumber(decisionFriction.capital_impact_per_decision, 0);
+  const decisionFrictionCapitalImpactCoveragePct = toNumber(decisionFriction.capital_impact_coverage_pct, 0);
+  const decisionFrictionCapitalBasisAvailableRows = toNumber(decisionFriction.capital_basis_available_rows, 0);
+  const decisionFrictionCapitalBasisMissingRows = toNumber(decisionFriction.capital_basis_missing_rows, 0);
+  const decisionFrictionCapitalBasisRowTotal = decisionFrictionCapitalBasisAvailableRows + decisionFrictionCapitalBasisMissingRows;
+  const decisionFrictionDominantGateName = String(decisionFriction.dominant_gate_name || "-");
+  const decisionFrictionDominantGateBlockedTotal = toNumber(decisionFriction.dominant_gate_blocked_total, 0);
+  const decisionFrictionDominantGateSharePct = toNumber(decisionFriction.dominant_gate_share_pct, 0);
+  const decisionFrictionDominantCostGateName = String(decisionFriction.dominant_cost_gate_name || "-");
+  const decisionFrictionDominantCostGateCapitalImpactUsd = toNumber(decisionFriction.dominant_cost_gate_capital_impact_usd, 0);
+  const decisionFrictionDominantDecisionId = String(decisionFriction.dominant_decision_id || "-");
+  const decisionFrictionDominantDecisionGateName = String(decisionFriction.dominant_decision_gate_name || "-");
+  const decisionFrictionDominantDecisionBlockedTotal = toNumber(decisionFriction.dominant_decision_blocked_total, 0);
+  const decisionFrictionDominantDecisionSharePct = toNumber(decisionFriction.dominant_decision_share_pct, 0);
+  const decisionFrictionDominantCostDecisionId = String(decisionFriction.dominant_cost_decision_id || "-");
+  const decisionFrictionDominantCostDecisionGateName = String(decisionFriction.dominant_cost_decision_gate_name || "-");
+  const decisionFrictionDominantCostDecisionOpportunityCostBps = toNumber(decisionFriction.dominant_cost_decision_opportunity_cost_bps, 0);
+  const decisionFrictionDominantCostDecisionMissedAlphaBps = toNumber(decisionFriction.dominant_cost_decision_missed_alpha_bps, 0);
+  const decisionFrictionDominantCostDecisionCapitalImpactUsd = toNumber(decisionFriction.dominant_cost_decision_capital_impact_usd, 0);
+  const decisionFrictionWatchlistGates = Array.isArray(decisionFriction.watchlist_gates)
+    ? (decisionFriction.watchlist_gates as Array<Record<string, unknown>>).slice(0, 4)
+    : [];
+  const decisionFrictionTopDecisions = Array.isArray(decisionFriction.top_decisions)
+    ? (decisionFriction.top_decisions as Array<Record<string, unknown>>).slice(0, 4)
+    : [];
+  const decisionFrictionTopGates = Array.isArray(decisionFriction.top_gates)
+    ? (decisionFriction.top_gates as Array<Record<string, unknown>>).slice(0, 4)
+    : [];
+  const decisionFrictionTopCostDecisions = Array.isArray(decisionFriction.top_cost_decisions)
+    ? (decisionFriction.top_cost_decisions as Array<Record<string, unknown>>).slice(0, 4)
+    : [];
+  const decisionFrictionTopCostGates = Array.isArray(decisionFriction.top_cost_gates)
+    ? (decisionFriction.top_cost_gates as Array<Record<string, unknown>>).slice(0, 4)
+    : [];
+  const decisionTraceCandidateIds = dedupeNonEmptyStrings([
+    decisionFrictionDominantDecisionId,
+    decisionFrictionDominantCostDecisionId,
+    ...lifecycleTopDecisionFriction.map((item) => String(item.decision_id || "")),
+    ...decisionFrictionTopDecisions.map((item) => String(item.decision_id || "")),
+    ...decisionFrictionTopCostDecisions.map((item) => String(item.decision_id || "")),
+  ]).slice(0, 8);
+  const hardeningAnalytics = asRecord(snapshot.hardening_analytics_30d);
+  const hardeningApprovalStage2Total = toNumber(hardeningAnalytics.approval_stage_2_total, 0);
+  const hardeningRefusedTotal = toNumber(hardeningAnalytics.hardening_refused_total, 0);
+  const hardeningUniqueDecisionTotal = toNumber(hardeningAnalytics.unique_decision_total, 0);
+  const hardeningTopRefusalCauses = Array.isArray(hardeningAnalytics.top_refusal_causes)
+    ? (hardeningAnalytics.top_refusal_causes as Array<Record<string, unknown>>).slice(0, 10)
+    : Array.isArray(hardeningAnalytics.rows)
+      ? (hardeningAnalytics.rows as Array<Record<string, unknown>>).slice(0, 10)
+      : [];
+  const hardeningTopCostCauses = Array.isArray(hardeningAnalytics.top_cost_causes)
+    ? (hardeningAnalytics.top_cost_causes as Array<Record<string, unknown>>).slice(0, 10)
+    : [];
+  const hardeningTopMissedAlphaCauses = Array.isArray(hardeningAnalytics.top_missed_alpha_causes)
+    ? (hardeningAnalytics.top_missed_alpha_causes as Array<Record<string, unknown>>).slice(0, 10)
+    : [];
   const runtimeTruth = asRecord(asRecord(snapshot.raw).runtime_truth);
   const runtimeTruthLayers = asRecord(runtimeTruth.layers);
   const decisionReality = asRecord(runtimeTruthLayers.decision_reality);
@@ -734,6 +1192,30 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
   const collectionLabelSummary = String(collectionLabelProgress.summary || "Pas encore assez de labels classes pour faire vivre l'edge map.");
   const collectionConfidenceSummary = String(collectionEdgeConfidence.summary || "Confiance edge en attente de labels frais.");
   const collectionTone = collectionStatus === "READY" ? "good" : collectionStatus === "LOCKED" || collectionStatus === "BLOCKED" ? "warn" : "subtle";
+  const microLiveProgram = asRecord(snapshot.micro_live_program);
+  const microLiveInfrastructure = asRecord(microLiveProgram.infrastructure);
+  const microLiveTargets = asRecord(microLiveProgram.session_targets);
+  const microLiveProgress = asRecord(microLiveProgram.progress);
+  const microLiveStage = asRecord(microLiveProgram.stage);
+  const microLiveHardeningProgram = asRecord(microLiveProgram.hardening);
+  const microLiveEntryStatus = String(microLiveProgram.entry_status || "UNKNOWN").toUpperCase();
+  const microLiveEntryTone = microLiveEntryStatus === "OPEN" ? "good" : microLiveEntryStatus === "REDUCE" ? "subtle" : "warn";
+  const microLiveEntryReasons = Array.isArray(microLiveProgram.entry_reasons) ? microLiveProgram.entry_reasons.map((item) => String(item)).filter(Boolean) : [];
+  const microLiveWarningReasons = Array.isArray(microLiveProgram.warning_reasons) ? microLiveProgram.warning_reasons.map((item) => String(item)).filter(Boolean) : [];
+  const microLiveActiveCutSwitches = Array.isArray(microLiveProgram.active_cut_switches) ? microLiveProgram.active_cut_switches.map((item) => String(item)).filter(Boolean) : [];
+  const microLiveCurrentStage = String(microLiveStage.current_stage || "n/a");
+  const microLiveStageCapUsd = toNumber(microLiveStage.max_order_notional_usd, 0);
+  const microLiveStageBuckets = Array.isArray(microLiveStage.buckets) ? microLiveStage.buckets : [];
+  const microLiveTransitionHistory = Array.isArray(microLiveStage.transition_history)
+    ? (microLiveStage.transition_history as Array<Record<string, unknown>>)
+    : [];
+  const microLiveCreatedTarget = toNumber(microLiveTargets.created_decisions_target, 100);
+  const microLiveCompleteTarget = toNumber(microLiveTargets.complete_decisions_target, 50);
+  const microLiveCreatedProgressPct = Math.max(0, Math.min(100, toNumber(microLiveProgress.created_progress_pct, 0)));
+  const microLiveCompleteProgressPct = Math.max(0, Math.min(100, toNumber(microLiveProgress.complete_progress_pct, 0)));
+  const microLiveEntrySummary = microLiveEntryStatus === "OPEN"
+    ? `${microLiveCurrentStage} · cap ${formatUsd(microLiveStageCapUsd)}`
+    : dedupeNonEmptyStrings([...microLiveEntryReasons, ...microLiveWarningReasons]).slice(0, 2).join(" · ") || "Gate micro-live degrade";
   const alerts = Array.isArray(snapshot.alerts) ? snapshot.alerts : [];
   const backendMode = String(governance.backend_mode || "guarded_auto");
   const modeConfig = asRecord(systemModePayload);
@@ -933,6 +1415,28 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
     }
     return { label: "OK", tone: "good", detail: "guarded micro-live remains acceptable" };
   })();
+  const microLiveChecklistItems = [
+    {
+      label: "Entree",
+      tone: microLiveEntryTone,
+      detail: microLiveEntrySummary,
+    },
+    {
+      label: "Coupe-circuits",
+      tone: microLiveActiveCutSwitches.length === 0 ? "good" : "warn",
+      detail: microLiveActiveCutSwitches.length === 0 ? "Aucun actif" : microLiveActiveCutSwitches.slice(0, 2).join(" · "),
+    },
+    {
+      label: "Progression 100/50",
+      tone: completeDecisionTotal >= microLiveCompleteTarget && createdDecisionTotal >= microLiveCreatedTarget ? "good" : (createdDecisionTotal > 0 || completeDecisionTotal > 0) ? "subtle" : "warn",
+      detail: `created ${createdDecisionTotal}/${microLiveCreatedTarget} · complete ${completeDecisionTotal}/${microLiveCompleteTarget}`,
+    },
+    {
+      label: "Fermeture",
+      tone: rootCauseClosureRatePct >= 80 && allocationClosureRatePct >= 50 ? "good" : rootCauseClosureRatePct >= 50 || allocationClosureRatePct >= 25 ? "subtle" : "warn",
+      detail: `allocation ${allocationClosureRatePct.toFixed(1)}% · root cause ${rootCauseClosureRatePct.toFixed(1)}%`,
+    },
+  ];
   const planCards = [
     {
       title: "Pre-open",
@@ -1077,6 +1581,71 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
     };
   });
 
+  const decisionTrace = asRecord(decisionTracePayload);
+  const decisionTraceSummary = asRecord(decisionTrace.summary);
+  const decisionTraceOracle = asRecord(decisionTrace.oracle_stability);
+  const decisionTraceDiagnostics = asRecord(decisionTrace.diagnostics);
+  const decisionTraceRequestedIds = asRecord(decisionTraceDiagnostics.requested_ids);
+  const decisionTraceSteps = Array.isArray(decisionTrace.causal_steps) ? decisionTrace.causal_steps as JsonMap[] : [];
+  const decisionTraceFacts = Array.isArray(decisionTrace.projected_facts) ? decisionTrace.projected_facts as JsonMap[] : [];
+  const decisionTracePhases = Array.isArray(decisionTraceDiagnostics.phases) ? decisionTraceDiagnostics.phases as JsonMap[] : [];
+  const decisionTraceMode = String(decisionTrace.mode || "lite");
+  const decisionTraceResolvedVia = String(decisionTraceDiagnostics.resolved_via || "-");
+  const decisionTraceTotalDurationMs = toNumber(decisionTraceDiagnostics.total_duration_ms, 0);
+  const decisionTracePartial = Boolean(decisionTraceDiagnostics.partial);
+  const decisionTraceStepsByKey = new Map(decisionTraceSteps.map((step) => [String(step.stage_key || "").trim(), step]));
+  const decisionTraceTimeline = DECISION_TRACE_EXPLORER_STAGES.map((stage) => {
+    const existing = decisionTraceStepsByKey.get(stage.key);
+    if (existing) {
+      return existing;
+    }
+    return {
+      stage_key: stage.key,
+      label: stage.label,
+      status: "missing",
+      timestamp: null,
+      event_category: null,
+      detail: stage.missingDetail,
+      actors: [],
+      payload: {},
+    } as JsonMap;
+  });
+  const decisionTraceCompletedCount = decisionTraceTimeline.filter((step) => String(step.status || "") === "completed").length;
+  const decisionTraceMissingLabels = decisionTraceTimeline
+    .filter((step) => String(step.status || "") === "missing")
+    .map((step) => String(step.label || step.stage_key || "step"));
+  const decisionTraceBlockedLabels = decisionTraceTimeline
+    .filter((step) => String(step.status || "") === "blocked")
+    .map((step) => String(step.label || step.stage_key || "step"));
+  const decisionTracePendingLabels = decisionTraceTimeline
+    .filter((step) => String(step.status || "") === "pending")
+    .map((step) => String(step.label || step.stage_key || "step"));
+  const decisionTraceSlaMet = decisionTraceTotalDurationMs > 0 && decisionTraceTotalDurationMs <= 10_000;
+
+  useEffect(() => {
+    if (decisionTraceCandidateIds.length === 0) {
+      setSelectedDecisionTraceId("");
+      setDecisionTracePayload(null);
+      setDecisionTraceError(null);
+      return;
+    }
+    setSelectedDecisionTraceId((current) => (decisionTraceCandidateIds.includes(current) ? current : decisionTraceCandidateIds[0]));
+  }, [decisionTraceCandidateIds.join("|")]);
+
+  useEffect(() => {
+    if (!selectedDecisionTraceId) {
+      return;
+    }
+    void loadDecisionTrace(selectedDecisionTraceId);
+  }, [selectedDecisionTraceId]);
+
+  useEffect(() => {
+    if (!selectedDecisionTraceId) {
+      return;
+    }
+    setDecisionTraceQueryInput(selectedDecisionTraceId);
+  }, [selectedDecisionTraceId]);
+
   function openDeskBriefing(): void {
     openOpsCopilotPrompt({ message: "Resume-moi en langage naturel le desk du jour: verite PnL, no-trade, risque, V6 et priorites operationnelles.", autoSend: true });
     void appendLiveOpsJournalEntry("ops-brief-opened", "Briefing Ops Copilot demande", {
@@ -1156,8 +1725,8 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
 
   return (
     <main className="shell txt-page-shell" data-testid="mission-control-live-ops-page">
-      <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "1.25fr 1fr" }}>
-        <div id="global-guide-liveops-hero" className="panel txt-page-hero">
+      <section className="hero txt-page-hero-grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))" }}>
+        <div className="panel txt-page-hero">
           <div className="eyebrow">Live Ops Control Room</div>
           <h1 className="title" style={{ fontSize: 34 }}>H24 Control Room</h1>
           <p className="subtle">Route dediee au pilotage live des gardes systeme, de la recovery et de la warfare logic. Le menu global pointe maintenant vers une vraie page, plus vers une route manquante.</p>
@@ -1186,14 +1755,905 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
         </div>
         <div className="panel">
           <div className="eyebrow">Etat Global</div>
+          <div style={{ marginTop: 10, marginBottom: 10, borderRadius: 12, border: "1px solid rgba(56, 189, 248, 0.22)", padding: 12, background: "rgba(8, 47, 73, 0.22)" }}>
+            <div className="subtle mini">Allocation Writer Closure Program</div>
+            <div className={allocationClosureRateTone} style={{ fontSize: 24, fontWeight: 700, marginTop: 4 }}>{allocationClosureRatePct.toFixed(1)}%</div>
+            <div className="subtle mini" style={{ marginTop: 4 }}>Primary KPI · Allocation Closure Rate · closed {toNumber(allocationWriterStateMachine.allocation_closed_total, 0)} / created {toNumber(allocationWriterStateMachine.allocation_created_total, 0)} · open {toNumber(allocationWriterStateMachine.allocation_open_total, 0)}</div>
+            <div className="subtle mini" style={{ marginTop: 4 }}>Secondary KPI · Root Cause Closure Rate {rootCauseClosureRatePct.toFixed(1)}% · concentration {rootCauseConcentrationPct.toFixed(1)}% · dominant root cause {dominantRootCauseLabel}</div>
+            <div className="subtle mini" style={{ marginTop: 4 }}>Journey completion {journeyCompletionRatePct.toFixed(1)}% · native evidence {evidenceNativePct.toFixed(1)}% · TRI indicator {truthReliabilityScorePct.toFixed(1)}%</div>
+            {truthReliabilityCapPct !== null ? (
+              <div className="subtle mini" style={{ marginTop: 4 }}>
+                cap {truthReliabilityCapPct.toFixed(0)}% · {truthReliabilityCapReasons.join(" · ") || "critical fracture guard"}
+              </div>
+            ) : null}
+          </div>
           <div className="row"><span>Watchdog</span><span className={String(watchdog.status || "UNKNOWN") === "OK" ? "good" : "warn"}>{String(watchdog.status || "UNKNOWN")}</span></div>
           <div className="row"><span>Health score</span><span>{toNumber(watchdog.health_score, 0).toFixed(0)}%</span></div>
           <div className="row"><span>System mode</span><span className={String(governance.mode || "SAFE") === "LIVE" ? "good" : String(governance.mode || "SAFE") === "LOCKED" ? "warn" : "subtle"}>{String(governance.mode || "SAFE")}</span></div>
           <div className="row"><span>Backend mode</span><span>{backendMode}</span></div>
           <div className="row"><span>Recovery</span><span>{String(recovery.mode || "NOMINAL")}</span></div>
+          <div className="row"><span>Allocation closure</span><span className={allocationClosureRateTone}>{allocationClosureRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Root cause closure</span><span className={rootCauseClosureRateTone}>{rootCauseClosureRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Root cause concentration</span><span className={rootCauseConcentrationTone}>{rootCauseConcentrationPct.toFixed(1)}%</span></div>
+          <div className="row"><span>Complete / created</span><span>{completeDecisionTotal} / {createdDecisionTotal}</span></div>
+          <div className="row"><span>Native evidence coverage</span><span className={toneClassForPct(evidenceNativePct)}>{evidenceNativePct.toFixed(1)}%</span></div>
+          <div className="row"><span>TRI indicator</span><span className={toneClassForPct(truthReliabilityScorePct)}>{truthReliabilityScorePct.toFixed(1)}% · {truthReliabilityStatus}</span></div>
+          <div className="row"><span>Spine match</span><span className={toneClassForPct(toNumber(truthReliabilityComponents.spine_match_rate_pct, 0))}>{toNumber(truthReliabilityComponents.spine_match_rate_pct, 0).toFixed(1)}%</span></div>
           <div className="row"><span>Memory gate</span><span className={String(memoryGap.memory_decision || "OK") === "OK" ? "good" : "warn"}>{String(memoryGap.memory_decision || "OK")}</span></div>
           <div className="row"><span>Alertes live</span><span>{String(alerts.length)}</span></div>
           <div className="row"><span>Refresh</span><span>{loading ? "bootstrap" : busy ? "sync" : "15s"}</span></div>
+        </div>
+        <div className="panel">
+          <div className="eyebrow">Source Tree Provenance Audit</div>
+          <div className="subtle" style={{ marginTop: 6 }}>La chaine workspace vers build puis runtime puis slot actif n est consideree prouvee que si les quatre commits convergent.</div>
+          <div className="row"><span>status</span><span className={toneClassForPct(sourceTreeCommitAlignmentRatePct)}>{formatSourceTreeProvenanceStatus(sourceTreeProvenanceNormalized.status)}</span></div>
+          <div className="row"><span>workspace_commit</span><span>{formatCommitHash(sourceTreeProvenance.workspace_commit)}</span></div>
+          <div className="row"><span>build_commit</span><span>{formatCommitHash(sourceTreeProvenance.build_commit)}</span></div>
+          <div className="row"><span>runtime_commit</span><span>{formatCommitHash(sourceTreeProvenance.runtime_commit)}</span></div>
+          <div className="row"><span>active_slot_commit</span><span>{formatCommitHash(sourceTreeProvenance.active_slot_commit)}</span></div>
+          <div className="row"><span>commit_alignment_rate</span><span className={toneClassForPct(sourceTreeCommitAlignmentRatePct)}>{sourceTreeCommitAlignmentRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>publish_blocked</span><span className={Boolean(sourceTreeProvenance.publish_blocked) ? "warn" : "good"}>{Boolean(sourceTreeProvenance.publish_blocked) ? "yes" : "no"}</span></div>
+          <div className="row"><span>certification_cap_pct</span><span className={toneClassForPct(toNumber(sourceTreeCertification.cap_pct, 0))}>{toNumber(sourceTreeCertification.cap_pct, 0).toFixed(1)}%</span></div>
+          <div className="row"><span>certified_tri_pct</span><span className={toneClassForPct(toNumber(sourceTreeCertification.certified_tri_pct, 0))}>{toNumber(sourceTreeCertification.certified_tri_pct, 0).toFixed(1)}%</span></div>
+          <div className="row"><span>certified_journey_completion_pct</span><span className={toneClassForPct(toNumber(sourceTreeCertification.certified_journey_completion_pct, 0))}>{toNumber(sourceTreeCertification.certified_journey_completion_pct, 0).toFixed(1)}%</span></div>
+          <div className="row"><span>healthy_alignment_hours_30d</span><span>{toNumber(sourceTreeProvenance30d.healthy_alignment_hours, 0).toFixed(1)}h</span></div>
+          <div className="row"><span>governance_breach_count_30d</span><span className={toNumber(sourceTreeProvenance30d.governance_breach_count, 0) > 0 ? "warn" : "good"}>{toNumber(sourceTreeProvenance30d.governance_breach_count, 0)}</span></div>
+          <div className="row"><span>longest_divergence_period_30d</span><span>{toNumber(sourceTreeProvenance30d.longest_divergence_period_hours, 0).toFixed(1)}h</span></div>
+          <div className="row"><span>healthy_alignment_hours_7d</span><span>{toNumber(sourceTreeProvenance7d.healthy_alignment_hours, 0).toFixed(1)}h</span></div>
+          <div className="row"><span>governance_breach_count_7d</span><span className={toNumber(sourceTreeProvenance7d.governance_breach_count, 0) > 0 ? "warn" : "good"}>{toNumber(sourceTreeProvenance7d.governance_breach_count, 0)}</span></div>
+          <div className="subtle mini" style={{ marginTop: 8 }}>{String(sourceTreeCertification.rule || "")}</div>
+          {sourceTreeCommitDelta.length > 0 ? <div className="subtle mini" style={{ marginTop: 8 }}>Delta commit · {sourceTreeCommitDelta.join(" · ")}</div> : null}
+        </div>
+      </section>
+
+      <section className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", marginBottom: 16 }}>
+        <div className="panel" data-testid="live-ops-micro-live-program-panel">
+          <OperatorPanelGuide
+            title="Micro-live gouverne"
+            what="Statut d'entree, coupe-circuits et progression de preuve pour la session micro-live."
+            why="Savoir en quelques secondes si la session peut ouvrir, rester bornee ou doit s'arreter."
+            example="Si l'entree passe a BLOCKED ou qu'un coupe-circuit s'active, on stoppe les nouvelles entrees avant toute discussion de taille."
+            compact
+          />
+          <div className="row" style={{ marginTop: 10 }}><span>Entree micro-live</span><span className={microLiveEntryTone}>{microLiveEntryStatus}</span></div>
+          <div className="subtle mini" style={{ marginTop: 8 }}>{microLiveEntrySummary}</div>
+          <div className="row" style={{ marginTop: 10 }}><span>Stage actif</span><span>{microLiveCurrentStage}</span></div>
+          <div className="row"><span>Cap ordre stage</span><span>{formatUsd(microLiveStageCapUsd)}</span></div>
+          <div className="row"><span>Bridge MT5</span><span className={String(microLiveInfrastructure.mt5_bridge_status || "unknown").toLowerCase() === "healthy" ? "good" : "warn"}>{String(microLiveInfrastructure.mt5_bridge_status || "unknown")}</span></div>
+          <div className="row"><span>Connecteurs degrades</span><span className={toNumber(microLiveInfrastructure.degraded_connector_count, 0) > 0 ? "warn" : "good"}>{toNumber(microLiveInfrastructure.degraded_connector_count, 0)}</span></div>
+          <div className="row"><span>Opportunity gate</span><span className={String(microLiveInfrastructure.opportunity_gate_status || "unknown").toLowerCase() === "go" ? "good" : "warn"}>{String(microLiveInfrastructure.opportunity_gate_status || "unknown")}</span></div>
+          <div className="row"><span>Coupe-circuits actifs</span><span className={microLiveActiveCutSwitches.length === 0 ? "good" : "warn"}>{microLiveActiveCutSwitches.length}</span></div>
+          <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
+            {microLiveActiveCutSwitches.length > 0 ? microLiveActiveCutSwitches.slice(0, 4).map((item) => (
+              <div key={`micro-live-cut-switch-${item}`} className="subtle mini" style={{ border: "1px solid rgba(248, 113, 113, 0.18)", borderRadius: 10, padding: "8px 10px", background: "rgba(127, 29, 29, 0.12)" }}>
+                {item}
+              </div>
+            )) : (
+              <div className="subtle mini" style={{ border: "1px solid rgba(34, 197, 94, 0.18)", borderRadius: 10, padding: "8px 10px", background: "rgba(20, 83, 45, 0.12)" }}>
+                Aucun coupe-circuit actif. La session reste toutefois bornee par la gouvernance et les caps de stage.
+              </div>
+            )}
+          </div>
+          <div style={{ marginTop: 12 }}>
+            <div className="row"><span>Created decisions</span><span>{createdDecisionTotal} / {microLiveCreatedTarget}</span></div>
+            <div style={{ marginTop: 8, height: 8, borderRadius: 999, background: "rgba(148, 163, 184, 0.14)", overflow: "hidden" }}>
+              <div style={{ width: `${microLiveCreatedProgressPct}%`, height: "100%", background: microLiveCreatedProgressPct >= 100 ? "linear-gradient(90deg, rgba(34,197,94,0.9), rgba(16,185,129,0.9))" : "linear-gradient(90deg, rgba(56,189,248,0.9), rgba(14,165,233,0.9))" }} />
+            </div>
+          </div>
+          <div style={{ marginTop: 12 }}>
+            <div className="row"><span>Complete decisions</span><span>{completeDecisionTotal} / {microLiveCompleteTarget}</span></div>
+            <div style={{ marginTop: 8, height: 8, borderRadius: 999, background: "rgba(148, 163, 184, 0.14)", overflow: "hidden" }}>
+              <div style={{ width: `${microLiveCompleteProgressPct}%`, height: "100%", background: microLiveCompleteProgressPct >= 100 ? "linear-gradient(90deg, rgba(34,197,94,0.9), rgba(16,185,129,0.9))" : "linear-gradient(90deg, rgba(250,204,21,0.9), rgba(249,115,22,0.9))" }} />
+            </div>
+          </div>
+          {microLiveTransitionHistory.length > 0 ? (
+            <div className="subtle mini" style={{ marginTop: 10 }}>
+              Derniere transition {String(microLiveTransitionHistory[0]?.from || "-")} -&gt; {String(microLiveTransitionHistory[0]?.to || "-")} · {formatDateTimeCompact(microLiveTransitionHistory[0]?.at)}
+            </div>
+          ) : null}
+        </div>
+        <div className="panel" data-testid="live-ops-micro-live-checklist-panel">
+          <div className="eyebrow">Checklist operateur ultra-courte</div>
+          <div className="subtle" style={{ marginTop: 6 }}>Quatre verifications maximum avant, pendant et a la cloture d'une session micro-live.</div>
+          <div style={{ display: "grid", gap: 10, marginTop: 12 }}>
+            {microLiveChecklistItems.map((item) => (
+              <div key={item.label} style={{ border: "1px solid rgba(148, 163, 184, 0.18)", borderRadius: 12, padding: 12, background: "rgba(15, 23, 42, 0.2)" }}>
+                <div className="row" style={{ marginBottom: 6 }}>
+                  <span>{item.label}</span>
+                  <span className={item.tone}>{item.tone === "good" ? "OK" : item.tone === "warn" ? "STOP" : "REDUCE"}</span>
+                </div>
+                <div className="subtle mini">{item.detail}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ marginTop: 12, borderRadius: 12, border: "1px solid rgba(56, 189, 248, 0.22)", padding: 12, background: "rgba(8, 47, 73, 0.22)" }}>
+            <div className="row"><span>Root cause dominante</span><span className={rootCauseConcentrationTone}>{dominantRootCauseLabel}</span></div>
+            <div className="row"><span>Allocation closure</span><span className={allocationClosureRateTone}>{allocationClosureRatePct.toFixed(1)}%</span></div>
+            <div className="row"><span>Root cause closure</span><span className={rootCauseClosureRateTone}>{rootCauseClosureRatePct.toFixed(1)}%</span></div>
+            <div className="row"><span>Native evidence</span><span className={toneClassForPct(evidenceNativePct)}>{evidenceNativePct.toFixed(1)}%</span></div>
+          </div>
+          <div className="subtle mini" style={{ marginTop: 10 }}>
+            Bucket {microLiveStageBuckets.length} · backend {String(microLiveInfrastructure.backend_mode || backendMode)} · truth line {truthLine.label}
+          </div>
+        </div>
+      </section>
+
+      <section className="grid" style={{ gridTemplateColumns: "1fr", marginBottom: 16 }}>
+        <div className="panel">
+          <div className="eyebrow">Canonical Spine</div>
+          <div className="row"><span>Spine match rate</span><span className={toneClassForPct(spineMatchRatePct)}>{spineMatchRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Allocation -&gt; Approval</span><span className={toneClassForPct(spineApprovalLinkRatePct)}>{spineApprovalLinkRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Approval -&gt; Hardening</span><span className={toneClassForPct(spineHardeningLinkRatePct)}>{spineHardeningLinkRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Approval -&gt; Execution</span><span className={toneClassForPct(spineApprovalExecutionLinkRatePct)}>{spineApprovalExecutionLinkRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Allocation -&gt; Execution</span><span className={toneClassForPct(spineAllocationLinkRatePct)}>{spineAllocationLinkRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Execution -&gt; Outcome</span><span className={toneClassForPct(spineExecutionLinkRatePct)}>{spineExecutionLinkRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Outcome -&gt; Attribution</span><span className={toneClassForPct(spineOutcomeLinkRatePct)}>{spineOutcomeLinkRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Refusal eligible -&gt; Opportunity</span><span className={toneClassForPct(spineOpportunityLinkRatePct)}>{spineOpportunityLinkRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Refusal brut -&gt; Opportunity</span><span className={toneClassForPct(spineOpportunityLinkRateRawPct)}>{spineOpportunityLinkRateRawPct.toFixed(1)}%</span></div>
+          <div className="row"><span>Refusal brut post-producteur</span><span className={toneClassForPct(spineOpportunityLinkRatePostProducerPct)}>{spineOpportunityLinkRatePostProducerPct.toFixed(1)}%</span></div>
+          <div className="row"><span>Execution source -&gt; Fact</span><span className={toneClassForPct(spineExecutionDerivationRatePct)}>{spineExecutionDerivationRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Matching follow-up attendu</span><span className={toneClassForPct(spineFollowupMatchingRatePct)}>{spineFollowupMatchingRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Opportunity scored / pending</span><span className={toneClassForPct(spineMatchingRatePct)}>{toNumber(canonicalSpine.opportunity_scored_total, 0)} / {toNumber(canonicalSpine.opportunity_pending_total, 0)}</span></div>
+          <div className="row"><span>Alpha attribution coverage</span><span className={toneClassForPct(spineAlphaCoveragePct)}>{spineAlphaCoveragePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Allocation writes 24h</span><span>{toNumber(canonicalSpine.allocation_decisions_24h, 0)}</span></div>
+          <div className="row"><span>Execution facts 24h</span><span>{toNumber(canonicalSpine.execution_facts_24h, 0)}</span></div>
+          <div className="row"><span>Opportunity logical 24h</span><span>{toNumber(canonicalSpine.opportunity_entries_24h, 0)}</span></div>
+          <div className="row"><span>Strategies 24h</span><span>{toNumber(canonicalSpine.unique_strategies_24h, 0)}</span></div>
+          {spineOperationalRefusalByCode.length > 0 ? (
+            <div style={{ marginTop: 10 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Refus operationnels 30j</div>
+              {spineOperationalRefusalByCode.map((item, index) => (
+                <div key={`${String(item.code || "unknown")}-${index}`} className="row" style={{ marginTop: 4 }}>
+                  <span>{String(item.code || "unknown")}</span>
+                  <span className="warn">{toNumber(item.count, 0)}</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {spineOperationalRefusalByCodePostProducer.length > 0 ? (
+            <div style={{ marginTop: 10 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Refus operationnels post-producteur</div>
+              {spineOperationalRefusalByCodePostProducer.map((item, index) => (
+                <div key={`${String(item.code || "unknown")}-post-${index}`} className="row" style={{ marginTop: 4 }}>
+                  <span>{String(item.code || "unknown")}</span>
+                  <span className="warn">{toNumber(item.count, 0)}</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {spinePendingByGate.length > 0 ? (
+            <div style={{ marginTop: 10 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Pending principaux</div>
+              {spinePendingByGate.map((item, index) => (
+                <div key={`${String(item.gate || "unknown")}-${index}`} className="row" style={{ marginTop: 4 }}>
+                  <span>{String(item.gate || "unknown")}</span>
+                  <span className="warn">{toNumber(item.count, 0)}</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      </section>
+
+      <section className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", marginBottom: 16 }}>
+        <div className="panel">
+          <div className="eyebrow">Reliability Governance Program</div>
+          <div className="subtle" style={{ marginTop: 6 }}>Le signal principal n est plus le volume de gaps mais la concentration de responsabilite. Ici, le backlog a ete compresse en cause structurelle actionnable.</div>
+          <div style={{ marginTop: 10, marginBottom: 12, borderRadius: 12, border: "1px solid rgba(248, 113, 113, 0.18)", padding: 12, background: "rgba(127, 29, 29, 0.12)" }}>
+            <div className="subtle mini">341 symptomes, 1 maladie quand la concentration atteint le plafond operatoire.</div>
+            <div className={rootCauseConcentrationTone} style={{ fontSize: 24, fontWeight: 700, marginTop: 4 }}>{rootCauseConcentrationPct.toFixed(1)}%</div>
+            <div className="subtle mini" style={{ marginTop: 4 }}>Root Cause Concentration actuelle · dominant root cause {dominantRootCauseLabel}</div>
+          </div>
+          <div className="row"><span>Decision Journey Completion Rate</span><span className={toneClassForPct(journeyCompletionRatePct)}>{journeyCompletionRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Decision Evidence Native</span><span className={toneClassForPct(evidenceNativePct)}>{evidenceNativePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Dominant Root Cause</span><span className={rootCauseConcentrationTone}>{dominantRootCauseLabel}</span></div>
+          <div className="row"><span>Root Cause Concentration</span><span className={rootCauseConcentrationTone}>{rootCauseConcentrationPct.toFixed(1)}%</span></div>
+          <div className="row"><span>Current occurrences</span><span className="warn">{toNumber(dominantRootCauseCurrent?.open_gap_total, 0)}</span></div>
+          <div className="row"><span>Current unique root causes</span><span>{toNumber(dominantGapCardinality.unique_root_cause_total, 0)}</span></div>
+          <div className="row"><span>7j concentration avg</span><span className={rootCauseConcentration7dPct >= 80 ? "warn" : rootCauseConcentration7dPct >= 40 ? "subtle" : "good"}>{rootCauseConcentration7dPct.toFixed(1)}%</span></div>
+          <div className="row"><span>30j concentration avg</span><span className={rootCauseConcentration30dPct >= 80 ? "warn" : rootCauseConcentration30dPct >= 40 ? "subtle" : "good"}>{rootCauseConcentration30dPct.toFixed(1)}%</span></div>
+          <div className="row"><span>Evidence pipeline</span><span>N {toNumber(decisionEvidenceQuality.native, 0)} / B {toNumber(decisionEvidenceQuality.backfilled, 0)} / I {toNumber(decisionEvidenceQuality.inferred, 0)} / M {toNumber(decisionEvidenceQuality.missing, 0)}</span></div>
+          <div className="subtle mini" style={{ marginTop: 10 }}>Quand la concentration descend de 100% vers 60% puis 20%, le systeme passe d un defaut systemique a des defauts localises.</div>
+        </div>
+        <div className="panel">
+          <div className="eyebrow">Decision Gap Reduction Campaign</div>
+          <div className="subtle" style={{ marginTop: 6 }}>Le KPI directeur est le parcours complet de preuve. La campagne reduit le first missing stage dominant sprint apres sprint.</div>
+          <div className="row"><span>Observed lifecycle keys</span><span>{lifecycleObservedTotal}</span></div>
+          <div className="row"><span>Created decisions</span><span>{createdDecisionTotal}</span></div>
+          <div className="row"><span>Complete decisions</span><span className={completeDecisionTotal > 0 ? "good" : "warn"}>{completeDecisionTotal}</span></div>
+          <div className="row"><span>Incomplete decisions</span><span className={incompleteDecisionTotal > 0 ? "warn" : "good"}>{incompleteDecisionTotal}</span></div>
+          <div className="row"><span>Decision Journey Completion Rate</span><span className={toneClassForPct(journeyCompletionRatePct)}>{journeyCompletionRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Institutional tier</span><span className={decisionContinuityGovernanceRule.tone}>{decisionContinuityGovernanceRule.label}</span></div>
+          <div className="row"><span>First missing stage dominant</span><span className={decisionGapReductionDominantStage && toNumber(decisionGapReductionDominantStage.blocked_decision_total, 0) > 0 ? "warn" : "good"}>{decisionGapReductionDominantStage ? String(decisionGapReductionDominantStage.gap_label || decisionGapReductionDominantStage.label || "none") : "none"}</span></div>
+          <div className="row"><span>7j dominant gap</span><span className={decisionGapReduction7dDominantStage ? "warn" : "good"}>{decisionGapReduction7dDominantStage ? `${String(decisionGapReduction7dDominantStage.gap_label || decisionGapReduction7dDominantStage.label || "unknown")} · ${toNumber(decisionGapReduction7dDominantStage.latest_blocked_decision_total, 0)} (${toNumber(decisionGapReduction7dDominantStage.blocked_decision_growth, 0) >= 0 ? "+" : ""}${toNumber(decisionGapReduction7dDominantStage.blocked_decision_growth, 0).toFixed(1)})` : "none"}</span></div>
+          <div className="row"><span>30j dominant gap</span><span className={decisionGapReduction30dDominantStage ? "warn" : "good"}>{decisionGapReduction30dDominantStage ? `${String(decisionGapReduction30dDominantStage.gap_label || decisionGapReduction30dDominantStage.label || "unknown")} · ${toNumber(decisionGapReduction30dDominantStage.latest_blocked_decision_total, 0)} (${toNumber(decisionGapReduction30dDominantStage.blocked_decision_growth, 0) >= 0 ? "+" : ""}${toNumber(decisionGapReduction30dDominantStage.blocked_decision_growth, 0).toFixed(1)})` : "none"}</span></div>
+          <div className="row"><span>Decision continuity score</span><span className={toneClassForPct(decisionContinuityScorePct)}>{decisionContinuityScorePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Link coverage score</span><span className={toneClassForPct(lifecycleCoverageScorePct)}>{lifecycleCoverageScorePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Allocation link rate</span><span className={toneClassForPct(lifecycleAllocationLinkRatePct)}>{lifecycleAllocationLinkRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Approval link rate</span><span className={toneClassForPct(lifecycleApprovalLinkRatePct)}>{lifecycleApprovalLinkRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Hardening link rate</span><span className={toneClassForPct(lifecycleHardeningLinkRatePct)}>{lifecycleHardeningLinkRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Execution link rate</span><span className={toneClassForPct(lifecycleExecutionLinkRatePct)}>{lifecycleExecutionLinkRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Outcome link rate</span><span className={toneClassForPct(lifecycleOutcomeLinkRatePct)}>{lifecycleOutcomeLinkRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Attribution link rate</span><span className={toneClassForPct(lifecycleAttributionLinkRatePct)}>{lifecycleAttributionLinkRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Opportunity link rate</span><span className={toneClassForPct(lifecycleOpportunityLinkRatePct)}>{lifecycleOpportunityLinkRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Evidence mix</span><span>N {toNumber(decisionEvidenceQuality.native, 0)} / B {toNumber(decisionEvidenceQuality.backfilled, 0)} / I {toNumber(decisionEvidenceQuality.inferred, 0)} / M {toNumber(decisionEvidenceQuality.missing, 0)}</span></div>
+          <div className="row"><span>Causality confidence</span><span>N {toNumber(lifecycleCausalityConfidence.native, 0)} / B {toNumber(lifecycleCausalityConfidence.backfilled, 0)} / I {toNumber(lifecycleCausalityConfidence.inferred, 0)}</span></div>
+          <div className="row"><span>Execution + Opportunity</span><span>{toNumber(tradeLifecycleHealth.cross_object_lifecycle_total, 0)}</span></div>
+          {decisionContinuityLinks.length > 0 ? (
+            <div style={{ marginTop: 10 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Journey completion by link</div>
+              {decisionContinuityLinks.map((item, index) => (
+                <div key={`${String(item.link_key || "unknown")}-${index}`} style={{ marginTop: 6 }}>
+                  <div className="row">
+                    <span>{String(item.label || "unknown")}</span>
+                    <span className={toneClassForPct(toNumber(item.continuity_score_pct, 0))}>{toNumber(item.continuity_score_pct, 0).toFixed(1)}%</span>
+                  </div>
+                  <div className="subtle mini">N {toNumber(item.native, 0)} / B {toNumber(item.backfilled, 0)} / I {toNumber(item.inferred, 0)} / M {toNumber(item.missing, 0)}</div>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {decisionGapReductionByStage.length > 0 ? (
+            <div style={{ marginTop: 12 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>First Missing Stage</div>
+              {decisionGapReductionByStage.map((stage, index) => (
+                <div key={`${String(stage.stage_key || "gap")}-${index}`} className="row" style={{ marginTop: 4 }}>
+                  <span>{String(stage.gap_label || stage.label || "unknown")}</span>
+                  <span className={toNumber(stage.blocked_decision_total, 0) > 0 ? "warn" : "good"}>{toNumber(stage.blocked_decision_total, 0)} · {toNumber(stage.share_pct, 0).toFixed(1)}%</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {decisionGapReductionDominantStage && Array.isArray(decisionGapReductionDominantStage.exemplar_decisions) && decisionGapReductionDominantStage.exemplar_decisions.length > 0 ? (
+            <div style={{ marginTop: 12 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Current dominant gap exemplars</div>
+              {decisionGapReductionDominantStage.exemplar_decisions.map((item, index) => (
+                <div key={`gap-current-exemplar-${String((item as Record<string, unknown>).decision_id || "unknown")}-${index}`} className="row" style={{ marginTop: 4 }}>
+                  <span>{String((item as Record<string, unknown>).decision_id || "unknown")}</span>
+                  <span className="warn">fragments {toNumber((item as Record<string, unknown>).observed_fragments, 0)}</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {decisionGapReduction7dDominantStage && Array.isArray(decisionGapReduction7dDominantStage.exemplar_decisions) && decisionGapReduction7dDominantStage.exemplar_decisions.length > 0 ? (
+            <div style={{ marginTop: 12 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>7j dominant gap exemplars</div>
+              {decisionGapReduction7dDominantStage.exemplar_decisions.map((item, index) => (
+                <div key={`gap-7d-exemplar-${String((item as Record<string, unknown>).decision_id || "unknown")}-${index}`} className="row" style={{ marginTop: 4 }}>
+                  <span>{String((item as Record<string, unknown>).decision_id || "unknown")}</span>
+                  <span className="warn">seen {toNumber((item as Record<string, unknown>).occurrence_count, 0)}</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {decisionGapReduction30dDominantStage && Array.isArray(decisionGapReduction30dDominantStage.exemplar_decisions) && decisionGapReduction30dDominantStage.exemplar_decisions.length > 0 ? (
+            <div style={{ marginTop: 12 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>30j dominant gap exemplars</div>
+              {decisionGapReduction30dDominantStage.exemplar_decisions.map((item, index) => (
+                <div key={`gap-30d-exemplar-${String((item as Record<string, unknown>).decision_id || "unknown")}-${index}`} className="row" style={{ marginTop: 4 }}>
+                  <span>{String((item as Record<string, unknown>).decision_id || "unknown")}</span>
+                  <span className="warn">seen {toNumber((item as Record<string, unknown>).occurrence_count, 0)}</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+        <div className="panel">
+          <div className="eyebrow">Evidence Conversion Engine</div>
+          <div className="subtle" style={{ marginTop: 6 }}>Deuxieme campagne : convertir l evidence INFERRED en BACKFILLED puis en NATIVE, maillon par maillon.</div>
+          <div className="row"><span>Evidence quality score</span><span className={toneClassForPct(decisionEvidenceQualityPct)}>{decisionEvidenceQualityPct.toFixed(1)}%</span></div>
+          <div className="row"><span>NATIVE</span><span className="good">{toNumber(decisionEvidenceQuality.native, 0)}</span></div>
+          <div className="row"><span>BACKFILLED</span><span>{toNumber(decisionEvidenceQuality.backfilled, 0)}</span></div>
+          <div className="row"><span>INFERRED</span><span className="warn">{toNumber(decisionEvidenceQuality.inferred, 0)}</span></div>
+          <div className="row"><span>MISSING</span><span className="warn">{toNumber(decisionEvidenceQuality.missing, 0)}</span></div>
+          <div className="row"><span>Causality confidence</span><span>N {toNumber(lifecycleCausalityConfidence.native, 0)} / B {toNumber(lifecycleCausalityConfidence.backfilled, 0)} / I {toNumber(lifecycleCausalityConfidence.inferred, 0)}</span></div>
+          <div style={{ marginTop: 10 }}>
+            <div className="subtle mini" style={{ marginBottom: 6 }}>Evidence conversion pipeline</div>
+            {evidencePipeline.map((step, index) => (
+              <div key={`evidence-pipeline-${step.key}`} style={{ marginTop: index === 0 ? 0 : 8, borderRadius: 10, border: "1px solid rgba(148, 163, 184, 0.12)", padding: 8, background: "rgba(2, 6, 23, 0.16)" }}>
+                <div className="row">
+                  <span>{step.label}</span>
+                  <span className={step.tone}>{step.value}</span>
+                </div>
+                <div className="subtle mini" style={{ marginTop: 4 }}>{step.next}</div>
+              </div>
+            ))}
+          </div>
+          {decisionEvidenceQualityByStage.length > 0 ? (
+            <div style={{ marginTop: 10 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Evidence quality by stage</div>
+              {decisionEvidenceQualityByStage.map((stage, index) => (
+                <div key={`${String(stage.stage_key || "stage")}-${index}`} style={{ marginTop: 8, borderRadius: 10, border: "1px solid rgba(148, 163, 184, 0.12)", padding: 8, background: "rgba(2, 6, 23, 0.16)" }}>
+                  <div className="row">
+                    <span>{String(stage.label || stage.stage_key || "unknown")}</span>
+                    <span className={toneClassForPct(toNumber(stage.score_pct, 0))}>{toNumber(stage.score_pct, 0).toFixed(1)}%</span>
+                  </div>
+                  <div className="subtle mini" style={{ marginTop: 4 }}>
+                    N {toNumber(stage.native, 0)} / B {toNumber(stage.backfilled, 0)} / I {toNumber(stage.inferred, 0)} / M {toNumber(stage.missing, 0)}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {lifecycleTopDecisionFriction.length > 0 ? (
+            <div style={{ marginTop: 10 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Decision friction principaux</div>
+              {lifecycleTopDecisionFriction.map((item, index) => (
+                <div key={`${String(item.decision_id || "unknown")}-${index}`} className="row" style={{ marginTop: 4 }}>
+                  <span>{String(item.gate_name || "unknown")} · {String(item.decision_id || "unknown").slice(0, 24)}</span>
+                  <span className="warn">{toNumber(item.blocked_count, 0)}x</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {lifecycleTopFrictionByGate.length > 0 ? (
+            <div style={{ marginTop: 10 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Decision friction par gate</div>
+              {lifecycleTopFrictionByGate.map((item, index) => (
+                <div key={`${String(item.gate_name || "unknown")}-${index}`} className="row" style={{ marginTop: 4 }}>
+                  <span>{String(item.gate_name || "unknown")}</span>
+                  <span className="warn">{toNumber(item.blocked_count, 0)} · {toNumber(item.unique_decision_count, 0)} decisions</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+        <div className="panel">
+          <div className="eyebrow">Decision Gap Resolution System</div>
+          <div className="subtle" style={{ marginTop: 6 }}>On ne suit plus seulement le gap dominant: on ouvre un dossier par decision, avec cause probable, remediation et temps jusqu a la continuite.</div>
+          <div className="row"><span>Gap Resolution Rate</span><span className={toneClassForPct(gapResolutionRatePct)}>{gapResolutionRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Gap Resolution Rate 7j</span><span className={toneClassForPct(gapResolutionRate7dPct)}>{gapResolutionRate7dPct.toFixed(1)}%</span></div>
+          <div className="row"><span>Gap Resolution Rate 30j</span><span className={toneClassForPct(gapResolutionRate30dPct)}>{gapResolutionRate30dPct.toFixed(1)}%</span></div>
+          <div className="row"><span>Mean Time To Continuity</span><span className={meanTimeToContinuityHours !== null && meanTimeToContinuityHours <= 24 ? "good" : "warn"}>{meanTimeToContinuityHours !== null ? `${meanTimeToContinuityHours.toFixed(1)} h` : "-"}</span></div>
+          <div className="row"><span>MTTC 7j</span><span className={meanTimeToContinuity7dHours !== null && meanTimeToContinuity7dHours <= 24 ? "good" : "warn"}>{meanTimeToContinuity7dHours !== null ? `${meanTimeToContinuity7dHours.toFixed(1)} h` : "-"}</span></div>
+          <div className="row"><span>MTTC 30j</span><span className={meanTimeToContinuity30dHours !== null && meanTimeToContinuity30dHours <= 24 ? "good" : "warn"}>{meanTimeToContinuity30dHours !== null ? `${meanTimeToContinuity30dHours.toFixed(1)} h` : "-"}</span></div>
+          <div className="row"><span>Open gaps</span><span className={toNumber(decisionGapResolution.open_gap_total, 0) > 0 ? "warn" : "good"}>{toNumber(decisionGapResolution.open_gap_total, 0)}</span></div>
+          <div className="row"><span>Resolved gaps</span><span className={toNumber(decisionGapResolution.resolved_gap_total, 0) > 0 ? "good" : "subtle"}>{toNumber(decisionGapResolution.resolved_gap_total, 0)}</span></div>
+          <div className="row"><span>Dominant open gap</span><span className={dominantOpenGapTotal > 0 ? "warn" : "good"}>{dominantOpenGapLabel}</span></div>
+          <div className="row"><span>Dominant share</span><span className={dominantOpenGapSharePct > 0 ? "warn" : "good"}>{dominantOpenGapSharePct.toFixed(1)}%</span></div>
+          {Object.keys(oldestOpenGap).length > 0 ? (
+            <div style={{ marginTop: 12 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Oldest open gap</div>
+              <div style={{ borderRadius: 10, border: "1px solid rgba(248, 113, 113, 0.18)", padding: 8, background: "rgba(127, 29, 29, 0.14)" }}>
+                <div className="row">
+                  <span>{String(oldestOpenGap.decision_id || "unknown")}</span>
+                  <span className="warn">{Number.isFinite(Number(oldestOpenGap.open_age_hours)) ? `${toNumber(oldestOpenGap.open_age_hours, 0).toFixed(1)} h` : "-"}</span>
+                </div>
+                <div className="subtle mini" style={{ marginTop: 4 }}>{String(oldestOpenGap.gap_label || oldestOpenGap.first_missing_stage || "gap")}</div>
+                <div className="subtle mini" style={{ marginTop: 4 }}>opened {formatDateTimeCompact(oldestOpenGap.opened_at_iso)}</div>
+              </div>
+            </div>
+          ) : null}
+          {backlogAgeBuckets.length > 0 ? (
+            <div style={{ marginTop: 12 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Gap backlog age</div>
+              {backlogAgeBuckets.map((bucket, index) => (
+                <div key={`gap-age-bucket-${String(bucket.bucket_key || index)}`} className="row" style={{ marginTop: 4 }}>
+                  <span>{String(bucket.label || bucket.bucket_key || "bucket")}</span>
+                  <span className={toNumber(bucket.open_gap_total, 0) > 0 ? "warn" : "good"}>{toNumber(bucket.open_gap_total, 0)} · {toNumber(bucket.share_pct, 0).toFixed(1)}%</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {backlogAgeBuckets7d.length > 0 ? (
+            <div style={{ marginTop: 12 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Gap backlog age 7j</div>
+              {backlogAgeBuckets7d.map((bucket, index) => (
+                <div key={`gap-age-bucket-7d-${String(bucket.bucket_key || index)}`} className="row" style={{ marginTop: 4 }}>
+                  <span>{String(bucket.label || bucket.bucket_key || "bucket")}</span>
+                  <span className={toNumber(bucket.latest_open_gap_total, 0) > 0 ? "warn" : "good"}>{toNumber(bucket.latest_open_gap_total, 0)} ({toNumber(bucket.open_gap_growth, 0) >= 0 ? "+" : ""}{toNumber(bucket.open_gap_growth, 0).toFixed(1)})</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {backlogAgeBuckets30d.length > 0 ? (
+            <div style={{ marginTop: 12 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Gap backlog age 30j</div>
+              {backlogAgeBuckets30d.map((bucket, index) => (
+                <div key={`gap-age-bucket-30d-${String(bucket.bucket_key || index)}`} className="row" style={{ marginTop: 4 }}>
+                  <span>{String(bucket.label || bucket.bucket_key || "bucket")}</span>
+                  <span className={toNumber(bucket.latest_open_gap_total, 0) > 0 ? "warn" : "good"}>{toNumber(bucket.latest_open_gap_total, 0)} ({toNumber(bucket.open_gap_growth, 0) >= 0 ? "+" : ""}{toNumber(bucket.open_gap_growth, 0).toFixed(1)})</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {Object.keys(dominantGapCardinality).length > 0 ? (
+            <div style={{ marginTop: 12 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Gap cardinality</div>
+              <div className="row"><span>Occurrences</span><span className="warn">{toNumber(dominantGapCardinality.gap_occurrence_total, 0)}</span></div>
+              <div className="row"><span>Decision IDs uniques</span><span>{toNumber(dominantGapCardinality.unique_decision_total, 0)}</span></div>
+              <div className="row"><span>Lifecycle IDs uniques</span><span>{toNumber(dominantGapCardinality.unique_trade_lifecycle_total, 0)}</span></div>
+              <div className="row"><span>Root causes uniques</span><span>{toNumber(dominantGapCardinality.unique_root_cause_total, 0)}</span></div>
+              {dominantGapRootCauses.length > 0 ? (
+                <div style={{ marginTop: 8 }}>
+                  <div className="subtle mini" style={{ marginBottom: 6 }}>Root causes dominantes</div>
+                  {dominantGapRootCauses.map((cause, index) => (
+                    <div key={`gap-root-cause-${String(cause.root_cause_code || index)}`} className="row" style={{ marginTop: 4 }}>
+                      <span>{String(cause.label || cause.root_cause_code || "unknown")}</span>
+                      <span className="warn">{toNumber(cause.open_gap_total, 0)} · {toNumber(cause.share_pct, 0).toFixed(1)}%</span>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+          {Object.keys(dominantGapCardinality7d).length > 0 ? (
+            <div style={{ marginTop: 12 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Gap cardinality 7j</div>
+              <div className="row"><span>Occurrences avg</span><span>{toNumber(asRecord(dominantGapCardinality7d.gap_occurrence_total).avg, 0).toFixed(1)}</span></div>
+              <div className="row"><span>Decision IDs avg</span><span>{toNumber(asRecord(dominantGapCardinality7d.unique_decision_total).avg, 0).toFixed(1)}</span></div>
+              <div className="row"><span>Root causes avg</span><span>{toNumber(asRecord(dominantGapCardinality7d.unique_root_cause_total).avg, 0).toFixed(1)}</span></div>
+            </div>
+          ) : null}
+          {Object.keys(dominantGapCardinality30d).length > 0 ? (
+            <div style={{ marginTop: 12 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Gap cardinality 30j</div>
+              <div className="row"><span>Occurrences avg</span><span>{toNumber(asRecord(dominantGapCardinality30d.gap_occurrence_total).avg, 0).toFixed(1)}</span></div>
+              <div className="row"><span>Decision IDs avg</span><span>{toNumber(asRecord(dominantGapCardinality30d.unique_decision_total).avg, 0).toFixed(1)}</span></div>
+              <div className="row"><span>Root causes avg</span><span>{toNumber(asRecord(dominantGapCardinality30d.unique_root_cause_total).avg, 0).toFixed(1)}</span></div>
+            </div>
+          ) : null}
+          {dominantGapTopDecisions.length > 0 ? (
+            <div style={{ marginTop: 12 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Top 10 decision_id du gap dominant</div>
+              {dominantGapTopDecisions.map((item, index) => (
+                <div key={`gap-resolution-dominant-${String(item.gap_id || item.decision_id || "unknown")}-${index}`} style={{ marginTop: 8, borderRadius: 10, border: "1px solid rgba(248, 113, 113, 0.18)", padding: 8, background: "rgba(127, 29, 29, 0.14)" }}>
+                  <div className="row">
+                    <span>{String(item.decision_id || "unknown")}</span>
+                    <span className="warn">fragments {toNumber(item.observed_fragments, 0)}</span>
+                  </div>
+                  <div className="subtle mini" style={{ marginTop: 4 }}>{String(item.gap_label || dominantOpenGapLabel || "Gap")}</div>
+                  <div className="subtle mini" style={{ marginTop: 4 }}>opened {formatDateTimeCompact(item.opened_at_iso)} · age {Number.isFinite(Number(item.open_age_hours)) ? `${toNumber(item.open_age_hours, 0).toFixed(1)} h` : "-"}</div>
+                  <div className="subtle mini" style={{ marginTop: 4 }}>why {String(item.root_cause || "unknown")}</div>
+                  <div className="subtle mini" style={{ marginTop: 4 }}>fix {String(item.remediation || "unknown")}</div>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {resolvedGapLedgerRows.length > 0 ? (
+            <div style={{ marginTop: 12 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Recently resolved gaps</div>
+              {resolvedGapLedgerRows.map((item, index) => (
+                <div key={`gap-resolution-resolved-${String(item.gap_id || item.decision_id || "resolved")}-${index}`} className="row" style={{ marginTop: 4 }}>
+                  <span>{String(item.decision_id || "unknown")} · {String(item.gap_label || "resolved")}</span>
+                  <span className="good">{Number.isFinite(Number(item.resolution_time_hours)) ? `${toNumber(item.resolution_time_hours, 0).toFixed(1)} h` : "resolved"}</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {openGapLedgerRows.length > 0 ? (
+            <div style={{ marginTop: 12 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Open gap ledger</div>
+              {openGapLedgerRows.map((item, index) => (
+                <div key={`gap-ledger-open-${String(item.gap_id || item.decision_id || "open")}-${index}`} className="row" style={{ marginTop: 4 }}>
+                  <span>{String(item.decision_id || "unknown")} · {String(item.gap_label || item.first_missing_stage || "gap")}</span>
+                  <span className="warn">{formatDateTimeCompact(item.opened_at_iso)}</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+        {allocationWriterAuditActive ? (
+          <div className="panel">
+            <div className="eyebrow">Allocation Writer Closure Program</div>
+            <div className="subtle" style={{ marginTop: 6 }}>Programme unique de suppression de la cause dominante. Le but n est plus de mesurer des symptomes, mais de prouver qu une correction elimine effectivement le gap et fait disparaitre la cause.</div>
+            <div className="row"><span>Allocation Closure Rate</span><span className={allocationClosureRateTone}>{allocationClosureRatePct.toFixed(1)}%</span></div>
+            <div className="row"><span>Dominant root cause</span><span className="warn">{String(allocationWriterClosure.dominant_root_cause_label || currentAllocationWriterCause?.label || dominantGapTopDecisions[0]?.root_cause || allocationWriterRootCauseCode)}</span></div>
+            <div className="row"><span>Root cause concentration</span><span className="warn">{rootCauseConcentrationPct.toFixed(1)}%</span></div>
+            <div className="row"><span>Current occurrences</span><span className="warn">{toNumber(currentAllocationWriterCause?.open_gap_total, 0)}</span></div>
+            <div className="row"><span>Current oldest open gap</span><span className="warn">{Number.isFinite(Number(oldestOpenGap.open_age_hours)) ? `${toNumber(oldestOpenGap.open_age_hours, 0).toFixed(1)} h` : "-"}</span></div>
+            <div className="row"><span>Root Cause Closure Rate</span><span className={rootCauseClosureRateTone}>{rootCauseClosureRatePct.toFixed(1)}%</span></div>
+            <div className="row"><span>Gap Closure Rate</span><span className={toneClassForPct(toNumber(allocationWriterClosureEvidence.gap_closure_rate_pct, 0))}>{toNumber(allocationWriterClosureEvidence.gap_closure_rate_pct, 0).toFixed(1)}%</span></div>
+            <div className="row"><span>Native Closure Rate</span><span className={toneClassForPct(toNumber(allocationWriterClosureEvidence.native_closure_rate_pct, 0))}>{toNumber(allocationWriterClosureEvidence.native_closure_rate_pct, 0).toFixed(1)}%</span></div>
+            <div className="row"><span>Top cause</span><span className="warn">{String(allocationWriterClosureEvidence.top_cause_label || allocationWriterClosureEvidence.top_cause_key || "none")}</span></div>
+            <div className="subtle mini" style={{ marginTop: 6 }}>Top fix {String(allocationWriterClosureEvidence.top_fix || "closure evidence not instrumented yet")}</div>
+            <div style={{ marginTop: 12 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Audit 1 · Canonical State Machine</div>
+              <div className="row"><span>allocation_created_total</span><span>{toNumber(allocationWriterStateMachine.allocation_created_total, 0)}</span></div>
+              <div className="row"><span>allocation_closed_total</span><span className={allocationClosureRateTone}>{toNumber(allocationWriterStateMachine.allocation_closed_total, 0)}</span></div>
+              <div className="row"><span>allocation_open_total</span><span className={toNumber(allocationWriterStateMachine.allocation_open_total, 0) > 0 ? "warn" : "good"}>{toNumber(allocationWriterStateMachine.allocation_open_total, 0)}</span></div>
+              <div className="row"><span>approval_created_total</span><span>{toNumber(allocationWriterStateMachine.approval_created_total, 0)}</span></div>
+              <div className="row"><span>approval_linked_total</span><span>{toNumber(allocationWriterStateMachine.approval_linked_total, 0)}</span></div>
+              <div className="row"><span>hardening_reached_total</span><span>{toNumber(allocationWriterStateMachine.hardening_reached_total, 0)}</span></div>
+              <div className="row"><span>execution_created_total</span><span>{toNumber(allocationWriterStateMachine.execution_created_total, 0)}</span></div>
+              <div className="row"><span>outcome_created_total</span><span>{toNumber(allocationWriterStateMachine.outcome_created_total, 0)}</span></div>
+              <div className="row"><span>attribution_created_total</span><span>{toNumber(allocationWriterStateMachine.attribution_created_total, 0)}</span></div>
+              <div className="row"><span>opportunity_created_total</span><span>{toNumber(allocationWriterStateMachine.opportunity_created_total, 0)}</span></div>
+            </div>
+            <div style={{ marginTop: 12 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Audit 2 · Writer Native Writes</div>
+              <div className="row"><span>allocation_created_total</span><span>{toNumber(allocationWriterCoverage.allocation_created_total, Number.NaN).toString() === "NaN" ? "-" : toNumber(allocationWriterCoverage.allocation_created_total, 0)}</span></div>
+              <div className="row"><span>allocation_persisted_total</span><span>{toNumber(allocationWriterCoverage.allocation_persisted_total, Number.NaN).toString() === "NaN" ? "-" : toNumber(allocationWriterCoverage.allocation_persisted_total, 0)}</span></div>
+              <div className="row"><span>allocation_failed_total</span><span className={toNumber(allocationWriterCoverage.allocation_failed_total, 0) > 0 ? "warn" : "good"}>{toNumber(allocationWriterCoverage.allocation_failed_total, Number.NaN).toString() === "NaN" ? "-" : toNumber(allocationWriterCoverage.allocation_failed_total, 0)}</span></div>
+              <div className="row"><span>allocation_written_total</span><span>{toNumber(allocationWriterCoverage.allocation_written_total, 0)}</span></div>
+              <div className="row"><span>allocation_write_rate_pct</span><span>{Number.isFinite(Number(allocationWriterCoverage.allocation_write_rate_pct)) ? `${toNumber(allocationWriterCoverage.allocation_write_rate_pct, 0).toFixed(1)}%` : "-"}</span></div>
+              {!Boolean(allocationWriterCoverage.created_signal_instrumented) ? (
+                <div className="subtle mini" style={{ marginTop: 4 }}>Le vrai created_total amont n est pas encore instrumente dans le writer; la couverture affiche donc la qualite des writes observes, pas le write rate source.</div>
+              ) : null}
+            </div>
+            <div style={{ marginTop: 12 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Audit 3 · Identity Propagation</div>
+              <div className="row"><span>identity_propagation_rate</span><span className={toneClassForPct(toNumber(allocationWriterIdentityPropagation.identity_propagation_rate_pct, 0))}>{toNumber(allocationWriterIdentityPropagation.identity_propagation_rate_pct, 0).toFixed(1)}%</span></div>
+              <div className="row"><span>decision_id</span><span>{toNumber(allocationWriterIdentityPropagation.decision_id_total, 0)} / {toNumber(allocationWriterCoverage.allocation_written_total, 0)}</span></div>
+              <div className="row"><span>candidate_id</span><span>{toNumber(allocationWriterIdentityPropagation.candidate_id_total, 0)} / {toNumber(allocationWriterCoverage.allocation_written_total, 0)}</span></div>
+              <div className="row"><span>trade_lifecycle_id</span><span>{toNumber(allocationWriterIdentityPropagation.trade_lifecycle_id_total, 0)} / {toNumber(allocationWriterCoverage.allocation_written_total, 0)}</span></div>
+              <div className="row"><span>approval_id</span><span>{toNumber(allocationWriterIdentityPropagation.approval_id_total, 0)} / {toNumber(allocationWriterCoverage.allocation_written_total, 0)}</span></div>
+              <div className="row"><span>execution_id</span><span>{toNumber(allocationWriterIdentityPropagation.execution_id_total, 0)} / {toNumber(allocationWriterCoverage.allocation_written_total, 0)}</span></div>
+              <div className="row"><span>outcome_id</span><span>{toNumber(allocationWriterIdentityPropagation.outcome_id_total, 0)} / {toNumber(allocationWriterCoverage.allocation_written_total, 0)}</span></div>
+            </div>
+            <div style={{ marginTop: 12 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Audit 4 · Dominant Gap Split</div>
+              {allocationWriterFailureCategories.map((category, index) => (
+                <div key={`allocation-writer-taxonomy-${String(category.category_key || index)}`} className="row" style={{ marginTop: 4 }}>
+                  <span>{String(category.label || category.category_key || "unknown")}</span>
+                  <span className={toNumber(category.total, 0) > 0 ? "warn" : "subtle"}>{toNumber(category.total, 0)} · {toNumber(category.share_pct, 0).toFixed(1)}%</span>
+                </div>
+              ))}
+              {allocationWriterFailureCategories.length === 0 ? (
+                <div className="subtle mini" style={{ marginTop: 4 }}>Aucune cause ouverte detaillee observee sur la fenetre courante.</div>
+              ) : null}
+            </div>
+            <div style={{ marginTop: 12 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Audit 5 · Writer Native Errors</div>
+              {allocationWriterNativeErrors.map((entry, index) => (
+                <div key={`allocation-writer-native-error-${String(entry.error_code || index)}`} className="row" style={{ marginTop: 4 }}>
+                  <span>{String(entry.label || entry.error_code || "unknown")}</span>
+                  <span className={toNumber(entry.total, 0) > 0 ? "warn" : "subtle"}>{toNumber(entry.total, 0)} · {toNumber(entry.share_pct, 0).toFixed(1)}%</span>
+                </div>
+              ))}
+            </div>
+            <div style={{ marginTop: 12 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Latency to first downstream fact</div>
+              <div className="row"><span>Measured allocations</span><span>{toNumber(allocationWriterLatency.measured_allocation_total, 0)}</span></div>
+              <div className="row"><span>P50</span><span className={Number.isFinite(Number(allocationWriterLatency.p50_hours)) && toNumber(allocationWriterLatency.p50_hours, 0) <= 24 ? "good" : "warn"}>{Number.isFinite(Number(allocationWriterLatency.p50_hours)) ? `${toNumber(allocationWriterLatency.p50_hours, 0).toFixed(1)} h` : "-"}</span></div>
+              <div className="row"><span>P95</span><span className={Number.isFinite(Number(allocationWriterLatency.p95_hours)) && toNumber(allocationWriterLatency.p95_hours, 0) <= 24 ? "good" : "warn"}>{Number.isFinite(Number(allocationWriterLatency.p95_hours)) ? `${toNumber(allocationWriterLatency.p95_hours, 0).toFixed(1)} h` : "-"}</span></div>
+              <div className="row"><span>P99</span><span className={Number.isFinite(Number(allocationWriterLatency.p99_hours)) && toNumber(allocationWriterLatency.p99_hours, 0) <= 24 ? "good" : "warn"}>{Number.isFinite(Number(allocationWriterLatency.p99_hours)) ? `${toNumber(allocationWriterLatency.p99_hours, 0).toFixed(1)} h` : "-"}</span></div>
+              <div className="row"><span>allocation_to_approval_rate</span><span className={toneClassForPct(toNumber(allocationWriterPropagation.allocation_to_approval_rate_pct, 0))}>{toNumber(allocationWriterPropagation.allocation_to_approval_rate_pct, 0).toFixed(1)}%</span></div>
+            </div>
+            <div className="row" style={{ marginTop: 12 }}><span>Root causes corrected / identified</span><span>{toNumber(allocationWriterClosureEvidence.corrected_root_cause_total, 0)} / {toNumber(allocationWriterClosureEvidence.identified_root_cause_total, 0)}</span></div>
+            <div className="row"><span>Gaps closed / open+closed</span><span>{toNumber(allocationWriterClosureEvidence.closed_gap_total, 0)} / {toNumber(allocationWriterClosureEvidence.open_gap_total, 0) + toNumber(allocationWriterClosureEvidence.closed_gap_total, 0)}</span></div>
+            <div className="row"><span>Native failed then closed</span><span>{toNumber(allocationWriterClosureEvidence.native_closed_allocation_total, 0)} / {toNumber(allocationWriterClosureEvidence.native_failed_allocation_total, 0)}</span></div>
+            {allocationWriterProvenance.length > 0 ? (
+              <div style={{ marginTop: 12 }}>
+                <div className="subtle mini" style={{ marginBottom: 6 }}>Writer Provenance</div>
+                {allocationWriterProvenance.slice(0, 8).map((entry, index) => (
+                  <div key={`allocation-writer-provenance-${String(entry.allocation_id || index)}`} style={{ marginTop: 8, borderRadius: 10, border: "1px solid rgba(148, 163, 184, 0.12)", padding: 8, background: "rgba(2, 6, 23, 0.16)" }}>
+                    <div className="row">
+                      <span>{String(entry.allocation_id || "unknown")}</span>
+                      <span className={String(entry.writer_result || "unknown") === "ok" ? "good" : "warn"}>{String(entry.writer_result || "unknown")}</span>
+                    </div>
+                    <div className="subtle mini" style={{ marginTop: 4 }}>decision {String(entry.decision_id || "-")} · writer {String(entry.writer_version || "unknown")}</div>
+                    <div className="subtle mini" style={{ marginTop: 4 }}>timestamp {formatDateTimeCompact(entry.writer_timestamp)}</div>
+                    <div className="subtle mini" style={{ marginTop: 4 }}>first downstream {String(entry.first_downstream_stage || "none")} · first failure {String(entry.first_failure_stage || "none")}</div>
+                    <div className="subtle mini" style={{ marginTop: 4 }}>failure reason {String(entry.failure_reason || "none")}</div>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            <div className="row" style={{ marginTop: 12 }}><span>7j dominant root cause</span><span className={String(dominantGapCardinality7d.dominant_root_cause_code_latest || "").trim() === allocationWriterRootCauseCode ? "warn" : "subtle"}>{String(dominantGapCardinality7d.dominant_root_cause_label_latest || "none")}</span></div>
+            <div className="row"><span>7j concentration avg</span><span className={rootCauseConcentration7dPct >= 80 ? "warn" : rootCauseConcentration7dPct >= 40 ? "subtle" : "good"}>{rootCauseConcentration7dPct.toFixed(1)}%</span></div>
+            <div className="row"><span>30j dominant root cause</span><span className={String(dominantGapCardinality30d.dominant_root_cause_code_latest || "").trim() === allocationWriterRootCauseCode ? "warn" : "subtle"}>{String(dominantGapCardinality30d.dominant_root_cause_label_latest || "none")}</span></div>
+            <div className="row"><span>30j concentration avg</span><span className={rootCauseConcentration30dPct >= 80 ? "warn" : rootCauseConcentration30dPct >= 40 ? "subtle" : "good"}>{rootCauseConcentration30dPct.toFixed(1)}%</span></div>
+            {dominantGapTopDecisions.length > 0 ? (
+              <div style={{ marginTop: 12 }}>
+                <div className="subtle mini" style={{ marginBottom: 6 }}>Allocation writer exemplar decisions</div>
+                {dominantGapTopDecisions.slice(0, 5).map((item, index) => (
+                  <div key={`allocation-writer-audit-${String(item.gap_id || item.decision_id || index)}`} style={{ marginTop: 8, borderRadius: 10, border: "1px solid rgba(248, 113, 113, 0.18)", padding: 8, background: "rgba(127, 29, 29, 0.14)" }}>
+                    <div className="row">
+                      <span>{String(item.decision_id || "unknown")}</span>
+                      <span className="warn">fragments {toNumber(item.observed_fragments, 0)}</span>
+                    </div>
+                    <div className="subtle mini" style={{ marginTop: 4 }}>opened {formatDateTimeCompact(item.opened_at_iso)} · age {Number.isFinite(Number(item.open_age_hours)) ? `${toNumber(item.open_age_hours, 0).toFixed(1)} h` : "-"}</div>
+                    <div className="subtle mini" style={{ marginTop: 4 }}>audit {String(item.root_cause || "unknown")}</div>
+                    <div className="subtle mini" style={{ marginTop: 4 }}>writer remediation {String(item.remediation || "unknown")}</div>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+      </section>
+
+      <section className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", marginBottom: 16 }}>
+        <div className="panel">
+          <div className="eyebrow">Hardening Analytics 30D</div>
+          <div className="row"><span>Approval #2 observed</span><span>{hardeningApprovalStage2Total}</span></div>
+          <div className="row"><span>Hardening refused</span><span className="warn">{hardeningRefusedTotal}</span></div>
+          <div className="row"><span>Unique decisions</span><span>{hardeningUniqueDecisionTotal}</span></div>
+          {hardeningTopRefusalCauses.length > 0 || hardeningTopCostCauses.length > 0 || hardeningTopMissedAlphaCauses.length > 0 ? (
+            <div style={{ marginTop: 10 }}>
+              {hardeningTopRefusalCauses.length > 0 ? (
+                <div style={{ marginTop: 10 }}>
+                  <div className="subtle mini" style={{ marginBottom: 6 }}>Top 10 causes de refus</div>
+                  {hardeningTopRefusalCauses.map((item, index) => (
+                    <div key={`hardening-refusal-${String(item.cause_key || "unknown")}-${index}`} style={{ marginTop: 6 }}>
+                      <div className="row">
+                        <span>{String(item.label || item.cause_key || "unknown")}</span>
+                        <span className="warn">{toNumber(item.count, 0)} · {toNumber(item.share_pct, 0).toFixed(1)}%</span>
+                      </div>
+                      <div className="subtle mini">decisions {toNumber(item.decision_count, 0)} · opp {toNumber(item.opportunity_cost_bps, 0).toFixed(1)}bps · missed {toNumber(item.missed_alpha_bps, 0).toFixed(1)}bps</div>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              {hardeningTopCostCauses.length > 0 ? (
+                <div style={{ marginTop: 12 }}>
+                  <div className="subtle mini" style={{ marginBottom: 6 }}>Top 10 causes de cout</div>
+                  {hardeningTopCostCauses.map((item, index) => (
+                    <div key={`hardening-cost-${String(item.cause_key || "unknown")}-${index}`} className="row" style={{ marginTop: 4 }}>
+                      <span>{String(item.label || item.cause_key || "unknown")}</span>
+                      <span className="warn">opp {toNumber(item.opportunity_cost_bps, 0).toFixed(1)}bps · {toNumber(item.count, 0)} refus</span>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              {hardeningTopMissedAlphaCauses.length > 0 ? (
+                <div style={{ marginTop: 12 }}>
+                  <div className="subtle mini" style={{ marginBottom: 6 }}>Top 10 causes d'alpha manque</div>
+                  {hardeningTopMissedAlphaCauses.map((item, index) => (
+                    <div key={`hardening-alpha-${String(item.cause_key || "unknown")}-${index}`} className="row" style={{ marginTop: 4 }}>
+                      <span>{String(item.label || item.cause_key || "unknown")}</span>
+                      <span className="warn">missed {toNumber(item.missed_alpha_bps, 0).toFixed(1)}bps · {toNumber(item.count, 0)} refus</span>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          ) : (
+            <div className="subtle mini" style={{ marginTop: 10 }}>Aucun refus hardening 30j materialise dans le snapshot local.</div>
+          )}
+        </div>
+        <div className="panel">
+          <div className="eyebrow">Decision Friction Analytics</div>
+          <div className="row"><span>Blocked opportunities</span><span>{decisionFrictionBlockedTotal}</span></div>
+          <div className="row"><span>Unique decisions</span><span>{decisionFrictionUniqueDecisionTotal}</span></div>
+          <div className="row"><span>Repeated decisions</span><span className="warn">{decisionFrictionRepeatedDecisionTotal}</span></div>
+          <div className="row"><span>Repeated blocked total</span><span className="warn">{decisionFrictionRepeatedBlockedTotal}</span></div>
+          <div className="row"><span>Repeated blocked share</span><span className="warn">{decisionFrictionRepeatedBlockedSharePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Opportunity cost total</span><span className="warn">{decisionFrictionOpportunityCostBpsTotal.toFixed(1)}bps</span></div>
+          <div className="row"><span>Missed alpha total</span><span className="warn">{decisionFrictionMissedAlphaBpsTotal.toFixed(1)}bps</span></div>
+          <div className="row"><span>Capital impact total</span><span className="warn">{formatUsd(decisionFrictionCapitalImpactUsdTotal)}</span></div>
+          <div className="row"><span>Capital impact / decision</span><span className="warn">{formatUsd(decisionFrictionCapitalImpactPerDecision)}</span></div>
+          <div className="row"><span>Capital impact coverage</span><span className="warn">{decisionFrictionCapitalImpactCoveragePct.toFixed(1)}% · {decisionFrictionCapitalBasisAvailableRows} / {decisionFrictionCapitalBasisRowTotal} rows</span></div>
+          <div className="row"><span>Dominant gate</span><span className="warn">{decisionFrictionDominantGateName} · {decisionFrictionDominantGateBlockedTotal} · {decisionFrictionDominantGateSharePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Dominant cost gate</span><span className="warn">{decisionFrictionDominantCostGateName} · {formatUsd(decisionFrictionDominantCostGateCapitalImpactUsd)}</span></div>
+          <div className="row"><span>Dominant decision</span><span className="warn">{decisionFrictionDominantDecisionGateName} · {decisionFrictionDominantDecisionId.slice(0, 24)} · {decisionFrictionDominantDecisionBlockedTotal} · {decisionFrictionDominantDecisionSharePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Dominant cost decision</span><span className="warn">{decisionFrictionDominantCostDecisionGateName} · {decisionFrictionDominantCostDecisionId.slice(0, 24)} · {formatUsd(decisionFrictionDominantCostDecisionCapitalImpactUsd)} · opp {decisionFrictionDominantCostDecisionOpportunityCostBps.toFixed(1)}bps · missed {decisionFrictionDominantCostDecisionMissedAlphaBps.toFixed(1)}bps</span></div>
+          {decisionFrictionWatchlistGates.length > 0 ? (
+            <div style={{ marginTop: 10 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Watchlist codes</div>
+              {decisionFrictionWatchlistGates.map((item, index) => (
+                <div key={`${String(item.gate_name || "unknown")}-${index}`} className="row" style={{ marginTop: 4 }}>
+                  <span>{String(item.gate_name || "unknown")}</span>
+                  <span className="warn">{toNumber(item.blocked_total, 0)} · {toNumber(item.unique_decision_total, 0)} decisions · {toNumber(item.blocked_share_pct, 0).toFixed(1)}%</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {decisionFrictionTopDecisions.length > 0 ? (
+            <div style={{ marginTop: 10 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Top repeated decisions</div>
+              {decisionFrictionTopDecisions.map((item, index) => (
+                <div key={`decision-friction-${String(item.decision_id || "unknown")}-${index}`} className="row" style={{ marginTop: 4 }}>
+                  <span>{String(item.gate_name || "unknown")} · {String(item.decision_id || "unknown").slice(0, 24)}</span>
+                  <span className="warn">{toNumber(item.blocked_count, 0)}x · corr {toNumber(item.unique_correlation_keys, 0)} · {formatUsd(toNumber(item.capital_impact_usd_total, 0))} · opp {toNumber(item.opportunity_cost_bps_total, 0).toFixed(1)}bps</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {decisionFrictionTopCostDecisions.length > 0 ? (
+            <div style={{ marginTop: 10 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Top costly decisions</div>
+              {decisionFrictionTopCostDecisions.map((item, index) => (
+                <div key={`decision-friction-cost-${String(item.decision_id || "unknown")}-${index}`} className="row" style={{ marginTop: 4 }}>
+                  <span>{String(item.gate_name || "unknown")} · {String(item.decision_id || "unknown").slice(0, 24)}</span>
+                  <span className="warn">{formatUsd(toNumber(item.capital_impact_usd_total, 0))} · opp {toNumber(item.opportunity_cost_bps_total, 0).toFixed(1)}bps · missed {toNumber(item.missed_alpha_bps_total, 0).toFixed(1)}bps</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {decisionFrictionTopGates.length > 0 ? (
+            <div style={{ marginTop: 10 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Top friction gates</div>
+              {decisionFrictionTopGates.map((item, index) => (
+                <div key={`decision-friction-gate-${String(item.gate_name || "unknown")}-${index}`} className="row" style={{ marginTop: 4 }}>
+                  <span>{String(item.gate_name || "unknown")}</span>
+                  <span className="warn">{toNumber(item.blocked_count, 0)} · {toNumber(item.unique_decision_count, 0)} decisions · {toNumber(item.repeated_decision_count, 0)} repeats · {formatUsd(toNumber(item.capital_impact_usd_total, 0))} · /dec {formatUsd(toNumber(item.capital_impact_per_decision, 0))} · opp {toNumber(item.opportunity_cost_bps_total, 0).toFixed(1)}bps</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {decisionFrictionTopCostGates.length > 0 ? (
+            <div style={{ marginTop: 10 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Top costly gates</div>
+              {decisionFrictionTopCostGates.map((item, index) => (
+                <div key={`decision-friction-gate-cost-${String(item.gate_name || "unknown")}-${index}`} className="row" style={{ marginTop: 4 }}>
+                  <span>{String(item.gate_name || "unknown")}</span>
+                  <span className="warn">{formatUsd(toNumber(item.capital_impact_usd_total, 0))} · /dec {formatUsd(toNumber(item.capital_impact_per_decision, 0))} · missed {toNumber(item.missed_alpha_bps_total, 0).toFixed(1)}bps · opp {toNumber(item.opportunity_cost_bps_total, 0).toFixed(1)}bps</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      </section>
+
+      <section className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", marginBottom: 16 }}>
+        <div className="panel">
+          <div className="eyebrow">Decision Governance Operating System</div>
+          <div className="subtle" style={{ marginTop: 6 }}>La completion journey pilote la roadmap. Le TRI n est plus qu un derive de la preuve, pas son substitut.</div>
+          <div style={{ marginTop: 12, borderRadius: 12, border: "1px solid rgba(148, 163, 184, 0.16)", padding: 12, background: "rgba(15, 23, 42, 0.22)" }}>
+            <div className="row"><span>Rule active</span><span className={decisionContinuityGovernanceRule.tone}>{decisionContinuityGovernanceRule.label}</span></div>
+            <div className="row"><span>Action now</span><span className={decisionContinuityGovernanceRule.tone}>{decisionContinuityGovernanceRule.action}</span></div>
+            <div className="row"><span>Objective</span><span>{decisionContinuityGovernanceRule.objective}</span></div>
+            <div className="row"><span>Current completion</span><span className={toneClassForPct(journeyCompletionRatePct)}>{journeyCompletionRatePct.toFixed(1)}%</span></div>
+            <div className="row"><span>Complete / created</span><span>{completeDecisionTotal} / {createdDecisionTotal}</span></div>
+            <div className="row"><span>Alpha V2 gate</span><span className={journeyCompletionRatePct < 10 ? "warn" : "good"}>{journeyCompletionRatePct < 10 ? "locked until >= 10%" : "eligible by journey threshold"}</span></div>
+            <div className="row"><span>Current evidence</span><span className={toneClassForPct(decisionEvidenceQualityPct)}>{decisionEvidenceQualityPct.toFixed(1)}%</span></div>
+            <div className="row"><span>Downstream TRI</span><span className={toneClassForPct(truthReliabilityScorePct)}>{truthReliabilityScorePct.toFixed(1)}% · {truthReliabilityStatus}</span></div>
+            <div className="row"><span>7j continuity avg</span><span>{truthReliability7dContinuityAvgPct.toFixed(1)}% · evidence {truthReliability7dEvidenceAvgPct.toFixed(1)}%</span></div>
+            <div className="row"><span>30j continuity avg</span><span>{truthReliability30dContinuityAvgPct.toFixed(1)}% · evidence {truthReliability30dEvidenceAvgPct.toFixed(1)}%</span></div>
+            <div className="row"><span>TRI trend</span><span>{truthReliability7dLatestPct.toFixed(1)}% / {truthReliability30dLatestPct.toFixed(1)}% · growth {truthReliability30dGrowthPct >= 0 ? "+" : ""}{truthReliability30dGrowthPct.toFixed(1)} pts</span></div>
+          </div>
+          <div style={{ marginTop: 10 }}>
+            {DECISION_CONTINUITY_RULES.map((rule) => {
+              const active = journeyCompletionRatePct >= rule.minInclusive && journeyCompletionRatePct < rule.maxExclusive;
+              return (
+                <div key={rule.label} className="row" style={{ marginTop: 4 }}>
+                  <span>{rule.label}</span>
+                  <span className={active ? rule.tone : "subtle"}>{active ? rule.action : rule.objective}</span>
+                </div>
+              );
+            })}
+          </div>
+          {Object.keys(truthReliability30dStatusCounts).length > 0 ? (
+            <div className="subtle mini" style={{ marginTop: 10 }}>
+              30j TRI status mix: {Object.entries(truthReliability30dStatusCounts).map(([status, count]) => `${status} ${toNumber(count, 0).toFixed(0)}`).join(" · ")}
+            </div>
+          ) : null}
+          <div className="subtle mini" style={{ marginTop: 6 }}>
+            TRI guard actif: {truthReliabilityGovernanceRule.label} · {truthReliabilityGovernanceRule.action.toLowerCase()}
+          </div>
+        </div>
+      </section>
+
+      <section className="grid" style={{ gridTemplateColumns: "1fr", marginBottom: 16 }}>
+        <div className="panel" data-testid="decision-trace-explorer-panel">
+          <div className="eyebrow">Decision Trace Explorer</div>
+          <div className="subtle" style={{ marginTop: 6 }}>Contrat operateur: expliquer n importe quel `decision_id` en moins de 10 secondes, avec timeline causale complete et maillons manquants visibles.</div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}>
+            {decisionTraceCandidateIds.length > 0 ? decisionTraceCandidateIds.map((decisionId) => (
+              <button
+                key={decisionId}
+                type="button"
+                className={selectedDecisionTraceId === decisionId ? "btn btn-primary" : "btn"}
+                onClick={() => { setSelectedDecisionTraceId(decisionId); setDecisionTraceQueryInput(decisionId); }}
+              >
+                {decisionId.slice(0, 28)}
+              </button>
+            )) : (
+              <div className="subtle mini">Aucun decision_id dominant disponible dans le snapshot courant.</div>
+            )}
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
+            <input
+              type="text"
+              value={decisionTraceQueryInput}
+              onChange={(event) => { setDecisionTraceQueryInput(event.target.value); }}
+              placeholder="decision_id a expliquer"
+              style={{ minWidth: 320, flex: "1 1 320px" }}
+            />
+            <button
+              type="button"
+              disabled={decisionTraceBusy || !decisionTraceQueryInput.trim()}
+              onClick={() => {
+                const nextDecisionId = decisionTraceQueryInput.trim();
+                if (!nextDecisionId) {
+                  return;
+                }
+                setSelectedDecisionTraceId(nextDecisionId);
+              }}
+            >
+              Expliquer ce decision_id
+            </button>
+          </div>
+          {decisionTraceError ? <p className="warn" style={{ marginTop: 10 }}>{decisionTraceError}</p> : null}
+          {decisionTraceBusy ? <p className="subtle" style={{ marginTop: 10 }}>Chargement du trace causal...</p> : null}
+          {!decisionTraceBusy && decisionTracePayload ? (
+            <>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 10, marginTop: 12 }}>
+                <div style={{ borderRadius: 12, border: "1px solid rgba(148, 163, 184, 0.16)", padding: 10, background: "rgba(15, 23, 42, 0.22)" }}>
+                  <div className="subtle mini">Summary</div>
+                  <div className="row" style={{ marginTop: 6 }}><span>Status</span><span className={traceStatusClass(decisionTraceSummary.status)}>{String(decisionTraceSummary.status || "unknown")}</span></div>
+                  <div className="row"><span>Decision</span><span>{String(decisionTraceSummary.decision_id || "-")}</span></div>
+                  <div className="row"><span>Approval</span><span>{String(decisionTrace.approval_id || "-")}</span></div>
+                  <div className="row"><span>Lifecycle</span><span>{String(decisionTraceSummary.trade_lifecycle_id || "-")}</span></div>
+                  <div className="row"><span>Symbol</span><span>{String(decisionTraceSummary.symbol || "-")} · {String(decisionTraceSummary.side || "-")}</span></div>
+                  <div className="row"><span>Blocking</span><span className={decisionTraceSummary.blocking_reason ? "warn" : "good"}>{String(decisionTraceSummary.blocking_reason || "none")}</span></div>
+                </div>
+                <div style={{ borderRadius: 12, border: "1px solid rgba(148, 163, 184, 0.16)", padding: 10, background: "rgba(15, 23, 42, 0.22)" }}>
+                  <div className="subtle mini">Operators</div>
+                  <div className="row" style={{ marginTop: 6 }}><span>Approval #1</span><span>{String(decisionTraceSummary.first_approved_by || "-")}</span></div>
+                  <div className="row"><span>Approval #2</span><span>{String(decisionTraceSummary.second_approved_by || "-")}</span></div>
+                  <div className="row"><span>Projected facts</span><span>{decisionTraceFacts.length}</span></div>
+                  <div className="row"><span>Oracle</span><span>{Object.keys(decisionTraceOracle).length > 0 ? String(decisionTraceOracle.status || decisionTraceOracle.reason || "present") : "n/a"}</span></div>
+                  <div className="subtle mini" style={{ marginTop: 8 }}>
+                    {Object.keys(decisionTraceOracle).length > 0
+                      ? `${String(decisionTraceOracle.source || "oracle")} · age ${toNumber(decisionTraceOracle.age_ms, 0).toFixed(0)} ms · confidence ${toNumber(decisionTraceOracle.confidence, 0).toFixed(1)}`
+                      : "Projection oracle indisponible pour cette trace."}
+                  </div>
+                </div>
+                <div style={{ borderRadius: 12, border: "1px solid rgba(148, 163, 184, 0.16)", padding: 10, background: decisionTraceError ? "rgba(127, 29, 29, 0.18)" : "rgba(15, 23, 42, 0.22)" }}>
+                  <div className="subtle mini">Diagnostics lite</div>
+                  <div className="row" style={{ marginTop: 6 }}><span>Mode</span><span>{decisionTraceMode}</span></div>
+                  <div className="row"><span>Resolution</span><span className={decisionTraceResolvedVia.includes("synthetic") ? "warn" : "subtle"}>{decisionTraceResolvedVia}</span></div>
+                  <div className="row"><span>Total</span><span>{decisionTraceTotalDurationMs.toFixed(0)} ms</span></div>
+                  <div className="row"><span>SLA &lt; 10s</span><span className={decisionTraceSlaMet ? "good" : "warn"}>{decisionTraceSlaMet ? "met" : "missed"}</span></div>
+                  <div className="row"><span>Partial</span><span className={decisionTracePartial ? "warn" : "good"}>{decisionTracePartial ? "yes" : "no"}</span></div>
+                  <div className="row"><span>Phases</span><span>{decisionTracePhases.length}</span></div>
+                  <div className="subtle mini" style={{ marginTop: 8 }}>
+                    request: {String(decisionTraceRequestedIds.decision_id || decisionTraceRequestedIds.approval_id || selectedDecisionTraceId || "-")}
+                  </div>
+                </div>
+                <div style={{ borderRadius: 12, border: "1px solid rgba(148, 163, 184, 0.16)", padding: 10, background: "rgba(15, 23, 42, 0.22)" }}>
+                  <div className="subtle mini">Explorer contract</div>
+                  <div className="row" style={{ marginTop: 6 }}><span>Coverage</span><span>{decisionTraceCompletedCount}/{decisionTraceTimeline.length}</span></div>
+                  <div className="row"><span>Missing</span><span className={decisionTraceMissingLabels.length > 0 ? "warn" : "good"}>{decisionTraceMissingLabels.length}</span></div>
+                  <div className="row"><span>Blocked</span><span className={decisionTraceBlockedLabels.length > 0 ? "warn" : "good"}>{decisionTraceBlockedLabels.length}</span></div>
+                  <div className="row"><span>Pending</span><span className={decisionTracePendingLabels.length > 0 ? "subtle" : "good"}>{decisionTracePendingLabels.length}</span></div>
+                  <div className="subtle mini" style={{ marginTop: 8 }}>
+                    {decisionTraceMissingLabels.length > 0 ? `missing: ${decisionTraceMissingLabels.join(" · ")}` : "Aucun maillon causal manquant sur la timeline attendue."}
+                  </div>
+                  {decisionTraceBlockedLabels.length > 0 ? (
+                    <div className="subtle mini" style={{ marginTop: 4 }}>
+                      blocked: {decisionTraceBlockedLabels.join(" · ")}
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+              {decisionTracePhases.length > 0 ? (
+                <div style={{ marginTop: 12, borderRadius: 12, border: "1px solid rgba(148, 163, 184, 0.16)", padding: 10, background: "rgba(2, 6, 23, 0.16)" }}>
+                  <div className="subtle mini" style={{ marginBottom: 6 }}>Phase diagnostics</div>
+                  <div style={{ display: "grid", gap: 6 }}>
+                    {decisionTracePhases.map((phase, index) => {
+                      const timedOut = Boolean(phase.timed_out);
+                      const failed = Boolean(phase.failed);
+                      const toneClass = timedOut || failed ? "warn" : "good";
+                      return (
+                        <div key={`${String(phase.phase_key || "phase")}-${index}`} className="row" style={{ alignItems: "flex-start", gap: 12 }}>
+                          <span>{String(phase.phase_key || `phase-${index + 1}`)}</span>
+                          <span className={toneClass}>
+                            {toNumber(phase.duration_ms, 0).toFixed(0)} ms · rows {toNumber(phase.rows, 0).toFixed(0)}
+                            {timedOut ? " · timeout" : ""}
+                            {failed ? " · failed" : ""}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : null}
+              <div style={{ marginTop: 12, display: "grid", gap: 8 }}>
+                {decisionTraceTimeline.map((step, index) => {
+                  const payload = asRecord(step.payload);
+                  const actors = Array.isArray(step.actors) ? step.actors.map((item) => String(item)).filter(Boolean) : [];
+                  return (
+                    <div key={`${String(step.stage_key || "step")}-${index}`} style={{ borderRadius: 12, border: "1px solid rgba(148, 163, 184, 0.16)", padding: 10, background: "rgba(2, 6, 23, 0.16)" }}>
+                      <div className="row"><span>{index + 1}. {String(step.label || step.stage_key || "step")}</span><span className={traceStatusClass(step.status)}>{String(step.status || "missing")}</span></div>
+                      <div className="subtle mini" style={{ marginTop: 6 }}>{String(step.detail || "No detail")}</div>
+                      <div className="subtle mini" style={{ marginTop: 4 }}>
+                        {String(step.timestamp || "-")} · {actors.length > 0 ? actors.join(" · ") : String(payload.approval_stage || payload.status || "no-actor")}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              {selectedDecisionTraceId ? (
+                <p className="subtle mini" style={{ marginTop: 10 }}>
+                  <Link href={`/api/system/decision-trace?decisionId=${encodeURIComponent(selectedDecisionTraceId)}&mode=lite`}>Ouvrir la trace JSON brute</Link>
+                </p>
+              ) : null}
+            </>
+          ) : null}
         </div>
       </section>
 
@@ -1243,7 +2703,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
         </div>
       </section>
 
-      <section className="grid" style={{ gridTemplateColumns: "1.05fr 0.95fr", marginBottom: 16 }}>
+      <section className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", marginBottom: 16 }}>
         <div className="panel" data-testid="alpha-reactivation-console">
           <OperatorPanelGuide
             title="Alpha Reactivation Console"
@@ -1270,7 +2730,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
               <span>Opportunity score</span>
               <span className={opportunityScore >= 70 ? "good" : opportunityScore >= 50 ? "subtle" : "warn"}>{opportunityScore}/100</span>
             </div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 10 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 10, marginTop: 10 }}>
               <div>
                 <div className="subtle mini" style={{ marginBottom: 6 }}>Pourquoi proposer</div>
                 {opportunityDrivers.map((item) => (
@@ -1359,7 +2819,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
         </div>
       </section>
 
-      <section className="grid" style={{ gridTemplateColumns: "1.1fr 0.9fr", marginBottom: 16 }}>
+      <section className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", marginBottom: 16 }}>
         <div className="panel">
           <OperatorPanelGuide
             title="Collecte Controlee"
@@ -1430,7 +2890,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
         </div>
       </section>
 
-      <section className="grid" style={{ gridTemplateColumns: "1.15fr 0.85fr", marginBottom: 16 }}>
+      <section className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(340px, 1fr))", marginBottom: 16 }}>
         <div className="panel">
           <ExecutionPnlTruthMonitoringPanel
             badge={null}

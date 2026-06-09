@@ -18,9 +18,28 @@ type BrokerRealityState = "UNTESTED" | "CONNECTED" | "ACK_VALIDATED" | "FILL_VAL
 type QuoteRealityState = "BLIND" | "OBSERVED";
 type DecisionRealityState = "UNKNOWN" | "POLICY_ONLY" | "PARTIAL_QUOTE_AWARE" | "OBSERVED";
 
-type RuntimeTruthSnapshot = {
+type ProjectionSourceDiagnostics = {
+  rows_scanned: number;
+  rows_returned: number;
+};
+
+export type RuntimeTruthCacheAudit = {
+  cache_hit: number;
+  cache_miss: number;
+  age_ms: number | null;
+  stale: boolean;
+  last_generated_at: string | null;
+};
+
+type RuntimeTruthCacheEntry = {
+  createdAtMs: number;
+  snapshot: RuntimeTruthSnapshot;
+};
+
+export type RuntimeTruthSnapshot = {
   schema_version: "runtime-truth/v1";
   generated_at: string;
+  source_diagnostics: ProjectionSourceDiagnostics;
   scope: {
     symbol: string;
     market_instrument: string;
@@ -63,12 +82,12 @@ type RuntimeTruthSnapshot = {
 };
 
 type RuntimeTruthGlobal = typeof globalThis & {
-  __runtimeTruthCache__?: Map<string, { createdAtMs: number; snapshot: RuntimeTruthSnapshot }>;
+  __runtimeTruthCache__?: Map<string, RuntimeTruthCacheEntry>;
   __runtimeTruthInflight__?: Map<string, Promise<RuntimeTruthSnapshot>>;
 };
 
 const runtimeTruthGlobal = globalThis as RuntimeTruthGlobal;
-const runtimeTruthCache = runtimeTruthGlobal.__runtimeTruthCache__ || new Map<string, { createdAtMs: number; snapshot: RuntimeTruthSnapshot }>();
+const runtimeTruthCache = runtimeTruthGlobal.__runtimeTruthCache__ || new Map<string, RuntimeTruthCacheEntry>();
 const runtimeTruthInflight = runtimeTruthGlobal.__runtimeTruthInflight__ || new Map<string, Promise<RuntimeTruthSnapshot>>();
 
 runtimeTruthGlobal.__runtimeTruthCache__ = runtimeTruthCache;
@@ -77,7 +96,7 @@ runtimeTruthGlobal.__runtimeTruthInflight__ = runtimeTruthInflight;
 const RUNTIME_TRUTH_CP_TIMEOUT_MS = 8_000;
 const RUNTIME_TRUTH_ANALYTICS_TIMEOUT_MS = 8_000;
 const RUNTIME_TRUTH_EDGE_EVIDENCE_TIMEOUT_MS = 900;
-const RUNTIME_TRUTH_CACHE_MS = 2_000;
+const RUNTIME_TRUTH_CACHE_MS = Math.max(5_000, Math.round(Number(process.env.RUNTIME_TRUTH_SNAPSHOT_TTL_MS || 15_000)));
 
 function asRecord(value: unknown): JsonMap {
   return value && typeof value === "object" && !Array.isArray(value) ? value as JsonMap : {};
@@ -118,6 +137,65 @@ function elapsedMinutesSince(iso: string | null, nowMs = Date.now()): number | n
     return null;
   }
   return Math.max(0, (nowMs - ts) / 60000);
+}
+
+function parseIsoMs(value: string | null | undefined): number | null {
+  if (!value) {
+    return null;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function defaultControlledCollectionSummary(): Awaited<ReturnType<typeof getControlledCollectionSessionSummary>> {
+  return {
+    available: false,
+    active: false,
+    baselineSince: null,
+    openedAt: null,
+    lastSnapshotAt: null,
+    durationMinutes: 0,
+    cycles: 0,
+    phase: "UNAVAILABLE",
+    fillsSeen: 0,
+    labelsSeen: 0,
+    killSwitchRearmed: false,
+    killSwitchActive: false,
+    killSwitchReason: null,
+    killSwitchSource: "unavailable",
+    watchStale: true,
+    watchAgeMinutes: null,
+    gateStatus: null,
+    gateHealthScore: null,
+    latestFillAt: null,
+    latestLabeledAt: null,
+    archivePath: "",
+    statePath: "",
+  };
+}
+
+function defaultEdgeEvidenceState(): RuntimeEdgeEvidenceState {
+  return {
+    available: false,
+    state: "UNAVAILABLE",
+    summary: "Runtime truth snapshot warming.",
+    filePath: "",
+    fileUpdatedAt: null,
+    matureThresholdEvents: 3,
+    cellCount: 0,
+    replicatedCells: 0,
+    matureCells: 0,
+    outcomesWithBoth: 0,
+    maxCellEventCount: 0,
+    nextGate: {
+      name: "UNAVAILABLE",
+      targetState: "UNKNOWN",
+      condition: "runtime truth snapshot available",
+      summary: "Runtime truth snapshot warming.",
+      candidateCells: [],
+    },
+    topCells: [],
+  };
 }
 
 function findNestedNumber(value: unknown, keys: string[]): number | null {
@@ -380,7 +458,209 @@ export type RuntimeTruthInput = {
   timeframe?: string;
   strategy?: string;
   bypassCache?: boolean;
+  allowStaleOnMiss?: boolean;
 };
+
+function normalizeRuntimeTruthInput(options: RuntimeTruthInput = {}): Required<RuntimeTruthInput> {
+  return {
+    symbol: String(options.symbol || "DESK").trim().toUpperCase() || "DESK",
+    marketInstrument: String(options.marketInstrument || options.symbol || "BTCUSDT").trim().toUpperCase() || "BTCUSDT",
+    timeframe: String(options.timeframe || "live").trim() || "live",
+    strategy: String(options.strategy || "live-ops").trim() || "live-ops",
+    bypassCache: Boolean(options.bypassCache),
+    allowStaleOnMiss: Boolean(options.allowStaleOnMiss),
+  };
+}
+
+function snapshotAgeMs(snapshot: RuntimeTruthSnapshot): number | null {
+  const generatedAtMs = parseIsoMs(snapshot.generated_at);
+  if (generatedAtMs === null) {
+    return null;
+  }
+  return Math.max(0, Date.now() - generatedAtMs);
+}
+
+function isFreshEntry(entry: RuntimeTruthCacheEntry): boolean {
+  const ageMs = snapshotAgeMs(entry.snapshot);
+  if (ageMs === null) {
+    return Date.now() - entry.createdAtMs <= RUNTIME_TRUTH_CACHE_MS;
+  }
+  return ageMs <= RUNTIME_TRUTH_CACHE_MS;
+}
+
+function snapshotFileName(input: Required<RuntimeTruthInput>): string {
+  const parts = [input.symbol, input.marketInstrument, input.timeframe, input.strategy]
+    .map((part) => String(part).trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "default");
+  return `mission-control-runtime-truth-${parts.join("-")}.json`;
+}
+
+function snapshotFilePath(input: Required<RuntimeTruthInput>): string {
+  const snapshotDir = process.env.RUNTIME_TRUTH_SNAPSHOT_DIR || path.resolve(process.cwd(), "../../logs");
+  return path.join(snapshotDir, snapshotFileName(input));
+}
+
+function normalizeCachedSnapshot(raw: unknown): RuntimeTruthSnapshot | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const payload = raw as Partial<RuntimeTruthSnapshot>;
+  if (payload.schema_version !== "runtime-truth/v1") {
+    return null;
+  }
+  if (typeof payload.generated_at !== "string" || !payload.generated_at.trim()) {
+    return null;
+  }
+  return payload as RuntimeTruthSnapshot;
+}
+
+async function readSnapshotFromDisk(input: Required<RuntimeTruthInput>): Promise<RuntimeTruthCacheEntry | null> {
+  const filePath = snapshotFilePath(input);
+  try {
+    const metadata = await fs.stat(filePath);
+    const content = await fs.readFile(filePath, "utf8");
+    const snapshot = normalizeCachedSnapshot(JSON.parse(content) as unknown);
+    if (!snapshot) {
+      return null;
+    }
+    const entry = {
+      createdAtMs: metadata.mtimeMs,
+      snapshot,
+    };
+    runtimeTruthCache.set(cacheKey(input), entry);
+    return entry;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return null;
+    }
+    return null;
+  }
+}
+
+async function readCachedSnapshotEntry(input: Required<RuntimeTruthInput>): Promise<RuntimeTruthCacheEntry | null> {
+  const key = cacheKey(input);
+  const cached = runtimeTruthCache.get(key);
+  if (cached) {
+    return cached;
+  }
+  return readSnapshotFromDisk(input);
+}
+
+async function persistSnapshot(input: Required<RuntimeTruthInput>, snapshot: RuntimeTruthSnapshot): Promise<void> {
+  const filePath = snapshotFilePath(input);
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const tempFilePath = `${filePath}.tmp`;
+  await fs.writeFile(tempFilePath, JSON.stringify(snapshot), "utf8");
+  await fs.rename(tempFilePath, filePath);
+}
+
+function buildUnavailableRuntimeTruthSnapshot(input: Required<RuntimeTruthInput>): RuntimeTruthSnapshot {
+  const generatedAt = new Date().toISOString();
+  return {
+    schema_version: "runtime-truth/v1",
+    generated_at: generatedAt,
+    source_diagnostics: {
+      rows_scanned: 0,
+      rows_returned: 0,
+    },
+    scope: {
+      symbol: input.symbol,
+      market_instrument: input.marketInstrument,
+      timeframe: input.timeframe,
+      strategy: input.strategy,
+    },
+    verdict: "DEGRADED",
+    summary: "Runtime truth snapshot warming: last known snapshot unavailable.",
+    blockers: [],
+    degraded_reasons: ["snapshot_refresh_inflight", "partial_data"],
+    degraded: true,
+    partial_data: true,
+    layers: {
+      market: {},
+      execution: {},
+      broker_reality: {},
+      quote_reality: {},
+      decision_reality: {},
+      health: {},
+      routing: {},
+      readiness: {},
+      publication: {
+        partial_data: true,
+        generated_at: generatedAt,
+        cache_ttl_ms: RUNTIME_TRUTH_CACHE_MS,
+      },
+      watchdog: {
+        status: "WARNING",
+        blockers: [],
+        degraded_reasons: ["snapshot_refresh_inflight", "partial_data"],
+        partial_data: true,
+      },
+      observation: {
+        controlled_collection_phase: "UNAVAILABLE",
+        active: false,
+        watch_stale: true,
+        watch_age_minutes: null,
+        kill_switch_source: "unavailable",
+        fills_seen: 0,
+        labels_seen: 0,
+        edge_evidence_state: "UNAVAILABLE",
+        edge_evidence_available: false,
+        mature_cells: 0,
+        replicated_cells: 0,
+        cell_count: 0,
+        outcomes_with_both: 0,
+        edge_evidence_summary: "Runtime truth snapshot warming.",
+        edge_evidence_next_gate: defaultEdgeEvidenceState().nextGate,
+        edge_evidence_top_cells: [],
+      },
+    },
+    raw: {
+      kill_switch: null,
+      system_config: null,
+      opportunity_gate: null,
+      market_session: null,
+      mt5_health: null,
+      runtime_decision: null,
+      controlled_collection: defaultControlledCollectionSummary(),
+      edge_evidence: defaultEdgeEvidenceState(),
+      broker_reality: {},
+      quote_reality: {},
+      decision_reality: {},
+      network: {},
+    },
+  };
+}
+
+export async function inspectRuntimeTruthCache(options: RuntimeTruthInput = {}): Promise<RuntimeTruthCacheAudit> {
+  const input = normalizeRuntimeTruthInput(options);
+  const cached = input.bypassCache ? null : await readCachedSnapshotEntry(input);
+  const ageMs = cached ? snapshotAgeMs(cached.snapshot) : null;
+  const cacheHit = Boolean(cached && isFreshEntry(cached));
+  return {
+    cache_hit: cacheHit ? 1 : 0,
+    cache_miss: cacheHit ? 0 : 1,
+    age_ms: ageMs,
+    stale: Boolean(cached && !cacheHit),
+    last_generated_at: cached?.snapshot.generated_at || null,
+  };
+}
+
+async function refreshSnapshot(input: Required<RuntimeTruthInput>): Promise<RuntimeTruthSnapshot> {
+  const key = cacheKey(input);
+  let inflight = runtimeTruthInflight.get(key);
+  if (!inflight) {
+    inflight = buildRuntimeTruthSnapshotUncached(input)
+      .then(async (snapshot) => {
+        runtimeTruthCache.set(key, { createdAtMs: Date.now(), snapshot });
+        await persistSnapshot(input, snapshot);
+        return snapshot;
+      })
+      .finally(() => {
+        runtimeTruthInflight.delete(key);
+      });
+    runtimeTruthInflight.set(key, inflight);
+  }
+  return inflight;
+}
 
 async function buildRuntimeTruthSnapshotUncached(input: Required<RuntimeTruthInput>): Promise<RuntimeTruthSnapshot> {
   const generatedAt = new Date().toISOString();
@@ -493,6 +773,13 @@ async function buildRuntimeTruthSnapshotUncached(input: Required<RuntimeTruthInp
     execution_reality_gap_recent: realityGapRecentResult.network,
   };
   const partialData = Object.values(network).some((item) => item.degraded_flag) || runtimeDecision === null || controlled.phase === "UNAVAILABLE";
+  const sourceRowsScanned = 15
+    + mt5Accounts.length
+    + mt5RiskHistory.length
+    + telemetryRecent.length
+    + realityGapRecent.length
+    + (runtimeDecision ? 1 : 0)
+    + (Object.keys(spreadDecisionTraceFile).length > 0 ? 1 : 0);
   const killSwitchActive = Boolean(killSwitchState.active);
   const gateStatusRaw = String(gateState.status || "").trim().toLowerCase();
   const gateKnown = typeof gateState.opportunity_enabled === "boolean" || Boolean(gateStatusRaw);
@@ -884,6 +1171,10 @@ async function buildRuntimeTruthSnapshotUncached(input: Required<RuntimeTruthInp
   return {
     schema_version: "runtime-truth/v1",
     generated_at: generatedAt,
+    source_diagnostics: {
+      rows_scanned: sourceRowsScanned,
+      rows_returned: 1,
+    },
     scope: {
       symbol: input.symbol,
       market_instrument: input.marketInstrument,
@@ -1073,26 +1364,20 @@ async function buildRuntimeTruthSnapshotUncached(input: Required<RuntimeTruthInp
 }
 
 export async function buildRuntimeTruthSnapshot(options: RuntimeTruthInput = {}): Promise<RuntimeTruthSnapshot> {
-  const input: Required<RuntimeTruthInput> = {
-    symbol: String(options.symbol || "DESK").trim().toUpperCase() || "DESK",
-    marketInstrument: String(options.marketInstrument || options.symbol || "BTCUSDT").trim().toUpperCase() || "BTCUSDT",
-    timeframe: String(options.timeframe || "live").trim() || "live",
-    strategy: String(options.strategy || "live-ops").trim() || "live-ops",
-    bypassCache: Boolean(options.bypassCache),
-  };
-  const key = cacheKey(input);
-  const cached = input.bypassCache ? null : runtimeTruthCache.get(key);
-  if (cached && Date.now() - cached.createdAtMs <= RUNTIME_TRUTH_CACHE_MS) {
-    return cached.snapshot;
+  const input = normalizeRuntimeTruthInput(options);
+  if (!input.bypassCache) {
+    const cached = await readCachedSnapshotEntry(input);
+    if (cached) {
+      if (isFreshEntry(cached)) {
+        return cached.snapshot;
+      }
+      void refreshSnapshot(input).catch(() => null);
+      return cached.snapshot;
+    }
+    if (input.allowStaleOnMiss) {
+      void refreshSnapshot(input).catch(() => null);
+      return buildUnavailableRuntimeTruthSnapshot(input);
+    }
   }
-  let inflight = runtimeTruthInflight.get(key);
-  if (!inflight) {
-    inflight = buildRuntimeTruthSnapshotUncached(input).finally(() => {
-      runtimeTruthInflight.delete(key);
-    });
-    runtimeTruthInflight.set(key, inflight);
-  }
-  const snapshot = await inflight;
-  runtimeTruthCache.set(key, { createdAtMs: Date.now(), snapshot });
-  return snapshot;
+  return refreshSnapshot(input);
 }

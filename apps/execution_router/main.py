@@ -92,6 +92,7 @@ _OBSERVATION_BUS_OFFLINE_AFTER_SEC = max(
     min(30.0, _env_float("ROUTING_OBSERVATION_BUS_OFFLINE_AFTER_SEC", 8.0)),
 )
 _OBSERVATION_NO_TRADES_AFTER_SEC = max(5.0, min(600.0, _env_float("ROUTING_OBSERVATION_NO_TRADES_AFTER_SEC", 60.0)))
+_OBSERVATION_READY_GRACE_SEC = max(_OBSERVATION_INTERVAL_SEC, min(30.0, _env_float("ROUTING_OBSERVATION_READY_GRACE_SEC", 12.0)))
 _OBSERVATION_SYMBOLS_RAW = os.getenv("ROUTING_OBSERVATION_SYMBOLS", "BTCUSDT")
 _ROUTING_INCLUDE_PAPER_VENUES = os.getenv("ROUTING_INCLUDE_PAPER_VENUES", "0").strip().lower() in {"1", "true", "yes", "on"}
 _ROUTE_CANDIDATE_MAX_FRESHNESS_MS = max(5_000.0, min(3_600_000.0, _env_float("ROUTE_CANDIDATE_MAX_FRESHNESS_MS", 120_000.0)))
@@ -99,6 +100,8 @@ _obs_cycle_results: deque[bool] = deque(maxlen=_OBS_WINDOW_SIZE)
 _obs_last_bus_event_ts: float = 0.0
 _obs_last_trade_ts: float = 0.0
 _obs_last_error: str | None = None
+_obs_last_ready_ts: float = 0.0
+_obs_last_ready_snapshot: dict[str, object] | None = None
 OBSERVATION_STATE: dict[str, object] = {
     "bus_seq": 0,
     "consistency": None,
@@ -173,6 +176,32 @@ def _observation_snapshot() -> dict[str, object]:
     return snapshot
 
 
+def _remember_ready_observation(snapshot: dict[str, object]) -> None:
+    global _obs_last_ready_snapshot, _obs_last_ready_ts
+    _obs_last_ready_snapshot = {
+        "candidate_count": int(snapshot.get("candidate_count", 0)),
+        "deviation_bps": snapshot.get("deviation_bps"),
+        "failure_blocking": bool(snapshot.get("failure_blocking", False)),
+        "freshness_ms": snapshot.get("freshness_ms"),
+        "symbols": [dict(item) for item in snapshot.get("symbols", []) if isinstance(item, dict)],
+    }
+    _obs_last_ready_ts = time.time()
+
+
+def _recent_ready_observation() -> dict[str, object] | None:
+    if not _obs_last_ready_snapshot or _obs_last_ready_ts <= 0:
+        return None
+    if (time.time() - _obs_last_ready_ts) > _OBSERVATION_READY_GRACE_SEC:
+        return None
+    return {
+        "candidate_count": int(_obs_last_ready_snapshot.get("candidate_count", 0)),
+        "deviation_bps": _obs_last_ready_snapshot.get("deviation_bps"),
+        "failure_blocking": bool(_obs_last_ready_snapshot.get("failure_blocking", False)),
+        "freshness_ms": _obs_last_ready_snapshot.get("freshness_ms"),
+        "symbols": [dict(item) for item in _obs_last_ready_snapshot.get("symbols", []) if isinstance(item, dict)],
+    }
+
+
 async def _refresh_observation_state() -> None:
     global _obs_last_error
 
@@ -200,6 +229,16 @@ async def _refresh_observation_state() -> None:
     freshness_values = [_to_float(item.get("freshness_ms"), 0.0) for item in symbol_snapshots if item.get("freshness_ms") is not None]
     freshness_ms = max(freshness_values) if freshness_values else None
     failure_blocking = any(bool(item.get("failure_blocking")) for item in symbol_snapshots)
+    grace_applied = False
+    if candidate_count <= 0:
+        ready_snapshot = _recent_ready_observation()
+        if ready_snapshot is not None:
+            candidate_count = int(ready_snapshot.get("candidate_count", 0))
+            deviation_bps = _to_float(ready_snapshot.get("deviation_bps"), 0.0)
+            freshness_ms = ready_snapshot.get("freshness_ms")
+            failure_blocking = bool(ready_snapshot.get("failure_blocking", False))
+            symbol_snapshots = [dict(item) for item in ready_snapshot.get("symbols", []) if isinstance(item, dict)]
+            grace_applied = True
     valid = candidate_count >= 3 and deviation_bps < 20.0 and not failure_blocking
     _obs_cycle_results.append(valid)
 
@@ -217,6 +256,21 @@ async def _refresh_observation_state() -> None:
         }
     )
     OBSERVATION_STATE["flags"] = _observation_flags(candidate_count)
+    if grace_applied:
+        flags = [flag for flag in OBSERVATION_STATE["flags"] if flag not in {"BUS_OFFLINE", "NO_CANDIDATES"}]
+        if "BUS_DEGRADED" not in flags:
+            flags.append("BUS_DEGRADED")
+        if "OBSERVATION_GRACE" not in flags:
+            flags.append("OBSERVATION_GRACE")
+        OBSERVATION_STATE["flags"] = flags
+    elif candidate_count > 0 and not failure_blocking:
+        _remember_ready_observation({
+            "candidate_count": candidate_count,
+            "deviation_bps": round(deviation_bps, 6),
+            "failure_blocking": failure_blocking,
+            "freshness_ms": None if freshness_ms is None else round(freshness_ms, 3),
+            "symbols": symbol_snapshots,
+        })
     _obs_last_error = None
 
 

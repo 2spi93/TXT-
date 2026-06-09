@@ -1,8 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import { attachInfraAwareResponseHeaders, cpFetchJsonSafe, extractMcContextHeaders, withControlPlaneNetwork } from "../../../../../../lib/controlPlane";
+import { evaluateDecisionGovernanceCapability } from "../../../../../../lib/decisionGovernanceControl";
 
 export async function POST(request: NextRequest): Promise<NextResponse> {
+  const governance = await evaluateDecisionGovernanceCapability("llm_trader");
+  if (!governance.allowed) {
+    return NextResponse.json(governance, { status: 412 });
+  }
   const payload = await request.json().catch(() => ({}));
   const headers = extractMcContextHeaders(request);
   headers.set("Content-Type", "application/json");

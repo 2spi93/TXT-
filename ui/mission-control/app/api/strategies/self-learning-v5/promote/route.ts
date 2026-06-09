@@ -2,8 +2,10 @@ import { NextResponse } from "next/server";
 
 import { requireControlPlaneSession } from "../../../../../lib/apiAuth";
 import { cpFetchJsonSafe } from "../../../../../lib/controlPlane";
+import { evaluateDecisionGovernanceCapability } from "../../../../../lib/decisionGovernanceControl";
 import { promoteSelfLearningV5State } from "../../../../../lib/metaHarnessSafe";
 import { parseSelfLearningV5Scope, readSelfLearningV5State, writeSelfLearningV5State } from "../../../../../lib/selfLearningV5Store";
+import { isSourceTreePromotionBlocked, readSourceTreeProvenanceAudit } from "../../../../../lib/sourceTreeProvenance";
 
 function noStoreJson(payload: unknown, status = 200): NextResponse {
   return NextResponse.json(payload, {
@@ -34,6 +36,19 @@ export async function POST(request: Request): Promise<NextResponse> {
   const rationale = String(payload.rationale || "manual_shadow_to_live").trim() || "manual_shadow_to_live";
   if (!scope || !strategyId) {
     return noStoreJson({ status: "error", message: "accountId, symbol, timeframe and strategyId are required" }, 400);
+  }
+
+  const provenanceAudit = await readSourceTreeProvenanceAudit();
+  if (isSourceTreePromotionBlocked(provenanceAudit)) {
+    return noStoreJson({
+      status: "error",
+      detail: "source_tree_provenance_blocked",
+      provenance: provenanceAudit,
+    }, 412);
+  }
+  const governance = await evaluateDecisionGovernanceCapability("alpha_v2");
+  if (!governance.allowed) {
+    return noStoreJson(governance, 412);
   }
 
   try {

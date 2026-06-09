@@ -503,12 +503,15 @@ services:
       PORT: 3001
       NODE_OPTIONS: --max-old-space-size=3072
       NEXT_DIST_DIR: .next-runtime-blue
-      CONTROL_PLANE_URL: http://control-plane:8000
-      CONTROL_PLANE_FALLBACK_URL: http://mission-control-gateway:3000/__mc_internal/control-plane
+      CONTROL_PLANE_URL: http://mission-control-gateway:3000/__mc_internal/control-plane
+      CONTROL_PLANE_FALLBACK_URL: http://control-plane:8000
       PREDICTOR_V8_URL: http://predictor-v8:8008
       CONTROL_PLANE_TOKEN: ${CONTROL_PLANE_TOKEN}
       FORCE_UI_REBUILD_ON_BOOT: 0
       V2_RISK_JOURNAL_DIR: /workspace/logs
+      ALLOCATION_DECISION_JOURNAL_DIR: /workspace/logs
+      EXECUTION_FACT_JOURNAL_DIR: /workspace/logs
+      OPPORTUNITY_COST_JOURNAL_DIR: /workspace/logs
       RUNTIME_DECISION_KPI_DIR: /workspace/logs
     env_file:
       - ./.env
@@ -517,7 +520,7 @@ services:
     expose:
       - "3001"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3001/"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3001/api/health/public"]
       interval: 20s
       timeout: 5s
       retries: 6
@@ -538,12 +541,15 @@ services:
       PORT: 3002
       NODE_OPTIONS: --max-old-space-size=3072
       NEXT_DIST_DIR: .next-runtime-green
-      CONTROL_PLANE_URL: http://control-plane:8000
-      CONTROL_PLANE_FALLBACK_URL: http://mission-control-gateway:3000/__mc_internal/control-plane
+      CONTROL_PLANE_URL: http://mission-control-gateway:3000/__mc_internal/control-plane
+      CONTROL_PLANE_FALLBACK_URL: http://control-plane:8000
       PREDICTOR_V8_URL: http://predictor-v8:8008
       CONTROL_PLANE_TOKEN: ${CONTROL_PLANE_TOKEN}
       FORCE_UI_REBUILD_ON_BOOT: 0
       V2_RISK_JOURNAL_DIR: /workspace/logs
+      ALLOCATION_DECISION_JOURNAL_DIR: /workspace/logs
+      EXECUTION_FACT_JOURNAL_DIR: /workspace/logs
+      OPPORTUNITY_COST_JOURNAL_DIR: /workspace/logs
       RUNTIME_DECISION_KPI_DIR: /workspace/logs
     env_file:
       - ./.env
@@ -552,7 +558,7 @@ services:
     expose:
       - "3002"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3002/"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3002/api/health/public"]
       interval: 20s
       timeout: 5s
       retries: 6

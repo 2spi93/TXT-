@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 
+import { appendAllocationWriterStageTransitions } from "../../../../../lib/allocationWriterAuditJournal";
+import { appendApprovalDecisionJournalEntry } from "../../../../../lib/approvalDecisionJournal";
 import {
   classifyControlPlaneNetworkRegime,
   computeControlPlaneInfraHealth,
@@ -52,6 +54,131 @@ function asNumber(value: unknown, fallback = 0): number {
 
 function asString(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
+}
+
+function firstNonEmpty(...values: unknown[]): string {
+  for (const value of values) {
+    const normalized = String(value || "").trim();
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return "";
+}
+
+async function appendApprovalDecisionArtifact(params: {
+  approvalPayloadRaw: unknown;
+  orderPayload: JsonMap;
+  predictorContext: JsonMap;
+}): Promise<void> {
+  const approvalPayload = asObject(params.approvalPayloadRaw);
+  const approvalId = firstNonEmpty(approvalPayload.approval_id);
+  if (!approvalId) {
+    return;
+  }
+  const orderPayload = asObject(params.orderPayload);
+  const metadata = asObject(orderPayload.metadata);
+  const orderIntent = asObject(orderPayload.order_intent);
+  const finalDecisionTruth = Object.keys(asObject(metadata.final_decision_truth)).length > 0
+    ? asObject(metadata.final_decision_truth)
+    : asObject(orderIntent.final_decision_truth);
+  const riskContext = Object.keys(asObject(approvalPayload.risk_context)).length > 0
+    ? asObject(approvalPayload.risk_context)
+    : params.predictorContext;
+  const hardening = Object.keys(asObject(approvalPayload.go_live_hardening)).length > 0
+    ? asObject(approvalPayload.go_live_hardening)
+    : asObject(approvalPayload.hardening);
+  const decisionId = firstNonEmpty(
+    approvalPayload.decision_id,
+    orderPayload.decision_id,
+    metadata.decision_id,
+    orderIntent.decision_id,
+    finalDecisionTruth.oracle_fingerprint,
+    approvalId,
+  );
+  const tradeLifecycleId = firstNonEmpty(
+    approvalPayload.trade_lifecycle_id,
+    orderPayload.trade_lifecycle_id,
+    metadata.trade_lifecycle_id,
+    orderIntent.trade_lifecycle_id,
+    finalDecisionTruth.oracle_fingerprint,
+    decisionId,
+  );
+  const candidateId = firstNonEmpty(
+    approvalPayload.candidate_id,
+    orderPayload.candidate_id,
+    metadata.candidate_id,
+    orderIntent.candidate_id,
+    finalDecisionTruth.oracle_fingerprint,
+    decisionId,
+  );
+  await appendApprovalDecisionJournalEntry({
+    approval_fact_id: `${approvalId}:approval_1:${Date.now()}`,
+    approval_id: approvalId,
+    approval_stage: "approval_1",
+    approval_status: firstNonEmpty(approvalPayload.status, "pending_second_approval"),
+    trade_lifecycle_id: tradeLifecycleId || null,
+    candidate_id: candidateId || null,
+    decision_id: decisionId || null,
+    causality_confidence: "native",
+    allocation_id: null,
+    execution_id: null,
+    outcome_id: null,
+    account_id: firstNonEmpty(approvalPayload.account_id, orderPayload.account_id) || null,
+    portfolio_id: firstNonEmpty(approvalPayload.portfolio_id, orderPayload.portfolio_id, metadata.portfolio_id) || null,
+    strategy_id: firstNonEmpty(approvalPayload.strategy_id, metadata.selected_strategy_id, metadata.strategy_id) || null,
+    symbol: firstNonEmpty(approvalPayload.symbol, orderPayload.symbol).toUpperCase(),
+    side: firstNonEmpty(approvalPayload.side, orderPayload.side, "buy").toLowerCase(),
+    lots: asNumber(approvalPayload.lots || orderPayload.lots || null, Number.NaN),
+    estimated_notional_usd: asNumber(approvalPayload.estimated_notional_usd || orderPayload.estimated_notional_usd || null, Number.NaN),
+    approval_mode: firstNonEmpty(approvalPayload.approval_mode, "mt5_double_approval"),
+    first_approved_by: firstNonEmpty(approvalPayload.first_approved_by) || null,
+    second_approved_by: null,
+    rejection_code: null,
+    rejection_reason: null,
+    predictor_summary: firstNonEmpty(approvalPayload.predictor_summary, riskContext.network_regime) || null,
+    hardening,
+    risk_context: riskContext,
+    order_payload: orderPayload,
+    source_event_category: "mt5_live_order_pending_second_approval",
+    created_at_iso: firstNonEmpty(approvalPayload.created_at, approvalPayload.timestamp, new Date().toISOString()),
+  });
+  const writerTimestampIso = firstNonEmpty(approvalPayload.created_at, approvalPayload.timestamp, new Date().toISOString());
+  await appendAllocationWriterStageTransitions([
+    {
+      decision_id: decisionId || null,
+      candidate_id: candidateId || null,
+      trade_lifecycle_id: tradeLifecycleId || null,
+      portfolio_id: firstNonEmpty(approvalPayload.portfolio_id, orderPayload.portfolio_id, metadata.portfolio_id) || null,
+      selected_strategy_id: firstNonEmpty(approvalPayload.strategy_id, metadata.selected_strategy_id, metadata.strategy_id) || null,
+      writer_version: firstNonEmpty(approvalPayload.approval_mode, "mt5_double_approval"),
+      writer_timestamp_iso: writerTimestampIso,
+      previous_stage: "PERSISTED",
+      next_stage: "APPROVAL_CREATED",
+    },
+    ...(decisionId || tradeLifecycleId || candidateId ? [{
+      decision_id: decisionId || null,
+      candidate_id: candidateId || null,
+      trade_lifecycle_id: tradeLifecycleId || null,
+      portfolio_id: firstNonEmpty(approvalPayload.portfolio_id, orderPayload.portfolio_id, metadata.portfolio_id) || null,
+      selected_strategy_id: firstNonEmpty(approvalPayload.strategy_id, metadata.selected_strategy_id, metadata.strategy_id) || null,
+      writer_version: firstNonEmpty(approvalPayload.approval_mode, "mt5_double_approval"),
+      writer_timestamp_iso: writerTimestampIso,
+      previous_stage: "APPROVAL_CREATED" as const,
+      next_stage: "APPROVAL_LINKED" as const,
+    }] : []),
+    ...(Object.keys(hardening).length > 0 ? [{
+      decision_id: decisionId || null,
+      candidate_id: candidateId || null,
+      trade_lifecycle_id: tradeLifecycleId || null,
+      portfolio_id: firstNonEmpty(approvalPayload.portfolio_id, orderPayload.portfolio_id, metadata.portfolio_id) || null,
+      selected_strategy_id: firstNonEmpty(approvalPayload.strategy_id, metadata.selected_strategy_id, metadata.strategy_id) || null,
+      writer_version: firstNonEmpty(approvalPayload.approval_mode, "mt5_double_approval"),
+      writer_timestamp_iso: writerTimestampIso,
+      previous_stage: "APPROVAL_LINKED" as const,
+      next_stage: "HARDENING_REACHED" as const,
+    }] : []),
+  ]);
 }
 
 export async function POST(request: Request): Promise<NextResponse> {
@@ -118,6 +245,7 @@ export async function POST(request: Request): Promise<NextResponse> {
     account_id: asString(raw.account_id),
     symbol: asString(raw.symbol),
     side,
+    confidence: asNumber(raw.confidence),
     preferred_venue: asString(raw.preferred_venue),
     lots: asNumber(raw.lots, 0.1),
     estimated_notional_usd: asNumber(raw.estimated_notional_usd),
@@ -157,6 +285,13 @@ export async function POST(request: Request): Promise<NextResponse> {
   if (normalizedOrderIntent) {
     augmented.order_intent = augmented.order_intent || normalizedOrderIntent;
     augmented.oco_group_id = asString(augmented.oco_group_id) || asString(normalizedOrderIntent.oco?.group_id);
+  }
+  if (response.ok) {
+    await appendApprovalDecisionArtifact({
+      approvalPayloadRaw: augmented,
+      orderPayload: body as JsonMap,
+      predictorContext,
+    }).catch(() => null);
   }
   return NextResponse.json(augmented, { status: response.status });
 }
