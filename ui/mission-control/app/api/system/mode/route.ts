@@ -3,9 +3,10 @@ import { request as httpRequest } from "node:http";
 import { NextResponse } from "next/server";
 
 import { requireControlPlaneSession } from "../../../../lib/apiAuth";
-import { cpFetchJsonSafe, getControlPlaneToken, type ControlPlaneNetworkMeta, withControlPlaneNetwork } from "../../../../lib/controlPlane";
+import { cpFetchJsonSafe, getControlPlaneSessionToken, type ControlPlaneNetworkMeta, withControlPlaneNetwork } from "../../../../lib/controlPlane";
 
 const directControlPlaneModeUrl = "http://control-plane:8000/v1/system/mode";
+const directControlPlaneConfigUrl = "http://control-plane:8000/v1/system/config";
 
 async function postSystemModeDirect(body: unknown): Promise<{
   status: number;
@@ -14,7 +15,7 @@ async function postSystemModeDirect(body: unknown): Promise<{
 }> {
   const target = new URL(directControlPlaneModeUrl);
   const requestBody = JSON.stringify(body || {});
-  const token = await getControlPlaneToken();
+  const token = await getControlPlaneSessionToken();
   const upstream = await new Promise<{ status: number; body: string }>((resolve, reject) => {
     const req = httpRequest(
       target,
@@ -76,7 +77,24 @@ export async function GET(): Promise<NextResponse> {
   if (authError) {
     return authError;
   }
-  const { response, payload, network } = await cpFetchJsonSafe("/v1/system/config");
+  const token = await getControlPlaneSessionToken();
+  const response = await fetch(directControlPlaneConfigUrl, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+    cache: "no-store",
+  });
+  const payload = await response.json().catch(() => ({}));
+  const network: ControlPlaneNetworkMeta = {
+    network_state: "healthy",
+    retry_count: 0,
+    degraded_flag: false,
+    failure_classification: "none",
+    failure_detail: "",
+    attempted_targets: ["http://control-plane:8000#1"],
+    attempted_base_urls: ["http://control-plane:8000"],
+    upstream_status: response.status,
+  };
   return NextResponse.json(withControlPlaneNetwork(payload, network), { status: response.status });
 }
 
