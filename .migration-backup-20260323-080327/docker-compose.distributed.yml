@@ -1,0 +1,131 @@
+services:
+  market-data:
+    environment:
+      MARKET_SHARD_INDEX: "0"
+      MARKET_SHARD_TOTAL: "8"
+
+  market-data-shard-1:
+    image: txt-python:3.11
+    container_name: market-data-shard-1
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    environment:
+      DATABASE_URL: postgresql://txt:txt@postgres:5432/mission_control
+      MARKET_SHARD_INDEX: "1"
+      MARKET_SHARD_TOTAL: "8"
+      MARKET_SYNC_SECONDS: "12"
+      MARKET_DEPTH_STREAM_ENABLED: "1"
+    command: >
+      sh -c "uvicorn apps.market_data_plane.main:app --host 0.0.0.0 --port 8003 --workers 2"
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  market-data-shard-2:
+    image: txt-python:3.11
+    container_name: market-data-shard-2
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    environment:
+      DATABASE_URL: postgresql://txt:txt@postgres:5432/mission_control
+      MARKET_SHARD_INDEX: "2"
+      MARKET_SHARD_TOTAL: "8"
+      MARKET_SYNC_SECONDS: "12"
+      MARKET_DEPTH_STREAM_ENABLED: "1"
+    command: >
+      sh -c "uvicorn apps.market_data_plane.main:app --host 0.0.0.0 --port 8003 --workers 2"
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  market-data-shard-3:
+    image: txt-python:3.11
+    container_name: market-data-shard-3
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    environment:
+      DATABASE_URL: postgresql://txt:txt@postgres:5432/mission_control
+      MARKET_SHARD_INDEX: "3"
+      MARKET_SHARD_TOTAL: "8"
+      MARKET_SYNC_SECONDS: "12"
+      MARKET_DEPTH_STREAM_ENABLED: "1"
+    command: >
+      sh -c "uvicorn apps.market_data_plane.main:app --host 0.0.0.0 --port 8003 --workers 2"
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  market-data-shard-4:
+    image: txt-python:3.11
+    container_name: market-data-shard-4
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    environment:
+      DATABASE_URL: postgresql://txt:txt@postgres:5432/mission_control
+      MARKET_SHARD_INDEX: "4"
+      MARKET_SHARD_TOTAL: "8"
+      MARKET_SYNC_SECONDS: "12"
+      MARKET_DEPTH_STREAM_ENABLED: "1"
+    command: >
+      sh -c "uvicorn apps.market_data_plane.main:app --host 0.0.0.0 --port 8003 --workers 2"
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  market-data-shard-5:
+    image: txt-python:3.11
+    container_name: market-data-shard-5
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    environment:
+      DATABASE_URL: postgresql://txt:txt@postgres:5432/mission_control
+      MARKET_SHARD_INDEX: "5"
+      MARKET_SHARD_TOTAL: "8"
+      MARKET_SYNC_SECONDS: "12"
+      MARKET_DEPTH_STREAM_ENABLED: "1"
+    command: >
+      sh -c "uvicorn apps.market_data_plane.main:app --host 0.0.0.0 --port 8003 --workers 2"
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  market-data-shard-6:
+    image: txt-python:3.11
+    container_name: market-data-shard-6
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    environment:
+      DATABASE_URL: postgresql://txt:txt@postgres:5432/mission_control
+      MARKET_SHARD_INDEX: "6"
+      MARKET_SHARD_TOTAL: "8"
+      MARKET_SYNC_SECONDS: "12"
+      MARKET_DEPTH_STREAM_ENABLED: "1"
+    command: >
+      sh -c "uvicorn apps.market_data_plane.main:app --host 0.0.0.0 --port 8003 --workers 2"
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  market-data-shard-7:
+    image: txt-python:3.11
+    container_name: market-data-shard-7
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    environment:
+      DATABASE_URL: postgresql://txt:txt@postgres:5432/mission_control
+      MARKET_SHARD_INDEX: "7"
+      MARKET_SHARD_TOTAL: "8"
+      MARKET_SYNC_SECONDS: "12"
+      MARKET_DEPTH_STREAM_ENABLED: "1"
+    command: >
+      sh -c "uvicorn apps.market_data_plane.main:app --host 0.0.0.0 --port 8003 --workers 2"
+    depends_on:
+      - postgres
+    restart: unless-stopped

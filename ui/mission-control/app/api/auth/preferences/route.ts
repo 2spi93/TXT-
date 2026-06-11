@@ -91,6 +91,8 @@ function buildThrottledHeaders(kind: "cache-hit" | "burst"): HeadersInit {
 
 function generateFallback() {
   return {
+    user_id: null,
+    updated_at: null,
     preferences: {
       ui_mode: "novice",
       theme: "dark",

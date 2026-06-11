@@ -1887,6 +1887,7 @@ export default function TradingTerminalPage() {
   const [autoExecutionAuditTrail, setAutoExecutionAuditTrail] = useState<AutoExecutionAuditEvent[]>([]);
   const [autoExecutionAuditStateFilter, setAutoExecutionAuditStateFilter] = useState<"all" | "READY" | "BLOCKED" | "KILLED">("all");
   const [autoExecutionAuditReasonSearch, setAutoExecutionAuditReasonSearch] = useState("");
+  const [showAdvancedModules, setShowAdvancedModules] = useState(false);
   const [selfLearningV4Enabled, setSelfLearningV4Enabled] = useState(true);
   const [selfLearningAutoAdaptEnabled, setSelfLearningAutoAdaptEnabled] = useState(true);
   const [selfLearningModelUpdatedAt, setSelfLearningModelUpdatedAt] = useState<string | null>(null);
@@ -2198,6 +2199,7 @@ export default function TradingTerminalPage() {
         autoSessionEndHour?: number;
         autoSymbolLossCapUsd?: number;
         autoSymbolAutoDisabled?: Record<string, string>;
+        advancedModulesVisible?: boolean;
         selfLearningV4Enabled?: boolean;
         selfLearningAutoAdaptEnabled?: boolean;
         selfLearningDriftAutoDemotedAt?: string | null;
@@ -2237,6 +2239,11 @@ export default function TradingTerminalPage() {
       if (parsed.autoSymbolAutoDisabled && typeof parsed.autoSymbolAutoDisabled === "object") {
         setAutoSymbolAutoDisabled(parsed.autoSymbolAutoDisabled);
       }
+      if (typeof parsed.advancedModulesVisible === "boolean") {
+        setShowAdvancedModules(parsed.advancedModulesVisible);
+      } else {
+        setShowAdvancedModules(parsed.signalDisplayMode === "ai-dominant");
+      }
       if (typeof parsed.selfLearningV4Enabled === "boolean") {
         setSelfLearningV4Enabled(parsed.selfLearningV4Enabled);
       }
@@ -2266,6 +2273,7 @@ export default function TradingTerminalPage() {
       autoSessionEndHour,
       autoSymbolLossCapUsd,
       autoSymbolAutoDisabled,
+      advancedModulesVisible: showAdvancedModules,
       selfLearningV4Enabled,
       selfLearningAutoAdaptEnabled,
       selfLearningDriftAutoDemotedAt,
@@ -2281,6 +2289,7 @@ export default function TradingTerminalPage() {
     autoSymbolLossCapUsd,
     confluenceWeights,
     executionAdaptMode,
+    showAdvancedModules,
     selfLearningDriftAutoDemotedAt,
     selfLearningAutoAdaptEnabled,
     selfLearningV4Enabled,
@@ -5546,6 +5555,51 @@ export default function TradingTerminalPage() {
   const selfLearningV4Active = selfLearningV4Enabled && selfLearningScopedOutcomesV4.length >= 4;
   const selfLearningV4WeightsLabel = selfLearningAutoAdaptEnabled ? "ADAPTED" : "MANUAL";
   const selfLearningV4ModelLabel = selfLearningModelUpdatedAt ? "UPDATED" : "BOOTING";
+  const advancedSummaryPills = useMemo(() => [
+    {
+      label: `AUTO ${autoExecutionGate.autoState} · ${autoExecutionGate.riskLabel}`,
+      tone: autoExecutionGate.autoState === "READY" ? "good" : autoExecutionGate.autoState === "KILLED" ? "bad" : "warn",
+    },
+    {
+      label: `META ${autoMetaFilter.pass ? "PASS" : "BLOCK"} · ${autoExecutionGate.ruleLabel}`,
+      tone: autoMetaFilter.pass ? "good" : autoMetaFilter.regimeChoppy ? "warn" : "bad",
+    },
+    {
+      label: `RISK ${openTradesCount}/${autoRiskEngine.maxOpenTrades} · EXPO ${(exposureRatio * 100).toFixed(1)}%`,
+      tone: autoRiskEngine.hardPass ? "good" : autoRiskEngine.killSwitchActive ? "bad" : "warn",
+    },
+    {
+      label: `SESS ${autoSessionGuard.pass ? "ON" : "OFF"} · ${autoSessionGuard.label}`,
+      tone: autoSessionGuard.pass ? "good" : "warn",
+    },
+    {
+      label: `SYM LOSS ${autoSymbolLoss.cumulativeLossUsd.toFixed(0)}/${autoSymbolLossCapUsd.toFixed(0)}`,
+      tone: autoSymbolLoss.pass ? "good" : "bad",
+    },
+    {
+      label: `LEARN ${selfLearningV4Active ? "ACTIVE" : "WARMUP"} · ${selfLearningV4DriftLabel}`,
+      tone: selfLearningDriftV4.shouldDemote ? "bad" : selfLearningV4Active ? "good" : "warn",
+    },
+  ], [
+    autoExecutionGate.autoState,
+    autoExecutionGate.riskLabel,
+    autoExecutionGate.ruleLabel,
+    autoMetaFilter.pass,
+    autoMetaFilter.regimeChoppy,
+    autoRiskEngine.hardPass,
+    autoRiskEngine.killSwitchActive,
+    autoRiskEngine.maxOpenTrades,
+    autoSessionGuard.label,
+    autoSessionGuard.pass,
+    autoSymbolLoss.cumulativeLossUsd,
+    autoSymbolLoss.pass,
+    autoSymbolLossCapUsd,
+    exposureRatio,
+    openTradesCount,
+    selfLearningDriftV4.shouldDemote,
+    selfLearningV4Active,
+    selfLearningV4DriftLabel,
+  ]);
   const suggestedBracketOverlay = (() => {
     const bracket = marketDecisionV1?.suggestedBracket;
     if (!bracket) {
@@ -10191,6 +10245,32 @@ export default function TradingTerminalPage() {
                               <span className="chart-action-pill">{trailingV3.detail}</span>
                             </div>
                           </div>
+                          <div className="chart-module-summary">
+                            <div className="chart-signal-kicker">Desk Summary</div>
+                            <div className="chart-module-summary-grid">
+                              {advancedSummaryPills.map((pill) => (
+                                <span key={pill.label} className={`chart-action-pill chart-action-pill-status ${pill.tone}`}>
+                                  {pill.label}
+                                </span>
+                              ))}
+                            </div>
+                            <div className="chart-module-summary-actions">
+                              <span className="chart-module-summary-copy">
+                                {showAdvancedModules
+                                  ? "Les modules experts sont affiches."
+                                  : "Les modules experts sont replies pour garder une lecture nette du terminal."}
+                              </span>
+                              <button
+                                type="button"
+                                className={`chart-chip ${showAdvancedModules ? "active" : ""}`}
+                                onClick={() => setShowAdvancedModules((current) => !current)}
+                              >
+                                {showAdvancedModules ? "Masquer modules experts" : "Afficher modules experts"}
+                              </button>
+                            </div>
+                          </div>
+                          {showAdvancedModules ? (
+                          <>
                           <div className="chart-auto-exec-panel">
                             <div className="chart-signal-kicker">Auto-Execution Modules</div>
                             <div className="chart-auto-exec-mode-row">
@@ -10398,6 +10478,8 @@ export default function TradingTerminalPage() {
                               {filteredSelfLearningJournalV4Trail.length === 0 ? <div className="chart-auto-exec-audit-empty">No V4 journal row for current filter.</div> : null}
                             </div>
                           </div>
+                          </>
+                          ) : null}
                           <div className="chart-action-card-plan">
                             <span>Snap {marketDecisionV1.executionPlan.snapPriority}</span>
                             <span>Preset {marketDecisionV1.executionPlan.preset}</span>

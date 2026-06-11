@@ -7,6 +7,30 @@ import {
   writeSelfLearningV4State,
 } from "../../../../lib/selfLearningV4Store";
 
+const READ_CACHE_TTL_MS = 1200;
+
+type ReadCacheEntry = {
+  atMs: number;
+  payload: {
+    status: string;
+    state: unknown;
+    updatedAt: string | null;
+    storage: string;
+    degraded?: boolean;
+    detail?: string;
+    upstream_status?: number;
+  };
+};
+
+const selfLearningGlobal = globalThis as typeof globalThis & {
+  __mcSelfLearningV4ReadCache?: Map<string, ReadCacheEntry>;
+};
+
+const readCache = selfLearningGlobal.__mcSelfLearningV4ReadCache || new Map<string, ReadCacheEntry>();
+if (!selfLearningGlobal.__mcSelfLearningV4ReadCache) {
+  selfLearningGlobal.__mcSelfLearningV4ReadCache = readCache;
+}
+
 function noStoreJson(payload: unknown, status = 200): NextResponse {
   return NextResponse.json(payload, {
     status,
@@ -27,6 +51,13 @@ export async function GET(request: Request) {
     return noStoreJson({ status: "error", message: "account_id, symbol and timeframe are required" }, 400);
   }
 
+  const cacheKey = `${scope.accountId}::${scope.symbol}::${scope.timeframe}`;
+  const nowMs = Date.now();
+  const cached = readCache.get(cacheKey);
+  if (cached && nowMs - cached.atMs <= READ_CACHE_TTL_MS) {
+    return noStoreJson(cached.payload, 200);
+  }
+
   try {
     const cpResponse = await cpFetch(
       `/v1/strategies/self-learning-v4?account_id=${encodeURIComponent(scope.accountId)}&symbol=${encodeURIComponent(scope.symbol)}&timeframe=${encodeURIComponent(scope.timeframe)}`,
@@ -34,22 +65,50 @@ export async function GET(request: Request) {
     );
     if (cpResponse.ok) {
       const payload = await cpResponse.json().catch(() => ({}));
-      return noStoreJson({
+      const normalized = {
         status: "ok",
         state: payload?.state ?? null,
         updatedAt: payload?.updated_at || null,
         storage: "control-plane",
-      }, 200);
+      };
+      readCache.set(cacheKey, { atMs: nowMs, payload: normalized });
+      return noStoreJson(normalized, 200);
     }
-    if (cpResponse.status === 400 || cpResponse.status === 401 || cpResponse.status === 403) {
+    if (cpResponse.status === 400) {
       const payload = await cpResponse.json().catch(() => ({ detail: "upstream_error" }));
       return noStoreJson({ status: "error", message: payload?.detail || "upstream_error" }, cpResponse.status);
     }
 
+    if (cpResponse.status === 401 || cpResponse.status === 403) {
+      const state = await readSelfLearningV4State(scope).catch(() => null);
+      const normalized = {
+        status: "ok",
+        state,
+        updatedAt: state?.updatedAt || null,
+        storage: "local-fallback",
+        degraded: true,
+        detail: "self_learning_v4_anonymous_degraded",
+        upstream_status: cpResponse.status,
+      };
+      readCache.set(cacheKey, { atMs: nowMs, payload: normalized });
+      return noStoreJson(normalized, 200);
+    }
+
     const state = await readSelfLearningV4State(scope);
-    return noStoreJson({ status: "ok", state, updatedAt: state?.updatedAt || null, storage: "local-fallback" }, 200);
+    const normalized = { status: "ok", state, updatedAt: state?.updatedAt || null, storage: "local-fallback" };
+    readCache.set(cacheKey, { atMs: nowMs, payload: normalized });
+    return noStoreJson(normalized, 200);
   } catch {
-    return noStoreJson({ status: "error", message: "unable to read self-learning v4 state" }, 500);
+    const normalized = {
+      status: "ok",
+      state: null,
+      updatedAt: null,
+      storage: "local-fallback",
+      degraded: true,
+      detail: "self_learning_v4_unreachable",
+    };
+    readCache.set(cacheKey, { atMs: nowMs, payload: normalized });
+    return noStoreJson(normalized, 200);
   }
 }
 
@@ -87,6 +146,16 @@ export async function PUT(request: Request) {
     if (error instanceof Error && error.message === "invalid_self_learning_v4_state") {
       return noStoreJson({ status: "error", message: "invalid self-learning v4 state" }, 400);
     }
-    return noStoreJson({ status: "error", message: "unable to persist self-learning v4 state" }, 500);
+    return noStoreJson(
+      {
+        status: "ok",
+        state: null,
+        updatedAt: null,
+        storage: "local-fallback",
+        degraded: true,
+        detail: "self_learning_v4_persist_unreachable",
+      },
+      200,
+    );
   }
 }

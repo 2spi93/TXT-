@@ -48,21 +48,30 @@ export interface MetricEvent {
   latency_ms?: number;
   reason?: string;
   timestamp: string;
+  expected?: boolean;
 }
 
 // Global metrics accumulator
 const metrics = new Map<string, number>();
 function recordMetric(event: MetricEvent) {
   const key = `${event.type}_${event.route}`;
-  metrics.set(key, (metrics.get(key) || 0) + 1);
-  
-  // Structured log for observability
-  console.warn('[TXT][SHADOW_METRIC]', {
+  const nextCount = (metrics.get(key) || 0) + 1;
+  metrics.set(key, nextCount);
+
+  const shouldLog = nextCount <= 3 || nextCount % 25 === 0;
+  if (!shouldLog) {
+    return;
+  }
+
+  const logMethod = event.expected ? console.info : console.warn;
+  logMethod('[TXT][SHADOW_METRIC]', {
     event: event.type,
     route: event.route,
     latency_ms: event.latency_ms,
     reason: event.reason,
     timestamp: event.timestamp,
+    count: nextCount,
+    expected: event.expected === true,
   });
 }
 
@@ -254,6 +263,7 @@ export async function executeWithShadowMode<T>(config: ShadowConfig, {
       latency_ms: backendLatency,
       reason: backendResult.status,
       timestamp: new Date().toISOString(),
+      expected: config.shadowOnly && config.rolloutPercentage === 0,
     });
   }
   

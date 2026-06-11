@@ -1,7 +1,7 @@
 import "./globals.css";
 import type { ReactNode } from "react";
 
-import OpsChatbot from "../components/OpsChatbot";
+import LazyOpsChatbot from "../components/LazyOpsChatbot";
 import TxtGlobalNav from "../components/ui/TxtGlobalNav";
 import UiModeController from "../components/ui/UiModeController";
 
@@ -17,7 +17,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         <UiModeController />
         <TxtGlobalNav />
         {children}
-        <OpsChatbot />
+        <LazyOpsChatbot />
       </body>
     </html>
   );

@@ -1921,7 +1921,6 @@ export default function InstitutionalChart({
         width: Math.floor(entry.contentRect.width),
         height: Math.floor(entry.contentRect.height),
       });
-      chartRef.current.timeScale().fitContent();
     });
     resizeObserver.observe(containerRef.current);
 
@@ -1953,8 +1952,8 @@ export default function InstitutionalChart({
         visible: true,
         left: clamp(param.point.x, 0, container.clientWidth),
         top: clamp(param.point.y, 0, container.clientHeight),
-        priceTop: clamp(param.point.y, 18, Math.max(18, container.clientHeight - 18)),
-        timeLeft: clamp(param.point.x, 58, Math.max(58, container.clientWidth - 58)),
+        priceTop: clamp(param.point.y, 24, Math.max(24, container.clientHeight - 24)),
+        timeLeft: clamp(param.point.x, 86, Math.max(86, container.clientWidth - 86)),
         price,
         time: formatCursorTime(param.time),
       });

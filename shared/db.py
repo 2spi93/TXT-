@@ -365,6 +365,48 @@ CREATE TABLE IF NOT EXISTS decision_outcomes (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS execution_brain_v3_journal (
+    journal_id TEXT PRIMARY KEY,
+    decision_id TEXT,
+    source TEXT NOT NULL DEFAULT 'api',
+    account_id TEXT,
+    symbol TEXT NOT NULL,
+    side TEXT,
+    brain_version TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    entry_allowed BOOLEAN NOT NULL DEFAULT FALSE,
+    timing TEXT,
+    status TEXT NOT NULL DEFAULT 'evaluated',
+    trade_active BOOLEAN NOT NULL DEFAULT FALSE,
+    recommended_notional_usd DOUBLE PRECISION,
+    requested_notional_usd DOUBLE PRECISION,
+    requested_lots DOUBLE PRECISION,
+    current_notional_usd DOUBLE PRECISION,
+    reference_price DOUBLE PRECISION,
+    current_price DOUBLE PRECISION,
+    unrealized_pnl_usd DOUBLE PRECISION,
+    unrealized_pnl_pct DOUBLE PRECISION,
+    trailing_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    trailing_stop_price DOUBLE PRECISION,
+    partial_close_pct INTEGER,
+    scale_in_pct INTEGER,
+    applied_action TEXT,
+    action_status TEXT,
+    actions JSONB NOT NULL DEFAULT '[]'::jsonb,
+    entry_checks JSONB NOT NULL DEFAULT '{}'::jsonb,
+    exit_reasons JSONB NOT NULL DEFAULT '[]'::jsonb,
+    safety JSONB NOT NULL DEFAULT '{}'::jsonb,
+    signal_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    decision_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    market_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    account_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    routing_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    trade_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    monitor_context JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS strategy_embeddings (
     embedding_id TEXT PRIMARY KEY,
     strategy_id TEXT NOT NULL,
@@ -514,6 +556,18 @@ ON decision_outcomes (created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_decision_outcomes_strategy_id
 ON decision_outcomes (strategy_id);
+
+CREATE INDEX IF NOT EXISTS idx_execution_brain_v3_journal_created_at
+ON execution_brain_v3_journal (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_execution_brain_v3_journal_symbol_account
+ON execution_brain_v3_journal (symbol, account_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_execution_brain_v3_journal_decision_id
+ON execution_brain_v3_journal (decision_id);
+
+CREATE INDEX IF NOT EXISTS idx_execution_brain_v3_journal_applied_action
+ON execution_brain_v3_journal (applied_action, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_self_learning_v4_states_updated_at
 ON self_learning_v4_states (updated_at DESC);

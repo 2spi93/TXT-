@@ -118,3 +118,27 @@ export async function cpFetch(path: string, init: RequestInit = {}): Promise<Res
     );
   }
 }
+
+export async function readJsonFromResponseSafe(response: Request | Response): Promise<unknown> {
+  const raw = await response.text().catch(() => "");
+  if (!raw) {
+    return {};
+  }
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    return {
+      detail: "invalid_upstream_json",
+      raw: raw.slice(0, 500),
+    };
+  }
+}
+
+export async function cpFetchJsonSafe(path: string, init: RequestInit = {}): Promise<{
+  response: Response;
+  payload: unknown;
+}> {
+  const response = await cpFetch(path, init);
+  const payload = await readJsonFromResponseSafe(response);
+  return { response, payload };
+}

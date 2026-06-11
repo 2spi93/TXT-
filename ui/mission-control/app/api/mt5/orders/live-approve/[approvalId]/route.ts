@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { cpFetch } from "../../../../../../lib/controlPlane";
+import { cpFetch, readJsonFromResponseSafe } from "../../../../../../lib/controlPlane";
 
 export async function POST(
   _: Request,
@@ -10,6 +10,6 @@ export async function POST(
   const response = await cpFetch(`/v1/mt5/orders/live-approve/${resolved.approvalId}`, {
     method: "POST",
   });
-  const payload = await response.json();
+  const payload = await readJsonFromResponseSafe(response);
   return NextResponse.json(payload, { status: response.status });
 }
