@@ -1,0 +1,21 @@
+www.app.txt.gtixt.com {
+    redir https://app.txt.gtixt.com{uri} permanent
+}
+
+app.txt.gtixt.com {
+    tls {
+        protocols tls1.2 tls1.3
+    }
+
+    encode zstd gzip
+
+    # Immediate TLS hardening headers.
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+
+    reverse_proxy mission-control-gateway:3000
+}
