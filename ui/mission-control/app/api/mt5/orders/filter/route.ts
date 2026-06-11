@@ -1,7 +1,10 @@
 import { NextResponse } from "next/server";
 
 import { appendAllocationWriterStageTransitions } from "../../../../../lib/allocationWriterAuditJournal";
-import { appendApprovalDecisionJournalEntry } from "../../../../../lib/approvalDecisionJournal";
+import {
+  APPROVAL_DECISION_JOURNAL_SCHEMA_VERSION,
+  appendApprovalDecisionJournalEntry,
+} from "../../../../../lib/approvalDecisionJournal";
 import {
   classifyControlPlaneNetworkRegime,
   computeControlPlaneInfraHealth,
@@ -113,6 +116,7 @@ async function appendApprovalDecisionArtifact(params: {
     decisionId,
   );
   await appendApprovalDecisionJournalEntry({
+    schema_version: APPROVAL_DECISION_JOURNAL_SCHEMA_VERSION,
     approval_fact_id: `${approvalId}:approval_1:${Date.now()}`,
     approval_id: approvalId,
     approval_stage: "approval_1",

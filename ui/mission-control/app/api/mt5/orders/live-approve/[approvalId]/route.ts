@@ -1,13 +1,16 @@
 import { NextResponse } from "next/server";
 
 import { appendAllocationWriterStageTransitions } from "../../../../../../lib/allocationWriterAuditJournal";
-import { appendApprovalDecisionJournalEntry } from "../../../../../../lib/approvalDecisionJournal";
+import {
+  APPROVAL_DECISION_JOURNAL_SCHEMA_VERSION,
+  appendApprovalDecisionJournalEntry,
+} from "../../../../../../lib/approvalDecisionJournal";
 import {
   appendAllocationDecisionJournalEntry,
   readAllocationDecisionJournalEntries,
   type AllocationDecisionJournalEntry,
 } from "../../../../../../lib/allocationDecisionJournal";
-import { cpFetchJsonSafe } from "../../../../../../lib/controlPlane";
+import { cpFetchMt5Live } from "../../../../../../lib/controlPlaneMt5Live";
 import { appendExecutionFactJournalEntry } from "../../../../../../lib/executionFactJournal";
 
 type JsonMap = Record<string, unknown>;
@@ -331,7 +334,9 @@ async function appendApprovalDecisionArtifacts(approvalId: string, approvalPaylo
   const result = asRecord(approvalPayload.result);
   const failure = asRecord(approvalPayload.failure);
   const failureDetail = asRecord(failure.detail);
-  const hardening = pickFirstRecord(failureDetail.hardening, approvalPayload.hardening, approvalPayload.go_live_hardening, pendingRow.go_live_hardening);
+  const eventCategory = responseEventCategoryFromPayload(approvalPayload);
+  const rawHardening = pickFirstRecord(failureDetail.hardening, approvalPayload.hardening, approvalPayload.go_live_hardening, pendingRow.go_live_hardening);
+  const hardening = eventCategory === "mt5_live_order_stale_approval_cancelled" ? {} : rawHardening;
   const metadata = asRecord(orderPayload.metadata);
   const orderIntent = asRecord(orderPayload.order_intent);
   const finalDecisionTruth = pickFirstRecord(metadata.final_decision_truth, orderIntent.final_decision_truth);
@@ -381,6 +386,7 @@ async function appendApprovalDecisionArtifacts(approvalId: string, approvalPaylo
     approvalPayload.status,
   );
   await appendApprovalDecisionJournalEntry({
+    schema_version: APPROVAL_DECISION_JOURNAL_SCHEMA_VERSION,
     approval_fact_id: `${approvalId}:approval_2:${Date.now()}`,
     approval_id: approvalId,
     approval_stage: "approval_2",
@@ -408,7 +414,7 @@ async function appendApprovalDecisionArtifacts(approvalId: string, approvalPaylo
     hardening,
     risk_context: pickFirstRecord(approvalPayload.risk_context, pendingRow.risk_context),
     order_payload: orderPayload,
-    source_event_category: responseEventCategoryFromPayload(approvalPayload),
+    source_event_category: eventCategory,
     created_at_iso: firstNonEmpty(result.approved_at, approvalPayload.approved_at, approvalPayload.created_at, new Date().toISOString()),
   });
   const approvalCreatedAtIso = firstNonEmpty(result.approved_at, approvalPayload.approved_at, approvalPayload.created_at, new Date().toISOString());
@@ -466,16 +472,17 @@ export async function POST(
   { params }: { params: Promise<{ approvalId: string }> },
 ): Promise<NextResponse> {
   const resolved = await params;
-  const pendingSnapshot = await cpFetchJsonSafe("/v1/mt5/orders/live-pending", {
+  const pendingSnapshot = await cpFetchMt5Live("/v1/mt5/orders/live-pending", {
     method: "GET",
   }).catch(() => null);
   const pendingRow = resolvePendingRow(pendingSnapshot?.payload, resolved.approvalId);
-  const { response, payload } = await cpFetchJsonSafe(`/v1/mt5/orders/live-approve/${resolved.approvalId}`, {
+  const result = await cpFetchMt5Live(`/v1/mt5/orders/live-approve/${resolved.approvalId}`, {
     method: "POST",
   });
+  const payload = result.payload;
   await appendApprovalDecisionArtifacts(resolved.approvalId, payload, pendingRow).catch(() => null);
-  if (response.ok) {
+  if (result.status >= 200 && result.status < 300) {
     await appendCanonicalApprovalArtifacts(resolved.approvalId, payload, pendingRow).catch(() => null);
   }
-  return NextResponse.json(payload, { status: response.status });
+  return NextResponse.json(payload, { status: result.status });
 }

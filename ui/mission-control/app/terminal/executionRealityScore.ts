@@ -3,9 +3,12 @@ import type { StabilitySnapshot } from "./stabilityEngine";
 
 export type ExecutionRealityState = "ALIGNED" | "CAUTION" | "DEGRADED" | "HALT";
 export type ExecutionRealityDrag = "NONE" | "SLIPPAGE" | "FILL" | "LATENCY" | "LIQUIDITY" | "STABILITY";
+export type ExecutionRealitySchemaVersion = "execution-reality/v1";
+
+export const EXECUTION_REALITY_SCHEMA_VERSION: ExecutionRealitySchemaVersion = "execution-reality/v1";
 
 export type ExecutionRealitySummary = {
-  schema_version?: "execution-reality/v1";
+  schema_version?: ExecutionRealitySchemaVersion;
   state: ExecutionRealityState;
   score_pct: number;
   allow_new_risk: boolean;
@@ -57,6 +60,31 @@ function inferDominantDrag(input: {
   ];
   const [drag, penalty] = entries.reduce((best, current) => current[1] > best[1] ? current : best, ["NONE", 0] as [ExecutionRealityDrag, number]);
   return penalty >= 0.14 ? drag : "NONE";
+}
+
+export function assertExecutionRealitySummary(summary: ExecutionRealitySummary): ExecutionRealitySummary {
+  const metrics = summary.metrics;
+  const numericFields = [
+    summary.score_pct,
+    summary.size_cap_pct,
+    metrics.execution_samples,
+    metrics.liquidity_samples,
+    metrics.slippage_bps,
+    metrics.latency_ms,
+    metrics.fill_rate_pct,
+    metrics.liquidity_accuracy_pct,
+    metrics.stability_monitor_pct,
+  ];
+  if (summary.schema_version !== EXECUTION_REALITY_SCHEMA_VERSION) {
+    throw new Error(`ExecutionReality schema mismatch: ${String(summary.schema_version || "missing")}`);
+  }
+  if (!summary.state || !summary.summary_label) {
+    throw new Error("ExecutionReality required fields missing");
+  }
+  if (numericFields.some((value) => !Number.isFinite(Number(value)))) {
+    throw new Error("ExecutionReality numeric metrics invalid");
+  }
+  return summary;
 }
 
 export function buildExecutionRealitySummary(input: BuildExecutionRealitySummaryInput): ExecutionRealitySummary {
@@ -151,8 +179,8 @@ export function buildExecutionRealitySummary(input: BuildExecutionRealitySummary
         ? 60
         : 100;
 
-  return {
-    schema_version: "execution-reality/v1",
+  return assertExecutionRealitySummary({
+    schema_version: EXECUTION_REALITY_SCHEMA_VERSION,
     state,
     score_pct: scorePct,
     allow_new_risk: state === "ALIGNED" || state === "CAUTION",
@@ -179,5 +207,5 @@ export function buildExecutionRealitySummary(input: BuildExecutionRealitySummary
       drift_watchdog: stability.driftWatchdog,
       optimization_action: input.pnlAnalyticsSnapshot.autoOptimization.action,
     },
-  };
+  });
 }

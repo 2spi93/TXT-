@@ -213,7 +213,7 @@ deploy_cmd() {
   )
 
   printf '[blue-green] starting %s\n' "$service"
-  "${COMPOSE[@]}" up -d --no-deps "$service"
+  "${COMPOSE[@]}" up -d --no-deps --force-recreate "$service"
   wait_for_healthy "$slot"
   warmup_slot_snapshots "$slot"
   wait_for_healthy "$slot"

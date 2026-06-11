@@ -12,6 +12,10 @@ type ProjectionSourceDiagnostics = {
   rows_returned: number;
 };
 
+export type CanonicalSpineHealthSchemaVersion = "canonical-spine-health/v1";
+
+export const CANONICAL_SPINE_HEALTH_SCHEMA_VERSION: CanonicalSpineHealthSchemaVersion = "canonical-spine-health/v1";
+
 export type CanonicalSpineCacheAudit = {
   cache_hit: number;
   cache_miss: number;
@@ -133,6 +137,7 @@ function isAttributionComputed(entry: ExecutionFactJournalEntry): boolean {
 }
 
 export type CanonicalSpineHealthSnapshot = {
+  schema_version: CanonicalSpineHealthSchemaVersion;
   generated_at_iso: string;
   window_days: number;
   source_diagnostics: ProjectionSourceDiagnostics;
@@ -245,6 +250,7 @@ function normalizeOptions(options?: {
 
 function buildUnavailableSnapshot(sinceDays: number): CanonicalSpineHealthSnapshot {
   return {
+    schema_version: CANONICAL_SPINE_HEALTH_SCHEMA_VERSION,
     generated_at_iso: new Date().toISOString(),
     window_days: sinceDays,
     source_diagnostics: {
@@ -298,6 +304,34 @@ function buildUnavailableSnapshot(sinceDays: number): CanonicalSpineHealthSnapsh
   };
 }
 
+export function assertCanonicalSpineHealthSnapshot(snapshot: CanonicalSpineHealthSnapshot): CanonicalSpineHealthSnapshot {
+  const diagnostics = asRecord(snapshot.source_diagnostics);
+  const numericFields = [
+    snapshot.window_days,
+    snapshot.spine_match_rate_pct,
+    snapshot.allocation_link_rate_pct,
+    snapshot.approval_link_rate_pct,
+    snapshot.execution_link_rate_pct,
+    snapshot.outcome_link_rate_pct,
+    snapshot.alpha_attribution_coverage_pct,
+    diagnostics.rows_scanned,
+    diagnostics.rows_returned,
+  ];
+  if (snapshot.schema_version !== CANONICAL_SPINE_HEALTH_SCHEMA_VERSION) {
+    throw new Error(`CanonicalSpine schema mismatch: ${String(snapshot.schema_version || "missing")}`);
+  }
+  if (!Number.isFinite(Date.parse(String(snapshot.generated_at_iso || "")))) {
+    throw new Error("CanonicalSpine generated_at_iso invalid");
+  }
+  if (numericFields.some((value) => !Number.isFinite(Number(value)) || Number(value) < 0)) {
+    throw new Error("CanonicalSpine numeric metrics invalid");
+  }
+  if (!Array.isArray(snapshot.operational_refusal_by_code) || !Array.isArray(snapshot.pending_by_gate)) {
+    throw new Error("CanonicalSpine arrays invalid");
+  }
+  return snapshot;
+}
+
 function cacheKey(options: CanonicalSpineNormalizedOptions): string {
   return `sinceDays:${options.sinceDays}`;
 }
@@ -334,7 +368,11 @@ function normalizeCachedSnapshot(raw: unknown): CanonicalSpineHealthSnapshot | n
   if (!Number.isFinite(Number(payload.window_days || Number.NaN))) {
     return null;
   }
-  return payload as CanonicalSpineHealthSnapshot;
+  try {
+    return assertCanonicalSpineHealthSnapshot(payload as CanonicalSpineHealthSnapshot);
+  } catch {
+    return null;
+  }
 }
 
 async function readSnapshotFromDisk(options: CanonicalSpineNormalizedOptions): Promise<CanonicalSpineCacheEntry | null> {
@@ -523,7 +561,8 @@ async function buildCanonicalSpineHealthSnapshotUncached(options?: {
   const operationalRefusalTotalPostProducer = operationalRefusalByCodePostProducer.reduce((sum, item) => sum + item.count, 0)
     + [...v2RiskDerivedIds.operationalRefusalCountsByCodePostProducer.entries()].slice(5).reduce((sum, [, count]) => sum + count, 0);
 
-  return {
+  return assertCanonicalSpineHealthSnapshot({
+    schema_version: CANONICAL_SPINE_HEALTH_SCHEMA_VERSION,
     generated_at_iso: new Date().toISOString(),
     window_days: sinceDays,
     source_diagnostics: {
@@ -574,7 +613,7 @@ async function buildCanonicalSpineHealthSnapshotUncached(options?: {
     operational_refusal_by_code: operationalRefusalByCode,
     operational_refusal_by_code_post_producer: operationalRefusalByCodePostProducer,
     pending_by_gate: pendingByGate,
-  };
+  });
 }
 
 export async function buildCanonicalSpineHealthSnapshot(options?: {

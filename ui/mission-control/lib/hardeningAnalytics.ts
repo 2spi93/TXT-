@@ -8,6 +8,10 @@ type ProjectionSourceDiagnostics = {
   rows_returned: number;
 };
 
+export type HardeningAnalyticsSchemaVersion = "hardening-analytics/v1";
+
+export const HARDENING_ANALYTICS_SCHEMA_VERSION: HardeningAnalyticsSchemaVersion = "hardening-analytics/v1";
+
 export type HardeningAnalyticsCauseKey =
   | "oracle_stability_blocked"
   | "predictor_hold"
@@ -32,6 +36,7 @@ export type HardeningAnalyticsCauseRow = {
 };
 
 export type HardeningAnalyticsSnapshot = {
+  schema_version: HardeningAnalyticsSchemaVersion;
   generated_at_iso: string;
   window_days: number;
   approval_stage_2_total: number;
@@ -43,6 +48,31 @@ export type HardeningAnalyticsSnapshot = {
   top_cost_causes: HardeningAnalyticsCauseRow[];
   top_missed_alpha_causes: HardeningAnalyticsCauseRow[];
 };
+
+export function assertHardeningAnalyticsSnapshot(snapshot: HardeningAnalyticsSnapshot): HardeningAnalyticsSnapshot {
+  const diagnostics = asRecord(snapshot.source_diagnostics);
+  const numericFields = [
+    snapshot.window_days,
+    snapshot.approval_stage_2_total,
+    snapshot.hardening_refused_total,
+    snapshot.unique_decision_total,
+    diagnostics.rows_scanned,
+    diagnostics.rows_returned,
+  ];
+  if (snapshot.schema_version !== HARDENING_ANALYTICS_SCHEMA_VERSION) {
+    throw new Error(`HardeningAnalytics schema mismatch: ${String(snapshot.schema_version || "missing")}`);
+  }
+  if (!Number.isFinite(Date.parse(String(snapshot.generated_at_iso || "")))) {
+    throw new Error("HardeningAnalytics generated_at_iso invalid");
+  }
+  if (numericFields.some((value) => !Number.isFinite(Number(value)) || Number(value) < 0)) {
+    throw new Error("HardeningAnalytics numeric metrics invalid");
+  }
+  if (!Array.isArray(snapshot.rows) || !Array.isArray(snapshot.top_refusal_causes)) {
+    throw new Error("HardeningAnalytics arrays invalid");
+  }
+  return snapshot;
+}
 
 function asRecord(value: unknown): JsonMap {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -360,7 +390,8 @@ export async function buildHardeningAnalyticsSnapshot(options?: {
 
   const uniqueDecisionIds = new Set(hardeningRefusals.map((entry) => String(entry.decision_id || "").trim()).filter(Boolean));
 
-  return {
+  return assertHardeningAnalyticsSnapshot({
+    schema_version: HARDENING_ANALYTICS_SCHEMA_VERSION,
     generated_at_iso: new Date().toISOString(),
     window_days: sinceDays,
     approval_stage_2_total: approvals.length,
@@ -374,5 +405,5 @@ export async function buildHardeningAnalyticsSnapshot(options?: {
     top_refusal_causes: topRefusalCauses,
     top_cost_causes: topCostCauses,
     top_missed_alpha_causes: topMissedAlphaCauses,
-  };
+  });
 }

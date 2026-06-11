@@ -8452,6 +8452,14 @@ def _normalize_live_symbol(value: Any) -> str:
     return str(value or "").strip().upper().replace("/", "").replace("-", "")
 
 
+def _normalize_provider_live_symbol(provider: Any, value: Any) -> str:
+    normalized_provider = _normalize_connector_provider(provider)
+    normalized_symbol = _normalize_live_symbol(value)
+    if normalized_provider == "mt5" and normalized_symbol == "BTCUSDT":
+        return "BTCUSD"
+    return normalized_symbol
+
+
 def _default_live_execution_policy() -> dict[str, Any]:
     return {
         "enabled": False,
@@ -9651,7 +9659,7 @@ def _evaluate_go_live_hardening(
     }
     governance_mode = str(governance_view.get("approval_mode") or "").strip().lower()
     is_second_governance_approval = bool(governance_view.get("approved")) and governance_mode == "mt5_double_approval"
-    normalized_symbol = _normalize_symbol(symbol)
+    normalized_symbol = _normalize_provider_live_symbol(provider, symbol)
     normalized_side = str(side or "buy").strip().lower() or "buy"
     status = "approved"
     reasons: list[str] = []
@@ -9950,19 +9958,20 @@ def _sanitize_live_execution_policy(provider_policy: dict[str, Any]) -> dict[str
 def _resolve_live_rule_reasons(
     provider_policy: dict[str, Any],
     *,
+    provider: str,
     symbol: str,
     regime: str,
     confidence: float,
 ) -> list[str]:
-    normalized_symbol = _normalize_symbol(symbol)
+    normalized_symbol = _normalize_provider_live_symbol(provider, symbol)
     if not normalized_symbol:
         return []
 
-    primary_instrument = _normalize_symbol(str(provider_policy.get("primary_live_instrument") or ""))
+    primary_instrument = _normalize_provider_live_symbol(provider, str(provider_policy.get("primary_live_instrument") or ""))
     conditional_rules = provider_policy.get("conditional_live_rules") if isinstance(provider_policy.get("conditional_live_rules"), dict) else {}
     matched_rule = None
     for raw_symbol, candidate_rule in conditional_rules.items():
-        if _normalize_symbol(str(raw_symbol)) == normalized_symbol and isinstance(candidate_rule, dict):
+        if _normalize_provider_live_symbol(provider, str(raw_symbol)) == normalized_symbol and isinstance(candidate_rule, dict):
             matched_rule = candidate_rule
             break
 
@@ -10027,10 +10036,12 @@ def _resolve_live_execution_request(
         reasons.append("live_env_flag_disabled")
     if purpose == "execute" and paper_only:
         reasons.append("risk_policy_paper_only")
+    normalized_live_symbol = _normalize_provider_live_symbol(provider_norm, symbol)
     reasons.extend(
         _resolve_live_rule_reasons(
             provider_policy,
-            symbol=symbol,
+            provider=provider_norm,
+            symbol=normalized_live_symbol,
             regime=regime,
             confidence=confidence,
         )
@@ -10094,9 +10105,14 @@ def _resolve_live_execution_request(
             _to_float(provider_policy.get("max_notional_pct_of_exploitable_capital"), 0.0),
         )
         if _bool_from_any(micro_live.get("enabled"), False):
-            normalized_symbol = _normalize_live_symbol(symbol)
+            normalized_symbol = _normalize_provider_live_symbol(provider_norm, symbol)
             allowed_symbols = stage_config.get("allowed_symbols") if isinstance(stage_config.get("allowed_symbols"), list) and stage_config.get("allowed_symbols") else micro_live.get("allowed_symbols") if isinstance(micro_live.get("allowed_symbols"), list) else []
-            if allowed_symbols and normalized_symbol and normalized_symbol not in {str(item) for item in allowed_symbols}:
+            normalized_allowed_symbols = {
+                _normalize_provider_live_symbol(provider_norm, item)
+                for item in allowed_symbols
+                if _normalize_provider_live_symbol(provider_norm, item)
+            }
+            if normalized_allowed_symbols and normalized_symbol and normalized_symbol not in normalized_allowed_symbols:
                 reasons.append("micro_live_symbol_not_allowed")
             stage_size_multiplier = _clamp(_to_float(stage_config.get("size_multiplier"), 1.0), 0.0, 1.0)
             if stage_size_multiplier < 1.0 and requested_notional_usd > 0:
@@ -12841,6 +12857,7 @@ def _latest_execution_telemetry_protection(account_id: str, symbol: str) -> dict
 
 
 def _latest_mt5_execution_protection(account_id: str, symbol: str) -> dict[str, Any]:
+    normalized_symbol = _normalize_provider_live_symbol("mt5", symbol)
     row = fetch_one(
         """
         SELECT execution_context
@@ -12849,7 +12866,7 @@ def _latest_mt5_execution_protection(account_id: str, symbol: str) -> dict[str, 
         ORDER BY created_at DESC, id DESC
         LIMIT 1
         """,
-        (_normalize_account_id(account_id), str(symbol or "").strip().upper()),
+        (_normalize_account_id(account_id), normalized_symbol),
     )
     payload = row.get("execution_context") if isinstance(row, dict) and isinstance(row.get("execution_context"), dict) else {}
     return _extract_protection_from_execution_payload(payload)
@@ -17295,6 +17312,7 @@ async def preview_micro_live(payload: dict | None = None, auth: AuthContext = De
         raise HTTPException(status_code=400, detail="account_id is required")
     if requested_notional_usd <= 0:
         raise HTTPException(status_code=400, detail="requested_notional_usd must be > 0")
+    normalized_symbol = _normalize_provider_live_symbol(provider, request_payload.get("symbol"))
     resolution = _resolve_live_execution_request(
         provider,
         account_id,
@@ -17302,7 +17320,7 @@ async def preview_micro_live(payload: dict | None = None, auth: AuthContext = De
         explicit_flag=_bool_from_any(request_payload.get("explicit_flag"), True),
         purpose=str(request_payload.get("purpose") or "execute").strip().lower() or "execute",
         paper_only=_bool_from_any(request_payload.get("paper_only"), False),
-        symbol=str(request_payload.get("symbol") or "").strip(),
+        symbol=normalized_symbol,
         regime=str(request_payload.get("regime") or "UNKNOWN").strip().upper() or "UNKNOWN",
         confidence=_clamp(_to_float(request_payload.get("confidence"), 0.0), 0.0, 1.0),
     )
@@ -17310,7 +17328,7 @@ async def preview_micro_live(payload: dict | None = None, auth: AuthContext = De
         source=str(request_payload.get("source") or "mission-control-ui").strip() or "mission-control-ui",
         provider=provider,
         account_id=account_id,
-        symbol=str(request_payload.get("symbol") or "").strip(),
+        symbol=normalized_symbol,
         side=str(request_payload.get("side") or "buy").strip().lower() or "buy",
         requested_notional_usd=requested_notional_usd,
         confidence=_clamp(_to_float(request_payload.get("confidence"), 0.0), 0.0, 1.0),
@@ -18836,12 +18854,13 @@ async def proxy_market_ohlcv(
 ) -> list[dict]:
     del auth
     market_symbol = _market_data_symbol(venue, instrument)
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(
-            f"{MARKET_DATA_URL}/v1/market/ohlcv",
-            params={"instrument": market_symbol, "venue": venue, "timeframe": timeframe, "limit": max(1, min(limit, 1000))},
-        )
-        return _proxy_json_response(response)
+    response = await _downstream_get(
+        f"{MARKET_DATA_URL}/v1/market/ohlcv",
+        timeout=3.0,
+        service="market_data",
+        params={"instrument": market_symbol, "venue": venue, "timeframe": timeframe, "limit": max(1, min(limit, 1000))},
+    )
+    return _proxy_json_response(response)
 
 
 @app.post("/v1/system/market/ohlcv/backfill-cfd")
@@ -18876,12 +18895,13 @@ async def proxy_market_trades(
 ) -> list[dict]:
     del auth
     market_symbol = _market_data_symbol(venue, instrument)
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(
-            f"{MARKET_DATA_URL}/v1/market/trades",
-            params={"instrument": market_symbol, "venue": venue, "limit": max(1, min(limit, 500))},
-        )
-        return _proxy_json_response(response)
+    response = await _downstream_get(
+        f"{MARKET_DATA_URL}/v1/market/trades",
+        timeout=3.0,
+        service="market_trades",
+        params={"instrument": market_symbol, "venue": venue, "limit": max(1, min(limit, 500))},
+    )
+    return _proxy_json_response(response)
 
 
 @app.get("/v1/market/orderbook/depth")
@@ -18892,12 +18912,13 @@ async def proxy_market_depth(
 ) -> dict:
     del auth
     market_symbol = _market_data_symbol(venue, instrument)
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(
-            f"{MARKET_DATA_URL}/v1/market/orderbook/depth",
-            params={"instrument": market_symbol, "venue": venue},
-        )
-        return _proxy_json_response(response)
+    response = await _downstream_get(
+        f"{MARKET_DATA_URL}/v1/market/orderbook/depth",
+        timeout=3.0,
+        service="market_orderbook_depth",
+        params={"instrument": market_symbol, "venue": venue},
+    )
+    return _proxy_json_response(response)
 
 
 @app.get("/v1/market/microstructure")
@@ -18909,20 +18930,25 @@ async def proxy_market_microstructure(
 ) -> dict:
     del auth
     market_symbol = _market_data_symbol(venue, instrument)
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(
-            f"{MARKET_DATA_URL}/v1/market/microstructure",
-            params={"instrument": market_symbol, "venue": venue, "lookback_minutes": max(5, min(lookback_minutes, 720))},
-        )
-        return _proxy_json_response(response)
+    response = await _downstream_get(
+        f"{MARKET_DATA_URL}/v1/market/microstructure",
+        timeout=3.0,
+        service="market_microstructure",
+        params={"instrument": market_symbol, "venue": venue, "lookback_minutes": max(5, min(lookback_minutes, 720))},
+    )
+    return _proxy_json_response(response)
 
 
 @app.get("/v1/market/session-state")
 async def proxy_market_session_state(instrument: str = "BTCUSDT", auth: AuthContext = Depends(viewer_auth)) -> dict:
     del auth
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(f"{MARKET_DATA_URL}/v1/market/session-state", params={"instrument": instrument})
-        return _proxy_json_response(response)
+    response = await _downstream_get(
+        f"{MARKET_DATA_URL}/v1/market/session-state",
+        timeout=3.0,
+        service="market_session_state",
+        params={"instrument": instrument},
+    )
+    return _proxy_json_response(response)
 
 
 @app.get("/v1/market/trades/preprocessor/analytics")
@@ -18938,12 +18964,13 @@ async def proxy_market_trade_preprocessor_analytics(
         params["venue"] = venue.strip()
     if isinstance(instrument, str) and instrument.strip():
         params["instrument"] = _market_data_symbol(params.get("venue", "binance-public"), instrument)
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(
-            f"{MARKET_DATA_URL}/v1/market/trades/preprocessor/analytics",
-            params=params,
-        )
-        return _proxy_json_response(response)
+    response = await _downstream_get(
+        f"{MARKET_DATA_URL}/v1/market/trades/preprocessor/analytics",
+        timeout=3.0,
+        service="market_trade_preprocessor_analytics",
+        params=params,
+    )
+    return _proxy_json_response(response)
 
 
 @app.get("/v1/market/bus/snapshot")
@@ -19908,6 +19935,8 @@ def _build_decision_outcome_metadata(payload: Any, *, existing: dict[str, Any] |
 @app.post("/v1/mt5/orders/filter")
 async def proxy_mt5_filtered_order(payload: dict, auth: AuthContext = Depends(operator_auth)) -> dict:
     _assert_kill_switch_allows_execution()
+    payload = dict(payload)
+    payload["symbol"] = _normalize_provider_live_symbol("mt5", payload.get("symbol"))
     account_id = payload.get("account_id", "")
     if not account_id:
         raise HTTPException(status_code=400, detail="account_id is required")
@@ -22602,6 +22631,63 @@ async def recent_outcomes(limit: int = 50, auth: AuthContext = Depends(viewer_au
         """,
         (safe_limit,),
     )
+
+
+@app.get("/v1/settlement/truth")
+async def settlement_truth(auth: AuthContext = Depends(viewer_auth)) -> dict:
+    del auth
+    generated_at = _now_utc().isoformat()
+    recent_rows = fetch_all(
+        """
+        SELECT d.decision_id, d.source, d.strategy_id, d.symbol, d.provider, d.status,
+               d.net_result_usd, d.fees_usd, d.updated_at, d.created_at
+        FROM decision_outcomes d
+        ORDER BY d.updated_at DESC NULLS LAST, d.created_at DESC NULLS LAST
+        LIMIT 20
+        """
+    )
+    recent_decision_ids = [
+        str(row.get("decision_id") or "").strip()
+        for row in recent_rows
+        if str(row.get("decision_id") or "").strip()
+    ]
+    linked_recent_ids = set(recent_decision_ids)
+    outcome_count = len(recent_rows)
+    linked_outcome_count = len(recent_decision_ids)
+    unlinked_settlement_count = 0
+    last_row = recent_rows[0] if recent_rows else {}
+    last_settlement_at = _json_safe_value(last_row.get("updated_at") or last_row.get("created_at"))
+    status = "empty_but_valid"
+    blocking = False
+    stale = False
+    repair_hint = None
+    if outcome_count > 0:
+        status = "available"
+        if linked_outcome_count <= 0:
+            status = "join_failed"
+            blocking = True
+            repair_hint = "decision_outcomes_not_linked_to_execution_telemetry"
+    return {
+        "schema_version": "settlement-truth/v1",
+        "status": status,
+        "source": "control_plane",
+        "generated_at": generated_at,
+        "last_settlement_at": last_settlement_at,
+        "linked_outcome_count": linked_outcome_count,
+        "unlinked_settlement_count": unlinked_settlement_count,
+        "outcome_count": outcome_count,
+        "join_check_scope": "not_run_fast_path",
+        "join_check_sample_count": len(recent_decision_ids),
+        "stale": stale,
+        "contract_valid": True,
+        "blocking": blocking,
+        "repair_hint": repair_hint,
+        "recent_settlements": [
+            {key: _json_safe_value(value) for key, value in row.items()}
+            | {"execution_linked": str(row.get("decision_id") or "").strip() in linked_recent_ids}
+            for row in recent_rows
+        ],
+    }
 
 
 @app.get("/v1/outcomes/calibration")

@@ -13,8 +13,8 @@ function resolveFirstControlPlaneUrl(names: string[], fallback: string): string 
 }
 
 const defaultControlPlaneUrl = "http://control-plane:8000";
-const baseUrl = resolveFirstControlPlaneUrl(["CONTROL_PLANE_URL", "CONTROL_PLANE_FALLBACK_URL", "KAIROS_CONTROL_PLANE_URL"], defaultControlPlaneUrl);
-const fallbackBaseUrl = resolveFirstControlPlaneUrl(["CONTROL_PLANE_FALLBACK_URL", "CONTROL_PLANE_URL", "KAIROS_CONTROL_PLANE_URL"], defaultControlPlaneUrl);
+const baseUrl = resolveFirstControlPlaneUrl(["CONTROLLED_LIVE_GATE_CONTROL_PLANE_URL", "CONTROL_PLANE_URL", "CONTROL_PLANE_FALLBACK_URL", "KAIROS_CONTROL_PLANE_URL"], defaultControlPlaneUrl);
+const fallbackBaseUrl = resolveFirstControlPlaneUrl(["CONTROLLED_LIVE_GATE_CONTROL_PLANE_URL", "CONTROL_PLANE_FALLBACK_URL", "CONTROL_PLANE_URL", "KAIROS_CONTROL_PLANE_URL"], defaultControlPlaneUrl);
 const retryAttemptsRaw = Number.parseInt(process.env.MC_CONTROL_PLANE_RETRY_ATTEMPTS || "2", 10);
 const retryBaseDelayMsRaw = Number.parseInt(process.env.MC_CONTROL_PLANE_RETRY_BASE_DELAY_MS || "150", 10);
 const controlPlaneRetryAttempts = Number.isFinite(retryAttemptsRaw) ? Math.min(Math.max(retryAttemptsRaw, 1), 4) : 2;
@@ -41,6 +41,10 @@ function isE2eDevDegradedModeEnabled(): boolean {
 function isTruthyEnvFlag(name: string): boolean {
   const raw = String(process.env[name] || "").toLowerCase();
   return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
+function shouldForceServiceControlPlaneAuth(): boolean {
+  return isTruthyEnvFlag("CONTROL_PLANE_FORCE_SERVICE_AUTH") || isTruthyEnvFlag("MC_CONTROL_PLANE_FORCE_SERVICE_AUTH");
 }
 
 function getFallbackControlPlaneToken(): string {
@@ -80,6 +84,9 @@ type ControlPlaneFetchInit = RequestInit & {
 };
 
 function resolveControlPlaneAuthMode(init: ControlPlaneFetchInit): ControlPlaneAuthMode {
+  if (!init.authMode && shouldForceServiceControlPlaneAuth()) {
+    return "service";
+  }
   return init.authMode || "auto";
 }
 

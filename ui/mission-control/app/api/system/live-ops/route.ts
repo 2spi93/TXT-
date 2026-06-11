@@ -3,9 +3,11 @@ import { NextResponse } from "next/server";
 import { requireControlPlaneSession } from "../../../../lib/apiAuth";
 import { buildCanonicalSpineHealthSnapshot, inspectCanonicalSpineSnapshotCache } from "../../../../lib/canonicalSpineHealth";
 import { cpFetchJsonSafe, getControlPlaneNetworkMetricsSnapshot, type ControlPlaneNetworkMeta } from "../../../../lib/controlPlane";
+import { buildControlledLiveRampGateReport, buildLifecyclePublishGateReportFromSnapshot, toNumber as toControlledLiveRampGateNumber } from "../../../../lib/controlledLiveRampGate";
 import { getEdgeObservationSummary, type EdgeObservationSummary } from "../../../../lib/edgeObservation";
 import { buildHardeningAnalyticsSnapshot } from "../../../../lib/hardeningAnalytics";
 import { appendLiveOpsDiagnosticsSample, readLiveOpsDiagnosticsWindowSummary } from "../../../../lib/liveOpsDiagnosticsJournal";
+import { assertLiveOpsCriticalPayload, LIVE_OPS_PAYLOAD_SCHEMA_VERSION, type LiveOpsCriticalPayload } from "../../../../lib/liveOpsPayloadContract";
 import { computeExecutionDomination } from "../../../../lib/liveOps/executionDominationEngine";
 import { classifyMarketState } from "../../../../lib/liveOps/marketStateEngine";
 import { detectSmartMoney } from "../../../../lib/liveOps/smartMoneyDetector";
@@ -69,8 +71,42 @@ const LIVE_OPS_SERVER_TRUTH_TIMEOUT_MS = 1_800;
 const LIVE_OPS_SERVER_PROJECTION_TIMEOUT_MS = 1_500;
 const LIVE_OPS_SOURCE_TREE_PROVENANCE_TIMEOUT_MS = 700;
 const LIVE_OPS_DIAGNOSTICS_HISTORY_TIMEOUT_MS = 250;
+const LIVE_OPS_UI_CACHE_TTL_MS = Math.max(1_000, Math.min(15_000, toNumber(process.env.LIVE_OPS_UI_CACHE_TTL_MS, 5_000)));
 const RUNTIME_TRUTH_TRI_TTL_MS = Math.max(1_000, toNumber(process.env.RUNTIME_TRUTH_SNAPSHOT_TTL_MS, 15_000));
 const CANONICAL_SPINE_TRI_TTL_MS = Math.max(1_000, toNumber(process.env.CANONICAL_SPINE_SNAPSHOT_TTL_MS, 60_000));
+
+type LiveOpsResponseCacheEntry = {
+  payload: LiveOpsCriticalPayload;
+  expiresAtMs: number;
+  generatedAtMs: number;
+};
+
+type LiveOpsRouteRequestMetrics = {
+  total: number;
+  ui_hit: number;
+  ui_miss: number;
+  bypass: number;
+  updated_at: string;
+};
+
+const liveOpsRouteGlobal = globalThis as typeof globalThis & {
+  __mcLiveOpsUiResponseCache?: Map<string, LiveOpsResponseCacheEntry>;
+  __mcLiveOpsRouteRequestMetrics?: LiveOpsRouteRequestMetrics;
+};
+const liveOpsUiResponseCache = liveOpsRouteGlobal.__mcLiveOpsUiResponseCache || new Map<string, LiveOpsResponseCacheEntry>();
+if (!liveOpsRouteGlobal.__mcLiveOpsUiResponseCache) {
+  liveOpsRouteGlobal.__mcLiveOpsUiResponseCache = liveOpsUiResponseCache;
+}
+const liveOpsRouteRequestMetrics = liveOpsRouteGlobal.__mcLiveOpsRouteRequestMetrics || {
+  total: 0,
+  ui_hit: 0,
+  ui_miss: 0,
+  bypass: 0,
+  updated_at: new Date(0).toISOString(),
+};
+if (!liveOpsRouteGlobal.__mcLiveOpsRouteRequestMetrics) {
+  liveOpsRouteGlobal.__mcLiveOpsRouteRequestMetrics = liveOpsRouteRequestMetrics;
+}
 
 type CpFetchJsonSafeResult = Awaited<ReturnType<typeof cpFetchJsonSafe>>;
 
@@ -94,6 +130,43 @@ function timedOutCpFetchResult(path: string): CpFetchJsonSafeResult {
     payload,
     network: timedOutNetworkMeta(path),
   };
+}
+
+function normalizeLiveOpsRequestSource(value: unknown): "ui" | "scanner" | "service" | "unknown" {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "ui" || normalized === "scanner" || normalized === "service") {
+    return normalized;
+  }
+  return "unknown";
+}
+
+function liveOpsCacheKey(input: { auditFilter: string; requestSource: string }): string {
+  return JSON.stringify({
+    auditFilter: input.auditFilter,
+    requestSource: input.requestSource,
+  });
+}
+
+function buildLiveOpsResponse(
+  payload: LiveOpsCriticalPayload,
+  input: { cacheStatus: "hit" | "miss" | "stored" | "bypass"; requestSource: string; ageMs?: number },
+): NextResponse {
+  return NextResponse.json(payload, {
+    status: 200,
+    headers: {
+      "Cache-Control": "no-store",
+      "X-Live-Ops-Cache": input.cacheStatus,
+      "X-Live-Ops-Request-Source": input.requestSource,
+      ...(typeof input.ageMs === "number" ? { "X-Live-Ops-Cache-Age-Ms": String(Math.max(0, Math.round(input.ageMs))) } : {}),
+    },
+  });
+}
+
+function recordLiveOpsRouteRequest(status: "ui_hit" | "ui_miss" | "bypass"): LiveOpsRouteRequestMetrics {
+  liveOpsRouteRequestMetrics.total += 1;
+  liveOpsRouteRequestMetrics[status] += 1;
+  liveOpsRouteRequestMetrics.updated_at = new Date().toISOString();
+  return { ...liveOpsRouteRequestMetrics };
 }
 
 function timedOutEdgeObservationSummary(): EdgeObservationSummary {
@@ -369,12 +442,38 @@ function computeDrawdownUsd(outcomes: JsonMap[]): number {
 }
 
 export async function GET(request: Request): Promise<NextResponse> {
-  const authError = await requireControlPlaneSession();
+  const authError = await requireControlPlaneSession(request, { allowServiceProbe: true });
   if (authError) {
     return authError;
   }
   const url = new URL(request.url);
   const auditFilter = String(url.searchParams.get("audit_filter") || "").trim();
+  const requestSource = normalizeLiveOpsRequestSource(url.searchParams.get("source") || request.headers.get("x-txt-request-source"));
+  const shouldUseUiCache = requestSource === "ui" && !url.searchParams.has("fresh");
+  const cacheKey = liveOpsCacheKey({ auditFilter, requestSource });
+  const nowAtStartMs = Date.now();
+  if (shouldUseUiCache) {
+    const cached = liveOpsUiResponseCache.get(cacheKey);
+    if (cached && cached.expiresAtMs > nowAtStartMs) {
+      const routeRequestMetrics = recordLiveOpsRouteRequest("ui_hit");
+      const cachedDiagnostics = {
+        ...cached.payload.live_ops_diagnostics,
+        request_source: requestSource,
+        response_cache_status: "hit",
+        response_cache_ttl_ms: LIVE_OPS_UI_CACHE_TTL_MS,
+        response_cache_age_ms: nowAtStartMs - cached.generatedAtMs,
+        route_request_metrics: routeRequestMetrics,
+      };
+      return buildLiveOpsResponse(
+        {
+          ...cached.payload,
+          live_ops_diagnostics: cachedDiagnostics,
+        },
+        { cacheStatus: "hit", requestSource, ageMs: nowAtStartMs - cached.generatedAtMs },
+      );
+    }
+  }
+  const routeRequestMetrics = recordLiveOpsRouteRequest(shouldUseUiCache ? "ui_miss" : "bypass");
   const shadowSnapshot = getMetricsSnapshot();
   const networkSnapshot = getControlPlaneNetworkMetricsSnapshot();
   const runtimeTruthInput = { symbol: "DESK", marketInstrument: "BTCUSDT", timeframe: "live", strategy: "live-ops" } as const;
@@ -717,9 +816,31 @@ export async function GET(request: Request): Promise<NextResponse> {
 
   const auditTrail = buildAuditTrail(auditRows, telemetryRows, realityGapRows);
   const filteredAuditTrail = filterAuditTrailRows(auditTrail, auditFilter);
+  const controlledLiveRampGateReport = await buildControlledLiveRampGateReport({
+    context: String(process.env.CONTROLLED_LIVE_GATE_CONTEXT || "ops").trim().toLowerCase() === "ci" ? "ci" : "ops",
+    sinceDays: 30,
+    lifecycleReport: buildLifecyclePublishGateReportFromSnapshot(tradeLifecycleHealth),
+    replayArtifact: null,
+    runtimeTruth,
+    publicUrl: String(process.env.CONTROLLED_LIVE_GATE_PUBLIC_URL || "").trim(),
+    authProbeUrl: String(process.env.CONTROLLED_LIVE_GATE_AUTH_URL || "").trim(),
+    authMode: String(process.env.CONTROLLED_LIVE_GATE_AUTH_MODE || "").trim().toLowerCase() === "service"
+      ? "service"
+      : String(process.env.CONTROLLED_LIVE_GATE_AUTH_MODE || "").trim().toLowerCase() === "cookie"
+        ? "cookie"
+        : "auto",
+    authCookie: String(process.env.CONTROLLED_LIVE_GATE_AUTH_COOKIE || "").trim(),
+    authToken: String(process.env.CONTROLLED_LIVE_GATE_AUTH_TOKEN || "").trim(),
+    currentCleanCycles: Math.max(0, toControlledLiveRampGateNumber(process.env.CONTROLLED_LIVE_GATE_CURRENT_CLEAN_CYCLES, 0)),
+    reviewRequiredBaseline: process.env.CONTROLLED_LIVE_GATE_REVIEW_REQUIRED_BASELINE === undefined
+      ? null
+      : Math.max(0, toControlledLiveRampGateNumber(process.env.CONTROLLED_LIVE_GATE_REVIEW_REQUIRED_BASELINE, 0)),
+  });
   const responseBody = {
+    schema_version: LIVE_OPS_PAYLOAD_SCHEMA_VERSION,
     status: "ok",
     generated_at: new Date().toISOString(),
+    controlled_live_ramp_gate: controlledLiveRampGateReport,
     watchdog_state: {
       latency: Number(avgLatencyMs.toFixed(2)),
       drift: Number(avgDriftScore.toFixed(4)),
@@ -1005,8 +1126,13 @@ export async function GET(request: Request): Promise<NextResponse> {
     responseBody.live_ops_diagnostics.canonical_spine_avg_snapshot_age_ms_24h = canonicalSpine24h.cache_age_ms_avg;
     responseBody.live_ops_diagnostics.canonical_spine_max_snapshot_age_ms_24h = canonicalSpine24h.cache_age_ms_max;
   }
-  responseBody.live_ops_diagnostics.payload_bytes = new TextEncoder().encode(JSON.stringify(responseBody)).length;
-  responseBody.live_ops_diagnostics.payload_size_bytes = responseBody.live_ops_diagnostics.payload_bytes;
+  const responseDiagnostics = responseBody.live_ops_diagnostics as JsonMap;
+  responseDiagnostics.request_source = requestSource;
+  responseDiagnostics.response_cache_status = shouldUseUiCache ? "stored" : "bypass";
+  responseDiagnostics.response_cache_ttl_ms = shouldUseUiCache ? LIVE_OPS_UI_CACHE_TTL_MS : 0;
+  responseDiagnostics.route_request_metrics = routeRequestMetrics;
+  responseDiagnostics.payload_bytes = new TextEncoder().encode(JSON.stringify(responseBody)).length;
+  responseDiagnostics.payload_size_bytes = responseDiagnostics.payload_bytes;
   await withTimingAndTimeout(
     () => appendLiveOpsDiagnosticsSample({
       timestamp_iso: String(responseBody.generated_at || new Date().toISOString()),
@@ -1015,7 +1141,7 @@ export async function GET(request: Request): Promise<NextResponse> {
       canonical_spine_ms: canonicalSpineTimed.duration_ms,
       trade_lifecycle_ms: tradeLifecycleHealthTimed.duration_ms,
       hardening_analytics_ms: hardeningAnalytics30dTimed.duration_ms,
-      payload_size_bytes: responseBody.live_ops_diagnostics.payload_size_bytes,
+      payload_size_bytes: toNumber(responseDiagnostics.payload_size_bytes, 0),
       tri_score: toNumber(truthReliability.score_pct, 0),
       tri_status: String(truthReliability.status || "unusable"),
       tri_cap: truthReliability.cap_pct,
@@ -1141,8 +1267,17 @@ export async function GET(request: Request): Promise<NextResponse> {
     false,
   );
 
-  return NextResponse.json(responseBody, {
-    status: 200,
-    headers: { "Cache-Control": "no-store" },
+  const validatedResponseBody = assertLiveOpsCriticalPayload(responseBody);
+  if (shouldUseUiCache) {
+    liveOpsUiResponseCache.set(cacheKey, {
+      payload: validatedResponseBody,
+      expiresAtMs: Date.now() + LIVE_OPS_UI_CACHE_TTL_MS,
+      generatedAtMs: Date.now(),
+    });
+  }
+  return buildLiveOpsResponse(validatedResponseBody, {
+    cacheStatus: shouldUseUiCache ? "stored" : "bypass",
+    requestSource,
+    ageMs: 0,
   });
 }

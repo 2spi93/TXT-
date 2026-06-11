@@ -1,0 +1,168 @@
+name: "txt-constitutional-regression"
+
+on:
+  pull_request:
+    paths:
+      - ui/mission-control/**
+      - apps/control_plane/**
+      - shared/**
+      - .github/workflows/txt-constitutional-regression.yml
+  push:
+    branches:
+      - main
+    paths:
+      - ui/mission-control/**
+      - apps/control_plane/**
+      - shared/**
+      - .github/workflows/txt-constitutional-regression.yml
+
+jobs:
+  contract-scanner:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui/mission-control
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ui/mission-control/package-lock.json
+      - name: install mission-control deps
+        run: npm ci
+      - name: Contract Scanner
+        run: |
+          npm run test:predictor-contract-regression
+          npm run test:constitutional-critical-regression
+
+  truth-scanner:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui/mission-control
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ui/mission-control/package-lock.json
+      - name: install mission-control deps
+        run: npm ci
+      - name: Truth Scanner
+        run: npm run scan:truth-divergence-matrix
+      - name: upload truth scanner report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: constitutional-truth-report
+          path: ui/mission-control/artifacts/constitutional-truth-matrix.report.json
+
+  lifecycle-scanner:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui/mission-control
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ui/mission-control/package-lock.json
+      - name: install mission-control deps
+        run: npm ci
+      - name: Lifecycle Scanner
+        run: npm run scan:lifecycle-publish-gate
+      - name: upload lifecycle scanner report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lifecycle-publish-gate-report
+          path: ui/mission-control/artifacts/lifecycle-publish-gate.report.json
+
+  replay-scanner:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui/mission-control
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ui/mission-control/package-lock.json
+      - name: install mission-control deps
+        run: npm ci
+      - name: Replay Scanner
+        run: npm run scan:replay-certification-gate
+
+      - name: upload replay scanner report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: replay-certified-outcomes-report
+          path: ui/mission-control/artifacts/replay-certified-outcomes.report.json
+
+  controlled-live-ramp-scanner:
+    runs-on: ubuntu-latest
+    needs:
+      - lifecycle-scanner
+      - replay-scanner
+    defaults:
+      run:
+        working-directory: ui/mission-control
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ui/mission-control/package-lock.json
+      - name: install mission-control deps
+        run: npm ci
+      - name: download lifecycle scanner report
+        uses: actions/download-artifact@v4
+        with:
+          name: lifecycle-publish-gate-report
+          path: ui/mission-control/artifacts
+      - name: download replay scanner report
+        uses: actions/download-artifact@v4
+        with:
+          name: replay-certified-outcomes-report
+          path: ui/mission-control/artifacts
+      - name: Controlled Live Ramp Scanner
+        run: CONTROLLED_LIVE_GATE_CONTEXT=ci npm run scan:controlled-live-ramp-gate
+      - name: upload controlled live ramp report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: controlled-live-ramp-gate-report
+          path: |
+            ui/mission-control/artifacts/controlled-live-ramp-gate.report.json
+            ui/mission-control/artifacts/controlled-live-ramp-gate.ci.report.json
+
+  mission-control-build:
+    runs-on: ubuntu-latest
+    needs:
+      - contract-scanner
+      - truth-scanner
+      - lifecycle-scanner
+      - replay-scanner
+      - controlled-live-ramp-scanner
+    defaults:
+      run:
+        working-directory: ui/mission-control
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ui/mission-control/package-lock.json
+      - name: install mission-control deps
+        run: npm ci
+      - name: mission-control build
+        run: npm run build

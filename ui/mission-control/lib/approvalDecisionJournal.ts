@@ -2,8 +2,12 @@ import { appendFile, mkdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 
 export type ApprovalDecisionCausalityConfidence = "native" | "backfilled" | "inferred";
+export type ApprovalDecisionJournalSchemaVersion = "approval-decision/v1";
+
+export const APPROVAL_DECISION_JOURNAL_SCHEMA_VERSION: ApprovalDecisionJournalSchemaVersion = "approval-decision/v1";
 
 export type ApprovalDecisionJournalEntry = {
+  schema_version: ApprovalDecisionJournalSchemaVersion;
   approval_fact_id: string;
   approval_id: string;
   approval_stage: "approval_1" | "approval_2";
@@ -69,24 +73,34 @@ function normalizeRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
+function normalizeSchemaVersion(value: unknown): ApprovalDecisionJournalSchemaVersion | null {
+  const normalized = String(value || "").trim();
+  if (!normalized || normalized === APPROVAL_DECISION_JOURNAL_SCHEMA_VERSION) {
+    return APPROVAL_DECISION_JOURNAL_SCHEMA_VERSION;
+  }
+  return null;
+}
+
 function normalizeEntry(raw: unknown): ApprovalDecisionJournalEntry | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return null;
   }
   const payload = raw as Partial<ApprovalDecisionJournalEntry>;
+  const schemaVersion = normalizeSchemaVersion(payload.schema_version);
   const approvalFactId = String(payload.approval_fact_id || "").trim();
   const approvalId = String(payload.approval_id || "").trim();
   const approvalStage = String(payload.approval_stage || "").trim();
   const symbol = String(payload.symbol || "").trim().toUpperCase();
   const side = String(payload.side || "").trim().toLowerCase();
   const createdAtIso = String(payload.created_at_iso || "").trim();
-  if (!approvalFactId || !approvalId || !symbol || !side || !createdAtIso) {
+  if (!schemaVersion || !approvalFactId || !approvalId || !symbol || !side || !createdAtIso || !Number.isFinite(Date.parse(createdAtIso))) {
     return null;
   }
   if (approvalStage !== "approval_1" && approvalStage !== "approval_2") {
     return null;
   }
   return {
+    schema_version: schemaVersion,
     approval_fact_id: approvalFactId,
     approval_id: approvalId,
     approval_stage: approvalStage,
@@ -117,6 +131,14 @@ function normalizeEntry(raw: unknown): ApprovalDecisionJournalEntry | null {
     source_event_category: String(payload.source_event_category || "approval_decision_event").trim() || "approval_decision_event",
     created_at_iso: createdAtIso,
   };
+}
+
+export function assertApprovalDecisionJournalEntry(entry: ApprovalDecisionJournalEntry): ApprovalDecisionJournalEntry {
+  const normalized = normalizeEntry(entry);
+  if (!normalized) {
+    throw new Error("ApprovalDecisionJournal contract violation");
+  }
+  return normalized;
 }
 
 async function loadAllEntries(): Promise<ApprovalDecisionJournalEntry[]> {
@@ -160,9 +182,10 @@ async function loadAllEntries(): Promise<ApprovalDecisionJournalEntry[]> {
 }
 
 export async function appendApprovalDecisionJournalEntry(entry: ApprovalDecisionJournalEntry): Promise<void> {
+  const normalizedEntry = assertApprovalDecisionJournalEntry(entry);
   const target = filePath();
   await mkdir(path.dirname(target), { recursive: true });
-  await appendFile(target, `${JSON.stringify(entry)}\n`, "utf-8");
+  await appendFile(target, `${JSON.stringify(normalizedEntry)}\n`, "utf-8");
   journalCache = null;
 }
 

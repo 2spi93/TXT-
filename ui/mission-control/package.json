@@ -37,6 +37,14 @@
     "test:terminal-v4-canonical-multi-tf": "sh scripts/run_terminal_v4_canonical_multi_tf.sh",
     "test:xscale-viewport-guard": "node scripts/test-xscale-viewport-guard.js",
     "test:ohlcv-kernel-regression": "sh scripts/test-ohlcv-kernel-regression.sh",
+    "test:predictor-contract-regression": "sh scripts/test-predictor-contract-regression.sh",
+    "scan:truth-divergence-matrix": "sh scripts/scan-runtime-truth-matrix.sh",
+    "scan:lifecycle-publish-gate": "sh scripts/scan-lifecycle-publish-gate.sh",
+    "scan:controlled-live-ramp-gate": "sh scripts/scan-controlled-live-ramp-gate.sh",
+    "scan:controlled-live-ramp-gate:ops-docker": "sh scripts/scan-controlled-live-ramp-gate-ops-docker.sh",
+    "scan:critical-route-divergence": "sh scripts/scan-critical-route-divergence.sh",
+    "scan:replay-certification-gate": "sh scripts/scan-replay-certification-gate.sh",
+    "test:constitutional-critical-regression": "sh scripts/scan-critical-route-divergence.sh",
     "test:risk-workspace": "node scripts/risk-workspace.integration.js",
     "pretest:e2e": "node scripts/playwright-preflight.js",
     "test:e2e": "playwright test",
@@ -47,9 +55,11 @@
     "qa:terminal-reliability": "sh scripts/qa-terminal-reliability.sh"
   },
   "dependencies": {
+    "@types/pg": "^8.20.0",
     "jszip": "^3.10.1",
     "lightweight-charts": "4.2.3",
     "next": "15.5.10",
+    "pg": "^8.21.0",
     "react": "18.3.1",
     "react-dom": "18.3.1",
     "react-resizable-panels": "^2.1.9"

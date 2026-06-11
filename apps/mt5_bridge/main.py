@@ -237,7 +237,10 @@ def _listed_symbols_for_account(account: dict[str, Any]) -> list[str]:
 
 
 def _normalize_symbol(symbol: str) -> str:
-    return str(symbol or "").replace("-PERP", "").replace("/", "").replace("-", "").strip().upper()
+    normalized = str(symbol or "").replace("-PERP", "").replace("/", "").replace("-", "").strip().upper()
+    if normalized == "BTCUSDT":
+        return "BTCUSD"
+    return normalized
 
 
 def _parse_mql_key_value_body(body: str) -> dict[str, Any]:

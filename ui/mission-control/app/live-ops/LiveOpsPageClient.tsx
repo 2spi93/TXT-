@@ -46,6 +46,8 @@ const SYSTEM_MODE_OVERRIDE_STORAGE_KEY = "txt.liveops.system-mode-override.v1";
 const SYSTEM_MODE_OVERRIDE_TTL_MS = 10 * 60 * 1000;
 const HYDRATION_SAFE_DATE_KEY = "1970-01-01";
 const INITIAL_LIVE_OPS_CONVERGENCE_DELAY_MS = 0;
+const LIVE_OPS_VISIBLE_REFRESH_MS = 20_000;
+const LIVE_OPS_HIDDEN_REFRESH_MS = 60_000;
 const LIVE_OPS_PRIMARY_FETCH_TIMEOUT_MS = 12_000;
 const LIVE_OPS_MODE_FETCH_TIMEOUT_MS = 4_000;
 const LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS = 4_000;
@@ -187,6 +189,18 @@ function asRecord(value: unknown): JsonMap {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as JsonMap
     : {};
+}
+
+function asRecordArray(value: unknown): JsonMap[] {
+  return Array.isArray(value)
+    ? value.filter((item) => item && typeof item === "object" && !Array.isArray(item)) as JsonMap[]
+    : [];
+}
+
+function asStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
 }
 
 function formatApiErrorDetail(value: unknown, fallback: string): string {
@@ -331,6 +345,8 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
   const [executionPnlAnalyzerPayload, setExecutionPnlAnalyzerPayload] = useState<JsonMap | null>(null);
   const [executionAiV6Payload, setExecutionAiV6Payload] = useState<JsonMap | null>(null);
   const [mt5PendingPayload, setMt5PendingPayload] = useState<JsonMap | null>(null);
+  const [predictorAnalyticsPayload, setPredictorAnalyticsPayload] = useState<JsonMap | null>(null);
+  const [predictorAnalyticsError, setPredictorAnalyticsError] = useState<string | null>(null);
   const [executionTelemetryPayload, setExecutionTelemetryPayload] = useState<JsonMap | null>(null);
   const [recentOutcomesPayload, setRecentOutcomesPayload] = useState<JsonMap | null>(null);
   const [recentGapPayload, setRecentGapPayload] = useState<JsonMap | null>(null);
@@ -383,8 +399,12 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
           }
         }, timeoutMs);
         try {
-          const response = await fetch(url, { cache: "no-store", signal: controller.signal }).catch(() => null);
-          if (!response || !response.ok) {
+          const response = await fetch(url, {
+            cache: "no-store",
+            signal: controller.signal,
+            headers: { "X-TXT-Request-Source": "ui" },
+          }).catch(() => null);
+          if (!response) {
             return { response, payload: null };
           }
           const payload = await response.json().catch(() => null);
@@ -395,9 +415,11 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
         }
       };
 
-      const liveOpsUrl = auditFilter
-        ? `/api/system/live-ops?audit_filter=${encodeURIComponent(auditFilter)}`
-        : "/api/system/live-ops";
+      const liveOpsParams = new URLSearchParams({ source: "ui" });
+      if (auditFilter) {
+        liveOpsParams.set("audit_filter", auditFilter);
+      }
+      const liveOpsUrl = `/api/system/live-ops?${liveOpsParams.toString()}`;
       const [
         liveOpsResponse,
         systemModeResponse,
@@ -405,6 +427,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
         pnlResponse,
         executionAiResponse,
         mt5PendingResponse,
+        predictorAnalyticsResponse,
         telemetryResponse,
         outcomesResponse,
         gapResponse,
@@ -415,6 +438,7 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
         fetchJsonWithTimeout("/api/execution/pnl-analyzer?scope_type=strategy&scope_id=mt5-live&limit=50", LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS),
         fetchJsonWithTimeout("/api/execution/ai/v6/state", LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS),
         fetchJsonWithTimeout("/api/mt5/orders/live-pending", LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS),
+        fetchJsonWithTimeout("/api/system/predictor-rejection-analytics?sinceDays=30", LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS),
         fetchJsonWithTimeout("/api/execution/telemetry/recent?limit=80", LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS),
         fetchJsonWithTimeout("/api/outcomes/recent?limit=80", LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS),
         fetchJsonWithTimeout("/api/execution/reality-gap/recent?limit=80", LIVE_OPS_OPTIONAL_FETCH_TIMEOUT_MS),
@@ -442,6 +466,12 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
       setExecutionPnlAnalyzerPayload(pnlResponse.payload);
       setExecutionAiV6Payload(executionAiResponse.payload);
       setMt5PendingPayload(mt5PendingResponse.payload);
+      setPredictorAnalyticsPayload(predictorAnalyticsResponse.response?.ok ? predictorAnalyticsResponse.payload : null);
+      setPredictorAnalyticsError(
+        predictorAnalyticsResponse.response && !predictorAnalyticsResponse.response.ok
+          ? formatApiErrorDetail(predictorAnalyticsResponse.payload, "Contrat predictor indisponible")
+          : null,
+      );
       setExecutionTelemetryPayload(telemetryResponse.payload);
       setRecentOutcomesPayload(outcomesResponse.payload);
       setRecentGapPayload(gapResponse.payload);
@@ -654,26 +684,49 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
 
   useEffect(() => {
     let mounted = true;
+    let timer: number | null = null;
     const refresh = async () => {
       if (!mounted) {
         return;
       }
       await loadData();
     };
+    const scheduleNextRefresh = () => {
+      if (!mounted) {
+        return;
+      }
+      if (timer) {
+        window.clearTimeout(timer);
+      }
+      const intervalMs = document.visibilityState === "visible"
+        ? LIVE_OPS_VISIBLE_REFRESH_MS
+        : LIVE_OPS_HIDDEN_REFRESH_MS;
+      timer = window.setTimeout(() => {
+        if (document.visibilityState === "visible") {
+          void refresh();
+        }
+        scheduleNextRefresh();
+      }, intervalMs);
+    };
     const initialRefreshDelayMs = initialLiveOpsPayload ? INITIAL_LIVE_OPS_CONVERGENCE_DELAY_MS : 0;
     const initialRefreshTimer = window.setTimeout(() => {
       void refresh();
     }, initialRefreshDelayMs);
-    const timer = window.setInterval(() => {
-      if (document.visibilityState === "hidden") {
-        return;
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void refresh();
       }
-      void refresh();
-    }, 15_000);
+      scheduleNextRefresh();
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    scheduleNextRefresh();
     return () => {
       mounted = false;
       window.clearTimeout(initialRefreshTimer);
-      window.clearInterval(timer);
+      if (timer) {
+        window.clearTimeout(timer);
+      }
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, [auditFilter, initialLiveOpsPayload]);
 
@@ -774,6 +827,13 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
   const decisionJourneyCompletion = asRecord(tradeLifecycleHealth.decision_journey_completion);
   const decisionGapReduction = asRecord(tradeLifecycleHealth.decision_gap_reduction);
   const decisionGapResolution = asRecord(tradeLifecycleHealth.decision_gap_resolution);
+  const terminalDecisionStateDiagnostic = asRecord(tradeLifecycleHealth.terminal_decision_state_diagnostic);
+  const terminalClosedStates = asRecord(terminalDecisionStateDiagnostic.terminal_closed);
+  const terminalActiveDebt = asRecord(terminalDecisionStateDiagnostic.active_debt);
+  const terminalReviewRequired = asRecord(terminalDecisionStateDiagnostic.review_required);
+  const terminalReviewRequiredItems = asRecordArray(terminalReviewRequired.items).slice(0, 6);
+  const executionGapDiagnostic = asRecord(tradeLifecycleHealth.execution_gap_diagnostic);
+  const executionGapBlockedFamilyBreakdown = asRecordArray(executionGapDiagnostic.blocked_family_breakdown);
   const decisionGapReduction7d = asRecord(measurementWindow7d.decision_gap_reduction);
   const decisionGapReduction30d = asRecord(measurementWindow30d.decision_gap_reduction);
   const decisionGapResolution7d = asRecord(measurementWindow7d.decision_gap_resolution);
@@ -805,6 +865,24 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
   const decisionGapReduction7dDominantStage = decisionGapReduction7dByStage.find((stage) => String(stage.stage_key || "").trim() === decisionGapReduction7dDominantStageKey) || null;
   const decisionGapReduction30dDominantStage = decisionGapReduction30dByStage.find((stage) => String(stage.stage_key || "").trim() === decisionGapReduction30dDominantStageKey) || null;
   const gapResolutionRatePct = toNumber(decisionGapResolution.gap_resolution_rate_pct, journeyCompletionRatePct);
+  const terminalPublishBlocked = Boolean(terminalDecisionStateDiagnostic.publish_blocked);
+  const executionGapBlockedDecisionTotal = toNumber(executionGapDiagnostic.blocked_decision_total, 0);
+  const lifecyclePublishBlocked = terminalPublishBlocked || executionGapBlockedDecisionTotal > 0;
+  const lifecyclePublishBlockReasons = [
+    ...asStringArray(terminalDecisionStateDiagnostic.publish_block_reasons),
+    ...executionGapBlockedFamilyBreakdown.flatMap((entry) => {
+      const familyKey = String(entry.family_key || "").trim();
+      const total = toNumber(entry.decision_total, 0);
+      return familyKey && total > 0 ? [`execution_gap:${familyKey}:${total}`] : [];
+    }),
+  ];
+  const terminalClosedTotal = [
+    toNumber(terminalClosedStates.cancelled, 0),
+    toNumber(terminalClosedStates.stale_cancelled, 0),
+    toNumber(terminalClosedStates.rejected, 0),
+    toNumber(terminalClosedStates.hardening_rejected, 0),
+    toNumber(terminalClosedStates.expired, 0),
+  ].reduce((sum, value) => sum + value, 0);
   const meanTimeToContinuityHours = Number.isFinite(Number(decisionGapResolution.mean_time_to_continuity_hours))
     ? toNumber(decisionGapResolution.mean_time_to_continuity_hours, 0)
     : null;
@@ -1216,6 +1294,44 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
   const microLiveEntrySummary = microLiveEntryStatus === "OPEN"
     ? `${microLiveCurrentStage} · cap ${formatUsd(microLiveStageCapUsd)}`
     : dedupeNonEmptyStrings([...microLiveEntryReasons, ...microLiveWarningReasons]).slice(0, 2).join(" · ") || "Gate micro-live degrade";
+  const controlledLiveRampGateReport = asRecord(snapshot.controlled_live_ramp_gate);
+  const controlledLiveRampGate = asRecord(controlledLiveRampGateReport.controlled_live_ramp_gate);
+  const controlledLiveRampRuntimeTruthGate = asRecord(controlledLiveRampGateReport.runtime_truth_gate);
+  const controlledLiveRampReplayGate = asRecord(controlledLiveRampGateReport.replay_certification_gate);
+  const controlledLiveRampPublicHealth = asRecord(controlledLiveRampGateReport.gateway_public_health);
+  const controlledLiveRampPublicProbe = asRecord(controlledLiveRampGateReport.public_probe);
+  const controlledLiveRampAuthProbe = asRecord(controlledLiveRampGateReport.auth_probe);
+  const controlledLiveRampSettlementTruth = asRecord(controlledLiveRampGateReport.settlement_truth);
+  const controlledLiveRampSettlementContextDiff = asRecord(controlledLiveRampGateReport.settlement_source_context_diff);
+  const controlledLiveRampOpsRunnerContext = asRecord(controlledLiveRampGateReport.ops_runner_context);
+  const controlledLiveRampBusHealth = asRecord(controlledLiveRampGateReport.bus_health);
+  const controlledLiveRampBusPublisher = asRecord(controlledLiveRampBusHealth.publisher);
+  const controlledLiveRampBusConsumer = asRecord(controlledLiveRampBusHealth.consumer);
+  const controlledLiveRampBusTransport = asRecord(controlledLiveRampBusHealth.transport);
+  const controlledLiveRampRuntimeTruthMatrix = asRecord(controlledLiveRampGateReport.runtime_truth_matrix);
+  const controlledLiveRampRuntimeTruthMatrixCoverage = asRecord(controlledLiveRampRuntimeTruthMatrix.coverage);
+  const controlledLiveRampRuntimeSourceMap = asRecord(controlledLiveRampGateReport.runtime_source_degradation_map);
+  const controlledLiveRampRuntimeSourceRows = asRecordArray(controlledLiveRampRuntimeSourceMap.sources).slice(0, 8);
+  const controlledLiveRampCleanliness = asRecord(controlledLiveRampGateReport.new_cycle_cleanliness);
+  const controlledLiveRampAllowed = Boolean(controlledLiveRampGate.allowed);
+  const controlledLiveRampOpsVerdictAvailable = controlledLiveRampGate.ops_verdict_available !== false;
+  const controlledLiveRampOpsUnavailableReasons = asStringArray(controlledLiveRampGate.ops_verdict_unavailable_reasons);
+  const controlledLiveRampMissingRuntimeSources = asStringArray(controlledLiveRampGate.missing_runtime_truth_sources);
+  const controlledLiveRampDegradedRuntimeSources = asStringArray(controlledLiveRampGate.degraded_runtime_truth_sources);
+  const controlledLiveRampKillSwitch = asRecord(controlledLiveRampGate.kill_switch);
+  const controlledLiveRampKillSwitchResetBlockers = asStringArray(controlledLiveRampKillSwitch.reset_blockers);
+  const controlledLiveRampAuthMissingFields = asStringArray(controlledLiveRampAuthProbe.missing_fields);
+  const controlledLiveRampMode = String(controlledLiveRampGate.mode || "unavailable");
+  const controlledLiveRampTone = controlledLiveRampAllowed
+    ? controlledLiveRampMode === "probe" ? "subtle" : "good"
+    : "warn";
+  const controlledLiveRampBlockReasons = asStringArray(controlledLiveRampGate.block_reasons);
+  const controlledLiveRampYellowFlags = asStringArray(controlledLiveRampGate.yellow_flags);
+  const controlledLiveRampSummary = controlledLiveRampAllowed
+    ? `${controlledLiveRampMode} · x${toNumber(controlledLiveRampGate.max_notional_multiplier, 0).toFixed(2)} notional · next ${String(controlledLiveRampGate.promotion_target || "micro_live")}`
+    : !controlledLiveRampOpsVerdictAvailable
+      ? `ops verdict unavailable · ${controlledLiveRampOpsUnavailableReasons.slice(0, 2).join(" · ") || "observability"}`
+      : controlledLiveRampBlockReasons.slice(0, 2).join(" · ") || "controlled ramp blocked";
   const alerts = Array.isArray(snapshot.alerts) ? snapshot.alerts : [];
   const backendMode = String(governance.backend_mode || "guarded_auto");
   const modeConfig = asRecord(systemModePayload);
@@ -1274,6 +1390,29 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
     }))
     .filter((row) => row.approvalId)
     .slice(0, 5);
+  const predictorAnalytics = asRecord(predictorAnalyticsPayload);
+  const predictorAcceptanceRatePct = toNumber(predictorAnalytics.predictor_acceptance_rate_pct, 0);
+  const predictorEvaluatedTotal = toNumber(predictorAnalytics.predictor_evaluated_total, 0);
+  const predictorAcceptedTotal = toNumber(predictorAnalytics.predictor_accepted_total, 0);
+  const predictorRejectedTotal = toNumber(predictorAnalytics.predictor_rejected_total, 0);
+  const predictorWindowDays = toNumber(predictorAnalytics.window_days, 30);
+  const predictorSourceDiagnostics = asRecord(predictorAnalytics.source_diagnostics);
+  const predictorAcceptanceTone = toneClassForPct(predictorAcceptanceRatePct);
+  const predictorCauseRows = asRecordArray(predictorAnalytics.top_rejection_causes).slice(0, 6);
+  const predictorSymbolRows = asRecordArray(predictorAnalytics.symbol_rows).slice(0, 4);
+  const predictorSessionRows = asRecordArray(predictorAnalytics.session_rows).slice(0, 4);
+  const predictorRegimeRows = asRecordArray(predictorAnalytics.regime_rows)
+    .filter((row) => String(row.key || "") !== "unknown")
+    .slice(0, 4);
+  const predictorHourRows = [...asRecordArray(predictorAnalytics.hour_rows)]
+    .sort((left, right) => {
+      if (toNumber(right.rejected_total, 0) !== toNumber(left.rejected_total, 0)) {
+        return toNumber(right.rejected_total, 0) - toNumber(left.rejected_total, 0);
+      }
+      return toNumber(right.evaluated_total, 0) - toNumber(left.evaluated_total, 0);
+    })
+    .slice(0, 4);
+  const predictorAnalyticsReady = predictorEvaluatedTotal > 0 || predictorCauseRows.length > 0;
   const nowMs = Date.now();
   const recentWindowMs = 24 * 60 * 60 * 1000;
   const telemetryRows = unwrapRows(executionTelemetryPayload);
@@ -1807,6 +1946,85 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
       </section>
 
       <section className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", marginBottom: 16 }}>
+        <div className="panel" data-testid="live-ops-predictor-rejection-analytics-panel">
+          <OperatorPanelGuide
+            title="Predictor Rejection Analytics"
+            what="Mesure les decisions micro-live vraiment evaluees par le predictor apres Approval #2."
+            why="Distinguer le verrou predictor du reste de la chaine et prioriser les causes de rejet qui plafonnent le micro-live."
+            example="Si l'infra est GO mais que l'acceptance rate predictor reste bas, le prochain travail est sur la qualification predictor, pas sur le bridge ou le broker."
+            compact
+          />
+          <div className="row" style={{ marginTop: 10 }}><span>Acceptance rate</span><span className={predictorAcceptanceTone}>{predictorAcceptanceRatePct.toFixed(1)}%</span></div>
+          <div className="row"><span>Predictor evaluated</span><span>{predictorEvaluatedTotal}</span></div>
+          <div className="row"><span>Accepted</span><span className={predictorAcceptedTotal > 0 ? "good" : "subtle"}>{predictorAcceptedTotal}</span></div>
+          <div className="row"><span>Rejected</span><span className={predictorRejectedTotal > 0 ? "warn" : "subtle"}>{predictorRejectedTotal}</span></div>
+          <div className="subtle mini" style={{ marginTop: 8 }}>
+            Fenetre {predictorWindowDays} jours · journal scanne {toNumber(predictorSourceDiagnostics.rows_scanned, 0)} · decisions retenues {toNumber(predictorSourceDiagnostics.rows_returned, 0)}
+          </div>
+          <div style={{ marginTop: 14 }}>
+            <div className="subtle mini" style={{ marginBottom: 6 }}>Top causes de rejet predictor</div>
+            {predictorAnalyticsReady && predictorCauseRows.length > 0 ? (
+              <div style={{ display: "grid", gap: 8 }}>
+                {predictorCauseRows.map((row) => (
+                  <div key={String(row.reason_key || row.label || "unknown")} style={{ border: "1px solid rgba(148, 163, 184, 0.16)", borderRadius: 12, padding: 10, background: "rgba(15, 23, 42, 0.22)" }}>
+                    <div className="row"><span>{String(row.label || formatReasonLabel(String(row.reason_key || "other")))}</span><span className="warn">{toNumber(row.count, 0)}</span></div>
+                    <div className="subtle mini" style={{ marginTop: 4 }}>
+                      {toNumber(row.share_pct, 0).toFixed(1)}% des rejets · symboles {asStringArray(row.unique_symbols).join(", ") || "-"}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : predictorAnalyticsError ? (
+              <div className="warn mini">Contrat predictor en erreur: {predictorAnalyticsError}</div>
+            ) : (
+              <div className="subtle mini">Aucune decision predictor evaluee dans la fenetre locale. Le bloc se remplira des que le journal Approval #2 recense de nouveaux passages.</div>
+            )}
+          </div>
+        </div>
+        <div className="panel">
+          <div className="eyebrow">Rejets par contexte</div>
+          <div style={{ display: "grid", gap: 14, marginTop: 10 }}>
+            <div>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Par symbole</div>
+              {predictorSymbolRows.length > 0 ? predictorSymbolRows.map((row) => (
+                <div key={String(row.key || row.label || "symbol")} className="row" style={{ marginTop: 4 }}>
+                  <span>{String(row.label || row.key || "-")}</span>
+                  <span>{toNumber(row.accepted_total, 0)} acc · {toNumber(row.rejected_total, 0)} rej · {toNumber(row.acceptance_rate_pct, 0).toFixed(1)}%</span>
+                </div>
+              )) : <div className="subtle mini">Aucune ligne symbole.</div>}
+            </div>
+            <div>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Par session</div>
+              {predictorSessionRows.length > 0 ? predictorSessionRows.map((row) => (
+                <div key={String(row.key || row.label || "session")} className="row" style={{ marginTop: 4 }}>
+                  <span>{String(row.label || row.key || "-")}</span>
+                  <span>{toNumber(row.accepted_total, 0)} acc · {toNumber(row.rejected_total, 0)} rej</span>
+                </div>
+              )) : <div className="subtle mini">Aucune ligne session.</div>}
+            </div>
+            <div>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Par regime</div>
+              {predictorRegimeRows.length > 0 ? predictorRegimeRows.map((row) => (
+                <div key={String(row.key || row.label || "regime")} className="row" style={{ marginTop: 4 }}>
+                  <span>{String(row.label || row.key || "-")}</span>
+                  <span>{toNumber(row.accepted_total, 0)} acc · {toNumber(row.rejected_total, 0)} rej</span>
+                </div>
+              )) : <div className="subtle mini">Aucun regime exploitable encore projete.</div>}
+            </div>
+            <div>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>Heures UTC les plus rejectives</div>
+              {predictorHourRows.length > 0 ? predictorHourRows.map((row) => (
+                <div key={String(row.key || row.label || "hour")} className="row" style={{ marginTop: 4 }}>
+                  <span>{String(row.label || row.key || "-")}</span>
+                  <span>{toNumber(row.rejected_total, 0)} rej · {toNumber(row.evaluated_total, 0)} eval</span>
+                </div>
+              )) : <div className="subtle mini">Aucune heure chaude detectee.</div>}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", marginBottom: 16 }}>
         <div className="panel" data-testid="live-ops-micro-live-program-panel">
           <OperatorPanelGuide
             title="Micro-live gouverne"
@@ -1962,6 +2180,13 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
           <div className="row"><span>Created decisions</span><span>{createdDecisionTotal}</span></div>
           <div className="row"><span>Complete decisions</span><span className={completeDecisionTotal > 0 ? "good" : "warn"}>{completeDecisionTotal}</span></div>
           <div className="row"><span>Incomplete decisions</span><span className={incompleteDecisionTotal > 0 ? "warn" : "good"}>{incompleteDecisionTotal}</span></div>
+          <div className="row"><span>Lifecycle publish gate</span><span className={lifecyclePublishBlocked ? "warn" : "good"}>{lifecyclePublishBlocked ? "blocked" : "clear"}</span></div>
+          <div className="row"><span>Controlled live ramp gate</span><span className={controlledLiveRampTone}>{controlledLiveRampAllowed ? controlledLiveRampMode : "halted"}</span></div>
+          <div className="row"><span>Terminal publish blocked</span><span className={terminalPublishBlocked ? "warn" : "good"}>{terminalPublishBlocked ? "yes" : "no"}</span></div>
+          <div className="row"><span>Execution debt blocked</span><span className={executionGapBlockedDecisionTotal > 0 ? "warn" : "good"}>{executionGapBlockedDecisionTotal}</span></div>
+          <div className="row"><span>Terminal closed total</span><span className={terminalClosedTotal > 0 ? "good" : "subtle"}>{terminalClosedTotal}</span></div>
+          <div className="row"><span>Stale cancelled</span><span className={toNumber(terminalClosedStates.stale_cancelled, 0) > 0 ? "good" : "subtle"}>{toNumber(terminalClosedStates.stale_cancelled, 0)}</span></div>
+          <div className="row"><span>Review required</span><span className={toNumber(terminalReviewRequired.total, toNumber(terminalDecisionStateDiagnostic.review_required_total, 0)) > 0 ? "subtle" : "good"}>{toNumber(terminalReviewRequired.total, toNumber(terminalDecisionStateDiagnostic.review_required_total, 0))}</span></div>
           <div className="row"><span>Decision Journey Completion Rate</span><span className={toneClassForPct(journeyCompletionRatePct)}>{journeyCompletionRatePct.toFixed(1)}%</span></div>
           <div className="row"><span>Institutional tier</span><span className={decisionContinuityGovernanceRule.tone}>{decisionContinuityGovernanceRule.label}</span></div>
           <div className="row"><span>First missing stage dominant</span><span className={decisionGapReductionDominantStage && toNumber(decisionGapReductionDominantStage.blocked_decision_total, 0) > 0 ? "warn" : "good"}>{decisionGapReductionDominantStage ? String(decisionGapReductionDominantStage.gap_label || decisionGapReductionDominantStage.label || "none") : "none"}</span></div>
@@ -1979,6 +2204,110 @@ export default function LiveOpsPageClient({ initialLiveOpsPayload = null }: Live
           <div className="row"><span>Evidence mix</span><span>N {toNumber(decisionEvidenceQuality.native, 0)} / B {toNumber(decisionEvidenceQuality.backfilled, 0)} / I {toNumber(decisionEvidenceQuality.inferred, 0)} / M {toNumber(decisionEvidenceQuality.missing, 0)}</span></div>
           <div className="row"><span>Causality confidence</span><span>N {toNumber(lifecycleCausalityConfidence.native, 0)} / B {toNumber(lifecycleCausalityConfidence.backfilled, 0)} / I {toNumber(lifecycleCausalityConfidence.inferred, 0)}</span></div>
           <div className="row"><span>Execution + Opportunity</span><span>{toNumber(tradeLifecycleHealth.cross_object_lifecycle_total, 0)}</span></div>
+          <div style={{ marginTop: 12, borderRadius: 12, border: lifecyclePublishBlocked ? "1px solid rgba(248, 113, 113, 0.24)" : "1px solid rgba(34, 197, 94, 0.22)", padding: 12, background: lifecyclePublishBlocked ? "rgba(127, 29, 29, 0.12)" : "rgba(20, 83, 45, 0.14)" }}>
+            <div className="subtle mini">Lifecycle publish gate gouverne par la verite metier terminale, pas par la dette structurelle brute.</div>
+            <div className={lifecyclePublishBlocked ? "warn" : "good"} style={{ fontSize: 22, fontWeight: 700, marginTop: 4 }}>{lifecyclePublishBlocked ? "BLOCKED" : "CLEAR"}</div>
+            <div className="subtle mini" style={{ marginTop: 4 }}>Terminal debt active {toNumber(terminalActiveDebt.hardening_not_reached, 0) + toNumber(terminalActiveDebt.hardening_rejected_without_reason, 0) + toNumber(terminalActiveDebt.approved_without_route, 0) + toNumber(terminalActiveDebt.routed_without_execution_event, 0) + toNumber(terminalActiveDebt.execution_without_outcome, 0)} · execution debt {executionGapBlockedDecisionTotal} · review blockers {toNumber(terminalReviewRequired.blocking_total, 0)}</div>
+            {lifecyclePublishBlockReasons.length > 0 ? (
+              <div style={{ marginTop: 10 }}>
+                <div className="subtle mini" style={{ marginBottom: 6 }}>publish_block_reasons</div>
+                {lifecyclePublishBlockReasons.map((reason, index) => (
+                  <div key={`publish-block-reason-${index}`} className="row" style={{ marginTop: 4 }}>
+                    <span>{reason}</span>
+                    <span className="warn">block</span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="subtle mini" style={{ marginTop: 8 }}>publish_block_reasons: none</div>
+            )}
+          </div>
+          <div style={{ marginTop: 12, borderRadius: 12, border: controlledLiveRampAllowed ? "1px solid rgba(34, 197, 94, 0.22)" : "1px solid rgba(248, 113, 113, 0.24)", padding: 12, background: controlledLiveRampAllowed ? "rgba(20, 83, 45, 0.14)" : "rgba(127, 29, 29, 0.12)" }}>
+            <div className="subtle mini">controlled_live_ramp_gate agrège lifecycle, runtime truth, replay et public health avant promotion de taille.</div>
+            <div className={controlledLiveRampTone} style={{ fontSize: 22, fontWeight: 700, marginTop: 4 }}>{controlledLiveRampAllowed ? "ALLOWED" : "HALTED"}</div>
+            <div className="subtle mini" style={{ marginTop: 4 }}>{controlledLiveRampSummary}</div>
+            <div className="row" style={{ marginTop: 8 }}><span>Ops verdict</span><span className={controlledLiveRampOpsVerdictAvailable ? "good" : "warn"}>{controlledLiveRampOpsVerdictAvailable ? "available" : "unavailable"}</span></div>
+            <div className="row"><span>Ramp mode</span><span className={controlledLiveRampTone}>{controlledLiveRampMode}</span></div>
+            <div className="row" style={{ marginTop: 8 }}><span>Clean cycles</span><span>{toNumber(controlledLiveRampGate.current_clean_cycles, 0)} / {toNumber(controlledLiveRampGate.required_clean_cycles, 3)}</span></div>
+            <div className="row"><span>Runtime truth</span><span className={String(controlledLiveRampRuntimeTruthGate.verdict || "UNAVAILABLE") === "BLOCKED" ? "warn" : String(controlledLiveRampRuntimeTruthGate.verdict || "") === "DEGRADED" ? "subtle" : "good"}>{String(controlledLiveRampRuntimeTruthGate.verdict || "UNAVAILABLE")}</span></div>
+            <div className="row"><span>Runtime matrix coverage</span><span className={String(controlledLiveRampRuntimeTruthMatrix.status || "") === "available" ? "good" : "warn"}>{toNumber(controlledLiveRampRuntimeTruthMatrixCoverage.available, 0)} / {toNumber(controlledLiveRampRuntimeTruthMatrixCoverage.required, 0)} · {String(controlledLiveRampRuntimeTruthMatrix.status || "unknown")}</span></div>
+            <div className="row"><span>Settlement truth</span><span className={String(controlledLiveRampSettlementTruth.status || "") === "available" ? "good" : "warn"}>{String(controlledLiveRampSettlementTruth.status || "unknown")} · {String(controlledLiveRampSettlementTruth.repair_hint || controlledLiveRampSettlementTruth.source || "-")}</span></div>
+            <div className="row"><span>Settlement source</span><span className={String(controlledLiveRampSettlementContextDiff.status || "") === "available" && controlledLiveRampSettlementContextDiff.ops_context_allowed !== false ? "good" : "warn"}>{String(controlledLiveRampSettlementContextDiff.source_context || "unknown")} · {String(controlledLiveRampSettlementContextDiff.http_status || "-")} · {String(controlledLiveRampSettlementContextDiff.resolved_url || controlledLiveRampSettlementContextDiff.expected_url || "-")}</span></div>
+            <div className="row"><span>Settlement context</span><span className={controlledLiveRampSettlementContextDiff.ops_context_allowed === false ? "warn" : "good"}>{controlledLiveRampSettlementContextDiff.ops_context_allowed === false ? "ops route not allowed" : "ops route allowed"} · {String(controlledLiveRampSettlementContextDiff.repair_hint || "no repair hint")}</span></div>
+            <div className="row"><span>Ops runner</span><span className={controlledLiveRampOpsRunnerContext.valid === false ? "warn" : "good"}>{controlledLiveRampOpsRunnerContext.valid === false ? "invalid" : "valid"} · {String(controlledLiveRampOpsRunnerContext.network_context || "unknown")} · {String(controlledLiveRampOpsRunnerContext.runner_service || "unknown")}</span></div>
+            <div className="row"><span>Settlement mismatch</span><span className={controlledLiveRampSettlementContextDiff.missing_source_reason ? "warn" : "good"}>{String(controlledLiveRampSettlementContextDiff.missing_source_reason || "none")}</span></div>
+            <div className="row"><span>Missing truth sources</span><span className={controlledLiveRampMissingRuntimeSources.length > 0 ? "warn" : "good"}>{controlledLiveRampMissingRuntimeSources.join(", ") || "none"}</span></div>
+            <div className="row"><span>Degraded truth sources</span><span className={controlledLiveRampDegradedRuntimeSources.length > 0 ? "warn" : "good"}>{controlledLiveRampDegradedRuntimeSources.join(", ") || "none"}</span></div>
+            {controlledLiveRampRuntimeSourceRows.length > 0 ? (
+              <div style={{ marginTop: 8 }}>
+                <div className="subtle mini" style={{ marginBottom: 6 }}>runtime_source_degradation_map</div>
+                {controlledLiveRampRuntimeSourceRows.map((source, index) => {
+                  const status = String(source.status || "unknown");
+                  const detailStatus = String(source.detail_status || "").trim();
+                  const sourceReasons = asStringArray(source.degradation_reasons);
+                  const freshness = asRecord(source.freshness);
+                  const sourceTone = status === "available" ? "good" : status === "skipped" ? "subtle" : "warn";
+                  return (
+                    <div key={`controlled-ramp-source-map-${String(source.name || "source")}-${index}`} className="row" style={{ marginTop: 4 }}>
+                      <span>{String(source.name || "source")}{detailStatus ? ` · ${detailStatus}` : ""} · {sourceReasons.slice(0, 2).join(", ") || String(source.repair_hint || "ok")}</span>
+                      <span className={sourceTone}>{status}{Boolean(source.blocking) ? " · block" : ""}{freshness.stale === true ? " · stale" : ""}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+            <div className="row"><span>Replay certification</span><span className={controlledLiveRampReplayGate.available && controlledLiveRampReplayGate.ready === false ? "subtle" : "good"}>{controlledLiveRampReplayGate.available ? `${toNumber(controlledLiveRampReplayGate.certified_total, 0)} / ${toNumber(controlledLiveRampReplayGate.required_total, 0)}` : "unavailable"}</span></div>
+            <div className="row"><span>Public probe</span><span className={String(controlledLiveRampPublicProbe.status || "") === "pass" ? "good" : String(controlledLiveRampPublicProbe.status || "") === "skipped" ? "subtle" : "warn"}>{String(controlledLiveRampPublicProbe.status || "unavailable")} · {String(controlledLiveRampPublicProbe.observed || controlledLiveRampPublicProbe.summary || "-")}</span></div>
+            <div className="row"><span>Auth probe</span><span className={String(controlledLiveRampAuthProbe.status || "") === "pass" ? "good" : ["fail", "not_authorized", "schema_not_verified"].includes(String(controlledLiveRampAuthProbe.status || "")) ? "warn" : "subtle"}>{String(controlledLiveRampAuthProbe.status || "not_run")} · {String(controlledLiveRampAuthProbe.method || "unauthenticated")}</span></div>
+            <div className="row"><span>Auth schema</span><span className={Boolean(controlledLiveRampAuthProbe.schema_verified) ? "good" : "warn"}>{Boolean(controlledLiveRampAuthProbe.schema_verified) ? "verified" : "not_verified"}</span></div>
+            <div className="row"><span>Auth missing fields</span><span className={controlledLiveRampAuthMissingFields.length > 0 ? "warn" : "good"}>{controlledLiveRampAuthMissingFields.join(", ") || "none"}</span></div>
+            <div className="row"><span>Bus health</span><span className={Boolean(controlledLiveRampBusHealth.verified) ? "good" : "warn"}>{String(controlledLiveRampBusHealth.status || "unknown")} · {String(controlledLiveRampBusHealth.repair_hint || "verified")}</span></div>
+            <div className="row"><span>Bus observer</span><span className={String(controlledLiveRampBusHealth.source_context || "") === "docker_service_network" ? "good" : "warn"}>{String(controlledLiveRampBusHealth.observer || "unknown")} · {String(controlledLiveRampBusHealth.source_context || "unknown")} · {String(controlledLiveRampBusHealth.http_status || "-")} · {String(controlledLiveRampBusHealth.checked_url || "-")}</span></div>
+            <div className="row"><span>Bus transport</span><span className={String(controlledLiveRampBusTransport.status || "") === "online" ? "good" : "warn"}>{String(controlledLiveRampBusTransport.status || "unknown")} · {String(controlledLiveRampBusTransport.kind || "unknown")} · {String(controlledLiveRampBusTransport.ping_ms ?? "-")}ms</span></div>
+            <div className="row"><span>Bus publisher</span><span className={String(controlledLiveRampBusPublisher.status || "") === "online" ? "good" : "warn"}>{String(controlledLiveRampBusPublisher.status || "unknown")} · {String(controlledLiveRampBusPublisher.stream || "unknown")} · {String(controlledLiveRampBusPublisher.last_heartbeat_at || "unknown")}</span></div>
+            <div className="row"><span>Bus consumer</span><span className={String(controlledLiveRampBusConsumer.status || "") === "online" ? "good" : "warn"}>{String(controlledLiveRampBusConsumer.status || "unknown")} · {String(controlledLiveRampBusConsumer.source || "unknown")} · {String(controlledLiveRampBusConsumer.last_read_at || "unknown")}</span></div>
+            <div className="row"><span>Bus last event</span><span className={toNumber(controlledLiveRampBusHealth.event_lag_ms, 0) > 600000 ? "warn" : "subtle"}>{String(controlledLiveRampBusHealth.last_event_at || "unknown")}</span></div>
+            <div className="row"><span>Kill switch</span><span className={controlledLiveRampKillSwitch.active ? "warn" : controlledLiveRampKillSwitch.active === false ? "good" : "subtle"}>{controlledLiveRampKillSwitch.active === true ? "active" : controlledLiveRampKillSwitch.active === false ? "inactive" : "unknown"} · reset {Boolean(controlledLiveRampKillSwitch.reset_eligible) ? "eligible" : "locked"}</span></div>
+            <div className="row"><span>Kill switch reason</span><span className={controlledLiveRampKillSwitch.active ? "warn" : "subtle"}>{String(controlledLiveRampKillSwitch.reason || "none")}</span></div>
+            <div className="row"><span>Kill switch transition</span><span>{String(controlledLiveRampKillSwitch.last_transition || "unknown")}</span></div>
+            <div className="row"><span>Reset blockers</span><span className={controlledLiveRampKillSwitchResetBlockers.length > 0 ? "warn" : "good"}>{controlledLiveRampKillSwitchResetBlockers.join(", ") || "none"}</span></div>
+            <div className="row"><span>Public health</span><span className={controlledLiveRampPublicHealth.healthy === false ? "warn" : controlledLiveRampPublicHealth.available ? "good" : "subtle"}>{String(controlledLiveRampPublicHealth.summary || "unavailable")}</span></div>
+            <div className="subtle mini" style={{ marginTop: 6 }}>{String(controlledLiveRampCleanliness.summary || "cleanliness unavailable")}</div>
+            {controlledLiveRampOpsUnavailableReasons.length > 0 || controlledLiveRampBlockReasons.length > 0 || controlledLiveRampYellowFlags.length > 0 ? (
+              <div style={{ marginTop: 10 }}>
+                {[
+                  ...controlledLiveRampOpsUnavailableReasons.map((reason) => ({ reason, tone: "warn", label: "ops unavailable" })),
+                  ...controlledLiveRampBlockReasons.map((reason) => ({ reason, tone: "warn", label: "block" })),
+                  ...controlledLiveRampYellowFlags.slice(0, 5).map((reason) => ({ reason, tone: "subtle", label: "flag" })),
+                ].map((item, index) => (
+                  <div key={`controlled-live-ramp-${item.label}-${index}`} className="row" style={{ marginTop: 4 }}>
+                    <span>{item.reason}</span>
+                    <span className={item.tone}>{item.label}</span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </div>
+          {terminalReviewRequiredItems.length > 0 ? (
+            <div style={{ marginTop: 12 }}>
+              <div className="subtle mini" style={{ marginBottom: 6 }}>review_required.items</div>
+              <div style={{ display: "grid", gap: 8 }}>
+                {terminalReviewRequiredItems.map((item, index) => {
+                  const decisionId = String(item.decision_id || "unknown").trim() || "unknown";
+                  const candidateState = String(item.candidate_state || "unclassified").trim() || "unclassified";
+                  const reason = String(item.reason || "no reason provided").trim() || "no reason provided";
+                  const missingEvidence = asStringArray(item.missing_evidence);
+                  return (
+                    <div key={`review-required-${decisionId}-${index}`} style={{ border: "1px solid rgba(148, 163, 184, 0.16)", borderRadius: 12, padding: 10, background: "rgba(15, 23, 42, 0.22)" }}>
+                      <div className="row"><span>{decisionId}</span><span className={Boolean(item.blocks_publish) ? "warn" : "subtle"}>{candidateState}</span></div>
+                      <div className="subtle mini" style={{ marginTop: 4 }}>{reason}</div>
+                      <div className="subtle mini" style={{ marginTop: 4 }}>missing_evidence: {missingEvidence.join(", ") || "none"} · blocks_publish: {Boolean(item.blocks_publish) ? "yes" : "no"}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ) : null}
           {decisionContinuityLinks.length > 0 ? (
             <div style={{ marginTop: 10 }}>
               <div className="subtle mini" style={{ marginBottom: 6 }}>Journey completion by link</div>

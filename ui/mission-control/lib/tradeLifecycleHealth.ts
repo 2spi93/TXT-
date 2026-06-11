@@ -2,6 +2,10 @@ import { readApprovalDecisionJournalEntries, type ApprovalDecisionJournalEntry }
 import { readAllocationDecisionJournalEntries, type AllocationDecisionJournalEntry } from "./allocationDecisionJournal";
 import { readAllocationWriterAuditEntries, type AllocationWriterAuditEntry, type AllocationWriterAuditErrorCode } from "./allocationWriterAuditJournal";
 import { readExecutionFactJournalEntries, type ExecutionFactJournalEntry } from "./executionFactJournal";
+import {
+  backfillApprovalDecisionJournalFromCanonicalSource,
+  backfillExecutionFactJournalFromCanonicalSource,
+} from "./mt5LiveApprovalCanonicalSource";
 import { readOpportunityCostJournalEntries, type OpportunityCostJournalEntry } from "./opportunityCostJournal";
 import { buildTruthReliabilitySnapshot, type TruthReliabilitySnapshot } from "./truthReliabilityIndex";
 
@@ -51,6 +55,10 @@ type ProjectionSourceDiagnostics = {
   rows_scanned: number;
   rows_returned: number;
 };
+
+export type TradeLifecycleHealthSchemaVersion = "trade-lifecycle-health/v1";
+
+export const TRADE_LIFECYCLE_HEALTH_SCHEMA_VERSION: TradeLifecycleHealthSchemaVersion = "trade-lifecycle-health/v1";
 
 type DecisionEvidenceQualityStageKey =
   | "allocation"
@@ -466,7 +474,123 @@ export type DecisionFrictionAnalyticsSnapshot = {
   top_cost_gates: DecisionFrictionGateRow[];
 };
 
+export type ExecutionGapDiagnosticFamilyKey =
+  | "never_routed"
+  | "routed_but_not_persisted"
+  | "persisted_elsewhere_not_linked"
+  | "unknown";
+
+export type ExecutionGapDiagnosticDecisionRow = {
+  decision_id: string;
+  trade_lifecycle_id: string | null;
+  first_missing_stage: DecisionFirstMissingStageKey | null;
+  hardening_state: string | null;
+  approval_id: string | null;
+  route_intent_id: string | null;
+  execution_order_id: string | null;
+  execution_event_id: string | null;
+  outcome_id: string | null;
+  writer_source: string | null;
+  last_transition: string | null;
+  missing_transition: string | null;
+  writer_failure_reason: string | null;
+  writer_family_key: ExecutionGapDiagnosticFamilyKey | null;
+  writer_family_label: string | null;
+};
+
+export type ExecutionGapDiagnosticFamilySnapshot = {
+  family_key: ExecutionGapDiagnosticFamilyKey;
+  label: string;
+  decision_total: number;
+  share_pct: number;
+  example_decision_ids: string[];
+};
+
+export type ExecutionGapDiagnosticFieldKey =
+  | "hardening_state"
+  | "approval_id"
+  | "route_intent_id"
+  | "execution_order_id"
+  | "execution_event_id"
+  | "outcome_id"
+  | "writer_source"
+  | "last_transition";
+
+export type ExecutionGapDiagnosticFieldCoverageSnapshot = {
+  field_key: ExecutionGapDiagnosticFieldKey;
+  complete_present_total: number;
+  blocked_present_total: number;
+  complete_present_rate_pct: number;
+  blocked_present_rate_pct: number;
+  coverage_gap_pct: number;
+};
+
+export type ExecutionGapDiagnosticSnapshot = {
+  comparison_goal: "execution_writer_divergence";
+  complete_definition: "execution_and_outcome_present";
+  blocked_definition: "hardening_present_execution_missing";
+  complete_decision_total: number;
+  blocked_decision_total: number;
+  dominant_divergence_field: ExecutionGapDiagnosticFieldKey | null;
+  field_coverage: ExecutionGapDiagnosticFieldCoverageSnapshot[];
+  blocked_family_breakdown: ExecutionGapDiagnosticFamilySnapshot[];
+  complete_decisions: ExecutionGapDiagnosticDecisionRow[];
+  blocked_decisions: ExecutionGapDiagnosticDecisionRow[];
+};
+
+export type TerminalDecisionClosedStateSnapshot = {
+  cancelled: number;
+  stale_cancelled: number;
+  rejected: number;
+  hardening_rejected: number;
+  expired: number;
+};
+
+export type TerminalDecisionActiveDebtSnapshot = {
+  hardening_not_reached: number;
+  hardening_rejected_without_reason: number;
+  approved_without_route: number;
+  routed_without_execution_event: number;
+  execution_without_outcome: number;
+};
+
+export type TerminalDecisionReviewCandidateStateKey =
+  | "allocation_not_recorded"
+  | "approval_not_recorded"
+  | "completed_pending_attribution"
+  | "completed_pending_opportunity"
+  | "decision_id_missing"
+  | "unclassified";
+
+export type TerminalDecisionReviewRequiredItem = {
+  decision_id: string | null;
+  reason: string;
+  candidate_state: TerminalDecisionReviewCandidateStateKey;
+  missing_evidence: string[];
+  first_missing_stage: DecisionFirstMissingStageKey | null;
+  blocks_publish: boolean;
+};
+
+export type TerminalDecisionReviewRequiredSnapshot = {
+  total: number;
+  blocking_total: number;
+  items: TerminalDecisionReviewRequiredItem[];
+};
+
+export type TerminalDecisionStateDiagnosticSnapshot = {
+  total: number;
+  completed_journey_total: number;
+  terminal_closed: TerminalDecisionClosedStateSnapshot;
+  active_debt: TerminalDecisionActiveDebtSnapshot;
+  active_debt_reasons: string[];
+  review_required_total: number;
+  review_required: TerminalDecisionReviewRequiredSnapshot;
+  publish_blocked: boolean;
+  publish_block_reasons: string[];
+};
+
 export type TradeLifecycleHealthSnapshot = {
+  schema_version: TradeLifecycleHealthSchemaVersion;
   generated_at_iso: string;
   window_days: number;
   source_diagnostics: ProjectionSourceDiagnostics;
@@ -475,6 +599,8 @@ export type TradeLifecycleHealthSnapshot = {
   decision_gap_reduction: DecisionGapReductionSnapshot;
   decision_gap_resolution: DecisionGapResolutionSnapshot;
   allocation_writer_closure: AllocationWriterClosureSnapshot;
+  execution_gap_diagnostic?: ExecutionGapDiagnosticSnapshot;
+  terminal_decision_state_diagnostic?: TerminalDecisionStateDiagnosticSnapshot;
   decision_governance?: DecisionGovernanceSnapshot;
   link_coverage_score_pct: number;
   decision_continuity_score_pct: number;
@@ -517,6 +643,37 @@ export type TradeLifecycleHealthSnapshot = {
   tri_freshness: number;
   truth_reliability_index: TruthReliabilitySnapshot;
 };
+
+export function assertTradeLifecycleHealthSnapshot(snapshot: TradeLifecycleHealthSnapshot): TradeLifecycleHealthSnapshot {
+  const diagnostics = snapshot.source_diagnostics || { rows_scanned: 0, rows_returned: 0 };
+  const numericFields = [
+    snapshot.window_days,
+    snapshot.lifecycle_total,
+    snapshot.link_coverage_score_pct,
+    snapshot.decision_continuity_score_pct,
+    snapshot.cross_object_lifecycle_total,
+    snapshot.tri_score,
+    snapshot.tri_continuity,
+    snapshot.tri_evidence,
+    snapshot.tri_spine_match,
+    snapshot.tri_freshness,
+    diagnostics.rows_scanned,
+    diagnostics.rows_returned,
+  ];
+  if (snapshot.schema_version !== TRADE_LIFECYCLE_HEALTH_SCHEMA_VERSION) {
+    throw new Error(`TradeLifecycleHealth schema mismatch: ${String(snapshot.schema_version || "missing")}`);
+  }
+  if (!Number.isFinite(Date.parse(String(snapshot.generated_at_iso || "")))) {
+    throw new Error("TradeLifecycleHealth generated_at_iso invalid");
+  }
+  if (numericFields.some((value) => !Number.isFinite(Number(value)) || Number(value) < 0)) {
+    throw new Error("TradeLifecycleHealth numeric metrics invalid");
+  }
+  if (!Array.isArray(snapshot.decision_continuity_links) || !Array.isArray(snapshot.top_decision_friction)) {
+    throw new Error("TradeLifecycleHealth arrays invalid");
+  }
+  return snapshot;
+}
 
 export type TradeLifecycleHealthSnapshotOptions = {
   sinceDays?: number;
@@ -639,6 +796,34 @@ function toHours(valueMs: number | null): number | null {
     return null;
   }
   return Number((valueMs / 3_600_000).toFixed(1));
+}
+
+function toNonEmptyString(value: unknown): string | null {
+  const normalized = String(value || "").trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function firstNonEmptyString(...values: unknown[]): string | null {
+  for (const value of values) {
+    const normalized = toNonEmptyString(value);
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return null;
+}
+
+function pickLatestEntry<T>(entries: T[], getTimestampMs: (entry: T) => number | null): T | null {
+  let latestEntry: T | null = null;
+  let latestTimestampMs = Number.NEGATIVE_INFINITY;
+  for (const entry of entries) {
+    const timestampMs = getTimestampMs(entry) ?? Number.NEGATIVE_INFINITY;
+    if (!latestEntry || timestampMs >= latestTimestampMs) {
+      latestEntry = entry;
+      latestTimestampMs = timestampMs;
+    }
+  }
+  return latestEntry;
 }
 
 const OPPORTUNITY_CAPITAL_BASIS_KEYS = [
@@ -996,7 +1181,12 @@ function buildDecisionEvidenceQualitySnapshot(lifecycles: LifecycleAccumulator[]
 }
 
 function isCreatedDecisionLifecycle(entry: LifecycleAccumulator): boolean {
-  return Boolean(entry.decision_id || entry.trade_lifecycle_id);
+  return entry.has_allocation
+    || entry.has_approval
+    || entry.has_hardening
+    || entry.has_execution
+    || entry.has_outcome
+    || entry.has_attribution;
 }
 
 function isCompleteDecisionLifecycle(entry: LifecycleAccumulator): boolean {
@@ -1221,13 +1411,16 @@ function buildDecisionGapResolutionSnapshot(lifecycles: LifecycleAccumulator[]):
     }
   }
 
-  const dominantOpenGap = DECISION_GAP_STAGE_DEFINITIONS
+  const dominantOpenGapCandidate = DECISION_GAP_STAGE_DEFINITIONS
     .map((stage) => ({
       stage_key: stage.stage_key,
       gap_label: stage.gap_label,
       blocked_total: openGapEntries.filter((entry) => entry.first_missing_stage === stage.stage_key).length,
     }))
     .sort((left, right) => right.blocked_total - left.blocked_total)[0] || null;
+  const dominantOpenGap = dominantOpenGapCandidate && dominantOpenGapCandidate.blocked_total > 0
+    ? dominantOpenGapCandidate
+    : null;
 
   const backlogAgeBuckets: DecisionGapBacklogAgeBucketSnapshot[] = [
     { bucket_key: "0_7d", label: "0-7 jours", open_gap_total: 0, share_pct: 0 },
@@ -1368,6 +1561,713 @@ function buildDecisionGapResolutionSnapshot(lifecycles: LifecycleAccumulator[]):
     dominant_gap_top_decisions: dominantGapTopDecisions,
     recently_resolved_gaps: recentlyResolvedGaps,
     gap_ledger: gapLedger,
+  };
+}
+
+function resolveApprovalRouteIntentId(entry: ApprovalDecisionJournalEntry | null): string | null {
+  if (!entry) {
+    return null;
+  }
+  const orderPayload = asRecord(entry.order_payload);
+  const orderIntent = asRecord(orderPayload.order_intent);
+  const metadata = asRecord(orderPayload.metadata);
+  return firstNonEmptyString(
+    orderPayload.intent_id,
+    orderIntent.intent_id,
+    metadata.intent_id,
+  );
+}
+
+function resolveHardeningState(entry: ApprovalDecisionJournalEntry | null): string | null {
+  if (!entry) {
+    return null;
+  }
+  const hardening = asRecord(entry.hardening);
+  const explicitState = firstNonEmptyString(
+    hardening.status,
+    hardening.state,
+    hardening.result,
+    hardening.phase,
+    hardening.go_live_state,
+    hardening.decision,
+  );
+  if (explicitState) {
+    return explicitState;
+  }
+  const booleanSignals = [
+    hardening.passed,
+    hardening.approved,
+    hardening.ready,
+    hardening.go_live_ready,
+    hardening.all_checks_passed,
+    hardening.all_passed,
+    hardening.is_ready,
+  ];
+  if (booleanSignals.includes(true)) {
+    return "passed";
+  }
+  if (booleanSignals.includes(false)) {
+    return "blocked";
+  }
+  if (Object.keys(hardening).length > 0) {
+    return "present";
+  }
+  return firstNonEmptyString(entry.approval_status);
+}
+
+function formatWriterTransition(entry: AllocationWriterAuditEntry | null): string | null {
+  if (!entry) {
+    return null;
+  }
+  const previousStage = toNonEmptyString(entry.previous_stage);
+  const nextStage = toNonEmptyString(entry.next_stage);
+  const transition = previousStage && nextStage
+    ? `${previousStage} -> ${nextStage}`
+    : nextStage || previousStage;
+  if (!transition) {
+    return null;
+  }
+  return entry.transition_success === false ? `${transition} (failed)` : transition;
+}
+
+function resolveMissingTransition(stageKey: DecisionFirstMissingStageKey | null): string | null {
+  if (stageKey === "approval") {
+    return "PERSISTED -> APPROVAL_CREATED";
+  }
+  if (stageKey === "hardening") {
+    return "APPROVAL_LINKED -> HARDENING_REACHED";
+  }
+  if (stageKey === "execution") {
+    return "HARDENING_REACHED -> EXECUTION_CREATED";
+  }
+  if (stageKey === "outcome") {
+    return "EXECUTION_CREATED -> OUTCOME_CREATED";
+  }
+  if (stageKey === "attribution") {
+    return "OUTCOME_CREATED -> ATTRIBUTION_CREATED";
+  }
+  if (stageKey === "opportunity") {
+    return "ATTRIBUTION_CREATED -> OPPORTUNITY_CREATED";
+  }
+  return null;
+}
+
+function resolveExecutionGapFamily(params: {
+  routeIntentId: string | null;
+  executionOrderId: string | null;
+  executionEventId: string | null;
+  outcomeId: string | null;
+  latestTransition: AllocationWriterAuditEntry | null;
+}): { key: ExecutionGapDiagnosticFamilyKey; label: string } {
+  const hasRouteIntent = Boolean(params.routeIntentId);
+  const transitionSucceeded = params.latestTransition?.transition_success !== false;
+  const attemptedExecutionTransition = params.latestTransition?.next_stage === "EXECUTION_CREATED";
+  const persistedExecutionEvidence = Boolean(
+    params.executionOrderId
+    || params.executionEventId
+    || params.outcomeId
+    || (attemptedExecutionTransition && transitionSucceeded)
+    || params.latestTransition?.next_stage === "OUTCOME_CREATED"
+    || params.latestTransition?.next_stage === "ATTRIBUTION_CREATED"
+    || params.latestTransition?.next_stage === "OPPORTUNITY_CREATED",
+  );
+
+  if (persistedExecutionEvidence) {
+    return {
+      key: "persisted_elsewhere_not_linked",
+      label: "Execution persistée ailleurs mais non liée au lifecycle canonique.",
+    };
+  }
+  if (hasRouteIntent || attemptedExecutionTransition) {
+    return {
+      key: "routed_but_not_persisted",
+      label: "Décision routée ou intent créée, mais persistance d'exécution absente.",
+    };
+  }
+  return {
+    key: "never_routed",
+    label: "Décision durcie, mais jamais routée jusqu'à une intent d'exécution.",
+  };
+}
+
+function buildExecutionGapDiagnosticDecisionRow(params: {
+  lifecycle: LifecycleAccumulator;
+  allocations: AllocationDecisionJournalEntry[];
+  approvals: ApprovalDecisionJournalEntry[];
+  executionFacts: ExecutionFactJournalEntry[];
+  opportunities: OpportunityCostJournalEntry[];
+  writerEvents: AllocationWriterAuditEntry[];
+}): ExecutionGapDiagnosticDecisionRow | null {
+  const decisionId = toNonEmptyString(params.lifecycle.decision_id);
+  if (!decisionId) {
+    return null;
+  }
+
+  const latestAllocation = pickLatestEntry(params.allocations, (entry) => parseIsoMs(entry.created_at_iso));
+  const latestApproval = pickLatestEntry(params.approvals, (entry) => parseIsoMs(entry.created_at_iso));
+  const latestExecution = pickLatestEntry(params.executionFacts, (entry) => parseIsoMs(entry.created_at_iso));
+  const latestOpportunity = pickLatestEntry(params.opportunities, (entry) => parseIsoMs(entry.created_at_iso));
+  const latestWriterEvent = pickLatestEntry(params.writerEvents, (entry) => parseIsoMs(entry.writer_timestamp_iso) ?? parseIsoMs(entry.created_at_iso));
+  const latestTransition = pickLatestEntry(
+    params.writerEvents.filter((entry) => String(entry.entry_kind || "writer_audit") === "stage_transition"),
+    (entry) => parseIsoMs(entry.writer_timestamp_iso) ?? parseIsoMs(entry.created_at_iso),
+  );
+
+  const executionMarketContext = asRecord(latestExecution?.market_context);
+  const executionApprovalContext = asRecord(latestExecution?.approval_context);
+  const firstMissingStage = resolveFirstMissingStage(params.lifecycle);
+  const approvalId = firstNonEmptyString(
+    latestApproval?.approval_id,
+    latestExecution?.approval_id,
+    latestOpportunity?.approval_id,
+    latestAllocation?.approval_id,
+  );
+  const routeIntentId = firstNonEmptyString(
+    latestExecution?.intent_id,
+    latestOpportunity?.intent_id,
+    resolveApprovalRouteIntentId(latestApproval),
+  );
+  const executionOrderId = firstNonEmptyString(
+    latestExecution?.order_id,
+    latestExecution?.execution_id,
+    latestOpportunity?.execution_id,
+    latestAllocation?.execution_id,
+    latestApproval?.execution_id,
+  );
+  const executionEventId = firstNonEmptyString(latestExecution?.fact_id);
+  const outcomeId = firstNonEmptyString(
+    latestExecution?.outcome_id,
+    latestOpportunity?.outcome_id,
+    latestAllocation?.outcome_id,
+    latestApproval?.outcome_id,
+  );
+  const family = firstMissingStage === "execution"
+    ? resolveExecutionGapFamily({
+        routeIntentId,
+        executionOrderId,
+        executionEventId,
+        outcomeId,
+        latestTransition,
+      })
+    : { key: "unknown" as const, label: "n/a" };
+
+  return {
+    decision_id: decisionId,
+    trade_lifecycle_id: params.lifecycle.trade_lifecycle_id,
+    first_missing_stage: firstMissingStage,
+    hardening_state: resolveHardeningState(latestApproval),
+    approval_id: approvalId,
+    route_intent_id: routeIntentId,
+    execution_order_id: executionOrderId,
+    execution_event_id: executionEventId,
+    outcome_id: outcomeId,
+    writer_source: firstNonEmptyString(
+      latestTransition?.writer_version,
+      latestWriterEvent?.writer_version,
+      executionMarketContext.source,
+      executionApprovalContext.source,
+      latestApproval?.source_event_category,
+      latestAllocation?.allocator_version,
+    ),
+    last_transition: formatWriterTransition(latestTransition),
+    missing_transition: resolveMissingTransition(firstMissingStage),
+    writer_failure_reason: firstNonEmptyString(
+      latestTransition?.failure_reason,
+      latestWriterEvent?.writer_error_detail,
+      latestWriterEvent?.writer_error_code,
+    ),
+    writer_family_key: firstMissingStage === "execution" ? family.key : null,
+    writer_family_label: firstMissingStage === "execution" ? family.label : null,
+  };
+}
+
+function buildExecutionGapDiagnosticSnapshot(
+  lifecycles: LifecycleAccumulator[],
+  allocations: AllocationDecisionJournalEntry[],
+  approvals: ApprovalDecisionJournalEntry[],
+  executionFacts: ExecutionFactJournalEntry[],
+  opportunities: OpportunityCostJournalEntry[],
+  auditEntries: AllocationWriterAuditEntry[],
+  decisionGapResolution: DecisionGapResolutionSnapshot,
+): ExecutionGapDiagnosticSnapshot {
+  const lifecycleByDecisionId = lifecycles.reduce((acc, lifecycle) => {
+    const decisionId = toNonEmptyString(lifecycle.decision_id);
+    if (decisionId) {
+      acc.set(decisionId, lifecycle);
+    }
+    return acc;
+  }, new Map<string, LifecycleAccumulator>());
+
+  const allocationsByDecisionId = allocations.reduce((acc, entry) => {
+    const decisionId = toNonEmptyString(entry.decision_id);
+    if (!decisionId) {
+      return acc;
+    }
+    const current = acc.get(decisionId) || [];
+    current.push(entry);
+    acc.set(decisionId, current);
+    return acc;
+  }, new Map<string, AllocationDecisionJournalEntry[]>());
+
+  const approvalsByDecisionId = approvals.reduce((acc, entry) => {
+    const decisionId = toNonEmptyString(entry.decision_id);
+    if (!decisionId) {
+      return acc;
+    }
+    const current = acc.get(decisionId) || [];
+    current.push(entry);
+    acc.set(decisionId, current);
+    return acc;
+  }, new Map<string, ApprovalDecisionJournalEntry[]>());
+
+  const executionFactsByDecisionId = executionFacts.reduce((acc, entry) => {
+    const decisionId = toNonEmptyString(entry.decision_id);
+    if (!decisionId) {
+      return acc;
+    }
+    const current = acc.get(decisionId) || [];
+    current.push(entry);
+    acc.set(decisionId, current);
+    return acc;
+  }, new Map<string, ExecutionFactJournalEntry[]>());
+
+  const opportunitiesByDecisionId = opportunities.reduce((acc, entry) => {
+    const decisionId = toNonEmptyString(entry.decision_id);
+    if (!decisionId) {
+      return acc;
+    }
+    const current = acc.get(decisionId) || [];
+    current.push(entry);
+    acc.set(decisionId, current);
+    return acc;
+  }, new Map<string, OpportunityCostJournalEntry[]>());
+
+  const writerEventsByDecisionId = auditEntries.reduce((acc, entry) => {
+    const decisionId = toNonEmptyString(entry.decision_id);
+    if (!decisionId) {
+      return acc;
+    }
+    const current = acc.get(decisionId) || [];
+    current.push(entry);
+    acc.set(decisionId, current);
+    return acc;
+  }, new Map<string, AllocationWriterAuditEntry[]>());
+
+  const completeDecisionIds = lifecycles
+    .filter((entry) => entry.has_execution && entry.has_outcome)
+    .sort((left, right) => {
+      if (observedFragments(right) !== observedFragments(left)) {
+        return observedFragments(right) - observedFragments(left);
+      }
+      const leftObservedAtMs = left.last_observed_at_ms ?? 0;
+      const rightObservedAtMs = right.last_observed_at_ms ?? 0;
+      if (rightObservedAtMs !== leftObservedAtMs) {
+        return rightObservedAtMs - leftObservedAtMs;
+      }
+      return String(left.decision_id || "").localeCompare(String(right.decision_id || ""));
+    })
+    .map((entry) => toNonEmptyString(entry.decision_id))
+    .filter((value, index, values): value is string => Boolean(value) && values.indexOf(value) === index);
+
+  const blockedDecisionIds = decisionGapResolution.gap_ledger
+    .filter((entry) => entry.status === "open" && entry.first_missing_stage === "execution")
+    .map((entry) => toNonEmptyString(entry.decision_id))
+    .filter((value, index, values): value is string => Boolean(value) && values.indexOf(value) === index);
+
+  const buildRow = (decisionId: string): ExecutionGapDiagnosticDecisionRow | null => {
+    const lifecycle = lifecycleByDecisionId.get(decisionId);
+    if (!lifecycle) {
+      return null;
+    }
+    return buildExecutionGapDiagnosticDecisionRow({
+      lifecycle,
+      allocations: allocationsByDecisionId.get(decisionId) || [],
+      approvals: approvalsByDecisionId.get(decisionId) || [],
+      executionFacts: executionFactsByDecisionId.get(decisionId) || [],
+      opportunities: opportunitiesByDecisionId.get(decisionId) || [],
+      writerEvents: writerEventsByDecisionId.get(decisionId) || [],
+    });
+  };
+
+  const completeDecisions = completeDecisionIds
+    .map(buildRow)
+    .filter((entry): entry is ExecutionGapDiagnosticDecisionRow => entry !== null);
+  const blockedDecisions = blockedDecisionIds
+    .map(buildRow)
+    .filter((entry): entry is ExecutionGapDiagnosticDecisionRow => entry !== null);
+
+  const familySeed: Array<{ key: ExecutionGapDiagnosticFamilyKey; label: string }> = [
+    { key: "never_routed", label: "Décision jamais routée" },
+    { key: "routed_but_not_persisted", label: "Routée mais non persistée" },
+    { key: "persisted_elsewhere_not_linked", label: "Persistée ailleurs mais non liée" },
+    { key: "unknown", label: "Inconnu" },
+  ];
+
+  const blockedFamilyBreakdown = familySeed
+    .map((family) => {
+      const matchingRows = blockedDecisions.filter((entry) => entry.writer_family_key === family.key);
+      return {
+        family_key: family.key,
+        label: family.label,
+        decision_total: matchingRows.length,
+        share_pct: asPercent(matchingRows.length, blockedDecisions.length),
+        example_decision_ids: matchingRows.slice(0, 5).map((entry) => entry.decision_id),
+      };
+    })
+    .filter((entry) => entry.decision_total > 0)
+    .sort((left, right) => right.decision_total - left.decision_total);
+
+  const coverageDefinitions: Array<{
+    field_key: ExecutionGapDiagnosticFieldKey;
+    read: (entry: ExecutionGapDiagnosticDecisionRow) => string | null;
+  }> = [
+    { field_key: "hardening_state", read: (entry) => entry.hardening_state },
+    { field_key: "approval_id", read: (entry) => entry.approval_id },
+    { field_key: "route_intent_id", read: (entry) => entry.route_intent_id },
+    { field_key: "execution_order_id", read: (entry) => entry.execution_order_id },
+    { field_key: "execution_event_id", read: (entry) => entry.execution_event_id },
+    { field_key: "outcome_id", read: (entry) => entry.outcome_id },
+    { field_key: "writer_source", read: (entry) => entry.writer_source },
+    { field_key: "last_transition", read: (entry) => entry.last_transition },
+  ];
+
+  const fieldCoverage = coverageDefinitions
+    .map((definition) => {
+      const completePresentTotal = completeDecisions.filter((entry) => Boolean(definition.read(entry))).length;
+      const blockedPresentTotal = blockedDecisions.filter((entry) => Boolean(definition.read(entry))).length;
+      const completePresentRatePct = asPercent(completePresentTotal, completeDecisions.length);
+      const blockedPresentRatePct = asPercent(blockedPresentTotal, blockedDecisions.length);
+      return {
+        field_key: definition.field_key,
+        complete_present_total: completePresentTotal,
+        blocked_present_total: blockedPresentTotal,
+        complete_present_rate_pct: completePresentRatePct,
+        blocked_present_rate_pct: blockedPresentRatePct,
+        coverage_gap_pct: Number((completePresentRatePct - blockedPresentRatePct).toFixed(1)),
+      };
+    })
+    .sort((left, right) => {
+      if (right.coverage_gap_pct !== left.coverage_gap_pct) {
+        return right.coverage_gap_pct - left.coverage_gap_pct;
+      }
+      return left.field_key.localeCompare(right.field_key);
+    });
+
+  return {
+    comparison_goal: "execution_writer_divergence",
+    complete_definition: "execution_and_outcome_present",
+    blocked_definition: "hardening_present_execution_missing",
+    complete_decision_total: completeDecisions.length,
+    blocked_decision_total: blockedDecisions.length,
+    dominant_divergence_field: fieldCoverage[0]?.field_key || null,
+    field_coverage: fieldCoverage,
+    blocked_family_breakdown: blockedFamilyBreakdown,
+    complete_decisions: completeDecisions,
+    blocked_decisions: blockedDecisions,
+  };
+}
+
+function resolveApprovalTerminalReason(entry: ApprovalDecisionJournalEntry | null): string | null {
+  if (!entry) {
+    return null;
+  }
+  const hardening = asRecord(entry.hardening);
+  return firstNonEmptyString(
+    entry.rejection_reason,
+    entry.rejection_code,
+    hardening.reason,
+    hardening.failure_reason,
+    hardening.block_reason,
+    hardening.message,
+    hardening.detail,
+  );
+}
+
+function resolveTerminalDecisionClosedState(entry: ApprovalDecisionJournalEntry | null): keyof TerminalDecisionClosedStateSnapshot | null {
+  if (!entry) {
+    return null;
+  }
+  const sourceEventCategory = String(entry.source_event_category || "").trim();
+  const approvalStatus = String(entry.approval_status || "").trim().toLowerCase();
+  const hardeningState = String(resolveHardeningState(entry) || "").trim().toLowerCase();
+
+  if (sourceEventCategory === "mt5_live_order_stale_approval_cancelled" || approvalStatus.includes("stale")) {
+    return "stale_cancelled";
+  }
+  if (approvalStatus.includes("cancel")) {
+    return "cancelled";
+  }
+  if (approvalStatus.includes("expir")) {
+    return "expired";
+  }
+
+  const hardeningRejected = hardeningState.includes("reject")
+    || hardeningState.includes("block")
+    || hardeningState.includes("denied")
+    || hardeningState.includes("fail");
+  const rejected = sourceEventCategory === "mt5_live_order_rejected_after_second_approval"
+    || approvalStatus.includes("reject")
+    || approvalStatus.includes("denied");
+
+  if (rejected && hardeningRejected && resolveApprovalTerminalReason(entry)) {
+    return "hardening_rejected";
+  }
+  if (rejected) {
+    return "rejected";
+  }
+  return null;
+}
+
+function buildTerminalActiveDebtReasons(activeDebt: TerminalDecisionActiveDebtSnapshot): string[] {
+  const definitions: Array<{ key: keyof TerminalDecisionActiveDebtSnapshot; label: string }> = [
+    { key: "hardening_not_reached", label: "hardening_not_reached" },
+    { key: "hardening_rejected_without_reason", label: "hardening_rejected_without_reason" },
+    { key: "approved_without_route", label: "approved_without_route" },
+    { key: "routed_without_execution_event", label: "routed_without_execution_event" },
+    { key: "execution_without_outcome", label: "execution_without_outcome" },
+  ];
+  return definitions
+    .filter((definition) => activeDebt[definition.key] > 0)
+    .map((definition) => `${definition.label}:${activeDebt[definition.key]}`);
+}
+
+function buildTerminalDecisionReviewRequiredItem(params: {
+  decisionId: string | null;
+  lifecycle: LifecycleAccumulator;
+  diagnosticRow: ExecutionGapDiagnosticDecisionRow | null;
+}): TerminalDecisionReviewRequiredItem {
+  const firstMissingStage = params.diagnosticRow?.first_missing_stage || resolveFirstMissingStage(params.lifecycle);
+
+  if (!params.decisionId) {
+    return {
+      decision_id: null,
+      reason: "Lifecycle created without a stable decision_id; classification cannot be made deterministic.",
+      candidate_state: "decision_id_missing",
+      missing_evidence: ["decision_id"],
+      first_missing_stage: firstMissingStage,
+      blocks_publish: false,
+    };
+  }
+
+  if (firstMissingStage === "allocation") {
+    return {
+      decision_id: params.decisionId,
+      reason: "Decision exists without native allocation evidence; this is a continuity-quality gap, not active execution debt.",
+      candidate_state: "allocation_not_recorded",
+      missing_evidence: ["allocation_id", "trade_lifecycle_id"],
+      first_missing_stage: firstMissingStage,
+      blocks_publish: false,
+    };
+  }
+
+  if (firstMissingStage === "approval") {
+    return {
+      decision_id: params.decisionId,
+      reason: "Allocation exists but approval evidence was not recorded on the canonical lifecycle path.",
+      candidate_state: "approval_not_recorded",
+      missing_evidence: ["approval_id", "approval_status"],
+      first_missing_stage: firstMissingStage,
+      blocks_publish: false,
+    };
+  }
+
+  if (firstMissingStage === "attribution") {
+    return {
+      decision_id: params.decisionId,
+      reason: "Execution and outcome exist; only attribution evidence is still pending.",
+      candidate_state: "completed_pending_attribution",
+      missing_evidence: ["attribution"],
+      first_missing_stage: firstMissingStage,
+      blocks_publish: false,
+    };
+  }
+
+  if (firstMissingStage === "opportunity") {
+    return {
+      decision_id: params.decisionId,
+      reason: "Execution, outcome, and attribution exist; only opportunity-cost evidence is still pending.",
+      candidate_state: "completed_pending_opportunity",
+      missing_evidence: ["opportunity"],
+      first_missing_stage: firstMissingStage,
+      blocks_publish: false,
+    };
+  }
+
+  return {
+    decision_id: params.decisionId,
+    reason: "Residual lifecycle state needs operator review because it does not match an active-debt or terminal-closed family yet.",
+    candidate_state: "unclassified",
+    missing_evidence: [firstMissingStage || "unknown"],
+    first_missing_stage: firstMissingStage,
+    blocks_publish: false,
+  };
+}
+
+function buildTerminalDecisionStateDiagnosticSnapshot(
+  lifecycles: LifecycleAccumulator[],
+  allocations: AllocationDecisionJournalEntry[],
+  approvals: ApprovalDecisionJournalEntry[],
+  executionFacts: ExecutionFactJournalEntry[],
+  opportunities: OpportunityCostJournalEntry[],
+  auditEntries: AllocationWriterAuditEntry[],
+): TerminalDecisionStateDiagnosticSnapshot {
+  const createdDecisionLifecycles = lifecycles.filter((entry) => isCreatedDecisionLifecycle(entry));
+  const allocationsByDecisionId = allocations.reduce((acc, entry) => {
+    const decisionId = toNonEmptyString(entry.decision_id);
+    if (!decisionId) {
+      return acc;
+    }
+    const current = acc.get(decisionId) || [];
+    current.push(entry);
+    acc.set(decisionId, current);
+    return acc;
+  }, new Map<string, AllocationDecisionJournalEntry[]>());
+  const approvalsByDecisionId = approvals.reduce((acc, entry) => {
+    const decisionId = toNonEmptyString(entry.decision_id);
+    if (!decisionId) {
+      return acc;
+    }
+    const current = acc.get(decisionId) || [];
+    current.push(entry);
+    acc.set(decisionId, current);
+    return acc;
+  }, new Map<string, ApprovalDecisionJournalEntry[]>());
+  const executionFactsByDecisionId = executionFacts.reduce((acc, entry) => {
+    const decisionId = toNonEmptyString(entry.decision_id);
+    if (!decisionId) {
+      return acc;
+    }
+    const current = acc.get(decisionId) || [];
+    current.push(entry);
+    acc.set(decisionId, current);
+    return acc;
+  }, new Map<string, ExecutionFactJournalEntry[]>());
+  const opportunitiesByDecisionId = opportunities.reduce((acc, entry) => {
+    const decisionId = toNonEmptyString(entry.decision_id);
+    if (!decisionId) {
+      return acc;
+    }
+    const current = acc.get(decisionId) || [];
+    current.push(entry);
+    acc.set(decisionId, current);
+    return acc;
+  }, new Map<string, OpportunityCostJournalEntry[]>());
+  const writerEventsByDecisionId = auditEntries.reduce((acc, entry) => {
+    const decisionId = toNonEmptyString(entry.decision_id);
+    if (!decisionId) {
+      return acc;
+    }
+    const current = acc.get(decisionId) || [];
+    current.push(entry);
+    acc.set(decisionId, current);
+    return acc;
+  }, new Map<string, AllocationWriterAuditEntry[]>());
+
+  const terminalClosed: TerminalDecisionClosedStateSnapshot = {
+    cancelled: 0,
+    stale_cancelled: 0,
+    rejected: 0,
+    hardening_rejected: 0,
+    expired: 0,
+  };
+  const activeDebt: TerminalDecisionActiveDebtSnapshot = {
+    hardening_not_reached: 0,
+    hardening_rejected_without_reason: 0,
+    approved_without_route: 0,
+    routed_without_execution_event: 0,
+    execution_without_outcome: 0,
+  };
+  const reviewRequiredItems: TerminalDecisionReviewRequiredItem[] = [];
+  let completedJourneyTotal = 0;
+
+  for (const lifecycle of createdDecisionLifecycles) {
+    const decisionId = toNonEmptyString(lifecycle.decision_id);
+    if (!decisionId) {
+      continue;
+    }
+    if (lifecycle.has_execution && lifecycle.has_outcome) {
+      completedJourneyTotal += 1;
+      continue;
+    }
+
+    const decisionApprovals = approvalsByDecisionId.get(decisionId) || [];
+    const latestApproval = pickLatestEntry(decisionApprovals, (entry) => parseIsoMs(entry.created_at_iso));
+    const terminalClosedState = resolveTerminalDecisionClosedState(latestApproval);
+    if (terminalClosedState) {
+      terminalClosed[terminalClosedState] += 1;
+      continue;
+    }
+
+    const hardeningState = String(resolveHardeningState(latestApproval) || "").trim().toLowerCase();
+    const hardeningRejected = hardeningState.includes("reject")
+      || hardeningState.includes("block")
+      || hardeningState.includes("denied")
+      || hardeningState.includes("fail");
+    if (hardeningRejected && !resolveApprovalTerminalReason(latestApproval)) {
+      activeDebt.hardening_rejected_without_reason += 1;
+      continue;
+    }
+
+    const diagnosticRow = buildExecutionGapDiagnosticDecisionRow({
+      lifecycle,
+      allocations: allocationsByDecisionId.get(decisionId) || [],
+      approvals: decisionApprovals,
+      executionFacts: executionFactsByDecisionId.get(decisionId) || [],
+      opportunities: opportunitiesByDecisionId.get(decisionId) || [],
+      writerEvents: writerEventsByDecisionId.get(decisionId) || [],
+    });
+    const firstMissingStage = diagnosticRow?.first_missing_stage || resolveFirstMissingStage(lifecycle);
+
+    if (firstMissingStage === "hardening") {
+      activeDebt.hardening_not_reached += 1;
+      continue;
+    }
+    if (firstMissingStage === "execution") {
+      const hasRoutingEvidence = Boolean(
+        diagnosticRow?.route_intent_id
+        || diagnosticRow?.execution_order_id
+        || String(diagnosticRow?.last_transition || "").includes("EXECUTION_CREATED"),
+      );
+      if (hasRoutingEvidence) {
+        activeDebt.routed_without_execution_event += 1;
+      } else {
+        activeDebt.approved_without_route += 1;
+      }
+      continue;
+    }
+    if (firstMissingStage === "outcome") {
+      activeDebt.execution_without_outcome += 1;
+      continue;
+    }
+    reviewRequiredItems.push(buildTerminalDecisionReviewRequiredItem({
+      decisionId,
+      lifecycle,
+      diagnosticRow,
+    }));
+  }
+
+  const activeDebtTotal = Object.values(activeDebt).reduce((sum, value) => sum + value, 0);
+  const activeDebtReasons = buildTerminalActiveDebtReasons(activeDebt);
+  const reviewBlockingItems = reviewRequiredItems.filter((item) => item.blocks_publish);
+  const publishBlockReasons = [
+    ...activeDebtReasons,
+    ...reviewBlockingItems.map((item) => `${item.candidate_state}:${item.decision_id || "unknown"}`),
+  ];
+
+  return {
+    total: createdDecisionLifecycles.length,
+    completed_journey_total: completedJourneyTotal,
+    terminal_closed: terminalClosed,
+    active_debt: activeDebt,
+    active_debt_reasons: activeDebtReasons,
+    review_required_total: reviewRequiredItems.length,
+    review_required: {
+      total: reviewRequiredItems.length,
+      blocking_total: reviewBlockingItems.length,
+      items: reviewRequiredItems,
+    },
+    publish_blocked: activeDebtTotal > 0 || reviewBlockingItems.length > 0,
+    publish_block_reasons: publishBlockReasons,
   };
 }
 
@@ -2170,6 +3070,40 @@ function markStage(
     : confidence;
 }
 
+function resolveAllocationBackfillObservedAtMs(entry: LifecycleAccumulator): number | null {
+  const downstreamStageTimes = [
+    entry.approval_first_seen_at_ms,
+    entry.hardening_first_seen_at_ms,
+    entry.execution_first_seen_at_ms,
+    entry.outcome_first_seen_at_ms,
+    entry.attribution_first_seen_at_ms,
+  ].filter((value): value is number => value !== null);
+  if (downstreamStageTimes.length === 0) {
+    return null;
+  }
+  return Math.min(...downstreamStageTimes);
+}
+
+function shouldBackfillAllocationStage(entry: LifecycleAccumulator): boolean {
+  if (entry.has_allocation) {
+    return false;
+  }
+  return entry.has_approval
+    || entry.has_hardening
+    || entry.has_execution
+    || entry.has_outcome
+    || entry.has_attribution;
+}
+
+function backfillAllocationStageFromDownstreamEvidence(lifecycles: LifecycleAccumulator[]): void {
+  for (const lifecycle of lifecycles) {
+    if (!shouldBackfillAllocationStage(lifecycle)) {
+      continue;
+    }
+    markStage(lifecycle, "allocation", "BACKFILLED", resolveAllocationBackfillObservedAtMs(lifecycle));
+  }
+}
+
 function readCausalityConfidence(entry: ApprovalDecisionJournalEntry | AllocationDecisionJournalEntry | ExecutionFactJournalEntry | OpportunityCostJournalEntry): unknown {
   const direct = asRecord(entry as unknown as Record<string, unknown>);
   if (typeof direct.causality_confidence === "string") {
@@ -2187,6 +3121,14 @@ function readCausalityConfidence(entry: ApprovalDecisionJournalEntry | Allocatio
 }
 
 function hasHardeningContext(entry: ApprovalDecisionJournalEntry): boolean {
+  const approvalStatus = String(entry.approval_status || "").trim().toLowerCase();
+  if (
+    entry.source_event_category === "mt5_live_order_stale_approval_cancelled"
+    || approvalStatus.includes("stale")
+    || approvalStatus.includes("cancel")
+  ) {
+    return false;
+  }
   return Object.keys(asRecord(entry.hardening)).length > 0;
 }
 
@@ -2471,6 +3413,18 @@ export async function buildDecisionFrictionAnalyticsSnapshot(options?: {
 
 export async function buildTradeLifecycleHealthSnapshot(options?: TradeLifecycleHealthSnapshotOptions): Promise<TradeLifecycleHealthSnapshot> {
   const sinceDays = Math.max(1, Math.min(365, Math.round(Number(options?.sinceDays || 30))));
+  await Promise.all([
+    backfillApprovalDecisionJournalFromCanonicalSource({ sinceDays, limit: 2000 }).catch(() => ({
+      canonical_rows: 0,
+      journal_rows: 0,
+      appended_rows: 0,
+    })),
+    backfillExecutionFactJournalFromCanonicalSource({ sinceDays, limit: 2000 }).catch(() => ({
+      canonical_rows: 0,
+      journal_rows: 0,
+      appended_rows: 0,
+    })),
+  ]);
   const [approvals, allocations, executionFacts, opportunities, allocationWriterAudits] = await Promise.all([
     readApprovalDecisionJournalEntries({ limit: 2000, sinceDays }),
     readAllocationDecisionJournalEntries({ limit: 2000, sinceDays }),
@@ -2544,11 +3498,29 @@ export async function buildTradeLifecycleHealthSnapshot(options?: TradeLifecycle
   }
 
   const lifecycles = [...lifecycleMap.values()];
+  backfillAllocationStageFromDownstreamEvidence(lifecycles);
   const lifecycleTotal = lifecycles.length;
   const decisionJourneyCompletion = buildDecisionJourneyCompletionSnapshot(lifecycles);
   const decisionGapReduction = buildDecisionGapReductionSnapshot(lifecycles);
   const decisionGapResolution = buildDecisionGapResolutionSnapshot(lifecycles);
   const allocationWriterClosure = buildAllocationWriterClosureSnapshot(allocations, approvals, executionFacts, opportunities, allocationWriterAudits, decisionGapResolution);
+  const executionGapDiagnostic = buildExecutionGapDiagnosticSnapshot(
+    lifecycles,
+    allocations,
+    approvals,
+    executionFacts,
+    opportunities,
+    allocationWriterAudits,
+    decisionGapResolution,
+  );
+  const terminalDecisionStateDiagnostic = buildTerminalDecisionStateDiagnosticSnapshot(
+    lifecycles,
+    allocations,
+    approvals,
+    executionFacts,
+    opportunities,
+    allocationWriterAudits,
+  );
   const decisionEvidenceQuality = buildDecisionEvidenceQualitySnapshot(lifecycles);
   const allocationLinkedTotal = lifecycles.filter((entry) => entry.has_allocation).length;
   const approvalLinkedTotal = lifecycles.filter((entry) => entry.has_approval).length;
@@ -2596,7 +3568,8 @@ export async function buildTradeLifecycleHealthSnapshot(options?: TradeLifecycle
     incrementConfidence(opportunityConfidence, lifecycle.opportunity_confidence);
   }
 
-  return {
+  return assertTradeLifecycleHealthSnapshot({
+    schema_version: TRADE_LIFECYCLE_HEALTH_SCHEMA_VERSION,
     generated_at_iso: new Date().toISOString(),
     window_days: sinceDays,
     source_diagnostics: {
@@ -2608,6 +3581,8 @@ export async function buildTradeLifecycleHealthSnapshot(options?: TradeLifecycle
     decision_gap_reduction: decisionGapReduction,
     decision_gap_resolution: decisionGapResolution,
     allocation_writer_closure: allocationWriterClosure,
+    execution_gap_diagnostic: executionGapDiagnostic,
+    terminal_decision_state_diagnostic: terminalDecisionStateDiagnostic,
     decision_governance: decisionGovernance,
     link_coverage_score_pct: average([
       asPercent(allocationLinkedTotal, lifecycleTotal),
@@ -2657,5 +3632,5 @@ export async function buildTradeLifecycleHealthSnapshot(options?: TradeLifecycle
     tri_spine_match: truthReliability.components.spine_match_rate_pct,
     tri_freshness: truthReliability.components.snapshot_freshness_pct,
     truth_reliability_index: truthReliability,
-  };
+  });
 }

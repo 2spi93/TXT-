@@ -9848,13 +9848,20 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
   }, [replayPayload]);
 
   function buildTradeTicketBody(overrides?: TradeTicketOverrides): JsonMap {
+    const mt5LockedFinalDecisionTruth = selectedAccountUsesMt5
+      ? {
+          ...finalDecisionTruth,
+          preferred_venue: "mt5",
+          route_mode: "bestSingleVenue",
+        }
+      : finalDecisionTruth;
     const orderIntent = {
       ...(overrides?.orderIntent || {}),
-      final_decision_truth: finalDecisionTruth,
+      final_decision_truth: mt5LockedFinalDecisionTruth,
     };
     const metadata = {
       ...(overrides?.metadata || {}),
-      final_decision_truth: finalDecisionTruth,
+      final_decision_truth: mt5LockedFinalDecisionTruth,
     };
     return {
       account_id: accountId,
@@ -9863,7 +9870,7 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
       lots: Number.isFinite(overrides?.lots) ? overrides?.lots : lots,
       estimated_notional_usd: Number.isFinite(overrides?.notional) ? overrides?.notional : notional,
       max_spread_bps: Number.isFinite(overrides?.maxSpread) ? overrides?.maxSpread : maxSpread,
-      preferred_venue: overrides?.preferredVenue,
+      preferred_venue: selectedAccountUsesMt5 ? "mt5" : overrides?.preferredVenue,
       rationale: overrides?.rationale || rationale,
       predictor_context: predictorRequestPayload,
       order_intent: orderIntent,
@@ -9871,7 +9878,138 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
     };
   }
 
+  function buildBrokerIntentRequest(overrides?: TradeTicketOverrides): JsonMap {
+    const requestedSide = overrides?.side === "sell" ? "SELL" : overrides?.side === "buy" ? "BUY" : side === "sell" ? "SELL" : "BUY";
+    const requestedSymbol = String(overrides?.symbol || symbol || selectedChartSymbol).trim() || String(selectedChartSymbol || symbol).trim();
+    const selectedStrategyId = String(
+      portfolioAllocatorSelectedEntry?.id
+      || strategyEvolutionV9Snapshot.selectedStrategy
+      || allocActiveStratId
+      || "terminal-manual",
+    ).trim() || "terminal-manual";
+    const provider = String(selectedBrokerProvider || selectedBrokerVenue || "bingx").trim().toLowerCase() || "bingx";
+    const liveExecutionConfidence = clamp(
+      Math.max(backendBrainConfidence, adaptiveV7Snapshot.decision.confidence, toNumber(confidenceV2Snapshot.finalScorePct, 0) / 100),
+      0.05,
+      1,
+    );
+    const estimatedNotionalUsd = Math.max(25, Number.isFinite(overrides?.notional) ? Number(overrides?.notional) : notional);
+    const slippageBudgetBps = Math.max(1, Math.round(Number.isFinite(overrides?.maxSpread) ? Number(overrides?.maxSpread) : maxSpread));
+    const explainabilityTags = Array.from(new Set([
+      `account:${String(accountId || "unknown").trim().toLowerCase() || "unknown"}`,
+      `provider:${provider}`,
+      `market:${String(finalDecisionTruth?.market_truth?.state || "unknown").trim().toLowerCase() || "unknown"}`,
+      `regime:${String(volatilityRegimeSnapshot.regime || "unknown").trim().toLowerCase() || "unknown"}`,
+      `confidence-v2:${String(confidenceV2Snapshot.actionState || "unknown").trim().toLowerCase() || "unknown"}`,
+      `oracle:${finalDecisionExecutionOracle.blocks_execution ? "blocked" : "go"}`,
+    ])).filter(Boolean).slice(0, 12);
+
+    return {
+      intent: {
+        strategy_id: selectedStrategyId,
+        portfolio_id: allocationDecisionPortfolioId,
+        venue: provider,
+        instrument: requestedSymbol,
+        side: requestedSide,
+        reason_code: String(finalDecisionObservabilityOracle.reason_code || "mission_control_terminal_send_order").trim() || "mission_control_terminal_send_order",
+        confidence: Number(liveExecutionConfidence.toFixed(4)),
+        target_notional_usd: Number(estimatedNotionalUsd.toFixed(2)),
+        max_slippage_bps: slippageBudgetBps,
+        leverage: 1,
+        risk_tags: explainabilityTags,
+        explainability: {
+          account_id: accountId,
+          broker_provider: provider,
+          preferred_venue: selectedBrokerVenue || provider,
+          live_execution: {
+            requested: true,
+            provider,
+            account_id: accountId,
+            preferred_venue: selectedBrokerVenue || provider,
+          },
+          predictor_context: predictorRequestPayload,
+          final_decision_truth: finalDecisionTruth,
+          terminal_submission: {
+            rationale: overrides?.rationale || rationale,
+            selected_strategy_id: selectedStrategyId,
+            selected_strategy_label: strategyEvolutionV9Snapshot.selectedStrategy,
+            confidence_v2: {
+              action_state: confidenceV2Snapshot.actionState,
+              final_score_pct: confidenceV2Snapshot.finalScorePct,
+              quality_label: confidenceV2Snapshot.qualityLabel,
+            },
+            execution_oracle: finalDecisionExecutionOracle,
+            metadata: overrides?.metadata || {},
+            order_intent: overrides?.orderIntent || {},
+          },
+        },
+      },
+      auto_execute: true,
+    };
+  }
+
+  async function executeBrokerIntentRequest(overrides?: TradeTicketOverrides): Promise<JsonMap> {
+    void marketDataBusRef.current?.refreshNow("execution");
+    const fallbackNotionalUsd = Math.max(25, Number.isFinite(overrides?.notional) ? Number(overrides?.notional) : notional);
+    const requestBody = buildBrokerIntentRequest(overrides);
+    const response = await fetch("/api/intents/submit", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...buildRoutingRequestHeaders("execution", overrides?.symbol || symbol),
+      },
+      body: JSON.stringify(requestBody),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(String((payload as JsonMap)?.detail || "Intent live rejete"));
+    }
+
+    const jsonPayload = (payload || null) as JsonMap;
+    const responseStatus = String(jsonPayload.status || "").trim().toLowerCase();
+    if (!responseStatus.startsWith("executed_")) {
+      const riskDecision = jsonPayload.risk_decision && typeof jsonPayload.risk_decision === "object"
+        ? jsonPayload.risk_decision as JsonMap
+        : null;
+      const rejectionReasons = Array.isArray(riskDecision?.reasons)
+        ? (riskDecision?.reasons as unknown[]).map((value) => String(value)).filter(Boolean)
+        : [];
+      throw new Error(rejectionReasons[0] || responseStatus || "Intent live non execute");
+    }
+
+    const order = jsonPayload.order && typeof jsonPayload.order === "object"
+      ? jsonPayload.order as JsonMap
+      : null;
+    if (!order) {
+      throw new Error("Intent live execute sans payload order exploitable");
+    }
+
+    return {
+      ...jsonPayload,
+      ...order,
+      provider: String(selectedBrokerProvider || order.venue || "bingx").trim().toLowerCase() || "bingx",
+      account_id: accountId,
+      symbol: String(order.instrument || overrides?.symbol || symbol).trim() || String(overrides?.symbol || symbol),
+      side: String(order.side || overrides?.side || side).trim().toLowerCase() || String(overrides?.side || side).trim().toLowerCase(),
+      status: responseStatus,
+      execution_status: responseStatus,
+      order_status: String(order.status || responseStatus).trim().toLowerCase() || responseStatus,
+      estimated_notional_usd: Number(order.requested_notional_usd ?? fallbackNotionalUsd),
+      notional_usd: Number(order.filled_notional_usd ?? order.requested_notional_usd ?? 0),
+      avg_fill_price: Number(order.avg_fill_price ?? 0),
+      routed_execution: {
+        venue: String(order.venue || selectedBrokerVenue || selectedBrokerProvider || "").trim().toLowerCase(),
+        provider: String(selectedBrokerProvider || order.venue || "").trim().toLowerCase(),
+        order_id: String(order.order_id || "").trim(),
+      },
+      live_execution_constraints: jsonPayload.live_execution_constraints,
+    };
+  }
+
   async function executeTradeTicketRequest(overrides?: TradeTicketOverrides): Promise<JsonMap> {
+    if (!selectedAccountUsesMt5) {
+      throw new Error("Terminal Send Order is currently wired to the MT5 approval route only. Non-MT5 accounts are blocked here to prevent BingX/MT5 venue confusion.");
+    }
     void marketDataBusRef.current?.refreshNow("execution");
     const response = await fetch("/api/mt5/orders/filter", {
       method: "POST",
@@ -10078,6 +10216,9 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
 
   async function executeWarfareTradeTicket(overrides?: TradeTicketOverrides): Promise<JsonMap> {
     const requestedSide = overrides?.side === "sell" ? "sell" : overrides?.side === "buy" ? "buy" : side === "sell" ? "sell" : "buy";
+    if (!selectedAccountUsesMt5) {
+      return executeBrokerIntentRequest(overrides);
+    }
     const executionMicrostructureControl = buildExecutionMicrostructureControlForSide(requestedSide);
     const profitRiskBlockedReason = getProfitRiskExecutionBlockReason(requestedSide);
     if (finalDecisionExecutionOracle.blocks_execution) {
@@ -10111,7 +10252,9 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
     const totalNotionalUsd = (aiSizingAlreadyApplied ? requestedNotionalUsd : applyRiskAiLiveSizing(requestedNotionalUsd))
       * autoOptimizationMultiplier
       * confidenceExecutionControl.executionRiskMultiplier;
-    const preGateVenue = truthExecutionVenue || overrides?.preferredVenue || crossVenueLocalRoutingDirective.preferred_venue || executionEngineSnapshot.entry.venue || executionWarfareV85Snapshot.plan.venue || String((routingScore?.best as JsonMap | undefined)?.venue || "");
+    const preGateVenue = selectedAccountUsesMt5
+      ? "mt5"
+      : truthExecutionVenue || overrides?.preferredVenue || crossVenueLocalRoutingDirective.preferred_venue || executionEngineSnapshot.entry.venue || executionWarfareV85Snapshot.plan.venue || String((routingScore?.best as JsonMap | undefined)?.venue || "");
     const maxSpreadBase = Number.isFinite(overrides?.maxSpread) ? Number(overrides?.maxSpread) : maxSpread;
     const smartMaxSpreadBudget = Math.max(
       1,
@@ -10165,19 +10308,33 @@ function TradingTerminalPageHydrated({ initialOperatorSnapshot = null }: Trading
     const smartSizedNotionalUsd = totalNotionalUsd > 0
       ? Number(Math.max(25, totalNotionalUsd * executionV7SmartGate.sizeMultiplier).toFixed(2))
       : 0;
-    const liveSmartRoutingPlan = routeOrder({
-      side: requestedSide,
-      notionalUsd: Math.max(25, smartSizedNotionalUsd),
-      aggregatedBook: aggregatedMultiVenueBook,
-      maxOrders: 4,
-      minOrderNotionalUsd: 25,
-    });
-    const effectiveVenue = truthExecutionVenue || overrides?.preferredVenue || crossVenueLocalRoutingDirective.preferred_venue || liveSmartRoutingPlan.primaryVenue || executionEngineSnapshot.entry.venue || executionWarfareV85Snapshot.plan.venue || undefined;
+    const liveSmartRoutingPlan = selectedAccountUsesMt5
+      ? {
+          primaryVenue: "mt5",
+          requestedNotionalUsd: Math.max(25, smartSizedNotionalUsd),
+          routedNotionalUsd: Math.max(25, smartSizedNotionalUsd),
+          remainingNotionalUsd: 0,
+          coverageRatio: 1,
+          estimatedAveragePrice: 0,
+          estimatedSlippageBps: 0,
+          venueCount: 1,
+          orders: [{ venue: "mt5", notionalUsd: Math.max(25, smartSizedNotionalUsd) }],
+        }
+      : routeOrder({
+          side: requestedSide,
+          notionalUsd: Math.max(25, smartSizedNotionalUsd),
+          aggregatedBook: aggregatedMultiVenueBook,
+          maxOrders: 4,
+          minOrderNotionalUsd: 25,
+        });
+    const effectiveVenue = selectedAccountUsesMt5
+      ? "mt5"
+      : truthExecutionVenue || overrides?.preferredVenue || crossVenueLocalRoutingDirective.preferred_venue || liveSmartRoutingPlan.primaryVenue || executionEngineSnapshot.entry.venue || executionWarfareV85Snapshot.plan.venue || undefined;
     const maxSpreadEffective = Math.max(
       1,
       Math.min(smartMaxSpreadBudget * (executionV7VenueLearning && executionV7VenueLearning.score < 0.5 ? 0.94 : 1), executionEngineSnapshot.slippage.budgetBps),
     );
-    const smartRoutingChildren = crossVenueLocalRoutingDirective.allow_smart_routing_split && liveSmartRoutingPlan.orders.length > 0 && liveSmartRoutingPlan.coverageRatio >= 0.55
+    const smartRoutingChildren = !selectedAccountUsesMt5 && crossVenueLocalRoutingDirective.allow_smart_routing_split && liveSmartRoutingPlan.orders.length > 0 && liveSmartRoutingPlan.coverageRatio >= 0.55
       ? liveSmartRoutingPlan.orders.map((order, index) => ({
         id: `${selectedChartSymbol}-${order.venue}-${index + 1}`,
         venue: order.venue,

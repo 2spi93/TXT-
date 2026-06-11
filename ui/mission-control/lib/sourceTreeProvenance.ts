@@ -69,6 +69,67 @@ async function readTextFile(filePath: string): Promise<string | null> {
   }
 }
 
+async function resolveGitDir(rootPath: string): Promise<string | null> {
+  let currentPath = rootPath;
+  while (true) {
+    const dotGitPath = path.join(currentPath, ".git");
+    if (await pathExists(dotGitPath)) {
+      const gitPointer = await readTextFile(dotGitPath);
+      if (gitPointer) {
+        const match = gitPointer.trim().match(/^gitdir:\s*(.+)$/i);
+        if (match) {
+          const resolvedGitDir = path.resolve(currentPath, match[1].trim());
+          return (await pathExists(resolvedGitDir)) ? resolvedGitDir : null;
+        }
+      }
+      return dotGitPath;
+    }
+    const parentPath = path.dirname(currentPath);
+    if (parentPath === currentPath) {
+      return null;
+    }
+    currentPath = parentPath;
+  }
+}
+
+async function readHeadCommitFromGitDir(gitDirPath: string): Promise<string | null> {
+  const headValue = await readTextFile(path.join(gitDirPath, "HEAD"));
+  if (!headValue) {
+    return null;
+  }
+  const normalizedHead = headValue.trim();
+  if (!normalizedHead.startsWith("ref:")) {
+    return normalizeCommit(normalizedHead);
+  }
+
+  const refName = normalizedHead.slice(4).trim();
+  if (!refName) {
+    return null;
+  }
+
+  const looseRefValue = await readTextFile(path.join(gitDirPath, ...refName.split("/")));
+  const looseRefCommit = normalizeCommit(looseRefValue);
+  if (looseRefCommit) {
+    return looseRefCommit;
+  }
+
+  const packedRefs = await readTextFile(path.join(gitDirPath, "packed-refs"));
+  if (!packedRefs) {
+    return null;
+  }
+  for (const line of packedRefs.split(/\r?\n/)) {
+    const normalizedLine = line.trim();
+    if (!normalizedLine || normalizedLine.startsWith("#") || normalizedLine.startsWith("^")) {
+      continue;
+    }
+    const [commit, name] = normalizedLine.split(/\s+/, 2);
+    if (name === refName) {
+      return normalizeCommit(commit);
+    }
+  }
+  return null;
+}
+
 async function readGitCommit(rootPath: string | null): Promise<string | null> {
   if (!rootPath || !(await pathExists(rootPath))) {
     return null;
@@ -77,7 +138,8 @@ async function readGitCommit(rootPath: string | null): Promise<string | null> {
     const result = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: rootPath });
     return normalizeCommit(result.stdout);
   } catch {
-    return null;
+    const gitDir = await resolveGitDir(rootPath);
+    return gitDir ? readHeadCommitFromGitDir(gitDir) : null;
   }
 }
 
@@ -86,7 +148,10 @@ async function resolveWorkspaceRoot(): Promise<string | null> {
   if (configuredRoot) {
     return (await pathExists(configuredRoot)) ? configuredRoot : null;
   }
-  return (await pathExists(DEFAULT_WORKSPACE_SOURCE_ROOT)) ? DEFAULT_WORKSPACE_SOURCE_ROOT : null;
+  if (await pathExists(DEFAULT_WORKSPACE_SOURCE_ROOT)) {
+    return DEFAULT_WORKSPACE_SOURCE_ROOT;
+  }
+  return (await pathExists(DEFAULT_RUNTIME_SOURCE_ROOT)) ? DEFAULT_RUNTIME_SOURCE_ROOT : null;
 }
 
 async function resolveRuntimeRoot(): Promise<string | null> {

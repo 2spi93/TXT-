@@ -61,6 +61,7 @@ export type RuntimeTruthSnapshot = {
     health: JsonMap;
     routing: JsonMap;
     readiness: JsonMap;
+    settlement: JsonMap;
     publication: JsonMap;
     watchdog: JsonMap;
     observation: JsonMap;
@@ -71,6 +72,7 @@ export type RuntimeTruthSnapshot = {
     opportunity_gate: unknown;
     market_session: unknown;
     mt5_health: unknown;
+    settlement_truth: unknown;
     runtime_decision: RuntimeDecisionSummary | null;
     controlled_collection: Awaited<ReturnType<typeof getControlledCollectionSessionSummary>>;
     edge_evidence: RuntimeEdgeEvidenceState;
@@ -94,6 +96,7 @@ runtimeTruthGlobal.__runtimeTruthCache__ = runtimeTruthCache;
 runtimeTruthGlobal.__runtimeTruthInflight__ = runtimeTruthInflight;
 
 const RUNTIME_TRUTH_CP_TIMEOUT_MS = 8_000;
+const RUNTIME_TRUTH_SETTLEMENT_TIMEOUT_MS = Math.max(RUNTIME_TRUTH_CP_TIMEOUT_MS, Math.round(Number(process.env.RUNTIME_TRUTH_SETTLEMENT_TIMEOUT_MS || 45_000)));
 const RUNTIME_TRUTH_ANALYTICS_TIMEOUT_MS = 8_000;
 const RUNTIME_TRUTH_EDGE_EVIDENCE_TIMEOUT_MS = 900;
 const RUNTIME_TRUTH_CACHE_MS = Math.max(5_000, Math.round(Number(process.env.RUNTIME_TRUTH_SNAPSHOT_TTL_MS || 15_000)));
@@ -283,7 +286,7 @@ function fallbackFetchResult(path: string, status = 504): CpFetchResult {
   };
 }
 
-async function cpFetchBounded(path: string, timeoutMs = RUNTIME_TRUTH_CP_TIMEOUT_MS): Promise<CpFetchResult> {
+async function cpFetchBounded(path: string, timeoutMs = RUNTIME_TRUTH_CP_TIMEOUT_MS, authMode?: "auto" | "service" | "session"): Promise<CpFetchResult> {
   const controller = new AbortController();
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
   const fallback = fallbackFetchResult(path, 504);
@@ -293,7 +296,7 @@ async function cpFetchBounded(path: string, timeoutMs = RUNTIME_TRUTH_CP_TIMEOUT
       resolve(fallback);
     }, timeoutMs);
   });
-  const fetchPromise = cpFetchJsonSafe(path, { signal: controller.signal })
+  const fetchPromise = cpFetchJsonSafe(path, { signal: controller.signal, ...(authMode ? { authMode } : {}) })
     .catch(() => fallbackFetchResult(path, 503))
     .finally(() => {
       if (timeoutId) {
@@ -583,6 +586,7 @@ function buildUnavailableRuntimeTruthSnapshot(input: Required<RuntimeTruthInput>
       health: {},
       routing: {},
       readiness: {},
+      settlement: {},
       publication: {
         partial_data: true,
         generated_at: generatedAt,
@@ -619,6 +623,7 @@ function buildUnavailableRuntimeTruthSnapshot(input: Required<RuntimeTruthInput>
       opportunity_gate: null,
       market_session: null,
       mt5_health: null,
+      settlement_truth: null,
       runtime_decision: null,
       controlled_collection: defaultControlledCollectionSummary(),
       edge_evidence: defaultEdgeEvidenceState(),
@@ -692,7 +697,7 @@ async function buildRuntimeTruthSnapshotUncached(input: Required<RuntimeTruthInp
     },
     topCells: [],
   };
-  const [killSwitchResult, systemConfigResult, gateResult, marketSessionResult, mt5HealthResult, mt5AccountsResult, mt5RiskHistoryResult, mt5BridgeQuoteResult, spreadDecisionTraceResult, telemetryRecentResult, realityGapRecentResult, controlledCollection, edgeEvidence, runtimeDecision, spreadDecisionTraceSummaryFile] = await Promise.all([
+  const [killSwitchResult, systemConfigResult, gateResult, marketSessionResult, mt5HealthResult, mt5AccountsResult, mt5RiskHistoryResult, mt5BridgeQuoteResult, spreadDecisionTraceResult, telemetryRecentResult, realityGapRecentResult, settlementTruthResult, controlledCollection, edgeEvidence, runtimeDecision, spreadDecisionTraceSummaryFile] = await Promise.all([
     cpFetchBounded("/v1/system/kill-switch"),
     cpFetchBounded("/v1/system/config"),
     cpFetchBounded("/v1/system/opportunity-gate"),
@@ -704,6 +709,7 @@ async function buildRuntimeTruthSnapshotUncached(input: Required<RuntimeTruthInp
     cpFetchBounded("/v1/mt5/orders/spread-decision-trace/summary?lookback_hours=168&limit=2500"),
     cpFetchBounded("/v1/execution/telemetry/recent?limit=120"),
     cpFetchBounded("/v1/execution/reality-gap/recent?limit=120"),
+    cpFetchBounded("/v1/settlement/truth", RUNTIME_TRUTH_SETTLEMENT_TIMEOUT_MS, "service"),
     getControlledCollectionSessionSummary().catch(() => null),
     withTimeout(getRuntimeEdgeEvidenceState().catch(() => edgeEvidenceFallback), RUNTIME_TRUTH_EDGE_EVIDENCE_TIMEOUT_MS, edgeEvidenceFallback),
     withTimeout(
@@ -734,6 +740,7 @@ async function buildRuntimeTruthSnapshotUncached(input: Required<RuntimeTruthInp
   const telemetryRecent = asArray<JsonMap>(telemetryRecentResult.payload);
   const realityGapPayload = asRecord(realityGapRecentResult.payload);
   const realityGapRecent = asArray<JsonMap>(realityGapPayload.rows);
+  const settlementTruth = asRecord(settlementTruthResult.payload);
   const controlled = controlledCollection || {
     available: false,
     active: false,
@@ -771,6 +778,7 @@ async function buildRuntimeTruthSnapshotUncached(input: Required<RuntimeTruthInp
       mt5_bridge_quote: mt5BridgeQuoteResult.network,
     execution_telemetry_recent: telemetryRecentResult.network,
     execution_reality_gap_recent: realityGapRecentResult.network,
+    settlement_truth: settlementTruthResult.network,
   };
   const partialData = Object.values(network).some((item) => item.degraded_flag) || runtimeDecision === null || controlled.phase === "UNAVAILABLE";
   const sourceRowsScanned = 15
@@ -778,6 +786,7 @@ async function buildRuntimeTruthSnapshotUncached(input: Required<RuntimeTruthInp
     + mt5RiskHistory.length
     + telemetryRecent.length
     + realityGapRecent.length
+    + (Object.keys(settlementTruth).length > 0 ? 1 : 0)
     + (runtimeDecision ? 1 : 0)
     + (Object.keys(spreadDecisionTraceFile).length > 0 ? 1 : 0);
   const killSwitchActive = Boolean(killSwitchState.active);
@@ -1298,6 +1307,19 @@ async function buildRuntimeTruthSnapshotUncached(input: Required<RuntimeTruthInp
         observation_status: runtimeDecision?.observation?.status || "UNAVAILABLE",
         summary: runtimeSummary,
       },
+      settlement: {
+        status: String(settlementTruth.status || "missing_source"),
+        source: String(settlementTruth.source || "control_plane"),
+        schema_version: String(settlementTruth.schema_version || ""),
+        generated_at: settlementTruth.generated_at || null,
+        last_settlement_at: settlementTruth.last_settlement_at || null,
+        linked_outcome_count: toNumber(settlementTruth.linked_outcome_count, 0),
+        unlinked_settlement_count: toNumber(settlementTruth.unlinked_settlement_count, 0),
+        stale: Boolean(settlementTruth.stale),
+        contract_valid: Boolean(settlementTruth.contract_valid),
+        blocking: Boolean(settlementTruth.blocking),
+        repair_hint: settlementTruth.repair_hint || null,
+      },
       publication: {
         partial_data: partialData,
         generated_at: generatedAt,
@@ -1334,6 +1356,7 @@ async function buildRuntimeTruthSnapshotUncached(input: Required<RuntimeTruthInp
       opportunity_gate: gateResult.payload,
       market_session: marketSessionResult.payload,
       mt5_health: mt5HealthResult.payload,
+      settlement_truth: settlementTruthResult.payload,
       runtime_decision: runtimeDecision,
       controlled_collection: controlled,
       edge_evidence: edgeEvidence,

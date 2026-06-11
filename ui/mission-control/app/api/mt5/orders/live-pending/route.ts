@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 
-import { cpFetchJsonSafe, getControlPlaneNetworkMetricsSnapshot } from "../../../../../lib/controlPlane";
+import { requireControlPlaneSession } from "../../../../../lib/apiAuth";
+import { getControlPlaneNetworkMetricsSnapshot } from "../../../../../lib/controlPlane";
+import { cpFetchMt5Live } from "../../../../../lib/controlPlaneMt5Live";
 
 const MT5_LIVE_PENDING_TIMEOUT_MS = 4_000;
 
@@ -14,29 +16,17 @@ function fallbackPayload(detail: string): Record<string, unknown> {
 }
 
 export async function GET(): Promise<NextResponse> {
-  const controller = new AbortController();
-  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  const authError = await requireControlPlaneSession();
+  if (authError) {
+    return authError;
+  }
   try {
-    const timeout = new Promise<null>((resolve) => {
-      timeoutId = setTimeout(() => {
-        controller.abort();
-        resolve(null);
-      }, MT5_LIVE_PENDING_TIMEOUT_MS);
+    const result = await cpFetchMt5Live("/v1/mt5/orders/live-pending", {
+      method: "GET",
+      timeoutMs: MT5_LIVE_PENDING_TIMEOUT_MS,
     });
-    const result = await Promise.race([
-      cpFetchJsonSafe("/v1/mt5/orders/live-pending", { signal: controller.signal }),
-      timeout,
-    ]);
-    if (!result) {
-      return NextResponse.json(fallbackPayload("mt5_live_pending_timeout"), { status: 200 });
-    }
-    const { response, payload } = result;
-    return NextResponse.json(payload, { status: response.status });
+    return NextResponse.json(result.payload, { status: result.status });
   } catch {
     return NextResponse.json(fallbackPayload("mt5_live_pending_unreachable"), { status: 200 });
-  } finally {
-    if (timeoutId) {
-      clearTimeout(timeoutId);
-    }
   }
 }
