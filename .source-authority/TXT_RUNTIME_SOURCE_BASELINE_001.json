@@ -1,0 +1,23 @@
+{
+  "schema_version": "TXT_RUNTIME_SOURCE_BASELINE_001",
+  "authority_type": "SANITIZED_RUNTIME_SOURCE_BASELINE",
+  "generated_at": "2026-07-22T22:25:46Z",
+  "historical_continuity_before_baseline": "NOT_CLAIMED",
+  "legacy_github_main": "be8eb8223ef096c3d1870d9fa64c30ab5c221045",
+  "tested_local_runtime_base": "bc1ec7ac20a18bd4be34e72804d52858de19a475",
+  "tested_local_runtime_base_scope": "LOCAL_REFERENCE_ONLY",
+  "tested_healthwatch_commit": "88e1680d7f38e443685426eccacdb58735db0fb7",
+  "tested_healthwatch_commit_scope": "LOCAL_EVIDENCE_ONLY",
+  "baseline_source_file_count": 925,
+  "git_authority_metadata_file_count": 3,
+  "publication_sanitizations": 29,
+  "excluded_files": 85,
+  "source_manifest": ".source-authority/TXT_RUNTIME_SOURCE_BASELINE_001_MANIFEST.jsonl",
+  "source_manifest_sha256": "0e56264dbfcb664c8a888b24e9ff3f466918a1110c27a8b3d59f6f2d0f332e87",
+  "source_manifest_scope": "All files except .source-authority/",
+  "baseline_claim": "BASELINE_MATCHES_SANITIZED_SOURCE_SNAPSHOT",
+  "full_active_runtime_match_claimed": false,
+  "healthwatch_runtime_subset_alignment": "11/11 PASS",
+  "github_push_executed": false,
+  "legacy_main_mutated": false
+}

@@ -1,0 +1,288 @@
+import { CandleLayer } from "./CandleLayer";
+import { GridLayer } from "./GridLayer";
+import { HeatmapHistoryLayer } from "./HeatmapHistoryLayer";
+import { OverlayLayer, type OverlayHeatmapLevel } from "./OverlayLayer";
+import { PriceSignalLayer, type PriceSignalBand } from "./PriceSignalLayer";
+import { TradeBubbleLayer, type TradeBubblePoint } from "./TradeBubbleLayer";
+import { resolvePerceptualRange } from "./chartPerceptualDominance";
+import type { OhlcBar } from "./sharedBuffer";
+import type { DomHistoryFrame } from "../../domHistoryBuffer";
+
+export type ChartViewport = {
+  id: string;
+  symbol?: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  candles: OhlcBar[];
+  visibleSlotCount?: number;
+  minPrice?: number;
+  maxPrice?: number;
+  minTime?: number;
+  maxTime?: number;
+  renderCandles?: boolean;
+  heatmapLevels?: OverlayHeatmapLevel[];
+  domHistory?: DomHistoryFrame[];
+  tradeBubbles?: TradeBubblePoint[];
+  priceSignalBands?: PriceSignalBand[];
+  overlayAlpha: number;
+  overlayHeatIntensity: number;
+  overlayDiscardThreshold: number;
+  gridAlpha: number;
+  gridVerticalLines: number;
+  gridHorizontalLines: number;
+};
+
+export class MultiChartManager {
+  private gl: WebGL2RenderingContext;
+  private candleLayer: CandleLayer;
+  private gridLayer: GridLayer;
+  private heatmapHistoryLayer: HeatmapHistoryLayer;
+  private overlayLayer: OverlayLayer;
+  private tradeBubbleLayer: TradeBubbleLayer;
+  private priceSignalLayer: PriceSignalLayer;
+  private viewports: ChartViewport[] = [];
+  private _drawCallCount = 0;
+  private _lastBatchSize = 0;
+  private previousFrameMs: number | null = null;
+  private frameBudgetMs = 16.7;
+  private skipOverlayForFrame = false;
+  private overlayIntervalMs = 250;
+  private overlayLastDrawMs = new Map<string, number>();
+  private uploadCursor = 0;
+  private lastBarSmoothingMs = 140;
+
+  constructor(gl: WebGL2RenderingContext) {
+    this.gl = gl;
+    this.candleLayer = new CandleLayer(gl);
+    this.gridLayer = new GridLayer(gl);
+    this.heatmapHistoryLayer = new HeatmapHistoryLayer(gl);
+    this.overlayLayer = new OverlayLayer(gl);
+    this.tradeBubbleLayer = new TradeBubbleLayer(gl);
+    this.priceSignalLayer = new PriceSignalLayer(gl);
+  }
+
+  dispose(): void {
+    this.candleLayer.dispose();
+    this.gridLayer.dispose();
+    this.heatmapHistoryLayer.dispose();
+    this.overlayLayer.dispose();
+    this.tradeBubbleLayer.dispose();
+    this.priceSignalLayer.dispose();
+  }
+
+  setViewports(viewports: ChartViewport[]): void {
+    this.viewports = viewports;
+  }
+
+  render(frameTimeMs: number): void {
+    const gl = this.gl;
+    this._drawCallCount = 0;
+    this._lastBatchSize = 0;
+    if (this.previousFrameMs === null) {
+      this.previousFrameMs = frameTimeMs;
+    }
+    const frameDelta = Math.max(0, frameTimeMs - this.previousFrameMs);
+    this.previousFrameMs = frameTimeMs;
+    this.skipOverlayForFrame = frameDelta > this.frameBudgetMs;
+
+    // Evict GPU buffers for viewports no longer in this frame
+    const activeIds = new Set(this.viewports.map((v) => v.id));
+    this.candleLayer.evictUnusedViewports(activeIds);
+
+    gl.enable(gl.SCISSOR_TEST);
+
+    gl.clearColor(0.02, 0.05, 0.09, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    const uploadBudget = this.viewports.length >= 16 ? 4 : this.viewports.length;
+    const uploadSet = this.resolveUploadSet(uploadBudget);
+
+    for (const viewport of this.viewports) {
+      if (viewport.width <= 0 || viewport.height <= 0) {
+        continue;
+      }
+
+      for (const id of this.overlayLastDrawMs.keys()) {
+        if (!activeIds.has(id)) this.overlayLastDrawMs.delete(id);
+      }
+
+      gl.scissor(viewport.x, viewport.y, viewport.width, viewport.height);
+
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      this.gridLayer.draw({
+        alpha: viewport.gridAlpha,
+        verticalLines: viewport.gridVerticalLines,
+        horizontalLines: viewport.gridHorizontalLines,
+      });
+      this._drawCallCount += 1;
+
+      const fallbackRange = resolvePerceptualRange(viewport.candles, viewport.candles.length);
+      const range = Number.isFinite(viewport.minPrice) && Number.isFinite(viewport.maxPrice) && Number(viewport.maxPrice) > Number(viewport.minPrice)
+        ? { minPrice: Number(viewport.minPrice), maxPrice: Number(viewport.maxPrice) }
+        : fallbackRange;
+      const minTime = Number.isFinite(viewport.minTime) ? Number(viewport.minTime) : (viewport.candles[0]?.time ?? 0);
+      const maxTime = Number.isFinite(viewport.maxTime) ? Number(viewport.maxTime) : (viewport.candles[viewport.candles.length - 1]?.time ?? minTime);
+
+      if ((viewport.domHistory || []).length > 0 && maxTime > minTime) {
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        this.heatmapHistoryLayer.draw({
+          historyFrames: viewport.domHistory || [],
+          alpha: Math.min(0.34, viewport.overlayAlpha * 1.25),
+          heatIntensity: viewport.overlayHeatIntensity,
+          discardThreshold: viewport.overlayDiscardThreshold * 0.82,
+          minPrice: range.minPrice,
+          maxPrice: range.maxPrice,
+          minTime,
+          maxTime,
+        });
+        this._drawCallCount += 1;
+      }
+
+      if (viewport.renderCandles !== false) {
+        gl.disable(gl.BLEND);
+        this.candleLayer.draw(viewport.id, viewport.candles, {
+          allowUpload: uploadSet.has(viewport.id),
+          frameTimeMs,
+          smoothingMs: this.lastBarSmoothingMs,
+          canvasWidth: gl.canvas.width,
+          canvasHeight: gl.canvas.height,
+          slotCount: viewport.visibleSlotCount,
+          minPrice: range.minPrice,
+          maxPrice: range.maxPrice,
+          minTime,
+          maxTime,
+        });
+        this._drawCallCount += 1;
+        if (viewport.candles.length > this._lastBatchSize) {
+          this._lastBatchSize = viewport.candles.length;
+        }
+      }
+
+      // Stagger: initialise first-draw time for each viewport so they are
+      // spread evenly across the overlay interval rather than all firing at
+      // the same frame (which would burst DC to viewports×3 at once).
+      if (!this.skipOverlayForFrame) {
+        const viewportIndex = this.viewports.indexOf(viewport);
+        const staggerOffset = this.overlayIntervalMs * (viewportIndex / Math.max(1, this.viewports.length));
+        const defaultLastMs = frameTimeMs - staggerOffset;
+        const lastOverlayMs = this.overlayLastDrawMs.has(viewport.id)
+          ? this.overlayLastDrawMs.get(viewport.id)!
+          : defaultLastMs;
+        if (frameTimeMs - lastOverlayMs >= this.overlayIntervalMs) {
+          gl.enable(gl.BLEND);
+          gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+          this.overlayLayer.draw({
+            viewportId: viewport.id,
+            alpha: viewport.overlayAlpha,
+            heatIntensity: viewport.overlayHeatIntensity,
+            discardThreshold: viewport.overlayDiscardThreshold,
+            heatmapLevels: viewport.heatmapLevels || [],
+            minPrice: range.minPrice,
+            maxPrice: range.maxPrice,
+          });
+          if ((viewport.heatmapLevels || []).length > 0) {
+            this._drawCallCount += 1;
+            this.overlayLastDrawMs.set(viewport.id, frameTimeMs);
+          }
+        }
+      }
+
+      if ((viewport.tradeBubbles || []).length > 0 && maxTime > minTime) {
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        this.tradeBubbleLayer.draw({
+          bubbles: viewport.tradeBubbles || [],
+          alpha: Math.min(0.9, viewport.overlayAlpha * 3.8),
+          minPrice: range.minPrice,
+          maxPrice: range.maxPrice,
+          minTime,
+          maxTime,
+          viewportWidth: viewport.width,
+          viewportHeight: viewport.height,
+        });
+        this._drawCallCount += 1;
+      }
+
+      if ((viewport.priceSignalBands || []).length > 0) {
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        this.priceSignalLayer.draw({
+          signals: viewport.priceSignalBands || [],
+          alpha: Math.min(0.92, viewport.overlayAlpha * 4.8),
+          minPrice: range.minPrice,
+          maxPrice: range.maxPrice,
+        });
+        this._drawCallCount += 1;
+      }
+    }
+
+    gl.disable(gl.BLEND);
+    gl.disable(gl.SCISSOR_TEST);
+  }
+
+  getMetrics(): { drawCalls: number; batchSize: number; overlayIntervalMs: number } {
+    const viewports = this.viewports.length;
+    const adaptiveOverlayInterval = viewports >= 16
+      ? 420
+      : viewports >= 4
+        ? 320
+        : 250;
+    if (this.overlayIntervalMs !== adaptiveOverlayInterval) {
+      this.overlayIntervalMs = adaptiveOverlayInterval;
+    }
+    return { drawCalls: this._drawCallCount, batchSize: this._lastBatchSize, overlayIntervalMs: this.overlayIntervalMs };
+  }
+
+  setFrameBudgetMs(value: number): void {
+    if (Number.isFinite(value) && value > 0) {
+      this.frameBudgetMs = value;
+    }
+  }
+
+  setLastBarSmoothingMs(value: number): void {
+    if (!Number.isFinite(value) || value < 0) {
+      return;
+    }
+    this.lastBarSmoothingMs = value;
+  }
+
+  private resolveUploadSet(limit: number): Set<string> {
+    const count = this.viewports.length;
+    if (count === 0 || limit <= 0) {
+      return new Set();
+    }
+    if (limit >= count) {
+      return new Set(this.viewports.map((viewport) => viewport.id));
+    }
+
+    const selected = new Set<string>();
+    const primary = this.viewports.find((viewport) => viewport.id === "primary");
+    if (primary) {
+      selected.add(primary.id);
+    }
+
+    const slots = Math.max(0, limit - selected.size);
+    if (slots === 0) {
+      return selected;
+    }
+
+    let scanned = 0;
+    let picked = 0;
+    while (scanned < count && picked < slots) {
+      const viewport = this.viewports[(this.uploadCursor + scanned) % count];
+      scanned += 1;
+      if (!viewport || selected.has(viewport.id)) {
+        continue;
+      }
+      selected.add(viewport.id);
+      picked += 1;
+    }
+
+    this.uploadCursor = (this.uploadCursor + Math.max(1, slots)) % Math.max(1, count);
+    return selected;
+  }
+}

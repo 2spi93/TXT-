@@ -1,0 +1,35 @@
+name: terminal-reliability
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/terminal-reliability.yml"
+      - "app/terminal/**"
+      - "lib/**"
+      - "playwright.config.ts"
+      - "package.json"
+      - "scripts/playwright-preflight.js"
+      - "scripts/playwright-web-server.sh"
+      - "scripts/qa-terminal-reliability.sh"
+      - "tests/e2e/terminal-interaction-scan.spec.ts"
+      - "tests/e2e/terminal-minimal-mode.spec.ts"
+
+jobs:
+  terminal-reliability:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Docker Version
+        run: docker --version
+
+      - name: Run Terminal Reliability Suite
+        env:
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:3328
+          MC_E2E_DEV_DEGRADED: "1"
+          MC_E2E_DEV_DEGRADED_SILENT: "1"
+        run: sh scripts/qa-terminal-reliability.sh

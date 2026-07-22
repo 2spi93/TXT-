@@ -1,0 +1,10 @@
+{
+  "source_root": "/opt/txt/artifacts",
+  "local_destination_root": "/opt/txt/artifacts/cold-replay-local/txt-replay-cold/txt/runtime",
+  "state_path": "/opt/txt/artifacts/cold-export-state/local-runtime.json",
+  "patterns": [
+    "jsonl-parquet/**/*.parquet",
+    "jsonl-archive/**/*.manifest.json"
+  ],
+  "max_files_per_run": 250
+}

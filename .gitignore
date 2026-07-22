@@ -1,0 +1,94 @@
+# Local environment and secrets
+.vscode/
+.env
+.env.*
+!.env.example
+secrets/
+
+# Build/runtime artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.tsbuildinfo
+.venv/
+.next/
+.next-runtime-e2e/
+.next-runtime/
+.next-runtime-blue/
+.next-runtime-green/
+node_modules/
+logs/
+*.log
+
+# Diagnostic / temporary
+*.cache
+*.local
+*.env.local
+coverage/
+dist/
+data/certbot/
+data/market-data/
+data/mission-control/
+data/predictor_v8/
+data/telegram-control-bot/
+rust-execution-engine/target/
+
+# Screenshots / diagnostic captures (Playwright, manual)
+*.png
+*.jpg
+*.jpeg
+
+# Test results
+ui/mission-control/test-results/
+ui/mission-control/playwright-report/
+
+# Mission Control scripts: ignore by default, but keep versioned test/qa tooling
+ui/mission-control/scripts/*
+!ui/mission-control/scripts/check-next-version.sh
+!ui/mission-control/scripts/mock-control-plane-cancel-replace.js
+!ui/mission-control/scripts/qa-*.sh
+!ui/mission-control/scripts/risk-workspace.integration.js
+!ui/mission-control/scripts/run_terminal_*.sh
+!ui/mission-control/scripts/test-*.js
+!ui/mission-control/scripts/scan-*.sh
+!ui/mission-control/scripts/scan-*.ts
+!ui/mission-control/scripts/test-*.sh
+
+# Smoke scripts at root
+ui/mission-control/final_smoke.js
+ui/mission-control/sidecar_smoke.js
+ui/mission-control/fetch_live_ops.js
+ui/mission-control/playwright_probe.js
+ui/mission-control/playwright_probe_final.js
+ui/mission-control/playwright_probe_v2.js
+ui/mission-control/playwright_validation.js
+ui/mission-control/playwright_validation_v2.js
+ui/mission-control/test-cold-load.js
+ui/mission-control/test-cold-load-v2.js
+ui/mission-control/v3_probe.js
+ui/mission-control/v3_probe_v2.js
+ui/mission-control/validate.js
+ui/mission-control/validate_live_ops.js
+
+# Artifacts
+artifacts/
+ui/mission-control/artifacts/
+ui/mission-control/build_log.txt
+ui/mission-control/lint_output.txt
+ui/mission-control/wget-log
+ui/mission-control/.tmp/
+ui/mission-control/.next-debug-prerender/
+soak_results.json
+token.txt
+
+# Site deployment/runtime artifacts
+sites/*/.autopublish/
+sites/*/backups/
+sites/*/*.snapshot.*.html
+
+# Operator audit artifacts from marketable-limit harness (sanitized, but operational — not source)
+var/marketable_limit_captures/
+
+# Autonomous proof-renewal readiness/audit artifacts (operational, not source)
+var/proof_renewal/

@@ -1,0 +1,12 @@
+{
+  "api_base_url": "https://api.telegram.org",
+  "token_file": "/opt/txt/secrets/telegram_bot_token",
+  "chat_id_file": "/opt/txt/secrets/telegram_chat_id",
+  "state_path": "/opt/txt/data/telegram-control-bot/state.json",
+  "log_path": "/opt/txt/logs/telegram-control-bot.jsonl",
+  "control_plane_url": "http://127.0.0.1:8000",
+  "poll_timeout_seconds": 25,
+  "request_timeout_seconds": 45,
+  "idle_sleep_seconds": 1,
+  "clear_webhook_on_start": true
+}

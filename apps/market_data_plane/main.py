@@ -1,0 +1,4005 @@
+from __future__ import annotations
+
+import asyncio
+import gzip
+import hashlib
+import json
+import logging
+import os
+import threading
+from datetime import datetime, time, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+
+import httpx
+import websockets
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+
+from shared.db import ensure_schema, execute, execute_rowcount, fetch_all, fetch_one, json_dumps
+
+
+def _secret_env(name: str, default: str = "") -> str:
+    file_path = os.getenv(f"{name}_FILE", "").strip()
+    if file_path:
+        try:
+            with open(file_path, "r", encoding="utf-8") as handle:
+                value = handle.read().strip()
+            if value:
+                return value
+        except OSError:
+            pass
+    return os.getenv(name, "").strip() or default
+
+app = FastAPI(title="Market Data Plane", version="0.3.0")
+APP_STARTED_AT = datetime.now(timezone.utc)
+LOGGER = logging.getLogger(__name__)
+
+DEFAULT_SYMBOLS = [symbol.strip() for symbol in os.getenv("MARKET_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT").split(",") if symbol.strip()]
+DEFAULT_CFD_SEED_SYMBOLS = [symbol.strip().upper() for symbol in os.getenv("MARKET_CFD_SEED_SYMBOLS", "EURUSD,XAUUSD,GBPUSD,USDJPY,XAGUSD").split(",") if symbol.strip()]
+CFD_AUTO_SEED_ENABLED = os.getenv("MARKET_CFD_AUTO_SEED", "0").strip().lower() in {"1", "true", "yes", "on"}
+DEFAULT_VENUE = os.getenv("MARKET_PRIMARY_VENUE", "binance-public")
+SYNC_SECONDS = max(4, int(os.getenv("MARKET_SYNC_SECONDS", "12")))
+MAX_DEPTH_LEVELS = max(5, min(100, int(os.getenv("MARKET_DEPTH_LEVELS", "20"))))
+DEPTH_STREAM_ENABLED = os.getenv("MARKET_DEPTH_STREAM_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+MARKET_SHARD_INDEX = max(0, int(os.getenv("MARKET_SHARD_INDEX", "0")))
+MARKET_SHARD_TOTAL = max(1, int(os.getenv("MARKET_SHARD_TOTAL", "1")))
+LIVENESS_PORT = max(1024, int(os.getenv("MARKET_DATA_LIVENESS_PORT", "8010")))
+MARKET_PRIMARY_WRITER = MARKET_SHARD_TOTAL <= 1 or MARKET_SHARD_INDEX == 0
+CFD_WRITE_ENABLED = os.getenv("MARKET_CFD_WRITE_ENABLED", "1").strip().lower() not in {"0", "false", "no"} and MARKET_PRIMARY_WRITER
+HOUSEKEEPING_ENABLED = os.getenv("MARKET_DATA_HOUSEKEEPING_ENABLED", "1").strip().lower() not in {"0", "false", "no"} and MARKET_PRIMARY_WRITER
+CFD_BACKFILL_LOCK_TTL_SEC = max(60, int(os.getenv("MARKET_CFD_BACKFILL_LOCK_TTL_SEC", "900")))
+GOLDAPI_API_KEY = _secret_env("GOLDAPI_API_KEY", "")
+GOLDAPI_ENABLED = bool(GOLDAPI_API_KEY)
+GOLDAPI_BASE_URL = os.getenv("GOLDAPI_BASE_URL", "https://www.goldapi.io/api").rstrip("/")
+GOLDAPI_HISTORY_DAYS = max(3, min(90, int(os.getenv("GOLDAPI_HISTORY_DAYS", "30"))))
+GOLDAPI_MAX_CALLS_PER_RUN = max(3, min(120, int(os.getenv("GOLDAPI_MAX_CALLS_PER_RUN", "40"))))
+GOLDAPI_CACHE_TTL_SEC = max(30, int(os.getenv("GOLDAPI_CACHE_TTL_SEC", "21600")))
+GOLDAPI_REQUEST_PAUSE_SEC = max(0.0, float(os.getenv("GOLDAPI_REQUEST_PAUSE_SEC", "0.25")))
+TWELVEDATA_API_KEY = _secret_env("TWELVEDATA_API_KEY", "")
+TWELVEDATA_ENABLED = bool(TWELVEDATA_API_KEY)
+TWELVEDATA_BASE_URL = os.getenv("TWELVEDATA_BASE_URL", "https://api.twelvedata.com").rstrip("/")
+TWELVEDATA_HISTORY_DAYS = max(3, min(365, int(os.getenv("TWELVEDATA_HISTORY_DAYS", "30"))))
+TWELVEDATA_CACHE_TTL_SEC = max(30, int(os.getenv("TWELVEDATA_CACHE_TTL_SEC", "21600")))
+METALSAPI_API_KEY = _secret_env("METALSAPI_API_KEY", "")
+METALSAPI_ENABLED = bool(METALSAPI_API_KEY)
+METALSAPI_BASE_URL = os.getenv("METALSAPI_BASE_URL", "https://metals-api.com/api").rstrip("/")
+METALSAPI_HISTORY_DAYS = max(3, min(90, int(os.getenv("METALSAPI_HISTORY_DAYS", "30"))))
+METALSAPI_MAX_CALLS_PER_RUN = max(3, min(120, int(os.getenv("METALSAPI_MAX_CALLS_PER_RUN", "40"))))
+METALSAPI_CACHE_TTL_SEC = max(30, int(os.getenv("METALSAPI_CACHE_TTL_SEC", "21600")))
+METALSAPI_REQUEST_PAUSE_SEC = max(0.0, float(os.getenv("METALSAPI_REQUEST_PAUSE_SEC", "0.15")))
+BINGX_API_BASE_URL = os.getenv("BINGX_API_BASE_URL", "https://open-api.bingx.com").rstrip("/")
+BINGX_WS_PUBLIC_URL = os.getenv("BINGX_WS_PUBLIC_URL", "wss://open-api-swap.bingx.com/swap-market")
+
+SUPPORTED_VENUES = [
+    "binance-public",
+    "bybit-public",
+    "coinbase-public",
+    "kraken-public",
+    "okx-public",
+    "bitget-public",
+    "bingx-public",
+    "solana-jupiter",
+    "paper-bitget",
+    "paper-coinbase",
+    "paper-kraken",
+    "paper-okx",
+    "paper-bingx",
+]
+
+SNAPSHOTS = {
+    "paper-bitget:BTCUSDT-PERP": {"venue": "paper-bitget", "instrument": "BTCUSDT-PERP", "bid": 68245.5, "ask": 68250.1, "last": 68247.8, "spread_bps": 0.67},
+    "paper-coinbase:ETHUSDT-PERP": {"venue": "paper-coinbase", "instrument": "ETHUSDT-PERP", "bid": 3520.2, "ask": 3521.0, "last": 3520.5, "spread_bps": 2.27},
+    "paper-kraken:BTCUSD-PERP": {"venue": "paper-kraken", "instrument": "BTCUSD-PERP", "bid": 68240.2, "ask": 68245.1, "last": 68242.9, "spread_bps": 0.71},
+    "paper-okx:ETHUSDT-SWAP": {"venue": "paper-okx", "instrument": "ETHUSDT-SWAP", "bid": 3519.8, "ask": 3520.7, "last": 3520.1, "spread_bps": 2.56},
+    "paper-bingx:SOLUSDT-PERP": {"venue": "paper-bingx", "instrument": "SOLUSDT-PERP", "bid": 184.12, "ask": 184.23, "last": 184.18, "spread_bps": 5.97},
+    "solana-jupiter:SOLUSDC": {"venue": "solana-jupiter", "instrument": "SOLUSDC", "bid": 184.05, "ask": 184.16, "last": 184.1, "spread_bps": 5.97},
+    "paper-polymarket:BTC-UP-THIS-WEEK": {"venue": "paper-polymarket", "instrument": "BTC-UP-THIS-WEEK", "bid": 0.57, "ask": 0.58, "last": 0.575, "spread_bps": 173.91},
+}
+
+DEPTH_BOOKS: dict[str, dict[str, Any]] = {}
+DEPTH_SUBSCRIBERS: dict[str, set[WebSocket]] = {}
+DERIVATIVES_CACHE: dict[str, dict[str, Any]] = {}
+OHLCV_SUBSCRIBERS: dict[str, set[WebSocket]] = {}
+OHLCV_STREAM_STATE: dict[str, dict[str, Any]] = {}
+TRADE_SUBSCRIBERS: dict[str, set[WebSocket]] = {}
+PREPROCESSED_TRADE_SUBSCRIBERS: dict[str, set[WebSocket]] = {}
+PREPROCESSED_TRADE_BUFFERS: dict[str, list[dict[str, Any]]] = {}
+PREPROCESSED_TRADE_FLUSH_TASKS: dict[str, asyncio.Task[Any]] = {}
+TRADE_RECENT_KEYS: dict[str, list[str]] = {}
+LIVENESS_SERVER_STARTED = False
+GOLDAPI_RESPONSE_CACHE: dict[str, tuple[datetime, dict[str, Any]]] = {}
+TWELVEDATA_RESPONSE_CACHE: dict[str, tuple[datetime, dict[str, Any]]] = {}
+METALSAPI_RESPONSE_CACHE: dict[str, tuple[datetime, dict[str, Any]]] = {}
+VENUE_STREAM_TELEMETRY: dict[str, dict[str, dict[str, Any]]] = {}
+PREPROCESSED_TRADE_FLUSH_MS = max(75, min(1000, int(os.getenv("MARKET_PREPROCESSOR_FLUSH_MS", "250"))))
+PREPROCESSED_TRADE_TARGET_COUNT = max(20, min(400, int(os.getenv("MARKET_PREPROCESSOR_TARGET_COUNT", "80"))))
+PREPROCESSED_TRADE_JOURNAL_BUCKET = os.getenv("MARKET_PREPROCESSOR_JOURNAL_BUCKET", "1m").strip().lower() or "1m"
+if PREPROCESSED_TRADE_JOURNAL_BUCKET not in {"1m", "5m", "15m", "1h"}:
+    PREPROCESSED_TRADE_JOURNAL_BUCKET = "1m"
+PREPROCESSED_TRADE_JOURNAL_RETENTION_DAYS = max(1, int(os.getenv("MARKET_PREPROCESSOR_JOURNAL_RETENTION_DAYS", "14")))
+PREPROCESSED_TRADE_PRICE_DISCOVERY_ALERT_SAVED_PCT = max(5.0, min(95.0, float(os.getenv("MARKET_PREPROCESSOR_PRICE_DISCOVERY_ALERT_SAVED_PCT", "30"))))
+PREPROCESSED_TRADE_PRICE_DISCOVERY_ALERT_RAW_COUNT = max(10, int(os.getenv("MARKET_PREPROCESSOR_PRICE_DISCOVERY_ALERT_RAW_COUNT", "40")))
+
+
+class _LivenessHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path != "/healthz":
+            self.send_response(404)
+            self.end_headers()
+            return
+        payload = json.dumps(
+            {
+                "status": "ok",
+                "service": "market-data-plane-liveness",
+                "uptime_sec": max(0, int((_now_utc() - APP_STARTED_AT).total_seconds())),
+            }
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
+        return
+
+
+def _start_liveness_server() -> None:
+    global LIVENESS_SERVER_STARTED
+    if LIVENESS_SERVER_STARTED:
+        return
+    server = ThreadingHTTPServer(("127.0.0.1", LIVENESS_PORT), _LivenessHandler)
+    thread = threading.Thread(target=server.serve_forever, name="market-data-liveness", daemon=True)
+    thread.start()
+    LIVENESS_SERVER_STARTED = True
+
+
+def _active_symbols() -> list[str]:
+    normalized = [_normalize_instrument(symbol) for symbol in DEFAULT_SYMBOLS]
+    if MARKET_SHARD_TOTAL <= 1:
+        return normalized
+    return [symbol for idx, symbol in enumerate(normalized) if idx % MARKET_SHARD_TOTAL == MARKET_SHARD_INDEX]
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _normalize_instrument(instrument: str) -> str:
+    return instrument.replace("-PERP", "").replace("/", "").replace("-", "").upper()
+
+
+def _normalize_bingx_symbol(symbol: str) -> str:
+    normalized = _normalize_instrument(symbol)
+    for suffix in ("USDT", "USDC", "USD", "BTC", "ETH"):
+        if normalized.endswith(suffix) and len(normalized) > len(suffix):
+            return f"{normalized[:-len(suffix)]}-{suffix}"
+    return normalized
+
+
+def _stream_key(venue: str, instrument: str) -> str:
+    return f"{venue}:{_normalize_instrument(instrument)}"
+
+
+def _ohlcv_stream_key(venue: str, instrument: str, timeframe: str) -> str:
+    return f"{venue}:{_normalize_instrument(instrument)}:{timeframe}"
+
+
+def _trade_stream_key(venue: str, instrument: str) -> str:
+    return f"{venue}:{_normalize_instrument(instrument)}"
+
+
+def _venue_stream_tracker(venue: str, instrument: str) -> dict[str, Any]:
+    normalized = _normalize_instrument(instrument)
+    by_venue = VENUE_STREAM_TELEMETRY.setdefault(venue, {})
+    return by_venue.setdefault(
+        normalized,
+        {
+            "instrument": normalized,
+            "quote_updates": 0,
+            "depth_updates": 0,
+            "trade_updates": 0,
+            "trade_count": 0,
+            "trade_notional_usd": 0.0,
+            "spread_bps": 0.0,
+            "depth_levels": 0,
+            "depth_latency_ema_ms": None,
+            "trade_latency_ema_ms": None,
+            "last_quote_at": None,
+            "last_depth_at": None,
+            "last_trade_at": None,
+            "last_depth_event_at": None,
+            "last_trade_event_at": None,
+        },
+    )
+
+
+def _ema_ms(previous: Any, sample_ms: int, alpha: float = 0.28) -> float:
+    sample = max(0, int(sample_ms))
+    if previous is None:
+      return float(sample)
+    return float(previous) * (1.0 - alpha) + float(sample) * alpha
+
+
+def _age_ms_from_datetime(value: Any) -> int | None:
+    if isinstance(value, datetime):
+        return max(0, int((_now_utc() - value.astimezone(timezone.utc)).total_seconds() * 1000))
+    if isinstance(value, str) and value:
+        parsed = _parse_iso_timestamp(value)
+        if parsed is not None:
+            return max(0, int((_now_utc() - parsed).total_seconds() * 1000))
+    return None
+
+
+def _record_quote_telemetry(snapshot: dict[str, Any]) -> None:
+    tracker = _venue_stream_tracker(str(snapshot.get("venue") or "unknown"), str(snapshot.get("instrument") or ""))
+    tracker["quote_updates"] = int(tracker.get("quote_updates") or 0) + 1
+    tracker["spread_bps"] = _float(snapshot.get("spread_bps"), _float(tracker.get("spread_bps"), 0.0))
+    tracker["last_quote_at"] = _now_utc().isoformat()
+
+
+def _record_depth_telemetry(depth_payload: dict[str, Any]) -> None:
+    venue = str(depth_payload.get("venue") or "unknown")
+    instrument = str(depth_payload.get("instrument") or "")
+    tracker = _venue_stream_tracker(venue, instrument)
+    tracker["depth_updates"] = int(tracker.get("depth_updates") or 0) + 1
+    tracker["spread_bps"] = _float(depth_payload.get("spread_bps"), _float(tracker.get("spread_bps"), 0.0))
+    tracker["last_depth_at"] = depth_payload.get("snapshot_at", _now_utc()).isoformat() if isinstance(depth_payload.get("snapshot_at"), datetime) else str(depth_payload.get("snapshot_at") or _now_utc().isoformat())
+    depth = depth_payload.get("depth") if isinstance(depth_payload.get("depth"), dict) else {}
+    bids = depth.get("bids") if isinstance(depth.get("bids"), list) else []
+    asks = depth.get("asks") if isinstance(depth.get("asks"), list) else []
+    tracker["depth_levels"] = max(len(bids), len(asks), int(tracker.get("depth_levels") or 0))
+    event_time = int(_float(depth.get("event_time"), 0))
+    if event_time > 0:
+        tracker["last_depth_event_at"] = datetime.fromtimestamp(event_time / 1000, tz=timezone.utc).isoformat()
+        tracker["depth_latency_ema_ms"] = _ema_ms(tracker.get("depth_latency_ema_ms"), int(_now_utc().timestamp() * 1000) - event_time)
+
+
+def _record_trade_telemetry(venue: str, instrument: str, trades: list[dict[str, Any]]) -> None:
+    if not trades:
+        return
+    tracker = _venue_stream_tracker(venue, instrument)
+    tracker["trade_updates"] = int(tracker.get("trade_updates") or 0) + 1
+    tracker["trade_count"] = int(tracker.get("trade_count") or 0) + len(trades)
+    tracker["trade_notional_usd"] = _float(tracker.get("trade_notional_usd"), 0.0) + sum(_float(item.get("price"), 0.0) * _float(item.get("size"), 0.0) for item in trades)
+    latest_trade = max(
+        (
+            item for item in trades
+            if isinstance(item.get("traded_at"), datetime)
+        ),
+        key=lambda item: item["traded_at"],
+        default=None,
+    )
+    if latest_trade is None:
+        return
+    traded_at = latest_trade["traded_at"].astimezone(timezone.utc)
+    tracker["last_trade_at"] = traded_at.isoformat()
+    tracker["last_trade_event_at"] = traded_at.isoformat()
+    tracker["trade_latency_ema_ms"] = _ema_ms(tracker.get("trade_latency_ema_ms"), int((_now_utc() - traded_at).total_seconds() * 1000))
+
+
+def _market_symbol_for_venue(venue: str, instrument: str) -> str:
+    normalized = _normalize_instrument(instrument)
+    if venue in {"bingx-public", "paper-bingx"}:
+        return _normalize_bingx_symbol(normalized)
+    if venue in {"binance-public", "bybit-public", "coinbase-public", "okx-public"} and normalized.endswith("USD") and not normalized.endswith("USDT"):
+        return f"{normalized[:-3]}USDT"
+    return normalized
+
+
+def _unwrap_bingx_public_payload(payload: object) -> object | None:
+    if not isinstance(payload, dict):
+        return None
+    code = payload.get("code")
+    if code not in {None, 0, "0", "", "SUCCESS", "success"}:
+        return None
+    data = payload.get("data")
+    return data if isinstance(data, (dict, list)) else None
+
+
+def _coinbase_product_id(instrument: str) -> str | None:
+    symbol = _market_symbol_for_venue("coinbase-public", instrument)
+    if not symbol:
+        return None
+    if symbol.endswith("USDT"):
+        base = symbol[:-4]
+    elif symbol.endswith("USD"):
+        base = symbol[:-3]
+    else:
+        return None
+    if not base:
+        return None
+    return f"{base}-USD"
+
+
+def _okx_inst_id(instrument: str) -> str | None:
+    symbol = _market_symbol_for_venue("okx-public", instrument)
+    if not symbol:
+        return None
+    if symbol.endswith("USDT"):
+        base = symbol[:-4]
+        return f"{base}-USDT"
+    if symbol.endswith("USD"):
+        base = symbol[:-3]
+        return f"{base}-USD"
+    return None
+
+
+def _bybit_symbol(instrument: str) -> str | None:
+    symbol = _market_symbol_for_venue("bybit-public", instrument)
+    return symbol or None
+
+
+def _bybit_category(instrument: str) -> str:
+    symbol = _market_symbol_for_venue("bybit-public", instrument)
+    return "linear" if symbol.endswith(("USDT", "USDC")) else "spot"
+
+
+def _bybit_ws_public_url(instrument: str) -> str:
+    return "wss://stream.bybit.com/v5/public/linear" if _bybit_category(instrument) == "linear" else "wss://stream.bybit.com/v5/public/spot"
+
+
+def _parse_iso_timestamp(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _session_label(ts: datetime) -> str:
+    hour = ts.hour
+    if 0 <= hour < 8:
+        return "asia"
+    if 8 <= hour < 14:
+        return "london"
+    return "new-york"
+
+
+def _instrument_trades_continuously(instrument: str) -> bool:
+    normalized = _normalize_instrument(instrument)
+    return normalized.startswith(("BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LTC"))
+
+
+def _easter_sunday(year: int) -> datetime:
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return datetime(year, month, day, tzinfo=timezone.utc)
+
+
+def _configured_market_holidays() -> dict[str, str]:
+    holidays: dict[str, str] = {}
+    for item in str(os.getenv("MARKET_DATA_FX_HOLIDAYS", "")).split(","):
+        raw = item.strip()
+        if not raw:
+            continue
+        day, _, reason = raw.partition(":")
+        day = day.strip()
+        if len(day) == 10:
+            holidays[day] = reason.strip() or "configured_market_holiday"
+    return holidays
+
+
+def _fx_market_holiday_reason(now: datetime, instrument: str) -> str:
+    if _instrument_trades_continuously(instrument):
+        return ""
+    day_key = now.date().isoformat()
+    configured = _configured_market_holidays().get(day_key)
+    if configured:
+        return configured
+    easter = _easter_sunday(now.year)
+    fixed_reasons = {
+        f"{now.year}-01-01": "new_year_market_holiday",
+        f"{now.year}-12-25": "christmas_market_holiday",
+        f"{now.year}-12-26": "boxing_day_market_holiday",
+        (easter - timedelta(days=2)).date().isoformat(): "good_friday_market_holiday",
+    }
+    return fixed_reasons.get(day_key, "")
+
+
+def _next_weekday_at(now: datetime, weekday: int, target_time: time) -> datetime:
+    days_ahead = (weekday - now.weekday()) % 7
+    candidate = (now + timedelta(days=days_ahead)).replace(hour=target_time.hour, minute=target_time.minute, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(days=7)
+    return candidate
+
+
+def _fx_market_status(now: datetime, instrument: str) -> dict[str, Any]:
+    if _instrument_trades_continuously(instrument):
+        return {"market_open": True, "market_status_reason": "continuous_market", "next_market_open_at": None}
+    monday_open = time(hour=1, minute=5)
+    friday_close = time(hour=23, minute=50)
+    reason = ""
+    next_open_at: str | None = None
+    if now.weekday() in {5, 6}:
+        reason = "weekend_market_closed"
+        next_open_at = _next_weekday_at(now, 0, monday_open).isoformat()
+    elif now.weekday() == 0 and now.time() < monday_open:
+        reason = "market_preopen"
+        next_open_at = now.replace(hour=monday_open.hour, minute=monday_open.minute, second=0, microsecond=0).isoformat()
+    elif now.weekday() == 4 and now.time() >= friday_close:
+        reason = "weekend_market_closed"
+        next_open_at = _next_weekday_at(now, 0, monday_open).isoformat()
+    holiday_reason = _fx_market_holiday_reason(now, instrument)
+    if not reason and holiday_reason:
+        reason = holiday_reason
+        candidate = (now + timedelta(days=1)).replace(hour=monday_open.hour, minute=monday_open.minute, second=0, microsecond=0)
+        for _ in range(14):
+            if candidate.weekday() in {5, 6}:
+                candidate = _next_weekday_at(candidate, 0, monday_open)
+                continue
+            if _fx_market_holiday_reason(candidate, instrument):
+                candidate = (candidate + timedelta(days=1)).replace(hour=monday_open.hour, minute=monday_open.minute, second=0, microsecond=0)
+                continue
+            next_open_at = candidate.isoformat()
+            break
+    return {"market_open": not bool(reason), "market_status_reason": reason or "market_open", "next_market_open_at": next_open_at}
+
+
+def _timeframe_delta(timeframe: str) -> timedelta:
+    mapping = {
+        "1m": timedelta(minutes=1),
+        "5m": timedelta(minutes=5),
+        "15m": timedelta(minutes=15),
+        "1h": timedelta(hours=1),
+        "1d": timedelta(days=1),
+    }
+    return mapping.get(timeframe, timedelta(minutes=1))
+
+
+def _bucket_floor(ts: datetime, timeframe: str) -> datetime:
+    if timeframe == "1d":
+        return ts.replace(hour=0, minute=0, second=0, microsecond=0)
+    if timeframe == "1h":
+        return ts.replace(minute=0, second=0, microsecond=0)
+    step = int(_timeframe_delta(timeframe).total_seconds() // 60)
+    minute = (ts.minute // step) * step
+    return ts.replace(minute=minute, second=0, microsecond=0)
+
+
+def _cfd_source_symbol(instrument: str) -> str | None:
+    mapping = {
+        "EURUSD": "EURUSD=X",
+        "GBPUSD": "GBPUSD=X",
+        "AUDUSD": "AUDUSD=X",
+        "NZDUSD": "NZDUSD=X",
+        "USDCHF": "CHF=X",
+        "USDCAD": "CAD=X",
+        "USDJPY": "JPY=X",
+        "XAUUSD": "GC=F",
+        "XAGUSD": "SI=F",
+        "USOIL": "CL=F",
+        "BRENT": "BZ=F",
+    }
+    return mapping.get(_normalize_instrument(instrument))
+
+
+def _frankfurter_pair(instrument: str) -> tuple[str, str, bool] | None:
+    mapping = {
+        "EURUSD": ("EUR", "USD", False),
+        "GBPUSD": ("GBP", "USD", False),
+        "AUDUSD": ("AUD", "USD", False),
+        "NZDUSD": ("NZD", "USD", False),
+        "USDJPY": ("JPY", "USD", True),
+        "USDCHF": ("CHF", "USD", True),
+        "USDCAD": ("CAD", "USD", True),
+    }
+    return mapping.get(_normalize_instrument(instrument))
+
+
+def _backfill_window_for_timeframe(timeframe: str) -> tuple[str, str]:
+    mapping = {
+        "1m": ("1m", "7d"),
+        "5m": ("5m", "30d"),
+        "15m": ("15m", "60d"),
+        "1h": ("60m", "60d"),
+        "1d": ("1d", "365d"),
+    }
+    return mapping.get(timeframe, ("60m", "60d"))
+
+
+def _is_metal_cfd(instrument: str) -> bool:
+    return _normalize_instrument(instrument) in {"XAUUSD", "XAGUSD"}
+
+
+def _goldapi_code(instrument: str) -> str | None:
+    mapping = {
+        "XAUUSD": "XAU",
+        "XAGUSD": "XAG",
+    }
+    return mapping.get(_normalize_instrument(instrument))
+
+
+def _goldapi_cache_get(cache_key: str) -> dict[str, Any] | None:
+    cached = GOLDAPI_RESPONSE_CACHE.get(cache_key)
+    if not cached:
+        return None
+    cached_at, payload = cached
+    if (_now_utc() - cached_at).total_seconds() > GOLDAPI_CACHE_TTL_SEC:
+        GOLDAPI_RESPONSE_CACHE.pop(cache_key, None)
+        return None
+    return payload
+
+
+def _goldapi_cache_set(cache_key: str, payload: dict[str, Any]) -> None:
+    GOLDAPI_RESPONSE_CACHE[cache_key] = (_now_utc(), payload)
+
+
+def _twelvedata_symbol(instrument: str) -> str | None:
+    mapping = {
+        "XAUUSD": "XAU/USD",
+        "XAGUSD": "XAG/USD",
+    }
+    return mapping.get(_normalize_instrument(instrument))
+
+
+def _metalsapi_code(instrument: str) -> str | None:
+    mapping = {
+        "XAUUSD": "XAU",
+        "XAGUSD": "XAG",
+    }
+    return mapping.get(_normalize_instrument(instrument))
+
+
+def _metalsapi_cache_get(cache_key: str) -> dict[str, Any] | None:
+    cached = METALSAPI_RESPONSE_CACHE.get(cache_key)
+    if not cached:
+        return None
+    cached_at, payload = cached
+    if (_now_utc() - cached_at).total_seconds() > METALSAPI_CACHE_TTL_SEC:
+        METALSAPI_RESPONSE_CACHE.pop(cache_key, None)
+        return None
+    return payload
+
+
+def _metalsapi_cache_set(cache_key: str, payload: dict[str, Any]) -> None:
+    METALSAPI_RESPONSE_CACHE[cache_key] = (_now_utc(), payload)
+
+
+def _twelvedata_cache_get(cache_key: str) -> dict[str, Any] | None:
+    cached = TWELVEDATA_RESPONSE_CACHE.get(cache_key)
+    if not cached:
+        return None
+    cached_at, payload = cached
+    if (_now_utc() - cached_at).total_seconds() > TWELVEDATA_CACHE_TTL_SEC:
+        TWELVEDATA_RESPONSE_CACHE.pop(cache_key, None)
+        return None
+    return payload
+
+
+def _twelvedata_cache_set(cache_key: str, payload: dict[str, Any]) -> None:
+    TWELVEDATA_RESPONSE_CACHE[cache_key] = (_now_utc(), payload)
+
+
+async def _twelvedata_get(path: str, params: dict[str, Any]) -> dict[str, Any] | None:
+    if not TWELVEDATA_ENABLED:
+        return None
+    cache_key = hashlib.sha256(json.dumps({"path": path, "params": params}, sort_keys=True).encode("utf-8")).hexdigest()
+    cached = _twelvedata_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    request_params = {**params, "apikey": TWELVEDATA_API_KEY}
+    async with httpx.AsyncClient(timeout=12.0, headers={"User-Agent": "TXT MarketData/1.0"}) as client:
+        response = await client.get(f"{TWELVEDATA_BASE_URL}/{path.lstrip('/')}", params=request_params)
+        response.raise_for_status()
+        payload = response.json()
+    if isinstance(payload, dict):
+        _twelvedata_cache_set(cache_key, payload)
+        return payload
+    return None
+
+
+async def _metalsapi_get(path: str, params: dict[str, Any]) -> dict[str, Any] | None:
+    if not METALSAPI_ENABLED:
+        return None
+    cache_key = hashlib.sha256(json.dumps({"path": path, "params": params}, sort_keys=True).encode("utf-8")).hexdigest()
+    cached = _metalsapi_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    request_params = {**params, "access_key": METALSAPI_API_KEY}
+    async with httpx.AsyncClient(timeout=12.0, headers={"User-Agent": "TXT MarketData/1.0"}) as client:
+        response = await client.get(f"{METALSAPI_BASE_URL}/{path.lstrip('/')}", params=request_params)
+        response.raise_for_status()
+        payload = response.json()
+    if isinstance(payload, dict):
+        _metalsapi_cache_set(cache_key, payload)
+        return payload
+    return None
+
+
+async def _fetch_twelvedata_rows(instrument: str, timeframe: str) -> list[dict[str, Any]]:
+    symbol = _twelvedata_symbol(instrument)
+    if symbol is None or timeframe != "1d" or not TWELVEDATA_ENABLED:
+        return []
+    payload = await _twelvedata_get(
+        "time_series",
+        {
+            "symbol": symbol,
+            "interval": "1day",
+            "outputsize": TWELVEDATA_HISTORY_DAYS,
+        },
+    )
+    values = payload.get("values") if isinstance(payload, dict) else None
+    if not isinstance(values, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in reversed(values):
+        if not isinstance(item, dict):
+            continue
+        bucket_raw = str(item.get("datetime") or "").strip()
+        if not bucket_raw:
+            continue
+        try:
+            bucket_date = datetime.fromisoformat(f"{bucket_raw}T00:00:00+00:00")
+        except ValueError:
+            continue
+        open_price = _float(item.get("open"), 0.0)
+        high_price = _float(item.get("high"), 0.0)
+        low_price = _float(item.get("low"), 0.0)
+        close_price = _float(item.get("close"), 0.0)
+        if min(open_price, high_price, low_price, close_price) <= 0:
+            continue
+        rows.append(
+            {
+                "bucket_start": _bucket_floor(bucket_date, "1d"),
+                "open": open_price,
+                "high": max(high_price, open_price, close_price),
+                "low": min(low_price, open_price, close_price),
+                "close": close_price,
+                "volume": 0.0,
+                "quote_volume": 0.0,
+                "trades_count": 0,
+            }
+        )
+    return rows
+
+
+def _metalsapi_payload_to_row(payload: dict[str, Any], bucket_date: datetime) -> dict[str, Any] | None:
+    rates = payload.get("rates") if isinstance(payload, dict) else None
+    if not isinstance(rates, dict):
+        return None
+    open_price = _float(rates.get("open"), 0.0)
+    high_price = _float(rates.get("high"), 0.0)
+    low_price = _float(rates.get("low"), 0.0)
+    close_price = _float(rates.get("close"), 0.0)
+    if min(open_price, high_price, low_price, close_price) <= 0:
+        return None
+    return {
+        "bucket_start": _bucket_floor(bucket_date, "1d"),
+        "open": open_price,
+        "high": max(high_price, open_price, close_price),
+        "low": min(low_price, open_price, close_price),
+        "close": close_price,
+        "volume": 0.0,
+        "quote_volume": 0.0,
+        "trades_count": 0,
+    }
+
+
+async def _fetch_metalsapi_rows(instrument: str, timeframe: str) -> list[dict[str, Any]]:
+    code = _metalsapi_code(instrument)
+    if code is None or timeframe != "1d" or not METALSAPI_ENABLED:
+        return []
+    rows: dict[str, dict[str, Any]] = {}
+    calls = 0
+    end_date = _now_utc().date() - timedelta(days=1)
+    start_date = end_date - timedelta(days=max(0, METALSAPI_HISTORY_DAYS - 1))
+    cursor = end_date
+    while cursor >= start_date and calls < METALSAPI_MAX_CALLS_PER_RUN:
+        payload = await _metalsapi_get(
+            f"open-high-low-close/{cursor.isoformat()}",
+            {"base": code, "symbols": "USD"},
+        )
+        calls += 1
+        if payload:
+            bucket_date = datetime(cursor.year, cursor.month, cursor.day, tzinfo=timezone.utc)
+            row = _metalsapi_payload_to_row(payload, bucket_date)
+            if row:
+                rows[row["bucket_start"].isoformat()] = row
+        if METALSAPI_REQUEST_PAUSE_SEC > 0 and cursor > start_date and calls < METALSAPI_MAX_CALLS_PER_RUN:
+            await asyncio.sleep(METALSAPI_REQUEST_PAUSE_SEC)
+        cursor -= timedelta(days=1)
+    return [rows[key] for key in sorted(rows.keys())]
+
+
+async def _goldapi_get(path: str) -> dict[str, Any] | None:
+    if not GOLDAPI_ENABLED:
+        return None
+    cache_key = path.strip()
+    cached = _goldapi_cache_get(cache_key)
+    if cached is not None:
+        return cached
+    async with httpx.AsyncClient(timeout=12.0, headers={
+        "x-access-token": GOLDAPI_API_KEY,
+        "Content-Type": "application/json",
+        "User-Agent": "TXT MarketData/1.0",
+    }) as client:
+        response = await client.get(f"{GOLDAPI_BASE_URL}/{cache_key}")
+        response.raise_for_status()
+        payload = response.json()
+    if isinstance(payload, dict):
+        _goldapi_cache_set(cache_key, payload)
+        return payload
+    return None
+
+
+def _goldapi_payload_to_row(payload: dict[str, Any], bucket_date: datetime) -> dict[str, Any] | None:
+    close_price = _float(payload.get("price") or payload.get("close") or payload.get("close_price"), 0.0)
+    if close_price <= 0:
+        return None
+    open_price = _float(payload.get("open") or payload.get("open_price"), close_price)
+    high_price = _float(payload.get("high") or payload.get("high_price"), max(open_price, close_price))
+    low_price = _float(payload.get("low") or payload.get("low_price"), min(open_price, close_price))
+    bucket_start = _bucket_floor(bucket_date, "1d")
+    return {
+        "bucket_start": bucket_start,
+        "open": max(open_price, 0.0),
+        "high": max(high_price, open_price, close_price),
+        "low": min(value for value in (low_price, open_price, close_price) if value > 0),
+        "close": close_price,
+        "volume": 0.0,
+        "quote_volume": 0.0,
+        "trades_count": 0,
+    }
+
+
+async def _fetch_goldapi_rows(instrument: str, timeframe: str) -> list[dict[str, Any]]:
+    code = _goldapi_code(instrument)
+    if code is None or timeframe != "1d" or not GOLDAPI_ENABLED:
+        return []
+    rows: dict[str, dict[str, Any]] = {}
+    calls = 0
+    end_date = _now_utc().date() - timedelta(days=1)
+    start_date = end_date - timedelta(days=max(0, GOLDAPI_HISTORY_DAYS - 1))
+    cursor = end_date
+    while cursor >= start_date and calls < GOLDAPI_MAX_CALLS_PER_RUN:
+        if cursor.weekday() >= 5:
+            cursor -= timedelta(days=1)
+            continue
+        payload = await _goldapi_get(f"{code}/USD/{cursor.isoformat()}")
+        calls += 1
+        if payload:
+            bucket_date = datetime(cursor.year, cursor.month, cursor.day, tzinfo=timezone.utc)
+            row = _goldapi_payload_to_row(payload, bucket_date)
+            if row:
+                rows[row["bucket_start"].isoformat()] = row
+        if GOLDAPI_REQUEST_PAUSE_SEC > 0 and cursor > start_date and calls < GOLDAPI_MAX_CALLS_PER_RUN:
+            await asyncio.sleep(GOLDAPI_REQUEST_PAUSE_SEC)
+        cursor -= timedelta(days=1)
+    return [rows[key] for key in sorted(rows.keys())]
+
+
+def _cfd_backfill_lock_key(instrument: str) -> str:
+    return f"market-data:cfd-backfill:{_normalize_instrument(instrument)}"
+
+
+def _try_acquire_cfd_backfill_lock(instrument: str) -> bool:
+    lock_key = _cfd_backfill_lock_key(instrument)
+    existing = fetch_one(
+        "SELECT config_value, updated_at FROM system_config WHERE config_key = %s",
+        (lock_key,),
+    )
+    if existing:
+        updated_at = existing.get("updated_at")
+        updated_dt = updated_at if isinstance(updated_at, datetime) else _parse_iso_timestamp(updated_at)
+        if updated_dt and (_now_utc() - updated_dt).total_seconds() > CFD_BACKFILL_LOCK_TTL_SEC:
+            execute("DELETE FROM system_config WHERE config_key = %s", (lock_key,))
+        else:
+            return False
+    payload = {
+        "instrument": _normalize_instrument(instrument),
+        "owner": f"shard-{MARKET_SHARD_INDEX}-of-{MARKET_SHARD_TOTAL}",
+        "started_at": _now_utc().isoformat(),
+    }
+    inserted = execute_rowcount(
+        """
+        INSERT INTO system_config (config_key, config_value)
+        VALUES (%s, %s::jsonb)
+        ON CONFLICT (config_key) DO NOTHING
+        """,
+        (lock_key, json_dumps(payload)),
+    )
+    return inserted > 0
+
+
+def _release_cfd_backfill_lock(instrument: str) -> None:
+    execute("DELETE FROM system_config WHERE config_key = %s", (_cfd_backfill_lock_key(instrument),))
+
+
+def _upsert_ohlcv_rows(venue: str, instrument: str, timeframe: str, rows: list[dict[str, Any]], source: str) -> int:
+    inserted = 0
+    for row in rows:
+        bucket_start = row.get("bucket_start")
+        if not isinstance(bucket_start, datetime):
+            continue
+        open_price = _float(row.get("open"), 0.0)
+        high_price = _float(row.get("high"), open_price)
+        low_price = _float(row.get("low"), open_price)
+        close_price = _float(row.get("close"), open_price)
+        if min(open_price, high_price, low_price, close_price) <= 0:
+            continue
+        execute(
+            """
+            INSERT INTO market_ohlcv (
+                venue, instrument, timeframe, bucket_start, open, high, low, close, volume, quote_volume, trades_count, source
+            ) VALUES (%s, %s, %s, %s::timestamptz, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (venue, instrument, timeframe, bucket_start) DO UPDATE SET
+                open = EXCLUDED.open,
+                high = EXCLUDED.high,
+                low = EXCLUDED.low,
+                close = EXCLUDED.close,
+                volume = EXCLUDED.volume,
+                quote_volume = EXCLUDED.quote_volume,
+                trades_count = EXCLUDED.trades_count,
+                source = EXCLUDED.source
+            """,
+            (
+                venue,
+                _normalize_instrument(instrument),
+                timeframe,
+                bucket_start.isoformat(),
+                open_price,
+                high_price,
+                low_price,
+                close_price,
+                _float(row.get("volume"), 0.0),
+                _float(row.get("quote_volume"), 0.0),
+                int(_float(row.get("trades_count"), 0.0)),
+                source,
+            ),
+        )
+        inserted += 1
+    return inserted
+
+
+def _cleanup_lower_priority_metal_daily_rows(instrument: str, canonical_venue: str, rows: list[dict[str, Any]]) -> int:
+    normalized = _normalize_instrument(instrument)
+    if not _is_metal_cfd(normalized):
+        return 0
+    provider_order = ["goldapi-cfd", "twelvedata-cfd", "metalsapi-cfd", "frankfurter-cfd", "yahoo-cfd"]
+    if canonical_venue not in provider_order:
+        return 0
+    bucket_starts = sorted(
+        {
+            row["bucket_start"]
+            for row in rows
+            if isinstance(row, dict) and isinstance(row.get("bucket_start"), datetime)
+        }
+    )
+    if not bucket_starts:
+        return 0
+    lower_priority_venues = provider_order[provider_order.index(canonical_venue) + 1 :]
+    if not lower_priority_venues:
+        return 0
+    placeholders = ", ".join(["%s"] * len(lower_priority_venues))
+    delete_until = _bucket_floor(_now_utc(), "1d")
+    params = (
+        normalized,
+        *lower_priority_venues,
+        bucket_starts[0].isoformat(),
+        delete_until.isoformat(),
+    )
+    existing = fetch_one(
+        f"""
+        SELECT COUNT(*) AS count
+        FROM market_ohlcv
+        WHERE instrument = %s
+          AND timeframe = '1d'
+          AND venue IN ({placeholders})
+          AND bucket_start >= %s::timestamptz
+          AND bucket_start <= %s::timestamptz
+        """,
+        params,
+    ) or {"count": 0}
+    count = int(existing.get("count") or 0)
+    if count <= 0:
+        return 0
+    execute(
+        f"""
+        DELETE FROM market_ohlcv
+        WHERE instrument = %s
+          AND timeframe = '1d'
+          AND venue IN ({placeholders})
+          AND bucket_start >= %s::timestamptz
+          AND bucket_start <= %s::timestamptz
+        """,
+        params,
+    )
+    return count
+
+
+async def _fetch_yahoo_chart_rows(instrument: str, timeframe: str) -> list[dict[str, Any]]:
+    source_symbol = _cfd_source_symbol(instrument)
+    if not source_symbol:
+        return []
+    interval, range_value = _backfill_window_for_timeframe(timeframe)
+    async with httpx.AsyncClient(timeout=8.0, headers={"User-Agent": "TXT MarketData/1.0"}) as client:
+        response = await client.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{source_symbol}",
+            params={"interval": interval, "range": range_value, "includePrePost": "false", "events": "div,splits"},
+        )
+        if response.status_code >= 400:
+            return []
+        payload = response.json()
+    result = payload.get("chart", {}).get("result") if isinstance(payload, dict) else None
+    if not isinstance(result, list) or not result:
+        return []
+    chart = result[0] if isinstance(result[0], dict) else {}
+    timestamps = chart.get("timestamp") if isinstance(chart.get("timestamp"), list) else []
+    quote = (((chart.get("indicators") or {}).get("quote") or [{}])[0]) if isinstance(chart.get("indicators"), dict) else {}
+    opens = quote.get("open") if isinstance(quote.get("open"), list) else []
+    highs = quote.get("high") if isinstance(quote.get("high"), list) else []
+    lows = quote.get("low") if isinstance(quote.get("low"), list) else []
+    closes = quote.get("close") if isinstance(quote.get("close"), list) else []
+    volumes = quote.get("volume") if isinstance(quote.get("volume"), list) else []
+    rows: list[dict[str, Any]] = []
+    for index, raw_ts in enumerate(timestamps):
+        ts = datetime.fromtimestamp(int(raw_ts), tz=timezone.utc)
+        open_price = _float(opens[index] if index < len(opens) else None, 0.0)
+        high_price = _float(highs[index] if index < len(highs) else None, 0.0)
+        low_price = _float(lows[index] if index < len(lows) else None, 0.0)
+        close_price = _float(closes[index] if index < len(closes) else None, 0.0)
+        volume = _float(volumes[index] if index < len(volumes) else None, 0.0)
+        if min(open_price, high_price, low_price, close_price) <= 0:
+            continue
+        rows.append(
+            {
+                "bucket_start": _bucket_floor(ts, timeframe),
+                "open": open_price,
+                "high": high_price,
+                "low": low_price,
+                "close": close_price,
+                "volume": volume,
+                "quote_volume": close_price * volume if volume > 0 else 0.0,
+                "trades_count": 0,
+            }
+        )
+    deduped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        bucket = row["bucket_start"].isoformat()
+        deduped[bucket] = row
+    return [deduped[key] for key in sorted(deduped.keys())]
+
+
+async def _fetch_frankfurter_rows(instrument: str, timeframe: str) -> list[dict[str, Any]]:
+    pair = _frankfurter_pair(instrument)
+    if pair is None or timeframe != "1d":
+        return []
+    quote_currency, base_currency, invert = pair
+    end_date = _now_utc().date()
+    start_date = end_date - timedelta(days=395)
+    async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "TXT MarketData/1.0"}) as client:
+        response = await client.get(
+            f"https://api.frankfurter.app/{start_date.isoformat()}..{end_date.isoformat()}",
+            params={"from": base_currency, "to": quote_currency},
+        )
+        response.raise_for_status()
+        payload = response.json()
+    rates = payload.get("rates") if isinstance(payload, dict) else None
+    if not isinstance(rates, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    for raw_date, quote_map in sorted(rates.items()):
+        if not isinstance(raw_date, str) or not isinstance(quote_map, dict):
+            continue
+        raw_rate = _float(quote_map.get(quote_currency), 0.0)
+        if raw_rate <= 0:
+            continue
+        close_price = (1.0 / raw_rate) if invert else raw_rate
+        if close_price <= 0:
+            continue
+        bucket = datetime.fromisoformat(f"{raw_date}T00:00:00+00:00")
+        rows.append(
+            {
+                "bucket_start": _bucket_floor(bucket, timeframe),
+                "open": close_price,
+                "high": close_price,
+                "low": close_price,
+                "close": close_price,
+                "volume": 0.0,
+                "quote_volume": 0.0,
+                "trades_count": 0,
+            }
+        )
+    return rows
+
+
+async def _fetch_cfd_rows(instrument: str, timeframe: str, preferred_venue: str | None = None) -> tuple[list[dict[str, Any]], str | None, str | None]:
+    errors: list[str] = []
+    requested = str(preferred_venue or "auto-cfd").strip().lower()
+
+    if _is_metal_cfd(instrument) and requested in {"auto-cfd", "goldapi", "goldapi-cfd"}:
+        try:
+            rows = await _fetch_goldapi_rows(instrument, timeframe)
+            if rows:
+                return rows, "goldapi-cfd", None
+            if timeframe == "1d":
+                errors.append("goldapi returned no rows")
+        except Exception as exc:
+            errors.append(f"goldapi error: {exc}")
+        if requested in {"goldapi", "goldapi-cfd"}:
+            return [], None, "; ".join(errors) if errors else "goldapi unavailable"
+
+    if _is_metal_cfd(instrument) and requested in {"auto-cfd", "twelvedata", "twelvedata-cfd"}:
+        try:
+            rows = await _fetch_twelvedata_rows(instrument, timeframe)
+            if rows:
+                return rows, "twelvedata-cfd", None
+            if timeframe == "1d":
+                errors.append("twelvedata returned no rows")
+        except Exception as exc:
+            errors.append(f"twelvedata error: {exc}")
+        if requested in {"twelvedata", "twelvedata-cfd"}:
+            return [], None, "; ".join(errors) if errors else "twelvedata unavailable"
+
+    if _is_metal_cfd(instrument) and requested in {"auto-cfd", "metalsapi", "metalsapi-cfd"}:
+        try:
+            rows = await _fetch_metalsapi_rows(instrument, timeframe)
+            if rows:
+                return rows, "metalsapi-cfd", None
+            if timeframe == "1d":
+                errors.append("metalsapi returned no rows")
+        except Exception as exc:
+            errors.append(f"metalsapi error: {exc}")
+        if requested in {"metalsapi", "metalsapi-cfd"}:
+            return [], None, "; ".join(errors) if errors else "metalsapi unavailable"
+
+    frankfurter_pair = _frankfurter_pair(instrument)
+    if frankfurter_pair is not None and requested in {"auto-cfd", "frankfurter", "frankfurter-cfd"}:
+        if timeframe == "1d":
+            try:
+                rows = await _fetch_frankfurter_rows(instrument, timeframe)
+                if rows:
+                    return rows, "frankfurter-cfd", None
+                errors.append("frankfurter returned no rows")
+            except Exception as exc:
+                errors.append(f"frankfurter error: {exc}")
+        else:
+            return [], None, "no intraday source configured"
+        if requested in {"frankfurter", "frankfurter-cfd"}:
+            return [], None, "; ".join(errors) if errors else "frankfurter unavailable"
+
+    if timeframe in {"1h", "1d"} and requested in {"auto-cfd", "yahoo", "yahoo-cfd"}:
+        try:
+            rows = await _fetch_yahoo_chart_rows(instrument, timeframe)
+            if rows:
+                return rows, "yahoo-cfd", None
+            errors.append("yahoo returned no rows")
+        except Exception as exc:
+            errors.append(f"yahoo error: {exc}")
+
+    error_detail = "; ".join(errors) if errors else "no source available"
+    return [], None, error_detail
+
+
+async def _backfill_cfd_symbol(instrument: str, venue: str = "yahoo-cfd") -> dict[str, Any]:
+    normalized = _normalize_instrument(instrument)
+    requested_venue = str(venue or "auto-cfd").strip().lower() or "auto-cfd"
+    if not CFD_WRITE_ENABLED:
+        return {
+            "status": "unavailable",
+            "instrument": normalized,
+            "venue": venue,
+            "resolved_venues": {},
+            "timeframes": {},
+            "source_symbol": _cfd_source_symbol(normalized),
+            "errors": {"writer": "CFD writer disabled on this instance"},
+        }
+    if not _try_acquire_cfd_backfill_lock(normalized):
+        return {
+            "status": "unavailable",
+            "instrument": normalized,
+            "venue": venue,
+            "resolved_venues": {},
+            "timeframes": {},
+            "source_symbol": _cfd_source_symbol(normalized),
+            "errors": {"lock": "Backfill already running for this symbol"},
+        }
+    seeded: dict[str, int] = {}
+    per_timeframe_venue: dict[str, str] = {}
+    cleaned_rows: dict[str, int] = {}
+    errors: dict[str, str] = {}
+    successful_timeframes = 0
+    try:
+        for timeframe in ("1h", "1d"):
+            rows, resolved_venue, error = await _fetch_cfd_rows(normalized, timeframe, preferred_venue=venue)
+            if rows and resolved_venue:
+                seeded[timeframe] = _upsert_ohlcv_rows(resolved_venue, normalized, timeframe, rows, source=f"{resolved_venue}-backfill")
+                per_timeframe_venue[timeframe] = resolved_venue
+                if (
+                    timeframe == "1d"
+                    and requested_venue in {"auto-cfd", "goldapi", "goldapi-cfd", "twelvedata", "twelvedata-cfd", "metalsapi", "metalsapi-cfd"}
+                    and resolved_venue in {"goldapi-cfd", "twelvedata-cfd", "metalsapi-cfd"}
+                ):
+                    cleaned_rows[timeframe] = _cleanup_lower_priority_metal_daily_rows(normalized, resolved_venue, rows)
+                successful_timeframes += 1
+                continue
+            seeded[timeframe] = 0
+            cleaned_rows[timeframe] = 0
+            if error:
+                errors[timeframe] = error
+    finally:
+        _release_cfd_backfill_lock(normalized)
+    status = "ok" if successful_timeframes == len(seeded) else ("partial" if successful_timeframes > 0 else "unavailable")
+    return {
+        "status": status,
+        "instrument": normalized,
+        "venue": venue,
+        "resolved_venues": per_timeframe_venue,
+        "timeframes": seeded,
+        "cleaned_rows": cleaned_rows,
+        "source_symbol": _cfd_source_symbol(normalized),
+        "errors": errors,
+    }
+
+
+def _float(value: Any, fallback: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return fallback
+
+
+def _trade_cache_signature(venue: str, instrument: str, trade: dict[str, Any]) -> str:
+    trade_id = str(trade.get("trade_id") or trade.get("id") or "")
+    traded_at = trade.get("traded_at")
+    if isinstance(traded_at, datetime):
+        traded_at_value = traded_at.isoformat()
+    else:
+        traded_at_value = str(traded_at or "")
+    return f"{venue}|{_normalize_instrument(instrument)}|{trade_id}|{traded_at_value}|{_float(trade.get('price'), 0.0):.8f}|{_float(trade.get('size'), 0.0):.8f}"
+
+
+def _remember_trade_signature(venue: str, instrument: str, trade: dict[str, Any], limit: int = 4000) -> bool:
+    stream_key = _trade_stream_key(venue, instrument)
+    signatures = TRADE_RECENT_KEYS.setdefault(stream_key, [])
+    signature = _trade_cache_signature(venue, instrument, trade)
+    if signature in signatures:
+        return False
+    signatures.append(signature)
+    if len(signatures) > limit:
+        del signatures[:-limit]
+    return True
+
+
+def _depth_rows_to_map(rows: list[list[float]]) -> dict[float, float]:
+    return {float(price): float(size) for price, size in rows if float(size) > 0}
+
+
+def _depth_map_to_rows(side_map: dict[float, float], reverse: bool, limit: int = MAX_DEPTH_LEVELS) -> list[list[float]]:
+    prices = sorted(side_map.keys(), reverse=reverse)[:limit]
+    return [[price, side_map[price]] for price in prices]
+
+
+def _apply_side_delta(side_map: dict[float, float], delta: list[list[str]]) -> None:
+    for raw_price, raw_size in delta:
+        price = _float(raw_price)
+        size = _float(raw_size)
+        if size <= 0:
+            side_map.pop(price, None)
+        else:
+            side_map[price] = size
+
+
+def _snapshot_from_book(venue: str, symbol: str, book: dict[str, Any], reason: str, source: str) -> dict[str, Any]:
+    bids = _depth_map_to_rows(book.get("bids", {}), reverse=True)
+    asks = _depth_map_to_rows(book.get("asks", {}), reverse=False)
+    crossed_book_repaired = False
+    if bids and asks and bids[0][0] >= asks[0][0]:
+        repaired_bids = [row for row in bids if row[0] < asks[0][0]]
+        if repaired_bids:
+            bids = repaired_bids
+            crossed_book_repaired = True
+        else:
+            repaired_asks = [row for row in asks if row[0] > bids[0][0]]
+            if repaired_asks:
+                asks = repaired_asks
+                crossed_book_repaired = True
+    best_bid = bids[0][0] if bids else 0.0
+    best_ask = asks[0][0] if asks else 0.0
+    mid = (best_bid + best_ask) / 2 if best_bid > 0 and best_ask > 0 else 0.0
+    spread_bps = max(0.0, ((best_ask - best_bid) / mid * 10000) if mid > 0 else 0.0)
+    return {
+        "venue": venue,
+        "instrument": symbol,
+        "snapshot_at": _now_utc(),
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "spread_bps": spread_bps,
+        "depth": {
+            "bids": bids,
+            "asks": asks,
+            "lastUpdateId": book.get("last_update_id"),
+            "event_time": book.get("event_time"),
+            "reason": reason,
+            "crossed_book_repaired": crossed_book_repaired,
+        },
+        "source": source,
+    }
+
+
+async def _broadcast_depth_delta(venue: str, symbol: str, payload: dict[str, Any]) -> None:
+    key = _stream_key(venue, symbol)
+    subscribers = DEPTH_SUBSCRIBERS.get(key, set())
+    if not subscribers:
+        return
+    stale: list[WebSocket] = []
+    for socket in list(subscribers):
+        try:
+            await socket.send_json(payload)
+        except Exception:
+            stale.append(socket)
+    for socket in stale:
+        subscribers.discard(socket)
+
+
+def _serialize_trade(venue: str, instrument: str, trade: dict[str, Any]) -> dict[str, Any]:
+    traded_at = trade.get("traded_at")
+    if isinstance(traded_at, datetime):
+        traded_at_iso = traded_at.isoformat()
+    else:
+        traded_at_iso = str(traded_at or _now_utc().isoformat())
+    return {
+        "venue": venue,
+        "instrument": _normalize_instrument(instrument),
+        "trade_id": str(trade.get("trade_id") or trade.get("id") or ""),
+        "side": str(trade.get("side") or ""),
+        "price": _float(trade.get("price"), 0.0),
+        "size": _float(trade.get("size"), 0.0),
+        "traded_at": traded_at_iso,
+        "payload": trade.get("payload", {}),
+    }
+
+
+def _trade_datetime(trade: dict[str, Any]) -> datetime:
+    traded_at = trade.get("traded_at")
+    if isinstance(traded_at, datetime):
+        return traded_at.astimezone(timezone.utc) if traded_at.tzinfo else traded_at.replace(tzinfo=timezone.utc)
+    parsed = _parse_iso_timestamp(traded_at)
+    if parsed is not None:
+        return parsed
+    return _now_utc()
+
+
+def _trade_side(trade: dict[str, Any]) -> str:
+    side = str(trade.get("side") or "").strip().lower()
+    if side in {"buy", "sell"}:
+        return side
+    return side or "unknown"
+
+
+def _price_distance_bps(reference_price: float, candidate_price: float) -> float:
+    base = max(abs(reference_price), abs(candidate_price), 1e-9)
+    return abs(candidate_price - reference_price) / base * 10000.0
+
+
+def _adaptive_trade_preprocessor_window_ms(trades: list[dict[str, Any]], target_count: int) -> int:
+    if len(trades) < 2:
+        return PREPROCESSED_TRADE_FLUSH_MS
+    first_at = _trade_datetime(trades[0])
+    last_at = _trade_datetime(trades[-1])
+    span_ms = max(0, int((last_at - first_at).total_seconds() * 1000))
+    if span_ms <= 0:
+        return PREPROCESSED_TRADE_FLUSH_MS
+    adaptive = int(span_ms / max(1, target_count))
+    return max(80, min(1500, adaptive))
+
+
+def _adaptive_trade_price_band_bps(raw_count: int, target_count: int) -> float:
+    density = raw_count / max(float(target_count), 1.0)
+    if density >= 3.0:
+        return 1.2
+    if density >= 2.0:
+        return 0.8
+    if density >= 1.25:
+        return 0.45
+    return 0.2
+
+
+def _resolve_trade_preprocessor_profile(trade_rows: list[dict[str, Any]], target_count: int) -> dict[str, Any]:
+    raw_count = len(trade_rows)
+    if raw_count == 0:
+        return {
+            "mode": "semantic_window_v1",
+            "market_regime": "empty",
+            "effective_target_count": target_count,
+            "aggregation_window_ms": PREPROCESSED_TRADE_FLUSH_MS,
+            "price_band_bps": 0.0,
+            "features": {},
+        }
+
+    base_window = _adaptive_trade_preprocessor_window_ms([item["trade"] for item in trade_rows], target_count)
+    base_band = _adaptive_trade_price_band_bps(raw_count, target_count)
+    first_at = trade_rows[0]["traded_at"]
+    last_at = trade_rows[-1]["traded_at"]
+    time_span_ms = max(1, int((last_at - first_at).total_seconds() * 1000))
+    time_span_seconds = max(time_span_ms / 1000.0, 1e-9)
+    buy_volume = sum(item["size"] for item in trade_rows if item["side"] == "buy")
+    sell_volume = sum(item["size"] for item in trade_rows if item["side"] == "sell")
+    raw_size = sum(item["size"] for item in trade_rows)
+    raw_notional = sum(item["price"] * item["size"] for item in trade_rows)
+    positive_prices = [item["price"] for item in trade_rows if item["price"] > 0]
+    first_price = positive_prices[0] if positive_prices else 0.0
+    last_price = positive_prices[-1] if positive_prices else 0.0
+    low_price = min(positive_prices) if positive_prices else 0.0
+    high_price = max(positive_prices) if positive_prices else 0.0
+    price_range_bps = _price_distance_bps(low_price, high_price) if low_price > 0 and high_price > 0 else 0.0
+    drift_bps = _price_distance_bps(first_price, last_price) if first_price > 0 and last_price > 0 else 0.0
+    volume_imbalance = (buy_volume - sell_volume) / max(buy_volume + sell_volume, 1e-9)
+    trades_per_second = raw_count / time_span_seconds
+    largest_trade_size = max((item["size"] for item in trade_rows), default=0.0)
+    largest_trade_share = largest_trade_size / max(raw_size, 1e-9)
+    effective_target_count = target_count
+    mode = "semantic_window_v1"
+    market_regime = "transitional"
+    aggregation_window_ms = base_window
+    price_band_bps = base_band
+
+    if raw_count <= max(14, int(target_count * 0.55)) and price_range_bps <= 2.2 and trades_per_second <= 3.5:
+        market_regime = "quiet_absorption"
+        mode = "semantic_quiet_absorption_v1"
+        aggregation_window_ms = max(160, min(2200, int(base_window * 1.75)))
+        price_band_bps = max(0.35, base_band * 1.8)
+        effective_target_count = max(20, min(raw_count, int(target_count * 0.75)))
+    elif price_range_bps >= 16.0 or drift_bps >= 10.0 or largest_trade_share >= 0.33:
+        market_regime = "price_discovery"
+        mode = "semantic_price_discovery_v1"
+        aggregation_window_ms = max(45, min(650, int(base_window * 0.35)))
+        price_band_bps = max(0.08, base_band * 0.35)
+        effective_target_count = max(target_count, min(raw_count, int(raw_count * 0.82)))
+    elif abs(volume_imbalance) >= 0.55 and (drift_bps >= 3.0 or trades_per_second >= 6.0):
+        market_regime = "directional_pressure"
+        mode = "semantic_directional_pressure_v1"
+        aggregation_window_ms = max(70, min(900, int(base_window * 0.6)))
+        price_band_bps = max(0.12, base_band * 0.55)
+        effective_target_count = max(target_count, min(raw_count, int(raw_count * 0.72)))
+    elif raw_count >= max(48, int(target_count * 1.4)) and price_range_bps <= 5.0 and abs(volume_imbalance) <= 0.2:
+        market_regime = "balanced_rotation"
+        mode = "semantic_balanced_rotation_v1"
+        aggregation_window_ms = max(100, min(1600, int(base_window * 1.15)))
+        price_band_bps = max(0.25, base_band * 1.2)
+        effective_target_count = max(20, min(raw_count, int(target_count * 0.9)))
+
+    return {
+        "mode": mode,
+        "market_regime": market_regime,
+        "effective_target_count": max(20, min(max(raw_count, 20), effective_target_count)),
+        "aggregation_window_ms": aggregation_window_ms,
+        "price_band_bps": price_band_bps,
+        "features": {
+            "price_range_bps": round(price_range_bps, 6),
+            "drift_bps": round(drift_bps, 6),
+            "volume_imbalance": round(volume_imbalance, 6),
+            "trades_per_second": round(trades_per_second, 6),
+            "largest_trade_share": round(largest_trade_share, 6),
+            "time_span_ms": time_span_ms,
+            "raw_size": round(raw_size, 10),
+            "raw_notional": round(raw_notional, 10),
+        },
+    }
+
+
+def _record_trade_preprocessor_journal(venue: str, instrument: str, compressed: dict[str, Any], source: str) -> None:
+    preprocessor = compressed.get("preprocessor") if isinstance(compressed.get("preprocessor"), dict) else None
+    if not preprocessor:
+        return
+    mode = str(preprocessor.get("mode") or "semantic_window_v1")
+    market_regime = str(preprocessor.get("market_regime") or "unknown")
+    raw_count = max(0, int(preprocessor.get("raw_count") or 0))
+    emitted_count = max(0, int(preprocessor.get("emitted_count") or 0))
+    sample_bucket = _bucket_floor(_now_utc(), PREPROCESSED_TRADE_JOURNAL_BUCKET)
+    execute(
+        """
+        INSERT INTO market_trade_preprocessor_journal (
+            sample_bucket,
+            venue,
+            instrument,
+            source,
+            mode,
+            market_regime,
+            sample_count,
+            raw_count_total,
+            emitted_count_total,
+            last_compression_ratio,
+            last_saved_pct,
+            payload,
+            updated_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, 1, %s, %s, %s, %s, %s::jsonb, NOW())
+        ON CONFLICT (venue, instrument, source, mode, market_regime, sample_bucket)
+        DO UPDATE SET
+            sample_count = market_trade_preprocessor_journal.sample_count + 1,
+            raw_count_total = market_trade_preprocessor_journal.raw_count_total + EXCLUDED.raw_count_total,
+            emitted_count_total = market_trade_preprocessor_journal.emitted_count_total + EXCLUDED.emitted_count_total,
+            last_compression_ratio = EXCLUDED.last_compression_ratio,
+            last_saved_pct = EXCLUDED.last_saved_pct,
+            payload = EXCLUDED.payload,
+            updated_at = NOW()
+        """,
+        (
+            sample_bucket,
+            venue,
+            _normalize_instrument(instrument),
+            source,
+            mode,
+            market_regime,
+            raw_count,
+            emitted_count,
+            _float(preprocessor.get("compression_ratio"), 0.0),
+            _float(preprocessor.get("compression_saved_pct"), 0.0),
+            json_dumps(preprocessor),
+        ),
+    )
+
+
+def _fetch_trade_preprocessor_analytics_rows(
+    *,
+    hours: int,
+    venue: str | None = None,
+    instrument: str | None = None,
+    limit: int = 24,
+) -> list[dict[str, Any]]:
+    clauses = ["sample_bucket >= NOW() - (%s || ' hours')::interval"]
+    where_params: list[Any] = [max(1, hours)]
+    if venue:
+        clauses.append("venue = %s")
+        where_params.append(venue)
+    if instrument:
+        clauses.append("instrument = %s")
+        where_params.append(_normalize_instrument(instrument))
+    params = [PREPROCESSED_TRADE_PRICE_DISCOVERY_ALERT_SAVED_PCT, *where_params, max(1, min(limit, 100))]
+    where_sql = " AND ".join(clauses)
+    return fetch_all(
+        f"""
+        SELECT
+            venue,
+            market_regime,
+            COUNT(*) AS bucket_count,
+            SUM(sample_count) AS sample_count,
+            SUM(raw_count_total) AS raw_count_total,
+            SUM(emitted_count_total) AS emitted_count_total,
+            CASE
+                WHEN SUM(raw_count_total) > 0 THEN SUM(emitted_count_total)::double precision / SUM(raw_count_total)
+                ELSE 0
+            END AS compression_ratio,
+            CASE
+                WHEN SUM(raw_count_total) > 0 THEN (1 - SUM(emitted_count_total)::double precision / SUM(raw_count_total)) * 100
+                ELSE 0
+            END AS compression_saved_pct,
+            AVG(COALESCE(last_saved_pct, 0)) AS avg_saved_pct,
+            MAX(COALESCE(last_saved_pct, 0)) AS max_saved_pct,
+            SUM(
+                CASE
+                    WHEN market_regime = 'price_discovery' AND COALESCE(last_saved_pct, 0) >= %s THEN 1
+                    ELSE 0
+                END
+            ) AS aggressive_bucket_count,
+            MAX(updated_at) AS updated_at
+        FROM market_trade_preprocessor_journal
+        WHERE {where_sql}
+        GROUP BY venue, market_regime
+        ORDER BY raw_count_total DESC, sample_count DESC, venue ASC, market_regime ASC
+        LIMIT %s
+        """,
+        tuple(params),
+    )
+
+
+def _build_trade_preprocessor_analytics_payload(
+    *,
+    venue: str | None = None,
+    instrument: str | None = None,
+    limit: int = 24,
+) -> dict[str, Any]:
+    window_24h = _fetch_trade_preprocessor_analytics_rows(hours=24, venue=venue, instrument=instrument, limit=limit)
+    window_7d = _fetch_trade_preprocessor_analytics_rows(hours=168, venue=venue, instrument=instrument, limit=limit)
+    return {
+        "filters": {
+            "venue": venue,
+            "instrument": _normalize_instrument(instrument) if instrument else None,
+        },
+        "thresholds": {
+            "price_discovery_saved_pct": PREPROCESSED_TRADE_PRICE_DISCOVERY_ALERT_SAVED_PCT,
+            "price_discovery_min_raw_count": PREPROCESSED_TRADE_PRICE_DISCOVERY_ALERT_RAW_COUNT,
+        },
+        "windows": {
+            "last_24h": window_24h,
+            "last_7d": window_7d,
+        },
+        "as_of": _now_utc().isoformat(),
+    }
+
+
+def _build_trade_preprocessor_alert(preprocessor: dict[str, Any] | None, analytics: dict[str, Any] | None = None) -> dict[str, Any]:
+    threshold_saved_pct = PREPROCESSED_TRADE_PRICE_DISCOVERY_ALERT_SAVED_PCT
+    threshold_raw_count = PREPROCESSED_TRADE_PRICE_DISCOVERY_ALERT_RAW_COUNT
+    if not isinstance(preprocessor, dict):
+        return {
+            "state": "unknown",
+            "triggered": False,
+            "reason_code": "preprocessor-missing",
+            "threshold_saved_pct": threshold_saved_pct,
+            "threshold_raw_count": threshold_raw_count,
+            "summary": "No preprocessor payload available.",
+        }
+    market_regime = str(preprocessor.get("market_regime") or "unknown")
+    saved_pct = _float(preprocessor.get("compression_saved_pct"), 0.0)
+    raw_count = max(0, int(preprocessor.get("raw_count") or 0))
+    current_triggered = market_regime == "price_discovery" and raw_count >= threshold_raw_count and saved_pct >= threshold_saved_pct
+    analytics_rows_24h = []
+    if isinstance(analytics, dict):
+        windows = analytics.get("windows") if isinstance(analytics.get("windows"), dict) else {}
+        analytics_rows_24h = windows.get("last_24h") if isinstance(windows.get("last_24h"), list) else []
+    price_discovery_24h = next(
+        (
+            row for row in analytics_rows_24h
+            if isinstance(row, dict) and str(row.get("market_regime") or "") == "price_discovery"
+        ),
+        None,
+    )
+    aggressive_buckets_24h = max(0, int((price_discovery_24h or {}).get("aggressive_bucket_count") or 0))
+    if current_triggered:
+        return {
+            "state": "warn",
+            "triggered": True,
+            "reason_code": "price-discovery-compression-too-high",
+            "threshold_saved_pct": threshold_saved_pct,
+            "threshold_raw_count": threshold_raw_count,
+            "summary": f"Price discovery compression too aggressive: {saved_pct:.1f}% saved on raw {raw_count}.",
+            "current_saved_pct": round(saved_pct, 4),
+            "current_raw_count": raw_count,
+            "aggressive_buckets_24h": aggressive_buckets_24h,
+        }
+    if aggressive_buckets_24h > 0:
+        max_saved_pct_24h = _float((price_discovery_24h or {}).get("max_saved_pct"), 0.0)
+        return {
+            "state": "watch",
+            "triggered": True,
+            "reason_code": "price-discovery-buckets-over-threshold-24h",
+            "threshold_saved_pct": threshold_saved_pct,
+            "threshold_raw_count": threshold_raw_count,
+            "summary": f"24h price discovery alert buckets: {aggressive_buckets_24h} (max saved {max_saved_pct_24h:.1f}%).",
+            "current_saved_pct": round(saved_pct, 4),
+            "current_raw_count": raw_count,
+            "aggressive_buckets_24h": aggressive_buckets_24h,
+        }
+    return {
+        "state": "ok",
+        "triggered": False,
+        "reason_code": "within-threshold",
+        "threshold_saved_pct": threshold_saved_pct,
+        "threshold_raw_count": threshold_raw_count,
+        "summary": f"Compression within price discovery threshold ({saved_pct:.1f}% / raw {raw_count}).",
+        "current_saved_pct": round(saved_pct, 4),
+        "current_raw_count": raw_count,
+        "aggressive_buckets_24h": aggressive_buckets_24h,
+    }
+
+
+def _build_preprocessed_trade_feed(
+    venue: str,
+    instrument: str,
+    trades: list[dict[str, Any]],
+    *,
+    target_count: int | None = None,
+) -> dict[str, Any]:
+    raw_count = len(trades)
+    safe_target = max(20, min(target_count or PREPROCESSED_TRADE_TARGET_COUNT, max(raw_count, 20)))
+    if raw_count == 0:
+        return {
+            "venue": venue,
+            "instrument": _normalize_instrument(instrument),
+            "items": [],
+            "preprocessor": {
+                "mode": "semantic_window_v1",
+                "market_regime": "empty",
+                "raw_count": 0,
+                "emitted_count": 0,
+                "compression_ratio": 0.0,
+                "compression_saved_pct": 0.0,
+                "target_count": safe_target,
+                "aggregation_window_ms": PREPROCESSED_TRADE_FLUSH_MS,
+                "price_band_bps": 0.0,
+            },
+            "as_of": _now_utc().isoformat(),
+        }
+
+    trade_rows: list[dict[str, Any]] = []
+    for trade in trades:
+        trade_rows.append(
+            {
+                "trade": trade,
+                "traded_at": _trade_datetime(trade),
+                "side": _trade_side(trade),
+                "price": _float(trade.get("price"), 0.0),
+                "size": _float(trade.get("size"), 0.0),
+            }
+        )
+    input_desc = len(trade_rows) > 1 and trade_rows[0]["traded_at"] > trade_rows[-1]["traded_at"]
+    ordered_rows = sorted(trade_rows, key=lambda item: item["traded_at"])
+    profile = _resolve_trade_preprocessor_profile(ordered_rows, safe_target)
+    aggregation_window_ms = int(profile.get("aggregation_window_ms") or PREPROCESSED_TRADE_FLUSH_MS)
+    price_band_bps = _float(profile.get("price_band_bps"), _adaptive_trade_price_band_bps(raw_count, safe_target))
+    effective_target_count = max(20, int(profile.get("effective_target_count") or safe_target))
+    mode = str(profile.get("mode") or "semantic_window_v1")
+    market_regime = str(profile.get("market_regime") or "transitional")
+    profile_features = profile.get("features") if isinstance(profile.get("features"), dict) else {}
+
+    grouped: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for row in ordered_rows:
+        trade = row["trade"]
+        traded_at = row["traded_at"]
+        price = row["price"]
+        size = max(0.0, row["size"])
+        side = row["side"]
+        if current is None:
+            current = {
+                "side": side,
+                "count": 1,
+                "first_at": traded_at,
+                "last_at": traded_at,
+                "price_weighted_sum": price * size,
+                "size": size,
+                "notional": price * size,
+                "min_price": price,
+                "max_price": price,
+                "last_price": price,
+                "trade_id": str(trade.get("trade_id") or trade.get("id") or ""),
+                "payload": trade.get("payload", {}),
+            }
+            continue
+        representative_price = current["price_weighted_sum"] / max(current["size"], 1e-9) if current["size"] > 0 else current["last_price"]
+        within_window = int((traded_at - current["last_at"]).total_seconds() * 1000) <= aggregation_window_ms
+        within_price_band = _price_distance_bps(representative_price, price) <= price_band_bps
+        if side == current["side"] and within_window and within_price_band:
+            current["count"] += 1
+            current["last_at"] = traded_at
+            current["price_weighted_sum"] += price * size
+            current["size"] += size
+            current["notional"] += price * size
+            current["min_price"] = min(current["min_price"], price)
+            current["max_price"] = max(current["max_price"], price)
+            current["last_price"] = price
+        else:
+            grouped.append(current)
+            current = {
+                "side": side,
+                "count": 1,
+                "first_at": traded_at,
+                "last_at": traded_at,
+                "price_weighted_sum": price * size,
+                "size": size,
+                "notional": price * size,
+                "min_price": price,
+                "max_price": price,
+                "last_price": price,
+                "trade_id": str(trade.get("trade_id") or trade.get("id") or ""),
+                "payload": trade.get("payload", {}),
+            }
+    if current is not None:
+        grouped.append(current)
+
+    emitted_items: list[dict[str, Any]] = []
+    buy_volume = 0.0
+    sell_volume = 0.0
+    for index, item in enumerate(grouped):
+        average_price = item["price_weighted_sum"] / max(item["size"], 1e-9) if item["size"] > 0 else item["last_price"]
+        if item["side"] == "buy":
+            buy_volume += item["size"]
+        elif item["side"] == "sell":
+            sell_volume += item["size"]
+        price_span_bps = _price_distance_bps(item["min_price"], item["max_price"]) if item["count"] > 1 else 0.0
+        payload = item["payload"] if isinstance(item["payload"], dict) else {}
+        payload = {
+            **payload,
+            "preprocessor": {
+                "mode": mode,
+                "market_regime": market_regime,
+                "aggregated": item["count"] > 1,
+                "raw_trade_count": item["count"],
+                "first_traded_at": item["first_at"].isoformat(),
+                "last_traded_at": item["last_at"].isoformat(),
+                "window_ms": max(0, int((item["last_at"] - item["first_at"]).total_seconds() * 1000)),
+                "price_span_bps": round(price_span_bps, 6),
+                "representative_price": round(average_price, 10),
+                "total_notional": round(item["notional"], 10),
+            },
+        }
+        emitted_items.append(
+            _serialize_trade(
+                venue,
+                instrument,
+                {
+                    "trade_id": item["trade_id"] or f"pp-{int(item['last_at'].timestamp() * 1000)}-{index + 1}",
+                    "side": item["side"],
+                    "price": average_price,
+                    "size": item["size"],
+                    "traded_at": item["last_at"],
+                    "payload": payload,
+                },
+            )
+        )
+
+    if input_desc:
+        emitted_items.reverse()
+
+    first_emitted = emitted_items[0] if emitted_items else None
+    last_emitted = emitted_items[-1] if emitted_items else None
+    raw_notional = sum(item["price"] * item["size"] for item in ordered_rows)
+    raw_size = sum(item["size"] for item in ordered_rows)
+    time_span_minutes = max((ordered_rows[-1]["traded_at"] - ordered_rows[0]["traded_at"]).total_seconds() / 60.0, 1.0 / 60.0)
+    emitted_count = len(emitted_items)
+    return {
+        "venue": venue,
+        "instrument": _normalize_instrument(instrument),
+        "items": emitted_items,
+        "preprocessor": {
+            "mode": mode,
+            "market_regime": market_regime,
+            "raw_count": raw_count,
+            "emitted_count": emitted_count,
+            "compression_ratio": round(emitted_count / max(raw_count, 1), 6),
+            "compression_saved_pct": round((1.0 - (emitted_count / max(raw_count, 1))) * 100.0, 4),
+            "target_count": effective_target_count,
+            "aggregation_window_ms": aggregation_window_ms,
+            "price_band_bps": price_band_bps,
+            "buy_volume": round(buy_volume, 10),
+            "sell_volume": round(sell_volume, 10),
+            "volume_imbalance": round((buy_volume - sell_volume) / max(buy_volume + sell_volume, 1e-9), 6),
+            "raw_size": round(raw_size, 10),
+            "raw_notional": round(raw_notional, 10),
+            "tape_acceleration": round(raw_size / max(time_span_minutes, 1e-9), 10),
+            "first_emitted_at": first_emitted.get("traded_at") if isinstance(first_emitted, dict) else None,
+            "last_emitted_at": last_emitted.get("traded_at") if isinstance(last_emitted, dict) else None,
+            "profile_features": profile_features,
+        },
+        "as_of": _now_utc().isoformat(),
+    }
+
+
+async def _flush_preprocessed_trade_buffer(venue: str, instrument: str) -> None:
+    key = _trade_stream_key(venue, instrument)
+    PREPROCESSED_TRADE_FLUSH_TASKS.pop(key, None)
+    subscribers = PREPROCESSED_TRADE_SUBSCRIBERS.get(key, set())
+    if not subscribers:
+        PREPROCESSED_TRADE_BUFFERS.pop(key, None)
+        return
+    trades = PREPROCESSED_TRADE_BUFFERS.pop(key, [])
+    if not trades:
+        return
+    compressed = _build_preprocessed_trade_feed(venue, instrument, trades, target_count=min(len(trades), PREPROCESSED_TRADE_TARGET_COUNT))
+    await asyncio.to_thread(_record_trade_preprocessor_journal, venue, instrument, compressed, "stream_flush")
+    items = compressed.get("items") if isinstance(compressed.get("items"), list) else []
+    if not items:
+        return
+    base_payload = {
+        "venue": venue,
+        "instrument": _normalize_instrument(instrument),
+        "preprocessor": compressed.get("preprocessor"),
+        "as_of": _now_utc().isoformat(),
+    }
+    payload = {"type": "trade", "item": items[0], **base_payload} if len(items) == 1 else {"type": "snapshot", "items": items, **base_payload}
+    stale: list[WebSocket] = []
+    for socket in list(subscribers):
+        try:
+            await socket.send_json(payload)
+        except Exception:
+            stale.append(socket)
+    for socket in stale:
+        subscribers.discard(socket)
+
+
+async def _flush_preprocessed_trade_buffer_after_delay(venue: str, instrument: str) -> None:
+    try:
+        await asyncio.sleep(PREPROCESSED_TRADE_FLUSH_MS / 1000)
+        await _flush_preprocessed_trade_buffer(venue, instrument)
+    except asyncio.CancelledError:
+        return
+
+
+def _buffer_preprocessed_trade(venue: str, instrument: str, trade: dict[str, Any]) -> None:
+    key = _trade_stream_key(venue, instrument)
+    subscribers = PREPROCESSED_TRADE_SUBSCRIBERS.get(key, set())
+    if not subscribers:
+        return
+    buffer = PREPROCESSED_TRADE_BUFFERS.setdefault(key, [])
+    buffer.append(trade)
+    task = PREPROCESSED_TRADE_FLUSH_TASKS.get(key)
+    immediate_flush_threshold = max(4, min(32, PREPROCESSED_TRADE_TARGET_COUNT // 6))
+    if len(buffer) >= immediate_flush_threshold:
+        if task and not task.done():
+            task.cancel()
+        PREPROCESSED_TRADE_FLUSH_TASKS[key] = asyncio.create_task(_flush_preprocessed_trade_buffer(venue, instrument))
+        return
+    if task is None or task.done():
+        PREPROCESSED_TRADE_FLUSH_TASKS[key] = asyncio.create_task(_flush_preprocessed_trade_buffer_after_delay(venue, instrument))
+
+
+async def _broadcast_trade(venue: str, instrument: str, trade: dict[str, Any]) -> None:
+    key = _trade_stream_key(venue, instrument)
+    subscribers = TRADE_SUBSCRIBERS.get(key, set())
+    if not subscribers:
+        return
+    payload = {
+        "type": "trade",
+        "venue": venue,
+        "instrument": _normalize_instrument(instrument),
+        "item": _serialize_trade(venue, instrument, trade),
+        "as_of": _now_utc().isoformat(),
+    }
+    stale: list[WebSocket] = []
+    for socket in list(subscribers):
+        try:
+            await socket.send_json(payload)
+        except Exception:
+            stale.append(socket)
+    for socket in stale:
+        subscribers.discard(socket)
+
+
+async def _broadcast_trades(venue: str, instrument: str, trades: list[dict[str, Any]]) -> None:
+    if not trades:
+        return
+    for trade in trades:
+        if not _remember_trade_signature(venue, instrument, trade):
+            continue
+        _buffer_preprocessed_trade(venue, instrument, trade)
+        await _broadcast_trade(venue, instrument, trade)
+
+
+async def _fetch_binance_book_ticker(client: httpx.AsyncClient, symbol: str) -> dict[str, Any] | None:
+    try:
+        response = await client.get("https://api.binance.com/api/v3/ticker/bookTicker", params={"symbol": symbol}, timeout=8.0)
+        if response.status_code >= 400:
+            return None
+        payload = response.json()
+        bid = _float(payload.get("bidPrice"))
+        ask = _float(payload.get("askPrice"))
+        if bid <= 0 or ask <= 0:
+            return None
+        last = (bid + ask) / 2
+        spread_bps = ((ask - bid) / last * 10000) if last > 0 else 0.0
+        return {
+            "venue": DEFAULT_VENUE,
+            "instrument": symbol,
+            "bid": bid,
+            "ask": ask,
+            "last": last,
+            "spread_bps": spread_bps,
+            "source": "binance-bookTicker",
+        }
+    except Exception:
+        return None
+
+
+async def _fetch_coinbase_ticker(client: httpx.AsyncClient, symbol: str) -> dict[str, Any] | None:
+    product_id = _coinbase_product_id(symbol)
+    if not product_id:
+        return None
+    try:
+        response = await client.get(f"https://api.exchange.coinbase.com/products/{product_id}/ticker", timeout=8.0)
+        if response.status_code >= 400:
+            return None
+        payload = response.json()
+        bid = _float(payload.get("bid"))
+        ask = _float(payload.get("ask"))
+        last = _float(payload.get("price"), (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0)
+        if bid <= 0 or ask <= 0:
+            return None
+        spread_bps = ((ask - bid) / last * 10000) if last > 0 else 0.0
+        return {
+            "venue": "coinbase-public",
+            "instrument": _market_symbol_for_venue("coinbase-public", symbol),
+            "bid": bid,
+            "ask": ask,
+            "last": last,
+            "spread_bps": spread_bps,
+            "source": "coinbase-ticker",
+        }
+    except Exception:
+        return None
+
+
+async def _fetch_okx_ticker(client: httpx.AsyncClient, symbol: str) -> dict[str, Any] | None:
+    inst_id = _okx_inst_id(symbol)
+    if not inst_id:
+        return None
+    try:
+        response = await client.get("https://www.okx.com/api/v5/market/ticker", params={"instId": inst_id}, timeout=8.0)
+        if response.status_code >= 400:
+            return None
+        payload = response.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        item = data[0] if isinstance(data, list) and data else None
+        if not isinstance(item, dict):
+            return None
+        bid = _float(item.get("bidPx"))
+        ask = _float(item.get("askPx"))
+        last = _float(item.get("last"), (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0)
+        if bid <= 0 or ask <= 0:
+            return None
+        spread_bps = ((ask - bid) / last * 10000) if last > 0 else 0.0
+        return {
+            "venue": "okx-public",
+            "instrument": _market_symbol_for_venue("okx-public", symbol),
+            "bid": bid,
+            "ask": ask,
+            "last": last,
+            "spread_bps": spread_bps,
+            "source": "okx-ticker",
+        }
+    except Exception:
+        return None
+
+
+async def _fetch_bybit_ticker(client: httpx.AsyncClient, symbol: str) -> dict[str, Any] | None:
+    bybit_symbol = _bybit_symbol(symbol)
+    if not bybit_symbol:
+        return None
+    try:
+        response = await client.get(
+            "https://api.bybit.com/v5/market/tickers",
+            params={"category": _bybit_category(symbol), "symbol": bybit_symbol},
+            timeout=8.0,
+        )
+        if response.status_code >= 400:
+            return None
+        payload = response.json()
+        result = payload.get("result") if isinstance(payload, dict) else None
+        rows = result.get("list") if isinstance(result, dict) else None
+        item = rows[0] if isinstance(rows, list) and rows else None
+        if not isinstance(item, dict):
+            return None
+        bid = _float(item.get("bid1Price"))
+        ask = _float(item.get("ask1Price"))
+        last = _float(item.get("lastPrice"), (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0)
+        if bid <= 0 or ask <= 0:
+            return None
+        spread_bps = ((ask - bid) / last * 10000) if last > 0 else 0.0
+        return {
+            "venue": "bybit-public",
+            "instrument": bybit_symbol,
+            "bid": bid,
+            "ask": ask,
+            "last": last,
+            "spread_bps": spread_bps,
+            "source": "bybit-ticker",
+        }
+    except Exception:
+        return None
+
+
+async def _fetch_bingx_ticker(client: httpx.AsyncClient, symbol: str) -> dict[str, Any] | None:
+    bingx_symbol = _normalize_bingx_symbol(symbol)
+    if not bingx_symbol:
+        return None
+    try:
+        response = await client.get(
+            f"{BINGX_API_BASE_URL}/openApi/swap/v2/quote/ticker",
+            params={"symbol": bingx_symbol},
+            timeout=8.0,
+        )
+        if response.status_code >= 400:
+            return None
+        item = _unwrap_bingx_public_payload(response.json())
+        if not isinstance(item, dict):
+            return None
+        bid = _float(item.get("bidPrice"))
+        ask = _float(item.get("askPrice"))
+        last = _float(item.get("lastPrice"), (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0)
+        if bid <= 0 or ask <= 0:
+            return None
+        spread_bps = ((ask - bid) / last * 10000) if last > 0 else 0.0
+        return {
+            "venue": "bingx-public",
+            "instrument": bingx_symbol,
+            "bid": bid,
+            "ask": ask,
+            "last": last,
+            "spread_bps": spread_bps,
+            "source": "bingx-ticker",
+        }
+    except Exception:
+        return None
+
+
+async def _fetch_binance_trades(client: httpx.AsyncClient, symbol: str, limit: int = 200) -> list[dict[str, Any]]:
+    try:
+        response = await client.get("https://api.binance.com/api/v3/trades", params={"symbol": symbol, "limit": max(1, min(limit, 500))}, timeout=8.0)
+        if response.status_code >= 400:
+            return []
+        rows = []
+        for item in response.json():
+            price = _float(item.get("price"))
+            qty = _float(item.get("qty"))
+            traded_at = datetime.fromtimestamp(int(item.get("time", 0)) / 1000, tz=timezone.utc)
+            rows.append(
+                {
+                    "trade_id": str(item.get("id")),
+                    "price": price,
+                    "size": qty,
+                    "side": "sell" if bool(item.get("isBuyerMaker")) else "buy",
+                    "traded_at": traded_at,
+                    "payload": item,
+                }
+            )
+        return rows
+    except Exception:
+        return []
+
+
+async def _fetch_binance_depth_snapshot(client: httpx.AsyncClient, symbol: str) -> dict[str, Any] | None:
+    try:
+        response = await client.get("https://api.binance.com/api/v3/depth", params={"symbol": symbol, "limit": MAX_DEPTH_LEVELS}, timeout=8.0)
+        if response.status_code >= 400:
+            return None
+        payload = response.json()
+        bids = [[_float(level[0]), _float(level[1])] for level in payload.get("bids", [])]
+        asks = [[_float(level[0]), _float(level[1])] for level in payload.get("asks", [])]
+        return {
+            "last_update_id": payload.get("lastUpdateId"),
+            "bids": bids,
+            "asks": asks,
+        }
+    except Exception:
+        return None
+
+
+async def _fetch_coinbase_depth_snapshot(client: httpx.AsyncClient, symbol: str) -> dict[str, Any] | None:
+    product_id = _coinbase_product_id(symbol)
+    if not product_id:
+        return None
+    try:
+        response = await client.get(
+            f"https://api.exchange.coinbase.com/products/{product_id}/book",
+            params={"level": 2},
+            timeout=8.0,
+        )
+        if response.status_code >= 400:
+            return None
+        payload = response.json()
+        bids = [[_float(level[0]), _float(level[1])] for level in payload.get("bids", [])]
+        asks = [[_float(level[0]), _float(level[1])] for level in payload.get("asks", [])]
+        return {
+            "last_update_id": payload.get("sequence"),
+            "bids": bids,
+            "asks": asks,
+        }
+    except Exception:
+        return None
+
+
+async def _fetch_okx_depth_snapshot(client: httpx.AsyncClient, symbol: str) -> dict[str, Any] | None:
+    inst_id = _okx_inst_id(symbol)
+    if not inst_id:
+        return None
+    try:
+        response = await client.get(
+            "https://www.okx.com/api/v5/market/books",
+            params={"instId": inst_id, "sz": MAX_DEPTH_LEVELS},
+            timeout=8.0,
+        )
+        if response.status_code >= 400:
+            return None
+        payload = response.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        item = data[0] if isinstance(data, list) and data else None
+        if not isinstance(item, dict):
+            return None
+        bids = [[_float(level[0]), _float(level[1])] for level in item.get("bids", [])]
+        asks = [[_float(level[0]), _float(level[1])] for level in item.get("asks", [])]
+        return {
+            "last_update_id": item.get("seqId") or item.get("ts"),
+            "bids": bids,
+            "asks": asks,
+            "event_time": int(_float(item.get("ts"), int(_now_utc().timestamp() * 1000))),
+        }
+    except Exception:
+        return None
+
+
+async def _fetch_bybit_trades(client: httpx.AsyncClient, symbol: str, limit: int = 200) -> list[dict[str, Any]]:
+    bybit_symbol = _bybit_symbol(symbol)
+    if not bybit_symbol:
+        return []
+    try:
+        response = await client.get(
+            "https://api.bybit.com/v5/market/recent-trade",
+            params={"category": _bybit_category(symbol), "symbol": bybit_symbol, "limit": max(1, min(limit, 1000))},
+            timeout=8.0,
+        )
+        if response.status_code >= 400:
+            return []
+        payload = response.json()
+        result = payload.get("result") if isinstance(payload, dict) else None
+        rows = result.get("list") if isinstance(result, dict) else None
+        if not isinstance(rows, list):
+            return []
+        trades: list[dict[str, Any]] = []
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            traded_ms = int(_float(item.get("time"), 0))
+            traded_at = datetime.fromtimestamp(traded_ms / 1000, tz=timezone.utc) if traded_ms > 0 else None
+            if traded_at is None:
+                continue
+            price = _float(item.get("price"), 0.0)
+            size = _float(item.get("size"), 0.0)
+            if price <= 0 or size <= 0:
+                continue
+            trades.append(
+                {
+                    "trade_id": str(item.get("execId") or traded_ms),
+                    "price": price,
+                    "size": size,
+                    "side": str(item.get("side") or "").lower(),
+                    "traded_at": traded_at,
+                    "payload": item,
+                }
+            )
+        return trades
+    except Exception:
+        return []
+
+
+async def _fetch_bybit_depth_snapshot(client: httpx.AsyncClient, symbol: str) -> dict[str, Any] | None:
+    bybit_symbol = _bybit_symbol(symbol)
+    if not bybit_symbol:
+        return None
+    try:
+        response = await client.get(
+            "https://api.bybit.com/v5/market/orderbook",
+            params={"category": _bybit_category(symbol), "symbol": bybit_symbol, "limit": MAX_DEPTH_LEVELS},
+            timeout=8.0,
+        )
+        if response.status_code >= 400:
+            return None
+        payload = response.json()
+        result = payload.get("result") if isinstance(payload, dict) else None
+        if not isinstance(result, dict):
+            return None
+        bids = [[_float(level[0]), _float(level[1])] for level in result.get("b", [])]
+        asks = [[_float(level[0]), _float(level[1])] for level in result.get("a", [])]
+        ts = int(_float(result.get("ts") or payload.get("time"), int(_now_utc().timestamp() * 1000)))
+        return {
+            "last_update_id": result.get("u") or result.get("seq") or ts,
+            "bids": bids,
+            "asks": asks,
+            "event_time": ts,
+        }
+    except Exception:
+        return None
+
+
+async def _fetch_bingx_trades(client: httpx.AsyncClient, symbol: str, limit: int = 200) -> list[dict[str, Any]]:
+    bingx_symbol = _normalize_bingx_symbol(symbol)
+    if not bingx_symbol:
+        return []
+    try:
+        response = await client.get(
+            f"{BINGX_API_BASE_URL}/openApi/swap/v2/quote/trades",
+            params={"symbol": bingx_symbol, "limit": max(1, min(limit, 200))},
+            timeout=8.0,
+        )
+        if response.status_code >= 400:
+            return []
+        rows = _unwrap_bingx_public_payload(response.json())
+        if not isinstance(rows, list):
+            return []
+        trades: list[dict[str, Any]] = []
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            traded_ms = int(_float(item.get("ts") or item.get("time"), 0))
+            traded_at = datetime.fromtimestamp(traded_ms / 1000, tz=timezone.utc) if traded_ms > 0 else None
+            if traded_at is None:
+                continue
+            price = _float(item.get("price"), 0.0)
+            size = _float(item.get("qty"), 0.0)
+            if price <= 0 or size <= 0:
+                continue
+            trades.append(
+                {
+                    "trade_id": str(item.get("fillId") or traded_ms),
+                    "price": price,
+                    "size": size,
+                    "side": "sell" if bool(item.get("isBuyerMaker")) else "buy",
+                    "traded_at": traded_at,
+                    "payload": item,
+                }
+            )
+        return trades
+    except Exception:
+        return []
+
+
+async def _fetch_bingx_depth_snapshot(client: httpx.AsyncClient, symbol: str) -> dict[str, Any] | None:
+    bingx_symbol = _normalize_bingx_symbol(symbol)
+    if not bingx_symbol:
+        return None
+    try:
+        response = await client.get(
+            f"{BINGX_API_BASE_URL}/openApi/swap/v2/quote/depth",
+            params={"symbol": bingx_symbol, "limit": min(MAX_DEPTH_LEVELS, 100)},
+            timeout=8.0,
+        )
+        if response.status_code >= 400:
+            return None
+        payload = _unwrap_bingx_public_payload(response.json())
+        if not isinstance(payload, dict):
+            return None
+        bids = [[_float(level[0]), _float(level[1])] for level in payload.get("bids", [])]
+        asks = [[_float(level[0]), _float(level[1])] for level in payload.get("asks", [])]
+        event_time = int(_float(payload.get("T") or payload.get("ts"), int(_now_utc().timestamp() * 1000)))
+        return {
+            "last_update_id": event_time,
+            "bids": bids,
+            "asks": asks,
+            "event_time": event_time,
+        }
+    except Exception:
+        return None
+
+
+def _decode_ws_message(raw_message: object) -> str | None:
+    if isinstance(raw_message, bytes):
+        try:
+            return gzip.decompress(raw_message).decode("utf-8")
+        except Exception:
+            try:
+                return raw_message.decode("utf-8")
+            except Exception:
+                return None
+    if isinstance(raw_message, str):
+        return raw_message
+    return None
+
+
+def _bingx_depth_book_from_message(payload: object, symbol: str) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    data_type = str(payload.get("dataType") or "")
+    bingx_symbol = _normalize_bingx_symbol(symbol)
+    if data_type != f"{bingx_symbol}@depth20":
+        return None
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else None
+    if not isinstance(data, dict):
+        return None
+    bids = [[_float(level[0]), _float(level[1])] for level in data.get("bids", [])]
+    asks = [[_float(level[0]), _float(level[1])] for level in data.get("asks", [])]
+    event_time = int(_float(payload.get("ts") or data.get("T") or data.get("ts"), int(_now_utc().timestamp() * 1000)))
+    return {
+        "bids": _depth_rows_to_map(bids),
+        "asks": _depth_rows_to_map(asks),
+        "last_update_id": event_time,
+        "event_time": event_time,
+    }
+
+
+def _coinbase_changes_to_depth_rows(changes: list[list[str]], side_label: str) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for change in changes:
+        if not isinstance(change, list) or len(change) < 3:
+            continue
+        side = str(change[0]).strip().lower()
+        if side_label == "bid" and side != "buy":
+            continue
+        if side_label == "ask" and side != "sell":
+            continue
+        rows.append([str(change[1]), str(change[2])])
+    return rows
+
+
+async def _sync_depth_snapshot(
+    venue: str,
+    symbol: str,
+    snapshot: dict[str, Any] | None,
+    *,
+    reason: str,
+    source: str,
+) -> None:
+    if not snapshot:
+        return
+    event_time = int(snapshot.get("event_time") or int(_now_utc().timestamp() * 1000))
+    book = {
+        "bids": _depth_rows_to_map(snapshot.get("bids", [])),
+        "asks": _depth_rows_to_map(snapshot.get("asks", [])),
+        "last_update_id": int(snapshot.get("last_update_id") or 0),
+        "event_time": event_time,
+    }
+    DEPTH_BOOKS[_stream_key(venue, symbol)] = book
+    await _store_depth_async(_snapshot_from_book(venue, symbol, book, reason, source))
+
+
+async def _fetch_binance_derivatives_metrics(client: httpx.AsyncClient, symbol: str) -> dict[str, Any] | None:
+    try:
+        premium_response = await client.get("https://fapi.binance.com/fapi/v1/premiumIndex", params={"symbol": symbol}, timeout=8.0)
+        oi_response = await client.get("https://fapi.binance.com/fapi/v1/openInterest", params={"symbol": symbol}, timeout=8.0)
+        if premium_response.status_code >= 400 or oi_response.status_code >= 400:
+            return None
+
+        premium = premium_response.json()
+        oi = oi_response.json()
+        next_funding_ms = int(_float(premium.get("nextFundingTime"), 0))
+        next_funding_time = datetime.fromtimestamp(next_funding_ms / 1000, tz=timezone.utc) if next_funding_ms > 0 else None
+        return {
+            "venue": DEFAULT_VENUE,
+            "instrument": symbol,
+            "funding_rate": _float(premium.get("lastFundingRate"), 0.0),
+            "open_interest": _float(oi.get("openInterest"), 0.0),
+            "mark_price": _float(premium.get("markPrice"), 0.0),
+            "next_funding_time": next_funding_time,
+            "payload": {"premiumIndex": premium, "openInterest": oi},
+            "captured_at": _now_utc(),
+        }
+    except Exception:
+        return None
+
+
+def _upsert_snapshot(snapshot: dict[str, Any]) -> None:
+    snapshot_key = f"{snapshot['venue']}:{snapshot['instrument']}"
+    execute(
+        """
+        INSERT INTO market_snapshots (snapshot_key, venue, instrument, bid, ask, last, spread_bps, payload)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+        ON CONFLICT (snapshot_key) DO UPDATE SET
+          bid = EXCLUDED.bid,
+          ask = EXCLUDED.ask,
+          last = EXCLUDED.last,
+          spread_bps = EXCLUDED.spread_bps,
+          payload = EXCLUDED.payload,
+          updated_at = NOW()
+        """,
+        (
+            snapshot_key,
+            snapshot["venue"],
+            snapshot["instrument"],
+            snapshot["bid"],
+            snapshot["ask"],
+            snapshot["last"],
+            snapshot["spread_bps"],
+            json_dumps(snapshot),
+        ),
+    )
+
+
+def _store_trades(venue: str, instrument: str, trades: list[dict[str, Any]]) -> None:
+    for trade in trades:
+        execute(
+            """
+                        INSERT INTO market_trades (venue, instrument, trade_id, side, price, size, traded_at, payload)
+                        SELECT %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+                        WHERE NOT EXISTS (
+                            SELECT 1
+                            FROM market_trades
+                            WHERE venue = %s
+                                AND instrument = %s
+                                AND (
+                                    (trade_id IS NOT NULL AND trade_id = %s)
+                                    OR (
+                                        trade_id IS NULL
+                                        AND traded_at = %s
+                                        AND price = %s
+                                        AND size = %s
+                                        AND COALESCE(side, '') = COALESCE(%s, '')
+                                    )
+                                )
+                        )
+            """,
+            (
+                venue,
+                instrument,
+                trade.get("trade_id"),
+                trade.get("side"),
+                trade.get("price"),
+                trade.get("size"),
+                trade.get("traded_at"),
+                json_dumps(trade.get("payload", {})),
+                venue,
+                instrument,
+                trade.get("trade_id"),
+                trade.get("traded_at"),
+                trade.get("price"),
+                trade.get("size"),
+                trade.get("side"),
+            ),
+        )
+
+
+def _store_depth(depth_payload: dict[str, Any]) -> None:
+    execute(
+        """
+        INSERT INTO market_orderbook_snapshots (venue, instrument, snapshot_at, best_bid, best_ask, spread_bps, depth_payload, source)
+        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+        """,
+        (
+            depth_payload["venue"],
+            depth_payload["instrument"],
+            depth_payload["snapshot_at"],
+            depth_payload.get("best_bid"),
+            depth_payload.get("best_ask"),
+            depth_payload.get("spread_bps"),
+            json_dumps(depth_payload.get("depth", {})),
+            depth_payload.get("source", "unknown"),
+        ),
+    )
+
+
+def _store_derivatives(metrics: dict[str, Any]) -> None:
+    execute(
+        """
+        INSERT INTO market_derivatives_metrics (venue, instrument, funding_rate, open_interest, mark_price, next_funding_time, payload, captured_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+        """,
+        (
+            metrics["venue"],
+            metrics["instrument"],
+            metrics.get("funding_rate"),
+            metrics.get("open_interest"),
+            metrics.get("mark_price"),
+            metrics.get("next_funding_time"),
+            json_dumps(metrics.get("payload", {})),
+            metrics.get("captured_at", _now_utc()),
+        ),
+    )
+
+
+async def _upsert_snapshot_async(snapshot: dict[str, Any]) -> None:
+    _record_quote_telemetry(snapshot)
+    await asyncio.to_thread(_upsert_snapshot, snapshot)
+
+
+async def _store_trades_async(venue: str, instrument: str, trades: list[dict[str, Any]]) -> None:
+    _record_trade_telemetry(venue, instrument, trades)
+    await asyncio.to_thread(_store_trades, venue, instrument, trades)
+
+
+async def _store_depth_async(depth_payload: dict[str, Any]) -> None:
+    _record_depth_telemetry(depth_payload)
+    await asyncio.to_thread(_store_depth, depth_payload)
+
+
+async def _store_derivatives_async(metrics: dict[str, Any]) -> None:
+    await asyncio.to_thread(_store_derivatives, metrics)
+
+
+async def _upsert_ohlcv_from_trades_async(venue: str, instrument: str, trades: list[dict[str, Any]], timeframe: str) -> None:
+    await asyncio.to_thread(_upsert_ohlcv_from_trades, venue, instrument, trades, timeframe)
+
+
+async def _cleanup_old_rows_async() -> None:
+    await asyncio.to_thread(_cleanup_old_rows)
+
+
+def _upsert_ohlcv_from_trades(venue: str, instrument: str, trades: list[dict[str, Any]], timeframe: str) -> None:
+    if not trades:
+        return
+    grouped: dict[datetime, list[dict[str, Any]]] = {}
+    for trade in trades:
+        ts = trade["traded_at"]
+        bucket = _bucket_floor(ts, timeframe)
+        grouped.setdefault(bucket, []).append(trade)
+
+    for bucket, rows in grouped.items():
+        rows_sorted = sorted(rows, key=lambda row: row["traded_at"])
+        open_price = _float(rows_sorted[0]["price"])
+        close_price = _float(rows_sorted[-1]["price"])
+        high_price = max(_float(row["price"]) for row in rows_sorted)
+        low_price = min(_float(row["price"]) for row in rows_sorted)
+        volume = sum(_float(row["size"]) for row in rows_sorted)
+        quote_volume = sum(_float(row["size"]) * _float(row["price"]) for row in rows_sorted)
+        execute(
+            """
+            INSERT INTO market_ohlcv (venue, instrument, timeframe, bucket_start, open, high, low, close, volume, quote_volume, trades_count, source)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (venue, instrument, timeframe, bucket_start) DO UPDATE SET
+              open = EXCLUDED.open,
+              high = EXCLUDED.high,
+              low = EXCLUDED.low,
+              close = EXCLUDED.close,
+              volume = EXCLUDED.volume,
+              quote_volume = EXCLUDED.quote_volume,
+              trades_count = EXCLUDED.trades_count,
+              source = EXCLUDED.source,
+              created_at = NOW()
+            """,
+            (
+                venue,
+                instrument,
+                timeframe,
+                bucket,
+                open_price,
+                high_price,
+                low_price,
+                close_price,
+                volume,
+                quote_volume,
+                len(rows_sorted),
+                "trade-resampled",
+            ),
+        )
+
+
+def _fetch_ohlcv_rows(venue: str, instrument: str, timeframe: str, limit: int) -> list[dict[str, Any]]:
+    rows = fetch_all(
+        """
+        SELECT venue, instrument, timeframe, bucket_start, open, high, low, close, volume, quote_volume, trades_count, source
+        FROM market_ohlcv
+        WHERE venue = %s AND instrument = %s AND timeframe = %s
+        ORDER BY bucket_start DESC
+        LIMIT %s
+        """,
+        (venue, _normalize_instrument(instrument), timeframe, limit),
+    )
+    return list(reversed(rows))
+
+
+def _sequence_ohlcv_rows(venue: str, instrument: str, timeframe: str, rows: list[dict[str, Any]]) -> list[int]:
+    stream_key = _ohlcv_stream_key(venue, instrument, timeframe)
+    state = OHLCV_STREAM_STATE.setdefault(stream_key, {"next_seq": 1, "bucket_seq": {}, "last_signature": ""})
+    bucket_seq = state.setdefault("bucket_seq", {})
+    next_seq = int(state.get("next_seq", 1) or 1)
+    sequences: list[int] = []
+
+    for row in rows:
+        bucket_start = row.get("bucket_start")
+        if isinstance(bucket_start, datetime):
+            bucket_key = bucket_start.isoformat()
+        else:
+            bucket_key = str(bucket_start or "")
+        seq = bucket_seq.get(bucket_key)
+        if not isinstance(seq, int) or seq <= 0:
+            seq = next_seq
+            next_seq += 1
+            bucket_seq[bucket_key] = seq
+        sequences.append(seq)
+
+    active_keys = {
+        bucket_start.isoformat() if isinstance(bucket_start := row.get("bucket_start"), datetime) else str(bucket_start or "")
+        for row in rows
+    }
+    state["bucket_seq"] = {
+        key: value
+        for key, value in bucket_seq.items()
+        if key in active_keys
+    }
+    state["next_seq"] = next_seq
+    return sequences
+
+
+def _serialize_ohlcv_rows(rows: list[dict[str, Any]], venue: str, instrument: str, timeframe: str) -> list[dict[str, Any]]:
+    sequences = _sequence_ohlcv_rows(venue, instrument, timeframe, rows)
+    normalized: list[dict[str, Any]] = []
+    for row, seq in zip(rows, sequences):
+        bucket_start = row.get("bucket_start")
+        if isinstance(bucket_start, datetime):
+            bucket_start_iso = bucket_start.isoformat()
+        else:
+            bucket_start_iso = str(bucket_start or "")
+
+        timeframe = str(row.get("timeframe") or "")
+        open_price = _float(row.get("open"), 0.0)
+        high_price = _float(row.get("high"), open_price)
+        low_price = _float(row.get("low"), open_price)
+        close_price = _float(row.get("close"), open_price)
+        volume = _float(row.get("volume"), 0.0)
+        quote_volume = _float(row.get("quote_volume"), 0.0)
+        trades_count = int(_float(row.get("trades_count"), 0.0))
+
+        normalized.append(
+            {
+                "venue": str(row.get("venue") or DEFAULT_VENUE),
+                "instrument": _normalize_instrument(str(row.get("instrument") or "")),
+                "timeframe": timeframe,
+                "bucket_start": bucket_start_iso,
+                "open": open_price,
+                "high": high_price,
+                "low": low_price,
+                "close": close_price,
+                "volume": volume,
+                "quote_volume": quote_volume,
+                "trades_count": trades_count,
+                "source": str(row.get("source") or "trade-resampled"),
+                "t": bucket_start_iso,
+                "o": open_price,
+                "h": high_price,
+                "l": low_price,
+                "c": close_price,
+                "v": volume,
+                "tf": timeframe,
+                "seq": seq,
+            }
+        )
+    return normalized
+
+
+async def _broadcast_ohlcv_snapshot(venue: str, instrument: str, timeframe: str, limit: int = 500) -> None:
+    stream_key = _ohlcv_stream_key(venue, instrument, timeframe)
+    subscribers = OHLCV_SUBSCRIBERS.get(stream_key, set())
+    if not subscribers:
+        return
+
+    rows = _serialize_ohlcv_rows(_fetch_ohlcv_rows(venue, instrument, timeframe, limit), venue, instrument, timeframe)
+    state = OHLCV_STREAM_STATE.setdefault(stream_key, {"next_seq": 1, "bucket_seq": {}, "last_signature": ""})
+    signature = hashlib.sha256(json_dumps(rows).encode("utf-8")).hexdigest()
+    if signature == str(state.get("last_signature") or ""):
+        return
+
+    payload = {
+        "type": "snapshot",
+        "venue": venue,
+        "instrument": _normalize_instrument(instrument),
+        "timeframe": timeframe,
+        "items": rows,
+        "as_of": _now_utc().isoformat(),
+    }
+    stale: list[WebSocket] = []
+    for socket in list(subscribers):
+        try:
+            await socket.send_json(payload)
+        except Exception:
+            stale.append(socket)
+    for socket in stale:
+        subscribers.discard(socket)
+
+    state["last_signature"] = signature
+
+
+def _cleanup_old_rows() -> None:
+    if not HOUSEKEEPING_ENABLED:
+        return
+    execute("DELETE FROM market_trades WHERE traded_at < NOW() - INTERVAL '24 hours'")
+    execute("DELETE FROM market_orderbook_snapshots WHERE snapshot_at < NOW() - INTERVAL '12 hours'")
+    execute(
+        """
+        DELETE FROM market_ohlcv
+        WHERE (timeframe IN ('1m', '5m', '15m') AND bucket_start < NOW() - INTERVAL '14 days')
+           OR (timeframe = '1h' AND bucket_start < NOW() - INTERVAL '120 days')
+           OR (timeframe = '1d' AND bucket_start < NOW() - INTERVAL '730 days')
+        """
+    )
+    execute("DELETE FROM market_derivatives_metrics WHERE captured_at < NOW() - INTERVAL '14 days'")
+    execute(
+        "DELETE FROM market_trade_preprocessor_journal WHERE sample_bucket < NOW() - (%s || ' days')::interval",
+        (PREPROCESSED_TRADE_JOURNAL_RETENTION_DAYS,),
+    )
+
+
+def _has_recent_trades(venue: str, instrument: str, lookback_seconds: int = 90) -> bool:
+    row = fetch_one(
+        """
+        SELECT COUNT(*) AS count
+        FROM market_trades
+        WHERE venue = %s
+          AND instrument = %s
+          AND traded_at >= NOW() - (%s || ' seconds')::interval
+        """,
+        (venue, _normalize_instrument(instrument), max(5, lookback_seconds)),
+    ) or {"count": 0}
+    return int(row.get("count") or 0) > 0
+
+
+async def _sync_symbol(client: httpx.AsyncClient, instrument: str) -> None:
+    symbol = _normalize_instrument(instrument)
+    quote = await _fetch_binance_book_ticker(client, symbol)
+    if quote:
+        await _upsert_snapshot_async(quote)
+
+    bingx_quote = await _fetch_bingx_ticker(client, symbol)
+    if bingx_quote:
+        await _upsert_snapshot_async(bingx_quote)
+
+    bybit_quote = await _fetch_bybit_ticker(client, symbol)
+    if bybit_quote:
+        await _upsert_snapshot_async(bybit_quote)
+
+    coinbase_quote = await _fetch_coinbase_ticker(client, symbol)
+    if coinbase_quote:
+        await _upsert_snapshot_async(coinbase_quote)
+
+    okx_quote = await _fetch_okx_ticker(client, symbol)
+    if okx_quote:
+        await _upsert_snapshot_async(okx_quote)
+
+    trades: list[dict[str, Any]] = []
+    if not _has_recent_trades(DEFAULT_VENUE, symbol):
+        trades = await _fetch_binance_trades(client, symbol, limit=200)
+    if trades:
+        await _store_trades_async(DEFAULT_VENUE, symbol, trades)
+        await _broadcast_trades(DEFAULT_VENUE, symbol, trades)
+        updated_timeframes: list[str] = []
+        for timeframe in ("1m", "5m", "15m", "1h"):
+            await _upsert_ohlcv_from_trades_async(DEFAULT_VENUE, symbol, trades, timeframe)
+            updated_timeframes.append(timeframe)
+        for timeframe in updated_timeframes:
+            await _broadcast_ohlcv_snapshot(DEFAULT_VENUE, symbol, timeframe)
+
+    bybit_trades: list[dict[str, Any]] = []
+    if not _has_recent_trades("bybit-public", symbol):
+        bybit_trades = await _fetch_bybit_trades(client, symbol, limit=200)
+    if bybit_trades:
+        await _store_trades_async("bybit-public", symbol, bybit_trades)
+        await _broadcast_trades("bybit-public", symbol, bybit_trades)
+        for timeframe in ("1m", "5m", "15m", "1h"):
+            await _upsert_ohlcv_from_trades_async("bybit-public", symbol, bybit_trades, timeframe)
+            await _broadcast_ohlcv_snapshot("bybit-public", symbol, timeframe)
+
+    bingx_trades: list[dict[str, Any]] = []
+    if not _has_recent_trades("bingx-public", symbol):
+        bingx_trades = await _fetch_bingx_trades(client, symbol, limit=200)
+    if bingx_trades:
+        await _store_trades_async("bingx-public", symbol, bingx_trades)
+        await _broadcast_trades("bingx-public", symbol, bingx_trades)
+        for timeframe in ("1m", "5m", "15m", "1h"):
+            await _upsert_ohlcv_from_trades_async("bingx-public", symbol, bingx_trades, timeframe)
+            await _broadcast_ohlcv_snapshot("bingx-public", symbol, timeframe)
+
+    await _sync_depth_snapshot(
+        DEFAULT_VENUE,
+        symbol,
+        await _fetch_binance_depth_snapshot(client, symbol),
+        reason="rest-sync",
+        source="binance-depth-rest",
+    )
+    await _sync_depth_snapshot(
+        "bybit-public",
+        symbol,
+        await _fetch_bybit_depth_snapshot(client, symbol),
+        reason="rest-sync",
+        source="bybit-depth-rest",
+    )
+    await _sync_depth_snapshot(
+        "bingx-public",
+        symbol,
+        await _fetch_bingx_depth_snapshot(client, symbol),
+        reason="rest-sync",
+        source="bingx-depth-rest",
+    )
+    await _sync_depth_snapshot(
+        "coinbase-public",
+        symbol,
+        await _fetch_coinbase_depth_snapshot(client, symbol),
+        reason="rest-sync",
+        source="coinbase-depth-rest",
+    )
+    await _sync_depth_snapshot(
+        "okx-public",
+        symbol,
+        await _fetch_okx_depth_snapshot(client, symbol),
+        reason="rest-sync",
+        source="okx-depth-rest",
+    )
+
+    derivatives = await _fetch_binance_derivatives_metrics(client, symbol)
+    if derivatives:
+        DERIVATIVES_CACHE[_stream_key(DEFAULT_VENUE, symbol)] = derivatives
+        await _store_derivatives_async(derivatives)
+
+
+async def _sync_loop() -> None:
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                for instrument in _active_symbols():
+                    await _sync_symbol(client, instrument)
+            await _cleanup_old_rows_async()
+        except Exception:
+            pass
+        await asyncio.sleep(SYNC_SECONDS)
+
+
+async def _stream_depth_symbol(symbol: str) -> None:
+    stream_url = f"wss://stream.binance.com:9443/ws/{symbol.lower()}@depth@100ms"
+    key = _stream_key(DEFAULT_VENUE, symbol)
+
+    while True:
+        try:
+            if key not in DEPTH_BOOKS:
+                async with httpx.AsyncClient(timeout=8.0) as client:
+                    snapshot = await _fetch_binance_depth_snapshot(client, symbol)
+                await _sync_depth_snapshot(DEFAULT_VENUE, symbol, snapshot, reason="rest-seed", source="binance-depth-rest")
+
+            async with websockets.connect(stream_url, ping_interval=20, ping_timeout=20) as socket:
+                last_persist = _now_utc()
+                while True:
+                    raw_message = await socket.recv()
+                    payload = json.loads(raw_message)
+                    book = DEPTH_BOOKS.setdefault(
+                        key,
+                        {
+                            "bids": {},
+                            "asks": {},
+                            "last_update_id": 0,
+                            "event_time": int(_now_utc().timestamp() * 1000),
+                        },
+                    )
+                    _apply_side_delta(book["bids"], payload.get("b", []))
+                    _apply_side_delta(book["asks"], payload.get("a", []))
+                    book["last_update_id"] = int(payload.get("u", book.get("last_update_id", 0)))
+                    book["event_time"] = int(payload.get("E", int(_now_utc().timestamp() * 1000)))
+
+                    await _broadcast_depth_delta(
+                        DEFAULT_VENUE,
+                        symbol,
+                        {
+                            "type": "delta",
+                            "venue": DEFAULT_VENUE,
+                            "instrument": symbol,
+                            "update_id": book["last_update_id"],
+                            "event_time": book["event_time"],
+                            "bids": payload.get("b", []),
+                            "asks": payload.get("a", []),
+                        },
+                    )
+
+                    if (_now_utc() - last_persist).total_seconds() >= 4:
+                        await _store_depth_async(_snapshot_from_book(DEFAULT_VENUE, symbol, book, "stream-delta", "binance-depth-stream"))
+                        last_persist = _now_utc()
+        except Exception:
+            await asyncio.sleep(2)
+
+
+async def _stream_coinbase_depth_symbol(symbol: str) -> None:
+    product_id = _coinbase_product_id(symbol)
+    if not product_id:
+        return
+
+    stream_url = "wss://ws-feed.exchange.coinbase.com"
+    subscribe_payload = {
+        "type": "subscribe",
+        "product_ids": [product_id],
+        "channels": ["level2"],
+    }
+    key = _stream_key("coinbase-public", symbol)
+
+    while True:
+        try:
+            if key not in DEPTH_BOOKS:
+                async with httpx.AsyncClient(timeout=8.0) as client:
+                    snapshot = await _fetch_coinbase_depth_snapshot(client, symbol)
+                await _sync_depth_snapshot("coinbase-public", symbol, snapshot, reason="rest-seed", source="coinbase-depth-rest")
+
+            async with websockets.connect(stream_url, ping_interval=20, ping_timeout=20) as socket:
+                await socket.send(json.dumps(subscribe_payload))
+                last_persist = _now_utc()
+                while True:
+                    raw_message = await socket.recv()
+                    payload = json.loads(raw_message)
+                    message_type = str(payload.get("type") or "")
+                    if str(payload.get("product_id") or product_id) != product_id:
+                        continue
+                    if message_type == "snapshot":
+                        book = {
+                            "bids": _depth_rows_to_map([[ _float(level[0]), _float(level[1])] for level in payload.get("bids", [])]),
+                            "asks": _depth_rows_to_map([[ _float(level[0]), _float(level[1])] for level in payload.get("asks", [])]),
+                            "last_update_id": int(_float(payload.get("sequence"), 0)),
+                            "event_time": int(_now_utc().timestamp() * 1000),
+                        }
+                        DEPTH_BOOKS[key] = book
+                        await _store_depth_async(_snapshot_from_book("coinbase-public", symbol, book, "stream-snapshot", "coinbase-depth-stream"))
+                        continue
+                    if message_type != "l2update":
+                        continue
+                    book = DEPTH_BOOKS.setdefault(
+                        key,
+                        {"bids": {}, "asks": {}, "last_update_id": 0, "event_time": int(_now_utc().timestamp() * 1000)},
+                    )
+                    changes = payload.get("changes", [])
+                    bid_rows = _coinbase_changes_to_depth_rows(changes, "bid")
+                    ask_rows = _coinbase_changes_to_depth_rows(changes, "ask")
+                    _apply_side_delta(book["bids"], bid_rows)
+                    _apply_side_delta(book["asks"], ask_rows)
+                    book["last_update_id"] = int(_float(payload.get("sequence"), book.get("last_update_id", 0)))
+                    event_time = _parse_iso_timestamp(payload.get("time"))
+                    book["event_time"] = int((event_time or _now_utc()).timestamp() * 1000)
+
+                    await _broadcast_depth_delta(
+                        "coinbase-public",
+                        symbol,
+                        {
+                            "type": "delta",
+                            "venue": "coinbase-public",
+                            "instrument": symbol,
+                            "update_id": book["last_update_id"],
+                            "event_time": book["event_time"],
+                            "bids": bid_rows,
+                            "asks": ask_rows,
+                        },
+                    )
+
+                    if (_now_utc() - last_persist).total_seconds() >= 4:
+                        await _store_depth_async(_snapshot_from_book("coinbase-public", symbol, book, "stream-delta", "coinbase-depth-stream"))
+                        last_persist = _now_utc()
+        except Exception:
+            await asyncio.sleep(2)
+
+
+async def _stream_okx_depth_symbol(symbol: str) -> None:
+    inst_id = _okx_inst_id(symbol)
+    if not inst_id:
+        return
+
+    stream_url = "wss://ws.okx.com:8443/ws/v5/public"
+    subscribe_payload = {"op": "subscribe", "args": [{"channel": "books5", "instId": inst_id}]}
+    key = _stream_key("okx-public", symbol)
+
+    while True:
+        try:
+            if key not in DEPTH_BOOKS:
+                async with httpx.AsyncClient(timeout=8.0) as client:
+                    snapshot = await _fetch_okx_depth_snapshot(client, symbol)
+                await _sync_depth_snapshot("okx-public", symbol, snapshot, reason="rest-seed", source="okx-depth-rest")
+
+            async with websockets.connect(stream_url, ping_interval=20, ping_timeout=20) as socket:
+                await socket.send(json.dumps(subscribe_payload))
+                last_persist = _now_utc()
+                while True:
+                    raw_message = await socket.recv()
+                    payload = json.loads(raw_message)
+                    arg = payload.get("arg") if isinstance(payload, dict) else None
+                    if not isinstance(arg, dict) or str(arg.get("instId") or "") != inst_id:
+                        continue
+                    rows = payload.get("data") if isinstance(payload, dict) else None
+                    if not isinstance(rows, list) or not rows:
+                        continue
+                    book_payload = rows[0]
+                    if not isinstance(book_payload, dict):
+                        continue
+                    bids = [[_float(level[0]), _float(level[1])] for level in book_payload.get("bids", [])]
+                    asks = [[_float(level[0]), _float(level[1])] for level in book_payload.get("asks", [])]
+                    event_time = int(_float(book_payload.get("ts"), int(_now_utc().timestamp() * 1000)))
+                    book = {
+                        "bids": _depth_rows_to_map(bids),
+                        "asks": _depth_rows_to_map(asks),
+                        "last_update_id": int(_float(book_payload.get("seqId"), event_time)),
+                        "event_time": event_time,
+                    }
+                    DEPTH_BOOKS[key] = book
+
+                    await _broadcast_depth_delta(
+                        "okx-public",
+                        symbol,
+                        {
+                            "type": "delta",
+                            "venue": "okx-public",
+                            "instrument": symbol,
+                            "update_id": book["last_update_id"],
+                            "event_time": book["event_time"],
+                            "bids": [[str(level[0]), str(level[1])] for level in bids],
+                            "asks": [[str(level[0]), str(level[1])] for level in asks],
+                        },
+                    )
+
+                    if (_now_utc() - last_persist).total_seconds() >= 4:
+                        await _store_depth_async(_snapshot_from_book("okx-public", symbol, book, "stream-delta", "okx-depth-stream"))
+                        last_persist = _now_utc()
+        except Exception:
+            await asyncio.sleep(2)
+
+
+async def _stream_bybit_depth_symbol(symbol: str) -> None:
+    bybit_symbol = _bybit_symbol(symbol)
+    if not bybit_symbol:
+        return
+
+    stream_url = _bybit_ws_public_url(symbol)
+    subscribe_payload = {"op": "subscribe", "args": [f"orderbook.200.{bybit_symbol}"]}
+    key = _stream_key("bybit-public", symbol)
+
+    while True:
+        try:
+            if key not in DEPTH_BOOKS:
+                async with httpx.AsyncClient(timeout=8.0) as client:
+                    snapshot = await _fetch_bybit_depth_snapshot(client, symbol)
+                await _sync_depth_snapshot("bybit-public", symbol, snapshot, reason="rest-seed", source="bybit-depth-rest")
+
+            async with websockets.connect(stream_url, ping_interval=20, ping_timeout=20) as socket:
+                await socket.send(json.dumps(subscribe_payload))
+                last_persist = _now_utc()
+                while True:
+                    raw_message = await socket.recv()
+                    payload = json.loads(raw_message)
+                    topic = str(payload.get("topic") or "")
+                    if topic != f"orderbook.200.{bybit_symbol}":
+                        continue
+                    data = payload.get("data") if isinstance(payload, dict) else None
+                    if not isinstance(data, dict):
+                        continue
+                    event_time = int(_float(payload.get("ts") or data.get("ts"), int(_now_utc().timestamp() * 1000)))
+                    bids = [[_float(level[0]), _float(level[1])] for level in data.get("b", [])]
+                    asks = [[_float(level[0]), _float(level[1])] for level in data.get("a", [])]
+                    message_type = str(payload.get("type") or "snapshot").lower()
+                    if message_type == "snapshot" or key not in DEPTH_BOOKS:
+                        book = {
+                            "bids": _depth_rows_to_map(bids),
+                            "asks": _depth_rows_to_map(asks),
+                            "last_update_id": int(_float(data.get("u") or data.get("seq"), event_time)),
+                            "event_time": event_time,
+                        }
+                        DEPTH_BOOKS[key] = book
+                    else:
+                        book = DEPTH_BOOKS.setdefault(
+                            key,
+                            {"bids": {}, "asks": {}, "last_update_id": 0, "event_time": int(_now_utc().timestamp() * 1000)},
+                        )
+                        _apply_side_delta(book["bids"], [[str(level[0]), str(level[1])] for level in bids])
+                        _apply_side_delta(book["asks"], [[str(level[0]), str(level[1])] for level in asks])
+                        book["last_update_id"] = int(_float(data.get("u") or data.get("seq"), book.get("last_update_id", event_time)))
+                        book["event_time"] = event_time
+
+                    await _broadcast_depth_delta(
+                        "bybit-public",
+                        symbol,
+                        {
+                            "type": "delta",
+                            "venue": "bybit-public",
+                            "instrument": bybit_symbol,
+                            "update_id": DEPTH_BOOKS[key]["last_update_id"],
+                            "event_time": event_time,
+                            "bids": [[str(level[0]), str(level[1])] for level in bids],
+                            "asks": [[str(level[0]), str(level[1])] for level in asks],
+                        },
+                    )
+
+                    if (_now_utc() - last_persist).total_seconds() >= 4:
+                        await _store_depth_async(_snapshot_from_book("bybit-public", symbol, DEPTH_BOOKS[key], "stream-delta", "bybit-depth-stream"))
+                        last_persist = _now_utc()
+        except Exception:
+            await asyncio.sleep(2)
+
+
+async def _stream_bingx_depth_symbol(symbol: str) -> None:
+    bingx_symbol = _normalize_bingx_symbol(symbol)
+    if not bingx_symbol:
+        return
+
+    subscribe_payload = {"id": f"depth-{bingx_symbol}", "reqType": "sub", "dataType": f"{bingx_symbol}@depth20"}
+    key = _stream_key("bingx-public", symbol)
+
+    while True:
+        try:
+            if key not in DEPTH_BOOKS:
+                async with httpx.AsyncClient(timeout=8.0) as client:
+                    snapshot = await _fetch_bingx_depth_snapshot(client, symbol)
+                await _sync_depth_snapshot("bingx-public", symbol, snapshot, reason="rest-seed", source="bingx-depth-rest")
+
+            async with websockets.connect(BINGX_WS_PUBLIC_URL, ping_interval=20, ping_timeout=20) as socket:
+                await socket.send(json.dumps(subscribe_payload))
+                last_persist = _now_utc()
+                while True:
+                    raw_message = await socket.recv()
+                    message = _decode_ws_message(raw_message)
+                    if not message:
+                        continue
+                    if message.lower() == "ping":
+                        await socket.send("Pong")
+                        continue
+                    payload = json.loads(message)
+                    if isinstance(payload, dict) and payload.get("ping") is not None:
+                        await socket.send(json.dumps({"pong": payload.get("ping")}))
+                        continue
+                    book = _bingx_depth_book_from_message(payload, symbol)
+                    if not isinstance(book, dict):
+                        continue
+                    DEPTH_BOOKS[key] = book
+                    bids = _depth_map_to_rows(book.get("bids", {}), reverse=True)
+                    asks = _depth_map_to_rows(book.get("asks", {}), reverse=False)
+                    await _broadcast_depth_delta(
+                        "bingx-public",
+                        symbol,
+                        {
+                            "type": "delta",
+                            "venue": "bingx-public",
+                            "instrument": bingx_symbol,
+                            "update_id": book["last_update_id"],
+                            "event_time": book["event_time"],
+                            "bids": [[str(level[0]), str(level[1])] for level in bids],
+                            "asks": [[str(level[0]), str(level[1])] for level in asks],
+                        },
+                    )
+
+                    if (_now_utc() - last_persist).total_seconds() >= 4:
+                        await _store_depth_async(_snapshot_from_book("bingx-public", symbol, book, "stream-delta", "bingx-depth-stream"))
+                        last_persist = _now_utc()
+        except Exception:
+            await asyncio.sleep(2)
+
+
+async def _stream_binance_trades_symbol(symbol: str) -> None:
+    stream_url = f"wss://stream.binance.com:9443/ws/{symbol.lower()}@trade"
+
+    while True:
+        try:
+            async with websockets.connect(stream_url, ping_interval=20, ping_timeout=20) as socket:
+                pending_trades: list[dict[str, Any]] = []
+                last_flush = _now_utc()
+                while True:
+                    raw_message = await socket.recv()
+                    payload = json.loads(raw_message)
+                    traded_at = datetime.fromtimestamp(int(_float(payload.get("T"), 0)) / 1000, tz=timezone.utc)
+                    trade = {
+                        "trade_id": str(payload.get("t") or ""),
+                        "price": _float(payload.get("p"), 0.0),
+                        "size": _float(payload.get("q"), 0.0),
+                        "side": "sell" if bool(payload.get("m")) else "buy",
+                        "traded_at": traded_at,
+                        "payload": payload,
+                    }
+                    if trade["price"] <= 0 or trade["size"] <= 0:
+                        continue
+                    pending_trades.append(trade)
+                    now = _now_utc()
+                    should_flush = len(pending_trades) >= 24 or (now - last_flush).total_seconds() >= 1
+                    if not should_flush:
+                        continue
+                    batch = pending_trades
+                    pending_trades = []
+                    await _store_trades_async(DEFAULT_VENUE, symbol, batch)
+                    for timeframe in ("1m", "5m", "15m", "1h"):
+                        await _upsert_ohlcv_from_trades_async(DEFAULT_VENUE, symbol, batch, timeframe)
+                    await _broadcast_trades(DEFAULT_VENUE, symbol, batch)
+                    last_flush = now
+        except Exception:
+            await asyncio.sleep(2)
+
+
+def _extract_coinbase_trades(message: dict[str, Any], instrument: str) -> list[dict[str, Any]]:
+    product_id = _coinbase_product_id(instrument)
+    if not product_id:
+        return []
+
+    items: list[dict[str, Any]] = []
+    events = message.get("events")
+    if isinstance(events, list):
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            trades = event.get("trades")
+            if not isinstance(trades, list):
+                continue
+            for trade in trades:
+                if not isinstance(trade, dict):
+                    continue
+                if str(trade.get("product_id") or product_id) != product_id:
+                    continue
+                traded_at = _parse_iso_timestamp(trade.get("time"))
+                if traded_at is None:
+                    continue
+                items.append(
+                    {
+                        "trade_id": str(trade.get("trade_id") or trade.get("trade_id_hash") or ""),
+                        "price": _float(trade.get("price"), 0.0),
+                        "size": _float(trade.get("size"), 0.0),
+                        "side": str(trade.get("side") or "").lower(),
+                        "traded_at": traded_at,
+                        "payload": trade,
+                    }
+                )
+
+    direct_trades = message.get("trades")
+    if isinstance(direct_trades, list):
+        for trade in direct_trades:
+            if not isinstance(trade, dict):
+                continue
+            if str(trade.get("product_id") or product_id) != product_id:
+                continue
+            traded_at = _parse_iso_timestamp(trade.get("time"))
+            if traded_at is None:
+                continue
+            items.append(
+                {
+                    "trade_id": str(trade.get("trade_id") or ""),
+                    "price": _float(trade.get("price"), 0.0),
+                    "size": _float(trade.get("size"), 0.0),
+                    "side": str(trade.get("side") or "").lower(),
+                    "traded_at": traded_at,
+                    "payload": trade,
+                }
+            )
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in items:
+        signature = _trade_cache_signature("coinbase-public", instrument, item)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        if item["price"] <= 0 or item["size"] <= 0:
+            continue
+        deduped.append(item)
+    return deduped
+
+
+async def _stream_coinbase_trades_symbol(symbol: str) -> None:
+    product_id = _coinbase_product_id(symbol)
+    if not product_id:
+        return
+
+    stream_url = "wss://advanced-trade-ws.coinbase.com"
+    subscribe_payload = {
+        "type": "subscribe",
+        "channel": "market_trades",
+        "product_ids": [product_id],
+    }
+
+    while True:
+        try:
+            async with websockets.connect(stream_url, ping_interval=20, ping_timeout=20) as socket:
+                await socket.send(json.dumps(subscribe_payload))
+                pending_trades: list[dict[str, Any]] = []
+                last_flush = _now_utc()
+                while True:
+                    raw_message = await socket.recv()
+                    payload = json.loads(raw_message)
+                    trades = _extract_coinbase_trades(payload, symbol)
+                    if not trades:
+                        continue
+                    pending_trades.extend(trades)
+                    now = _now_utc()
+                    should_flush = len(pending_trades) >= 24 or (now - last_flush).total_seconds() >= 1
+                    if not should_flush:
+                        continue
+                    batch = pending_trades
+                    pending_trades = []
+                    await _store_trades_async("coinbase-public", symbol, batch)
+                    for timeframe in ("1m", "5m", "15m", "1h"):
+                        await _upsert_ohlcv_from_trades_async("coinbase-public", symbol, batch, timeframe)
+                    await _broadcast_trades("coinbase-public", symbol, batch)
+                    last_flush = now
+        except Exception:
+            await asyncio.sleep(2)
+
+
+def _extract_okx_trades(message: dict[str, Any], instrument: str) -> list[dict[str, Any]]:
+    inst_id = _okx_inst_id(instrument)
+    arg = message.get("arg") if isinstance(message, dict) else None
+    if not inst_id or not isinstance(arg, dict) or str(arg.get("instId") or "") != inst_id:
+        return []
+    rows = message.get("data") if isinstance(message, dict) else None
+    if not isinstance(rows, list):
+        return []
+    trades: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        traded_ms = int(_float(row.get("ts"), 0))
+        traded_at = datetime.fromtimestamp(traded_ms / 1000, tz=timezone.utc) if traded_ms > 0 else None
+        if traded_at is None:
+            continue
+        price = _float(row.get("px"), 0.0)
+        size = _float(row.get("sz"), 0.0)
+        if price <= 0 or size <= 0:
+            continue
+        trades.append(
+            {
+                "trade_id": str(row.get("tradeId") or traded_ms),
+                "price": price,
+                "size": size,
+                "side": str(row.get("side") or "").lower(),
+                "traded_at": traded_at,
+                "payload": row,
+            }
+        )
+    return trades
+
+
+def _extract_bybit_trades(message: dict[str, Any], instrument: str) -> list[dict[str, Any]]:
+    bybit_symbol = _bybit_symbol(instrument)
+    topic = str(message.get("topic") or "") if isinstance(message, dict) else ""
+    if not bybit_symbol or topic != f"publicTrade.{bybit_symbol}":
+        return []
+    rows = message.get("data") if isinstance(message, dict) else None
+    if not isinstance(rows, list):
+        return []
+    trades: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        traded_ms = int(_float(row.get("T") or row.get("ts") or message.get("ts"), 0))
+        traded_at = datetime.fromtimestamp(traded_ms / 1000, tz=timezone.utc) if traded_ms > 0 else None
+        if traded_at is None:
+            continue
+        price = _float(row.get("p"), 0.0)
+        size = _float(row.get("v") or row.get("q"), 0.0)
+        if price <= 0 or size <= 0:
+            continue
+        trades.append(
+            {
+                "trade_id": str(row.get("i") or row.get("execId") or traded_ms),
+                "price": price,
+                "size": size,
+                "side": str(row.get("S") or row.get("side") or "").lower(),
+                "traded_at": traded_at,
+                "payload": row,
+            }
+        )
+    return trades
+
+
+async def _stream_okx_trades_symbol(symbol: str) -> None:
+    inst_id = _okx_inst_id(symbol)
+    if not inst_id:
+        return
+
+    stream_url = "wss://ws.okx.com:8443/ws/v5/public"
+    subscribe_payload = {
+        "op": "subscribe",
+        "args": [{"channel": "trades", "instId": inst_id}],
+    }
+
+    while True:
+        try:
+            async with websockets.connect(stream_url, ping_interval=20, ping_timeout=20) as socket:
+                await socket.send(json.dumps(subscribe_payload))
+                pending_trades: list[dict[str, Any]] = []
+                last_flush = _now_utc()
+                while True:
+                    raw_message = await socket.recv()
+                    payload = json.loads(raw_message)
+                    trades = _extract_okx_trades(payload, symbol)
+                    if not trades:
+                        continue
+                    pending_trades.extend(trades)
+                    now = _now_utc()
+                    should_flush = len(pending_trades) >= 24 or (now - last_flush).total_seconds() >= 1
+                    if not should_flush:
+                        continue
+                    batch = pending_trades
+                    pending_trades = []
+                    await _store_trades_async("okx-public", symbol, batch)
+                    for timeframe in ("1m", "5m", "15m", "1h"):
+                        await _upsert_ohlcv_from_trades_async("okx-public", symbol, batch, timeframe)
+                    await _broadcast_trades("okx-public", symbol, batch)
+                    last_flush = now
+        except Exception:
+            await asyncio.sleep(2)
+
+
+async def _stream_bybit_trades_symbol(symbol: str) -> None:
+    bybit_symbol = _bybit_symbol(symbol)
+    if not bybit_symbol:
+        return
+
+    stream_url = _bybit_ws_public_url(symbol)
+    subscribe_payload = {"op": "subscribe", "args": [f"publicTrade.{bybit_symbol}"]}
+
+    while True:
+        try:
+            async with websockets.connect(stream_url, ping_interval=20, ping_timeout=20) as socket:
+                await socket.send(json.dumps(subscribe_payload))
+                pending_trades: list[dict[str, Any]] = []
+                last_flush = _now_utc()
+                while True:
+                    raw_message = await socket.recv()
+                    payload = json.loads(raw_message)
+                    trades = _extract_bybit_trades(payload, symbol)
+                    if not trades:
+                        continue
+                    pending_trades.extend(trades)
+                    now = _now_utc()
+                    should_flush = len(pending_trades) >= 24 or (now - last_flush).total_seconds() >= 1
+                    if not should_flush:
+                        continue
+                    batch = pending_trades
+                    pending_trades = []
+                    await _store_trades_async("bybit-public", symbol, batch)
+                    for timeframe in ("1m", "5m", "15m", "1h"):
+                        await _upsert_ohlcv_from_trades_async("bybit-public", symbol, batch, timeframe)
+                    await _broadcast_trades("bybit-public", symbol, batch)
+                    last_flush = now
+        except Exception:
+            await asyncio.sleep(2)
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    ensure_schema()
+    _start_liveness_server()
+    for _, snapshot in SNAPSHOTS.items():
+        await _upsert_snapshot_async(snapshot)
+    if CFD_AUTO_SEED_ENABLED and CFD_WRITE_ENABLED:
+        for instrument in DEFAULT_CFD_SEED_SYMBOLS:
+            try:
+                result = await _backfill_cfd_symbol(instrument)
+                if result.get("status") != "ok":
+                    LOGGER.warning("CFD auto-seed incomplete for %s: %s", instrument, result)
+            except Exception as exc:
+                LOGGER.warning("CFD auto-seed failed for %s: %s", instrument, exc)
+    elif CFD_AUTO_SEED_ENABLED:
+        LOGGER.info("CFD auto-seed skipped on non-writer instance shard=%s/%s", MARKET_SHARD_INDEX, MARKET_SHARD_TOTAL)
+    asyncio.create_task(_sync_loop())
+    for symbol in _active_symbols():
+        asyncio.create_task(_stream_binance_trades_symbol(symbol))
+        asyncio.create_task(_stream_bybit_trades_symbol(symbol))
+        asyncio.create_task(_stream_coinbase_trades_symbol(symbol))
+        asyncio.create_task(_stream_okx_trades_symbol(symbol))
+    if DEPTH_STREAM_ENABLED:
+        for symbol in _active_symbols():
+            asyncio.create_task(_stream_depth_symbol(symbol))
+            asyncio.create_task(_stream_bybit_depth_symbol(symbol))
+            asyncio.create_task(_stream_bingx_depth_symbol(symbol))
+            asyncio.create_task(_stream_coinbase_depth_symbol(symbol))
+            asyncio.create_task(_stream_okx_depth_symbol(symbol))
+
+
+@app.get("/health")
+async def health() -> dict:
+    symbols = fetch_one("SELECT COUNT(*) AS count FROM market_snapshots") or {"count": 0}
+    return {
+        "status": "ok",
+        "service": "market-data-plane",
+        "snapshots": symbols["count"],
+        "symbols": DEFAULT_SYMBOLS,
+        "active_symbols": _active_symbols(),
+        "supported_venues": SUPPORTED_VENUES,
+        "shard": {"index": MARKET_SHARD_INDEX, "total": MARKET_SHARD_TOTAL},
+        "writer": {
+            "primary": MARKET_PRIMARY_WRITER,
+            "cfd_write_enabled": CFD_WRITE_ENABLED,
+            "housekeeping_enabled": HOUSEKEEPING_ENABLED,
+        },
+        "goldapi": {
+            "enabled": GOLDAPI_ENABLED,
+            "history_days": GOLDAPI_HISTORY_DAYS,
+            "max_calls_per_run": GOLDAPI_MAX_CALLS_PER_RUN,
+        },
+        "twelvedata": {
+            "enabled": TWELVEDATA_ENABLED,
+            "history_days": TWELVEDATA_HISTORY_DAYS,
+        },
+        "metalsapi": {
+            "enabled": METALSAPI_ENABLED,
+            "history_days": METALSAPI_HISTORY_DAYS,
+            "max_calls_per_run": METALSAPI_MAX_CALLS_PER_RUN,
+        },
+        "depth_stream_enabled": DEPTH_STREAM_ENABLED,
+        "depth_books": len(DEPTH_BOOKS),
+        "uptime_sec": max(0, int((_now_utc() - APP_STARTED_AT).total_seconds())),
+    }
+
+
+@app.get("/healthz")
+async def healthz() -> dict:
+    return {
+        "status": "ok",
+        "service": "market-data-plane",
+        "uptime_sec": max(0, int((_now_utc() - APP_STARTED_AT).total_seconds())),
+    }
+
+
+@app.post("/internal/backfill/cfd")
+async def internal_backfill_cfd(payload: dict | None = None) -> dict[str, Any]:
+    body = payload if isinstance(payload, dict) else {}
+    raw_symbols = body.get("symbols")
+    venue = str(body.get("venue") or "auto-cfd").strip() or "auto-cfd"
+    if isinstance(raw_symbols, list):
+        symbols = [str(item).strip().upper() for item in raw_symbols if str(item).strip()]
+    elif isinstance(raw_symbols, str):
+        symbols = [part.strip().upper() for part in raw_symbols.split(",") if part.strip()]
+    else:
+        symbols = DEFAULT_CFD_SEED_SYMBOLS
+    if not symbols:
+        raise HTTPException(status_code=400, detail="At least one CFD symbol is required")
+    results: list[dict[str, Any]] = []
+    successful = 0
+    for symbol in symbols:
+        result = await _backfill_cfd_symbol(symbol, venue=venue)
+        results.append(result)
+        if result.get("status") in {"ok", "partial"}:
+            successful += 1
+        resolved_venues = result.get("resolved_venues") if isinstance(result.get("resolved_venues"), dict) else {}
+        for timeframe in ("1h", "1d"):
+            resolved_venue = str(resolved_venues.get(timeframe) or venue)
+            if int((result.get("timeframes") or {}).get(timeframe, 0)) > 0:
+                await _broadcast_ohlcv_snapshot(resolved_venue, symbol, timeframe)
+    overall_status = "ok" if successful == len(results) else ("partial" if successful > 0 else "unavailable")
+    return {"status": overall_status, "results": results, "count": len(results), "successful": successful}
+
+
+@app.get("/v1/market/venues")
+async def market_venues() -> dict:
+    return {
+        "status": "ok",
+        "primary": DEFAULT_VENUE,
+        "supported_venues": SUPPORTED_VENUES,
+    }
+
+
+@app.get("/v1/market/venues/telemetry")
+async def market_venue_telemetry() -> dict:
+    now = _now_utc()
+    venues: list[dict[str, Any]] = []
+    for venue in sorted(SUPPORTED_VENUES):
+        trackers = VENUE_STREAM_TELEMETRY.get(venue, {})
+        if not trackers:
+            continue
+        instruments: list[dict[str, Any]] = []
+        for instrument in sorted(trackers.keys()):
+            tracker = trackers[instrument]
+            quote_freshness_ms = _age_ms_from_datetime(tracker.get("last_quote_at"))
+            depth_freshness_ms = _age_ms_from_datetime(tracker.get("last_depth_at"))
+            trade_freshness_ms = _age_ms_from_datetime(tracker.get("last_trade_at"))
+            instruments.append(
+                {
+                    "instrument": instrument,
+                    "quote_updates": int(tracker.get("quote_updates") or 0),
+                    "depth_updates": int(tracker.get("depth_updates") or 0),
+                    "trade_updates": int(tracker.get("trade_updates") or 0),
+                    "trade_count": int(tracker.get("trade_count") or 0),
+                    "trade_notional_usd": round(_float(tracker.get("trade_notional_usd"), 0.0), 2),
+                    "spread_bps": round(_float(tracker.get("spread_bps"), 0.0), 4),
+                    "depth_levels": int(tracker.get("depth_levels") or 0),
+                    "depth_latency_ms": round(_float(tracker.get("depth_latency_ema_ms"), 0.0), 1) if tracker.get("depth_latency_ema_ms") is not None else None,
+                    "trade_latency_ms": round(_float(tracker.get("trade_latency_ema_ms"), 0.0), 1) if tracker.get("trade_latency_ema_ms") is not None else None,
+                    "quote_freshness_ms": quote_freshness_ms,
+                    "depth_freshness_ms": depth_freshness_ms,
+                    "trade_freshness_ms": trade_freshness_ms,
+                    "last_quote_at": tracker.get("last_quote_at"),
+                    "last_depth_at": tracker.get("last_depth_at"),
+                    "last_trade_at": tracker.get("last_trade_at"),
+                }
+            )
+        if not instruments:
+            continue
+        depth_latencies = [item["depth_latency_ms"] for item in instruments if item["depth_latency_ms"] is not None]
+        trade_latencies = [item["trade_latency_ms"] for item in instruments if item["trade_latency_ms"] is not None]
+        venues.append(
+            {
+                "venue": venue,
+                "instrument_count": len(instruments),
+                "avg_spread_bps": round(sum(item["spread_bps"] for item in instruments) / max(len(instruments), 1), 4),
+                "avg_depth_levels": round(sum(item["depth_levels"] for item in instruments) / max(len(instruments), 1), 1),
+                "avg_depth_latency_ms": round(sum(depth_latencies) / max(len(depth_latencies), 1), 1) if depth_latencies else None,
+                "avg_trade_latency_ms": round(sum(trade_latencies) / max(len(trade_latencies), 1), 1) if trade_latencies else None,
+                "max_quote_freshness_ms": max((item["quote_freshness_ms"] or 0 for item in instruments), default=0),
+                "max_depth_freshness_ms": max((item["depth_freshness_ms"] or 0 for item in instruments), default=0),
+                "max_trade_freshness_ms": max((item["trade_freshness_ms"] or 0 for item in instruments), default=0),
+                "depth_updates": sum(item["depth_updates"] for item in instruments),
+                "trade_updates": sum(item["trade_updates"] for item in instruments),
+                "quote_updates": sum(item["quote_updates"] for item in instruments),
+                "trade_count": sum(item["trade_count"] for item in instruments),
+                "trade_notional_usd": round(sum(item["trade_notional_usd"] for item in instruments), 2),
+                "updated_at": now.isoformat(),
+                "instruments": instruments,
+            }
+        )
+    return {"status": "ok", "venues": venues, "updated_at": now.isoformat()}
+
+
+@app.get("/v1/quotes")
+async def quotes() -> list[dict]:
+    return fetch_all("SELECT venue, instrument, bid, ask, last, spread_bps, updated_at FROM market_snapshots ORDER BY venue, instrument")
+
+
+@app.get("/v1/market/ohlcv")
+async def market_ohlcv(
+    instrument: str = Query(...),
+    venue: str = Query(DEFAULT_VENUE),
+    timeframe: str = Query("1m"),
+    limit: int = Query(200, ge=1, le=1000),
+) -> list[dict]:
+    market_symbol = _market_symbol_for_venue(venue, instrument)
+    rows = _fetch_ohlcv_rows(venue, market_symbol, timeframe, limit)
+    return _serialize_ohlcv_rows(rows, venue, market_symbol, timeframe)
+
+
+@app.get("/v1/market/trades")
+async def market_trades(
+    instrument: str = Query(...),
+    venue: str = Query(DEFAULT_VENUE),
+    limit: int = Query(200, ge=1, le=500),
+) -> list[dict]:
+    market_symbol = _market_symbol_for_venue(venue, instrument)
+    return fetch_all(
+        """
+        SELECT venue, instrument, trade_id, side, price, size, traded_at, payload
+        FROM market_trades
+        WHERE venue = %s AND instrument = %s
+        ORDER BY traded_at DESC
+        LIMIT %s
+        """,
+        (venue, market_symbol, limit),
+    )
+
+
+@app.get("/v1/market/trades/preprocessed")
+async def market_trades_preprocessed(
+    instrument: str = Query(...),
+    venue: str = Query(DEFAULT_VENUE),
+    limit: int = Query(200, ge=20, le=500),
+    target_count: int = Query(PREPROCESSED_TRADE_TARGET_COUNT, ge=20, le=400),
+) -> dict:
+    market_symbol = _market_symbol_for_venue(venue, instrument)
+    safe_target = max(20, min(target_count, limit))
+    rows = fetch_all(
+        """
+        SELECT venue, instrument, trade_id, side, price, size, traded_at, payload
+        FROM market_trades
+        WHERE venue = %s AND instrument = %s
+        ORDER BY traded_at DESC
+        LIMIT %s
+        """,
+        (venue, market_symbol, limit),
+    )
+    compressed = _build_preprocessed_trade_feed(venue, market_symbol, rows, target_count=safe_target)
+    await asyncio.to_thread(_record_trade_preprocessor_journal, venue, market_symbol, compressed, "http_snapshot")
+    return compressed
+
+
+@app.get("/v1/market/trades/preprocessor/journal")
+async def market_trades_preprocessor_journal(
+    instrument: str = Query(...),
+    venue: str = Query(DEFAULT_VENUE),
+    hours: int = Query(12, ge=1, le=168),
+    limit: int = Query(48, ge=1, le=240),
+) -> dict:
+    market_symbol = _market_symbol_for_venue(venue, instrument)
+    rows = fetch_all(
+        """
+        SELECT
+            sample_bucket,
+            venue,
+            instrument,
+            source,
+            mode,
+            market_regime,
+            sample_count,
+            raw_count_total,
+            emitted_count_total,
+            CASE
+                WHEN raw_count_total > 0 THEN emitted_count_total::double precision / raw_count_total
+                ELSE 0
+            END AS compression_ratio,
+            CASE
+                WHEN raw_count_total > 0 THEN (1 - emitted_count_total::double precision / raw_count_total) * 100
+                ELSE 0
+            END AS compression_saved_pct,
+            CASE
+                WHEN sample_count > 0 THEN raw_count_total::double precision / sample_count
+                ELSE 0
+            END AS avg_raw_count,
+            CASE
+                WHEN sample_count > 0 THEN emitted_count_total::double precision / sample_count
+                ELSE 0
+            END AS avg_emitted_count,
+            payload,
+            updated_at
+        FROM market_trade_preprocessor_journal
+        WHERE venue = %s
+          AND instrument = %s
+          AND sample_bucket >= NOW() - (%s || ' hours')::interval
+        ORDER BY sample_bucket DESC, updated_at DESC
+        LIMIT %s
+        """,
+        (venue, market_symbol, hours, limit),
+    )
+    total_raw = sum(max(0, int(row.get("raw_count_total") or 0)) for row in rows)
+    total_emitted = sum(max(0, int(row.get("emitted_count_total") or 0)) for row in rows)
+    total_samples = sum(max(0, int(row.get("sample_count") or 0)) for row in rows)
+    return {
+        "venue": venue,
+        "instrument": market_symbol,
+        "bucket": PREPROCESSED_TRADE_JOURNAL_BUCKET,
+        "items": rows,
+        "summary": {
+            "sample_count": total_samples,
+            "raw_count_total": total_raw,
+            "emitted_count_total": total_emitted,
+            "compression_ratio": round(total_emitted / max(total_raw, 1), 6),
+            "compression_saved_pct": round((1.0 - (total_emitted / max(total_raw, 1))) * 100.0, 4),
+        },
+        "as_of": _now_utc().isoformat(),
+    }
+
+
+@app.get("/v1/market/trades/preprocessor/analytics")
+async def market_trades_preprocessor_analytics(
+    venue: str | None = Query(None),
+    instrument: str | None = Query(None),
+    limit: int = Query(24, ge=1, le=100),
+) -> dict:
+    normalized_venue = str(venue).strip() if isinstance(venue, str) and venue.strip() else None
+    normalized_instrument = _normalize_instrument(instrument) if isinstance(instrument, str) and instrument.strip() else None
+    payload = _build_trade_preprocessor_analytics_payload(
+        venue=normalized_venue,
+        instrument=normalized_instrument,
+        limit=limit,
+    )
+    return payload
+
+
+@app.get("/v1/market/orderbook/depth")
+async def market_depth(
+    instrument: str = Query(...),
+    venue: str = Query(DEFAULT_VENUE),
+) -> dict:
+    symbol = _market_symbol_for_venue(venue, instrument)
+    key = _stream_key(venue, symbol)
+
+    book = DEPTH_BOOKS.get(key)
+    if book:
+        snapshot = _snapshot_from_book(venue, symbol, book, "in-memory", f"{venue}-depth-memory")
+        return {
+            "venue": snapshot["venue"],
+            "instrument": snapshot["instrument"],
+            "snapshot_at": snapshot["snapshot_at"],
+            "best_bid": snapshot["best_bid"],
+            "best_ask": snapshot["best_ask"],
+            "spread_bps": snapshot["spread_bps"],
+            "depth_payload": snapshot["depth"],
+            "source": snapshot["source"],
+        }
+
+    row = fetch_one(
+        """
+        SELECT venue, instrument, snapshot_at, best_bid, best_ask, spread_bps, depth_payload, source
+        FROM market_orderbook_snapshots
+        WHERE venue = %s AND instrument = %s
+        ORDER BY snapshot_at DESC
+        LIMIT 1
+        """,
+        (venue, symbol),
+    )
+    if row:
+        return row
+
+    quote = fetch_one(
+        """
+        SELECT venue, instrument, bid AS best_bid, ask AS best_ask, spread_bps
+        FROM market_snapshots
+        WHERE venue = %s AND instrument = %s
+        """,
+        (venue, symbol),
+    )
+    if not quote:
+        return {"venue": venue, "instrument": symbol, "status": "unknown", "depth_payload": {"bids": [], "asks": []}}
+
+    return {
+        "venue": quote["venue"],
+        "instrument": quote["instrument"],
+        "snapshot_at": _now_utc(),
+        "best_bid": quote["best_bid"],
+        "best_ask": quote["best_ask"],
+        "spread_bps": quote["spread_bps"],
+        "depth_payload": {"bids": [[quote["best_bid"], 1.0]], "asks": [[quote["best_ask"], 1.0]]},
+        "source": "quote-fallback",
+    }
+
+
+@app.websocket("/ws/v1/market/orderbook/depth/{instrument}")
+async def ws_market_depth(websocket: WebSocket, instrument: str, venue: str = DEFAULT_VENUE) -> None:
+    symbol = _market_symbol_for_venue(venue, instrument)
+    key = _stream_key(venue, symbol)
+    await websocket.accept()
+    DEPTH_SUBSCRIBERS.setdefault(key, set()).add(websocket)
+
+    initial = await market_depth(instrument=symbol, venue=venue)
+    snapshot_at = initial.get("snapshot_at") if isinstance(initial, dict) else None
+    if isinstance(snapshot_at, datetime):
+        initial["snapshot_at"] = snapshot_at.isoformat()
+    await websocket.send_json({"type": "snapshot", **initial})
+
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        DEPTH_SUBSCRIBERS.get(key, set()).discard(websocket)
+
+
+@app.websocket("/ws/v1/market/ohlcv/{instrument}")
+async def ws_market_ohlcv(
+    websocket: WebSocket,
+    instrument: str,
+    venue: str = DEFAULT_VENUE,
+    timeframe: str = "1m",
+    limit: int = 500,
+) -> None:
+    symbol = _market_symbol_for_venue(venue, instrument)
+    safe_limit = max(50, min(limit, 1000))
+    stream_key = _ohlcv_stream_key(venue, symbol, timeframe)
+    await websocket.accept()
+    OHLCV_SUBSCRIBERS.setdefault(stream_key, set()).add(websocket)
+
+    rows = _serialize_ohlcv_rows(_fetch_ohlcv_rows(venue, symbol, timeframe, safe_limit), venue, symbol, timeframe)
+    state = OHLCV_STREAM_STATE.setdefault(stream_key, {"next_seq": 1, "bucket_seq": {}, "last_signature": ""})
+    state["last_signature"] = hashlib.sha256(json_dumps(rows).encode("utf-8")).hexdigest()
+    await websocket.send_json(
+        {
+            "type": "snapshot",
+            "venue": venue,
+            "instrument": symbol,
+            "timeframe": timeframe,
+            "items": rows,
+            "as_of": _now_utc().isoformat(),
+        }
+    )
+
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        OHLCV_SUBSCRIBERS.get(stream_key, set()).discard(websocket)
+
+
+@app.websocket("/ws/v1/market/trades/{instrument}")
+async def ws_market_trades(
+    websocket: WebSocket,
+    instrument: str,
+    venue: str = DEFAULT_VENUE,
+    limit: int = 200,
+) -> None:
+    symbol = _market_symbol_for_venue(venue, instrument)
+    safe_limit = max(20, min(limit, 500))
+    stream_key = _trade_stream_key(venue, symbol)
+    await websocket.accept()
+    TRADE_SUBSCRIBERS.setdefault(stream_key, set()).add(websocket)
+
+    rows = fetch_all(
+        """
+        SELECT venue, instrument, trade_id, side, price, size, traded_at, payload
+        FROM market_trades
+        WHERE venue = %s AND instrument = %s
+        ORDER BY traded_at DESC
+        LIMIT %s
+        """,
+        (venue, symbol, safe_limit),
+    )
+    serialized = [_serialize_trade(venue, symbol, row) for row in reversed(rows)]
+    await websocket.send_json(
+        {
+            "type": "snapshot",
+            "venue": venue,
+            "instrument": symbol,
+            "items": serialized,
+            "as_of": _now_utc().isoformat(),
+        }
+    )
+
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        TRADE_SUBSCRIBERS.get(stream_key, set()).discard(websocket)
+
+
+@app.websocket("/ws/v1/market/trades/preprocessed/{instrument}")
+async def ws_market_trades_preprocessed(
+    websocket: WebSocket,
+    instrument: str,
+    venue: str = DEFAULT_VENUE,
+    limit: int = 200,
+    target_count: int = PREPROCESSED_TRADE_TARGET_COUNT,
+) -> None:
+    symbol = _market_symbol_for_venue(venue, instrument)
+    safe_limit = max(20, min(limit, 500))
+    safe_target = max(20, min(target_count, safe_limit))
+    stream_key = _trade_stream_key(venue, symbol)
+    await websocket.accept()
+    PREPROCESSED_TRADE_SUBSCRIBERS.setdefault(stream_key, set()).add(websocket)
+
+    rows = fetch_all(
+        """
+        SELECT venue, instrument, trade_id, side, price, size, traded_at, payload
+        FROM market_trades
+        WHERE venue = %s AND instrument = %s
+        ORDER BY traded_at DESC
+        LIMIT %s
+        """,
+        (venue, symbol, safe_limit),
+    )
+    compressed = _build_preprocessed_trade_feed(venue, symbol, list(reversed(rows)), target_count=safe_target)
+    await websocket.send_json(
+        {
+            "type": "snapshot",
+            "venue": venue,
+            "instrument": symbol,
+            "items": compressed.get("items", []),
+            "preprocessor": compressed.get("preprocessor"),
+            "as_of": _now_utc().isoformat(),
+        }
+    )
+
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        subscribers = PREPROCESSED_TRADE_SUBSCRIBERS.get(stream_key, set())
+        subscribers.discard(websocket)
+        if not subscribers:
+            pending = PREPROCESSED_TRADE_FLUSH_TASKS.pop(stream_key, None)
+            if pending and not pending.done():
+                pending.cancel()
+            PREPROCESSED_TRADE_BUFFERS.pop(stream_key, None)
+
+
+@app.get("/v1/market/microstructure")
+async def market_microstructure(
+    instrument: str = Query(...),
+    venue: str = Query(DEFAULT_VENUE),
+    lookback_minutes: int = Query(60, ge=5, le=720),
+) -> dict:
+    symbol = _market_symbol_for_venue(venue, instrument)
+    depth = await market_depth(instrument=symbol, venue=venue)
+    trades = fetch_all(
+        """
+        SELECT side, price, size, traded_at
+        FROM market_trades
+        WHERE venue = %s AND instrument = %s
+          AND traded_at >= NOW() - (%s || ' minutes')::interval
+        ORDER BY traded_at DESC
+        LIMIT 500
+        """,
+        (venue, symbol, lookback_minutes),
+    )
+
+    buy_volume = sum(_float(row.get("size")) for row in trades if str(row.get("side", "")).lower() == "buy")
+    sell_volume = sum(_float(row.get("size")) for row in trades if str(row.get("side", "")).lower() == "sell")
+    trade_count = len(trades)
+    imbalance = (buy_volume - sell_volume) / max(buy_volume + sell_volume, 1e-9)
+
+    bids = depth.get("depth_payload", {}).get("bids", []) if isinstance(depth, dict) else []
+    asks = depth.get("depth_payload", {}).get("asks", []) if isinstance(depth, dict) else []
+    bid_depth = sum(_float(level[1]) for level in bids[:10]) if isinstance(bids, list) else 0.0
+    ask_depth = sum(_float(level[1]) for level in asks[:10]) if isinstance(asks, list) else 0.0
+    depth_imbalance = (bid_depth - ask_depth) / max(bid_depth + ask_depth, 1e-9)
+
+    spread_bps = _float(depth.get("spread_bps"), 0.0) if isinstance(depth, dict) else 0.0
+    derivatives = DERIVATIVES_CACHE.get(_stream_key(venue, symbol))
+    if not derivatives:
+        derivatives = fetch_one(
+            """
+            SELECT funding_rate, open_interest, mark_price, next_funding_time, captured_at
+            FROM market_derivatives_metrics
+            WHERE venue = %s AND instrument = %s
+            ORDER BY captured_at DESC
+            LIMIT 1
+            """,
+            (venue, symbol),
+        )
+
+    return {
+        "venue": venue,
+        "instrument": symbol,
+        "spread_bps": spread_bps,
+        "trade_count": trade_count,
+        "buy_volume": buy_volume,
+        "sell_volume": sell_volume,
+        "tape_acceleration": (buy_volume + sell_volume) / max(lookback_minutes, 1),
+        "depth_imbalance": depth_imbalance,
+        "volume_imbalance": imbalance,
+        "depth_top10": {"bid": bid_depth, "ask": ask_depth},
+        "funding_rate": _float((derivatives or {}).get("funding_rate"), 0.0),
+        "open_interest": _float((derivatives or {}).get("open_interest"), 0.0),
+        "mark_price": _float((derivatives or {}).get("mark_price"), 0.0),
+        "next_funding_time": (derivatives or {}).get("next_funding_time"),
+        "as_of": _now_utc().isoformat(),
+    }
+
+
+@app.get("/v1/market/session-state")
+async def market_session_state(instrument: str = Query("BTCUSDT")) -> dict:
+    symbol = _normalize_instrument(instrument)
+    now = _now_utc()
+    market_status = _fx_market_status(now, symbol)
+    return {
+        "instrument": symbol,
+        "session": _session_label(now),
+        **market_status,
+        "as_of": now.isoformat(),
+        "next_session_change_at": (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).isoformat(),
+    }

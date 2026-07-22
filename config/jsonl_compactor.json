@@ -1,0 +1,41 @@
+{
+  "policies": [
+    {
+      "name": "txt-risk-journal",
+      "source_root": "/workspace/logs",
+      "patterns": [
+        "mission-control-v2-risk-journal*.jsonl",
+        "intent_outcome_labels*.jsonl"
+      ],
+      "parquet_root": "/workspace/artifacts/jsonl-parquet/risk-journal",
+      "archive_root": "/workspace/artifacts/jsonl-archive/risk-journal",
+      "compression": "zstd",
+      "min_age_seconds": 600,
+      "max_files_per_run": 4
+    },
+    {
+      "name": "txt-logs",
+      "source_root": "/workspace/logs",
+      "patterns": [
+        "*.jsonl"
+      ],
+      "parquet_root": "/workspace/artifacts/jsonl-parquet/logs",
+      "archive_root": "/workspace/artifacts/jsonl-archive/logs",
+      "compression": "zstd",
+      "min_age_seconds": 600,
+      "max_files_per_run": 12
+    },
+    {
+      "name": "txt-data-jsonl",
+      "source_root": "/workspace/data/market-data",
+      "patterns": [
+        "**/*.jsonl"
+      ],
+      "parquet_root": "/workspace/artifacts/jsonl-parquet/market-data",
+      "archive_root": "/workspace/artifacts/jsonl-archive/market-data",
+      "compression": "zstd",
+      "min_age_seconds": 600,
+      "max_files_per_run": 24
+    }
+  ]
+}

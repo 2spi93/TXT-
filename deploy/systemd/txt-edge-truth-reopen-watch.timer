@@ -1,0 +1,16 @@
+[Unit]
+Description=Publish TXT Edge Truth market reopen watch snapshots after market reopen
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 00:06:00
+OnCalendar=Mon..Fri *-*-* 00:11:00
+OnCalendar=Mon..Fri *-*-* 00:16:00
+OnCalendar=Mon..Fri *-*-* 00:21:00
+OnCalendar=Mon..Fri *-*-* 00:26:00
+OnCalendar=Mon..Fri *-*-* 00:31:00
+AccuracySec=30s
+Persistent=false
+Unit=txt-edge-truth-reopen-watch.service
+
+[Install]
+WantedBy=timers.target
